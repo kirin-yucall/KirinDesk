@@ -1,0 +1,23 @@
+[device]
+id = "default-device"
+name = "My Device"
+
+[godaddy]
+api_key = ""
+api_secret = ""
+domain = "example.com"
+api_url = "https://api.godaddy.com"
+
+[network]
+port = 3389
+heartbeat_interval = 30
+dns_ttl = 600
+
+[media]
+encoder = "auto"
+framerate = 30
+bitrate = 5000
+
+[logging]
+level = "info"
+format = "text"

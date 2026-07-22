@@ -1,0 +1,14 @@
+[package]
+name = "kirin-desk-dns"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio = { workspace = true, features = ["time", "sync"] }
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+rand.workspace = true
+get_if_addrs = "0.4"

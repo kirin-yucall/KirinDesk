@@ -1,0 +1,15 @@
+[package]
+name = "kirin-desk-utils"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["json", "env-filter"] }
+thiserror.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+anyhow.workspace = true
+dirs-next = "2.0"

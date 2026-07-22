@@ -1,0 +1,24 @@
+[package]
+name = "kirin-desk-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio = { workspace = true, features = ["full"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+bincode.workspace = true
+ed25519-dalek.workspace = true
+x25519-dalek.workspace = true
+hkdf.workspace = true
+aes-gcm.workspace = true
+chacha20poly1305.workspace = true
+rand.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+base64 = "0.22"
+zeroize = { version = "1", features = ["zeroize_derive"] }
+tracing.workspace = true
+get-if-addrs = { version = "0.4", package = "get_if_addrs" }
+kirin-desk-dns = { path = "../dns" }
