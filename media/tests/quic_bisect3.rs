@@ -90,7 +90,7 @@ async fn bisect3() {
         .unwrap();
         let encoder = VideoEncoderPipeline::new(Codec::H264, None).unwrap();
         let capture: Box<dyn ScreenCaptureSource> = Box::new(SyntheticCapture::new(W, H));
-        run_server_session(t, capture, encoder, SessionConfig::default(), stop_server)
+        run_server_session(Box::new(t), capture, encoder, SessionConfig::default(), None, None, stop_server)
             .await
             .unwrap()
     });

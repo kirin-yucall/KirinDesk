@@ -24,6 +24,10 @@ get-if-addrs = { version = "0.5", package = "get_if_addrs" }
 dirs-next = "2.0"
 libloading = "0.8"   # M12-MAC MAC-T006：macOS Keychain 经 dlopen Security/CoreFoundation
 kirin-desk-dns = { path = "../dns" }
+# M8-T026-P1: 客户端审计（打洞成功/失败/重打洞/换路事件，PUNCH-SEC-004）
+kirin-desk-utils = { path = "../utils" }
+# M8-T026-P1: 打洞协议类型（候选交换/探测报文，relay 为叶子 crate，无循环）
+kirin-desk-relay = { path = "../relay" }
 
 # M11: 远程 Shell PTY 模式 — 跨平台 PTY（Windows=ConPTY / Unix=forkpty+openpty）
 portable-pty = "0.9"

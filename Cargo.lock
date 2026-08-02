@@ -1252,6 +1252,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7c1832837b905bbfb5101e07cc24c8deddf52f93225eee6ead5f4d63d53ddcb"
 dependencies = [
  "const-oid",
+ "pem-rfc7468",
  "zeroize",
 ]
 
@@ -1411,6 +1412,7 @@ checksum = "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9"
 dependencies = [
  "curve25519-dalek",
  "ed25519",
+ "rand_core 0.6.4",
  "serde",
  "sha2",
  "subtle",
@@ -2656,6 +2658,8 @@ dependencies = [
  "get_if_addrs 0.5.3",
  "hkdf",
  "kirin-desk-dns",
+ "kirin-desk-relay",
+ "kirin-desk-utils",
  "libloading 0.8.9",
  "portable-pty",
  "rand 0.8.7",
@@ -2708,6 +2712,7 @@ dependencies = [
  "bytes",
  "ed25519-dalek",
  "kirin-desk-core",
+ "kirin-desk-relay",
  "libloading 0.8.9",
  "quinn",
  "quinn-proto",
@@ -2716,6 +2721,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "serde",
+ "socket2 0.6.5",
  "thiserror 2.0.19",
  "time",
  "tokio",
@@ -2724,6 +2730,23 @@ dependencies = [
  "windows 0.62.2",
  "windows-capture 2.0.0",
  "zed-scap",
+]
+
+[[package]]
+name = "kirin-desk-relay"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "bincode",
+ "ed25519-dalek",
+ "get_if_addrs 0.5.3",
+ "rand 0.8.7",
+ "serde",
+ "socket2 0.6.5",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -2741,6 +2764,7 @@ dependencies = [
  "kirin-desk-dns",
  "kirin-desk-input",
  "kirin-desk-media",
+ "kirin-desk-relay",
  "kirin-desk-updater",
  "kirin-desk-utils",
  "serde",
@@ -3525,6 +3549,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pem-rfc7468"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "88b39c9bfcfc231068454382784bb460aae594343fb030d46e9f50a645418412"
+dependencies = [
+ "base64ct",
+]
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4030,6 +4063,16 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "relay-server"
+version = "0.1.0"
+dependencies = [
+ "kirin-desk-relay",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "renderdoc-sys"

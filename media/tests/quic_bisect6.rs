@@ -107,7 +107,7 @@ async fn bisect6() {
         ).await.unwrap();
         let encoder = VideoEncoderPipeline::from_parts(None, Box::new(DummyEncoder)).unwrap();
         let capture: Box<dyn ScreenCaptureSource> = Box::new(SyntheticCapture::new(W, H));
-        run_server_session(t, capture, encoder, SessionConfig::default(), stop_server).await.unwrap()
+        run_server_session(Box::new(t), capture, encoder, SessionConfig::default(), None, None, stop_server).await.unwrap()
     });
 
     tokio::time::sleep(Duration::from_millis(200)).await;

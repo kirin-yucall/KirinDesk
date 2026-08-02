@@ -52,6 +52,58 @@ pub enum AuditEvent {
     TempModeDisabled,
     /// M8-T017: 临时连接窗口过期（倒计时归零/残留状态文件清理）。
     TempModeExpired,
+    /// M8-T026-P1 (PUNCH-SEC-004): 打洞成功（UDP/TCP 路径建立）。
+    /// detail 含设备与路径，如 `device=pc-a path=udp peer=203.0.113.5:9000`。
+    TunnelPunchSuccess,
+    /// M8-T026-P1 (PUNCH-SEC-004): 打洞失败（探测超时/握手失败）。
+    /// detail 含设备、路径与原因。
+    TunnelPunchFailed,
+    /// M8-T026-P1 (PUNCH-SEC-004): NAT 老化触发重打洞（同会话重新候选交换）。
+    /// detail 含设备与尝试次数，如 `device=pc-a attempt=1`。
+    TunnelRepunch,
+    /// M8-T026-P1 (PUNCH-SEC-004): 路径切换（PATH-003 决策执行）。
+    /// detail 含源/目标路径与原因，如 `from=relay to=punch-udp reason=rtt_degraded`。
+    PathSwitch,
+    /// M8-T026 (TNL-SEC-003): 隧道登录成功（token 校验通过）。
+    /// detail 含客户端地址与主机名，如 `ip=[::1]:1234 hostname=pc-a`。
+    TunnelLoginSuccess,
+    /// M8-T026 (TNL-SEC-003): 隧道登录失败（token 错误 / 版本不兼容）。
+    /// detail 含客户端地址与原因（**不记录 token 原文**，TNL-SEC-005）。
+    TunnelLoginFailed,
+    /// M8-T026 (TNL-SEC-003): 代理注册成功（绑定公网端口）。
+    /// detail 含客户端地址与代理名/端口，如 `ip=... proxy=ssh port=60022`。
+    TunnelProxyRegistered,
+    /// M8-T026 (TNL-SEC-003): 代理移除（CloseProxy / 级联清理）。
+    /// detail 含客户端地址与代理名。
+    TunnelProxyRemoved,
+    /// M8-T026 (TNL-SEC-003): work 连接配对成功（数据面开始泵流）。
+    /// detail 含客户端地址与代理名。
+    TunnelWorkConnOpened,
+    /// M8-T026 (TNL-SEC-003): work 连接关闭（任一端断开 / 配对失败 / 级联清理）。
+    /// detail 含客户端地址、代理名与原因。
+    TunnelWorkConnClosed,
+    /// M8-T026 (TNL-SEC-003): 隧道速率限制拒绝（控制端口防爆破）。
+    /// detail 含客户端地址与判定，如 `ip=... decision=TooManyAttempts`。
+    TunnelRateLimited,
+    /// M8-T026-P2 (ID-022): 设备注册上线（Login 携带 device_id 登记在线表）。
+    /// detail 含设备与来源地址，如 `device=pc-a ip=...`。
+    DeviceRegistered,
+    /// M8-T026-P2 (ID-022): 设备上线（重连重注册刷新在线表）。
+    /// detail 含设备 ID。
+    DeviceOnline,
+    /// M8-T026-P2 (ID-022): 设备离线（控制连接断开 / 心跳超时清理）。
+    /// detail 含设备 ID。
+    DeviceOffline,
+    /// M8-T026-P2 (ID-022): 设备解析成功（返回候选 + 公钥，响应已签名）。
+    /// detail 含设备与在线状态，如 `device=pc-a online=true`。
+    DeviceResolveAccepted,
+    /// M8-T026-P2 (ID-022): 设备解析拒绝（限速 / 协议违规）。
+    /// detail 含设备与原因。
+    DeviceResolveRejected,
+    /// M8-T026-P2 (ID-022): 连接路径选择（ID-011 三级路径编排结果）。
+    /// detail 含目标与路径，如 `device=pc-a path=relay`（`punch_skipped` =
+    /// P1 打洞未接入）。
+    TunnelPathSelected,
 }
 
 impl fmt::Display for AuditEvent {
@@ -73,6 +125,26 @@ impl fmt::Display for AuditEvent {
             AuditEvent::TempModeEnabled => "temp_mode_enabled",
             AuditEvent::TempModeDisabled => "temp_mode_disabled",
             AuditEvent::TempModeExpired => "temp_mode_expired",
+            // M8-T026-P1 (PUNCH-SEC-004): 打洞与路径切换事件。
+            AuditEvent::TunnelPunchSuccess => "tunnel_punch_success",
+            AuditEvent::TunnelPunchFailed => "tunnel_punch_failed",
+            AuditEvent::TunnelRepunch => "tunnel_repunch",
+            AuditEvent::PathSwitch => "path_switch",
+            // M8-T026 (TNL-SEC-003): 隧道事件（7 类）。
+            AuditEvent::TunnelLoginSuccess => "tunnel_login_success",
+            AuditEvent::TunnelLoginFailed => "tunnel_login_failed",
+            AuditEvent::TunnelProxyRegistered => "tunnel_proxy_registered",
+            AuditEvent::TunnelProxyRemoved => "tunnel_proxy_removed",
+            AuditEvent::TunnelWorkConnOpened => "tunnel_work_conn_opened",
+            AuditEvent::TunnelWorkConnClosed => "tunnel_work_conn_closed",
+            AuditEvent::TunnelRateLimited => "tunnel_rate_limited",
+            // M8-T026-P2 (ID-022): 设备 ID 模式事件（6 类）。
+            AuditEvent::DeviceRegistered => "device_registered",
+            AuditEvent::DeviceOnline => "device_online",
+            AuditEvent::DeviceOffline => "device_offline",
+            AuditEvent::DeviceResolveAccepted => "device_resolve_accepted",
+            AuditEvent::DeviceResolveRejected => "device_resolve_rejected",
+            AuditEvent::TunnelPathSelected => "tunnel_path_selected",
         };
         f.write_str(s)
     }
@@ -205,6 +277,19 @@ mod tests {
         assert_eq!(AuditEvent::TempModeEnabled.to_string(), "temp_mode_enabled");
         assert_eq!(AuditEvent::TempModeDisabled.to_string(), "temp_mode_disabled");
         assert_eq!(AuditEvent::TempModeExpired.to_string(), "temp_mode_expired");
+        // M8-T026 (TNL-SEC-003): 隧道事件 display。
+        assert_eq!(AuditEvent::TunnelLoginSuccess.to_string(), "tunnel_login_success");
+        assert_eq!(AuditEvent::TunnelLoginFailed.to_string(), "tunnel_login_failed");
+        assert_eq!(AuditEvent::TunnelProxyRegistered.to_string(), "tunnel_proxy_registered");
+        assert_eq!(AuditEvent::TunnelProxyRemoved.to_string(), "tunnel_proxy_removed");
+        assert_eq!(AuditEvent::TunnelWorkConnOpened.to_string(), "tunnel_work_conn_opened");
+        assert_eq!(AuditEvent::TunnelWorkConnClosed.to_string(), "tunnel_work_conn_closed");
+        assert_eq!(AuditEvent::TunnelRateLimited.to_string(), "tunnel_rate_limited");
+        // M8-T026-P1 (PUNCH-SEC-004): 打洞与路径切换事件 display。
+        assert_eq!(AuditEvent::TunnelPunchSuccess.to_string(), "tunnel_punch_success");
+        assert_eq!(AuditEvent::TunnelPunchFailed.to_string(), "tunnel_punch_failed");
+        assert_eq!(AuditEvent::TunnelRepunch.to_string(), "tunnel_repunch");
+        assert_eq!(AuditEvent::PathSwitch.to_string(), "path_switch");
     }
 
     #[test]

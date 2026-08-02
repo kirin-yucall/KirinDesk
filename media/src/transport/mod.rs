@@ -17,9 +17,11 @@ pub mod control;
 pub mod datagram;
 pub mod loss_detection;
 pub mod priority;
+pub mod punch_bridge; // M8-T026-P1: 打洞路径 → 媒体传输桥（PATH-004 升舱）
 pub mod quic;
 pub mod reassembly;
 pub mod stream;
+pub mod tcp_fallback;
 pub mod transport;
 
 // ── 重新导出 ───────────────────────────────────────────
@@ -33,9 +35,16 @@ pub use stream::{
     FLAG_EXTRADATA, FLAG_INCREMENTAL, FLAG_KEY, HEADER_MAGIC, HEADER_SIZE, HEADER_VERSION,
     MAX_PACKET_PAYLOAD,
 };
+pub use tcp_fallback::TcpMediaTransport;
 pub use transport::{
-    accept_quic_transport, connect_quic_transport, QuicMediaTransport, SecureChannelReceiver,
-    SecureChannelSender, SecureChannelTransport,
+    accept_media_transport, accept_quic_transport, bind_dual_stack_tcp_listener,
+    connect_media_transport, connect_quic_transport, connect_quic_transport_on,
+    QuicMediaTransport, SecureChannelReceiver, SecureChannelSender, SecureChannelTransport,
+};
+// M8-T026-P1: 打洞桥导出（PATH-004 升舱 + 打洞 socket 媒体传输）
+pub use punch_bridge::{
+    accept_punch_transport, connect_punch_transport, punch_upgrade_accept_task,
+    punch_upgrade_connect_task, PunchMediaCreds, PunchUpgrade, PunchUpgradeEvent,
 };
 
 use crate::proto::EncodedWindow;
@@ -75,6 +84,15 @@ pub enum TransportError {
     Timeout,
 }
 
+/// 传输模式（P5 会话层按模式分支自适应与 UI 显示）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportMode {
+    /// QUIC（主路径，DATAGRAM + 可靠流）。
+    Quic,
+    /// TCP（SecureChannel 优雅降级路径，M8-T025 P4）。
+    Tcp,
+}
+
 /// 传输层抽象——对所有上层透明。
 ///
 /// 实现者：QuicMediaTransport（主路径）或 SecureChannel 回退。
@@ -100,4 +118,15 @@ pub trait MediaTransport: Send {
 
     /// 主动关闭。
     async fn close(self: Box<Self>) -> Result<(), TransportError>;
+
+    /// 当前传输模式。默认 Quic（既有实现零改动；`TcpMediaTransport` 覆写为 Tcp）。
+    fn mode(&self) -> TransportMode {
+        TransportMode::Quic
+    }
+
+    /// 类型擦除下转（P5 会话层按 `mode()` 下转具体实现，取 QUIC 专属能力：
+    /// 控制流拆分 / cipher / 连接统计）。默认 `None`；两个实现均覆写为 `Some(self)`。
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        None
+    }
 }

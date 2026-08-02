@@ -26,8 +26,45 @@ bitrate = 5000
 level = "info"
 format = "text"
 
+# M8-T025 P5-4: 传输设置（QUIC 优先 → TCP 优雅降级；CLI --transport/--ip-family 覆盖）
+[transport]
+mode = "auto"                 # auto | quic | tcp（B1：auto = QUIC 优先，失败回退 TCP）
+ip_family = "auto"            # auto | ipv4 | ipv6（A4：auto = IPv6 优先，无 v6 用 v4）
+quic_connect_timeout_ms = 3000  # QUIC 建连/握手超时（B1）
+graceful_degrade = true       # 会话中途降级开关（B2：QUIC 失效自动 TCP 重建续传）
+tcp_mode_feedback_interval_ms = 500  # TCP 模式反馈上报周期（§3.5）
+
 [file_transfer]
 # M13-T006: 接收文件落盘目录（留空 = 默认 ~/Downloads/KirinDesk）
 download_dir = ""
 # 单文件大小上限（字节，默认 4 GiB）
 max_file_size = 4294967296
+
+# M8-T026: 内网穿透设置（FRP 式通用 TCP 反向代理）。
+# 默认关闭——可选兜底能力，与 P2P 直连并存；开启仅在有公网 relay 服务器时。
+# 客户端核心字段（server_addr / token / proxies）可在 GUI Settings 页
+# 「Tunnel (内网穿透)」分组编辑；本段为完整配置与默认值。
+[tunnel]
+enabled = false               # 总开关（默认关闭）
+mode = "client"               # client（frpc 等价，默认）| server（frps 等价）
+server_addr = ""              # relay 服务器地址：域名 / IPv4 / IPv6，支持 :port 后缀
+token = ""                    # 认证 token（建议 ≥32 字节高熵随机串；不写日志）
+# --- 以下为 server 模式 / 稳定性参数（GUI 不占位，直接改本文件） ---
+bind_port = 7000              # server 控制端口（v4/v6 双栈）
+port_range = "60000-61000"    # remote_port=0 时自动分配区间（start-end）
+heartbeat_interval = 10       # 心跳间隔秒
+heartbeat_timeout = 30        # 心跳超时秒（连续 3 周期无响应判死）
+pool_count = 0                # 连接池预建 work 连接数（P1 增强，0=关闭）
+max_pool_count = 5            # server 每代理池上限（P1 增强）
+# --- M8-T026-P2 设备 ID 模式（ID 注册/解析/中继） ---
+device_id = ""                # 注册设备 ID（留空 = 由本机身份公钥指纹派生，ID-001）
+server_pubkey = ""            # relay 服务器 Ed25519 公钥（base64；`connect --id` 验签必需，
+                              # 首次 `tunnel serve` 启动时输出，ID-SEC-001）
+extra_candidates = []         # 额外连接候选："ip:port" 列表（ID-005；服务器自动附加观察地址）
+# 代理列表：把内网 TCP 服务映射到公网端口（GUI 中每行一条
+# "name|local_addr:port|remote_port"，remote_port 留空 = 服务端分配）
+# [[tunnel.proxies]]
+# name = "ssh"
+# local_addr = "127.0.0.1"
+# local_port = 22
+# remote_port = 6022

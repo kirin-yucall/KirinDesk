@@ -53,7 +53,8 @@ pub use encoder::{
 };
 pub use proto::{EncodeConfig, EncodedWindow, RawFrame, WindowConfig};
 pub use session::{
-    run_client_session, run_server_session, ClientSessionStats, ServerSessionStats, SessionConfig,
+    run_client_session, run_server_session, ClientDegrade, ClientSessionStats, ServerDegrade,
+    ServerSessionStats, SessionConfig,
 };
 pub use window_pipeline::WindowPipeline;
 // 解码层音频（M8-T015 P2C，对称 P1D 编码侧）：客户端接入音频播放流水线。

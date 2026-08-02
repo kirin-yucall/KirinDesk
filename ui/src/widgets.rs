@@ -224,20 +224,41 @@ pub fn toolbar_button(ui: &mut Ui, theme: &Theme, icon: &str, tooltip: &str) -> 
     resp.on_hover_text(tooltip)
 }
 
-/// 小复制按钮（📋）：点击把文本写入剪贴板。
-pub fn copy_button(ui: &mut Ui, theme: &Theme, text: &str) -> egui::Response {
+/// 小复制按钮（📋，M8-T028）：点击把文本写入剪贴板。
+/// - `text` 为空 → 禁用（灰化不可点，UI-BTY-023）；
+/// - 点击后按钮瞬态显示 ✓（1.5s 自动还原；按按钮 id 记忆，无持续动画，UI-BTY-028）；
+/// - 返回 `(Response, bool)`：`bool` = 本帧发生复制（调用方用于状态栏浮出提示）。
+pub fn copy_button(ui: &mut Ui, theme: &Theme, text: &str) -> (egui::Response, bool) {
+    // 先取本按钮的 auto id（下一个 widget 会消耗它），据此查询上次点击时刻：
+    // 1.5s 内显示 ✓ 而非 📋（跨帧瞬态，不引入持续动画）。
+    // 过期条目不主动清理——每个按钮 id 至多一条，总量有界（约 12 处按钮）。
+    let id = ui.next_auto_id();
+    let show_ok = ui.ctx().data(|d| {
+        d.get_temp::<std::time::Instant>(id)
+            .is_some_and(|t| t.elapsed() < COPY_BUTTON_FEEDBACK)
+    });
+    let icon = if show_ok { "✓" } else { "📋" };
     let resp = ui
-        .add_sized(
-            [26.0, 20.0],
-            egui::Button::new(RichText::new("📋").size(12.0)),
+        .add_enabled(
+            !text.is_empty(),
+            egui::Button::new(RichText::new(icon).size(12.0))
+                .min_size(egui::vec2(26.0, 20.0)),
         )
         .on_hover_text("Copy");
+    let mut copied = false;
     if resp.clicked() {
         ui.output_mut(|o| o.copied_text = text.to_owned());
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(resp.id, std::time::Instant::now()));
+        copied = true;
+        ui.ctx().request_repaint(); // ✓ 瞬态自下一帧起可见
     }
     let _ = theme;
-    resp
+    (resp, copied)
 }
+
+/// M8-T028 (UI-BTY-028): 📋 复制成功反馈持续时间（按钮 ✓ 瞬态）。
+const COPY_BUTTON_FEEDBACK: std::time::Duration = std::time::Duration::from_millis(1500);
 
 // ════════════════════════════════════════════════════════════════
 // 输入
@@ -368,7 +389,14 @@ pub struct StatRow<'a> {
 }
 
 /// 信息卡片（§4 StatCard）：标题栏（Small 弱色）+ 分隔线 + 键值行。
-pub fn stat_card(ui: &mut Ui, theme: &Theme, title: &str, rows: &[StatRow<'_>]) {
+/// 返回本帧被复制的内容（`None` = 未复制；M8-T028 状态栏浮出提示用）。
+pub fn stat_card(
+    ui: &mut Ui,
+    theme: &Theme,
+    title: &str,
+    rows: &[StatRow<'_>],
+) -> Option<String> {
+    let mut copied: Option<String> = None;
     egui::Frame::none()
         .fill(theme.bg_panel)
         .stroke(Stroke::new(theme.border_width, theme.border))
@@ -401,11 +429,15 @@ pub fn stat_card(ui: &mut Ui, theme: &Theme, title: &str, rows: &[StatRow<'_>]) 
                     }
                     ui.add(egui::Label::new(rt).selectable(true));
                     if row.copy {
-                        copy_button(ui, theme, &row.value);
+                        let (_, was_copied) = copy_button(ui, theme, &row.value);
+                        if was_copied {
+                            copied = Some(row.value.clone());
+                        }
                     }
                 });
             }
         });
+    copied
 }
 
 /// 通用卡片容器（服务器控制卡等非键值内容用）。
@@ -573,6 +605,8 @@ mod tests {
                     segmented_control(ui, t, &["IP Mode", "Domain Mode"], &mut sel);
                     toolbar_button(ui, t, "▣", "Fullscreen (F11)");
                     toolbar_button(ui, t, "✖", "Disconnect");
+                    copy_button(ui, t, "2001:db8::1");
+                    copy_button(ui, t, ""); // 空值禁用（UI-BTY-023）
                     labeled_input(
                         ui,
                         t,
@@ -645,10 +679,64 @@ mod tests {
         }
     }
 
+    /// M8-T028 (UI-BTY-023/028): 点击 📋 → 剪贴板写入 + 返回 (Response, bool) 上抛
+    /// + ✓ 瞬态记忆；空值按钮禁用（headless 模拟按下/释放）。
+    #[test]
+    fn test_copy_button_click_and_disabled() {
+        let ctx = egui::Context::default();
+        let mut btn_id = egui::Id::NULL;
+        let mut btn_rect = egui::Rect::NOTHING;
+        // 帧 1：布局并记录按钮位置/id；空值按钮为禁用态。
+        ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let t = &Theme::LIGHT;
+                let (r, copied) = copy_button(ui, t, "hello");
+                btn_id = r.id;
+                btn_rect = r.rect;
+                assert!(r.enabled());
+                assert!(!copied);
+                let (r2, _) = copy_button(ui, t, "");
+                assert!(!r2.enabled());
+            });
+        });
+        // 帧 2：按下 + 释放（同一帧）——点击当帧生效（egui 帧末结算快照，
+        // 同帧 get_response 即可读到 clicked()）；end_frame 会 mem::take 走
+        // viewport.output → 从该帧 FullOutput 读剪贴板内容。
+        let press = |pressed: bool| egui::Event::PointerButton {
+            pos: btn_rect.center(),
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        let full = ctx.run(
+            egui::RawInput {
+                events: vec![press(true), press(false)],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let (r, copied) = copy_button(ui, &Theme::LIGHT, "hello");
+                    assert!(r.clicked());
+                    assert!(copied); // 复制发生 → 上抛（调用方据此浮出提示）
+                });
+            },
+        );
+        assert_eq!(full.platform_output.copied_text, "hello");
+        // ✓ 瞬态记忆已按按钮 id 写入（1.5s 内下一帧起显示 ✓）。
+        assert!(ctx.data(|d| d.get_temp::<std::time::Instant>(btn_id).is_some()));
+        // 帧 3：无点击 → 不再写入。
+        ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let (r, copied) = copy_button(ui, &Theme::LIGHT, "hello");
+                assert!(!r.clicked());
+                assert!(!copied);
+            });
+        });
+    }
+
     /// 密文编辑启发式：追加/回删同步真实值。
     #[test]
-    fn test_secret_sync_heuristic() {
-        let mut value = "abc".to_owned();
+    fn test_secret_sync_heuristic() {        let mut value = "abc".to_owned();
         let prev: String = "•".repeat(value.chars().count());
         // 追加
         let mut edited = prev.clone();

@@ -179,10 +179,12 @@ async fn quic_loopback_end_to_end() {
         let encoder = VideoEncoderPipeline::new(Codec::H264, None).expect("encoder");
         let capture: Box<dyn ScreenCaptureSource> = Box::new(SyntheticCapture::new(W, H));
         run_server_session(
-            transport,
+            Box::new(transport),
             capture,
             encoder,
             SessionConfig::default(),
+            None, // P5：不启用降级（纯 QUIC 主路径回归）
+            None, // M8-T026-P1：不启用打洞升舱
             Arc::clone(&stop_server),
         )
         .await
@@ -214,9 +216,16 @@ async fn quic_loopback_end_to_end() {
                 decoded_task.lock().unwrap().push(rgba.to_vec());
             }
         };
-        run_client_session(transport, on_frame, SessionConfig::default(), stop_client)
-            .await
-            .expect("client session")
+        run_client_session(
+            Box::new(transport),
+            on_frame,
+            SessionConfig::default(),
+            None, // P5：不启用降级（纯 QUIC 主路径回归）
+            None, // M8-T026-P1：不启用打洞升舱
+            stop_client,
+        )
+        .await
+        .expect("client session")
     });
 
     // ── 运行 3s：覆盖 ≥2 个窗口 + ≥1 个反馈周期 ────────────────

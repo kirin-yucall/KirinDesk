@@ -76,6 +76,268 @@ pub struct Config {
     /// M13-T006: 文件传输设置（`[file_transfer]` 段）
     #[serde(default)]
     pub file_transfer: FileTransferConfig,
+
+    /// M8-T025 P5-4: 传输设置（`[transport]` 段：QUIC 优先 → TCP 优雅降级）
+    #[serde(default)]
+    pub transport: TransportConfig,
+
+    /// M8-T026: 内网穿透设置（`[tunnel]` 段：FRP 式通用 TCP 反向代理）
+    #[serde(default)]
+    pub tunnel: TunnelConfig,
+}
+
+/// M8-T025 P5-4: 传输配置（`[transport]` 段，主文档 §3.6）。
+///
+/// CLI 参数（`--transport` / `--ip-family`）覆盖本配置；无参保持 auto 现状
+/// （IPv6 优先 + QUIC 主路径）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransportConfig {
+    /// 传输模式: "auto"（QUIC 优先，失败回退 TCP）| "quic" | "tcp"
+    #[serde(default = "default_transport_mode")]
+    pub mode: String,
+
+    /// 地址族策略: "auto"（IPv6 优先，无 v6 用 v4）| "ipv4" | "ipv6"
+    #[serde(default = "default_ip_family")]
+    pub ip_family: String,
+
+    /// QUIC 建连/握手超时（毫秒，默认 3000）
+    #[serde(default = "default_quic_connect_timeout_ms")]
+    pub quic_connect_timeout_ms: u64,
+
+    /// 会话中途降级开关（true = QUIC 失效自动 TCP 重建续传；false = 直接断连）
+    #[serde(default = "default_graceful_degrade")]
+    pub graceful_degrade: bool,
+
+    /// TCP 模式反馈上报周期（毫秒，默认 500）
+    #[serde(default = "default_tcp_feedback_interval_ms")]
+    pub tcp_mode_feedback_interval_ms: u64,
+}
+
+fn default_transport_mode() -> String {
+    "auto".to_string()
+}
+
+fn default_ip_family() -> String {
+    "auto".to_string()
+}
+
+fn default_quic_connect_timeout_ms() -> u64 {
+    3000
+}
+
+fn default_graceful_degrade() -> bool {
+    true
+}
+
+fn default_tcp_feedback_interval_ms() -> u64 {
+    500
+}
+
+impl Default for TransportConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_transport_mode(),
+            ip_family: default_ip_family(),
+            quic_connect_timeout_ms: default_quic_connect_timeout_ms(),
+            graceful_degrade: default_graceful_degrade(),
+            tcp_mode_feedback_interval_ms: default_tcp_feedback_interval_ms(),
+        }
+    }
+}
+
+/// M8-T026: 内网穿透配置（`[tunnel]` 段，FRP 式通用 TCP 反向代理）。
+///
+/// 默认关闭（`enabled = false`）——可选兜底能力，与 P2P 直连并存。
+/// 客户端（client）主动出站连接公网 relay 服务器，把内网 TCP 服务
+/// （SSH/RDP/HTTP 等）映射到公网端口。服务端参数（bind_port/port_range/
+/// heartbeat 等）不占 GUI，在 `config/default.toml` 配置；客户端填写的
+/// 核心字段（server_addr / token / proxies）在 Settings 页「Tunnel
+/// (内网穿透)」分组编辑（对齐 TNL-CFG-001）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TunnelConfig {
+    /// 内网穿透总开关（默认关闭；开启仅在有公网 relay 服务器时）。
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// 运行模式: "client"（默认，frpc 等价）| "server"（frps 等价）。
+    /// `mode = "server"` 时忽略 client 字段（反之亦然，TNL-CFG-002）。
+    #[serde(default = "default_tunnel_mode")]
+    pub mode: String,
+
+    /// relay 服务器地址（client 模式）：域名 / IPv4 / IPv6，支持 `:port` 后缀。
+    #[serde(default)]
+    pub server_addr: String,
+
+    /// 认证 token（client 与服务端比对，常数时间比较；不写日志，TNL-SEC-005）。
+    #[serde(default)]
+    pub token: String,
+
+    /// 服务端控制端口（server 模式监听，默认 7000，v4/v6 双栈）。
+    #[serde(default = "default_tunnel_bind_port")]
+    pub bind_port: u16,
+
+    /// 服务端自动分配端口区间（`remote_port = 0` 时），格式 `"start-end"`。
+    #[serde(default = "default_tunnel_port_range")]
+    pub port_range: String,
+
+    /// 心跳间隔秒数（默认 10s，TNL-STAB-001）。
+    #[serde(default = "default_tunnel_heartbeat_interval")]
+    pub heartbeat_interval: u64,
+
+    /// 心跳超时秒数（默认 30s，即连续 3 个心跳周期无响应判死）。
+    #[serde(default = "default_tunnel_heartbeat_timeout")]
+    pub heartbeat_timeout: u64,
+
+    /// 连接池预建 work 连接数（P1 增强，默认 0 = 关闭，TNL-STAB-004）。
+    #[serde(default)]
+    pub pool_count: u32,
+
+    /// 服务端每代理连接池上限（P1 增强，默认 5）。
+    #[serde(default = "default_tunnel_max_pool_count")]
+    pub max_pool_count: u32,
+
+    /// 代理列表（client 模式）：把本地 TCP 服务映射到公网端口。
+    #[serde(default)]
+    pub proxies: Vec<TunnelProxy>,
+
+    // ════════════════════════════════════════════════════════════
+    // M8-T026-P2 设备 ID 模式字段（ID-001 / ID-SEC-001 / ID-005）
+    // ════════════════════════════════════════════════════════════
+
+    /// 注册设备 ID（ID-001：显式配置；`None` → 由本机身份 Ed25519 公钥
+    /// 指纹派生）。仅 `enabled && mode="client"` 时生效。
+    #[serde(default)]
+    pub device_id: Option<String>,
+
+    /// relay 服务器 Ed25519 公钥（base64，ID-SEC-001 验签 `DeviceInfo`）。
+    /// ID 模式连接（`connect --id`）必需；缺失 → 拒绝解析并提示配置。
+    #[serde(default)]
+    pub server_pubkey: Option<String>,
+
+    /// 额外连接候选（ID-005）：`"ip:port"` 列表，附加到设备候选（服务器
+    /// 另自动附加观察地址）。
+    #[serde(default)]
+    pub extra_candidates: Vec<String>,
+}
+
+/// 一条端口代理（`[tunnel] proxies` 项，对齐 TNL-PROTO-003）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TunnelProxy {
+    /// 代理名称（唯一，如 "ssh"；同一 name 重复注册 = 更新）。
+    pub name: String,
+
+    /// 本地服务地址（域名 / IPv4 / IPv6）。
+    #[serde(default)]
+    pub local_addr: String,
+
+    /// 本地服务端口。
+    pub local_port: u16,
+
+    /// 公网映射端口（0 = 由服务端从 `port_range` 自动分配）。
+    #[serde(default)]
+    pub remote_port: u16,
+}
+
+fn default_tunnel_mode() -> String {
+    "client".to_string()
+}
+
+fn default_tunnel_bind_port() -> u16 {
+    7000
+}
+
+fn default_tunnel_port_range() -> String {
+    "60000-61000".to_string()
+}
+
+fn default_tunnel_heartbeat_interval() -> u64 {
+    10
+}
+
+fn default_tunnel_heartbeat_timeout() -> u64 {
+    30
+}
+
+fn default_tunnel_max_pool_count() -> u32 {
+    5
+}
+
+impl Default for TunnelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: default_tunnel_mode(),
+            server_addr: String::new(),
+            token: String::new(),
+            bind_port: default_tunnel_bind_port(),
+            port_range: default_tunnel_port_range(),
+            heartbeat_interval: default_tunnel_heartbeat_interval(),
+            heartbeat_timeout: default_tunnel_heartbeat_timeout(),
+            pool_count: 0,
+            max_pool_count: default_tunnel_max_pool_count(),
+            proxies: Vec::new(),
+            // M8-T026-P2：设备 ID 模式配置（默认关闭，None/空）。
+            device_id: None,
+            server_pubkey: None,
+            extra_candidates: Vec::new(),
+        }
+    }
+}
+
+impl TunnelConfig {
+    /// 解析 Settings 页代理多行文本（每行 `name|local_addr:port|remote_port`，
+    /// remote_port 留空 = 服务端分配；空行与 `#` 注释行跳过；非法行跳过）。
+    pub fn parse_proxy_lines(text: &str) -> Vec<TunnelProxy> {
+        let mut proxies = Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut parts = line.split('|');
+            let name = parts.next().unwrap_or("").trim().to_string();
+            let addr_port = parts.next().unwrap_or("").trim();
+            let remote_str = parts.next().map(|s| s.trim()).unwrap_or("");
+            if name.is_empty() || addr_port.is_empty() {
+                continue;
+            }
+            let Some((addr, port_str)) = addr_port.rsplit_once(':') else {
+                continue;
+            };
+            let Ok(local_port) = port_str.parse::<u16>() else {
+                continue;
+            };
+            let remote_port = if remote_str.is_empty() {
+                0
+            } else if let Ok(p) = remote_str.parse::<u16>() {
+                p
+            } else {
+                continue;
+            };
+            proxies.push(TunnelProxy {
+                name,
+                local_addr: addr.to_string(),
+                local_port,
+                remote_port,
+            });
+        }
+        proxies
+    }
+
+    /// 格式化代理列表为多行文本（`parse_proxy_lines` 的逆操作；
+    /// remote_port = 0 时省略第三段）。
+    pub fn format_proxy_lines(proxies: &[TunnelProxy]) -> String {
+        let mut lines = String::new();
+        for p in proxies {
+            let remote = if p.remote_port == 0 {
+                String::new()
+            } else {
+                format!("|{}", p.remote_port)
+            };
+            lines.push_str(&format!("{}|{}:{}{}\n", p.name, p.local_addr, p.local_port, remote));
+        }
+        lines
+    }
 }
 
 /// M13-T006: 文件传输配置（`[file_transfer]` 段）。
@@ -362,6 +624,8 @@ impl Default for Config {
             ui: UiConfig::default(),
             unattended: UnattendedConfig::default(),
             file_transfer: FileTransferConfig::default(),
+            transport: TransportConfig::default(),
+            tunnel: TunnelConfig::default(),
         }
     }
 }
@@ -714,6 +978,142 @@ mod tests {
         assert!(loaded.unattended.auto_start_on_boot);
         assert!(loaded.unattended.auto_start_server);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------- M8-T026: 内网穿透配置测试 ----------
+
+    #[test]
+    fn test_tunnel_defaults() {
+        let config = Config::default();
+        assert!(!config.tunnel.enabled);
+        assert_eq!(config.tunnel.mode, "client");
+        assert!(config.tunnel.server_addr.is_empty());
+        assert!(config.tunnel.token.is_empty());
+        assert_eq!(config.tunnel.bind_port, 7000);
+        assert_eq!(config.tunnel.port_range, "60000-61000");
+        assert_eq!(config.tunnel.heartbeat_interval, 10);
+        assert_eq!(config.tunnel.heartbeat_timeout, 30);
+        assert_eq!(config.tunnel.pool_count, 0);
+        assert_eq!(config.tunnel.max_pool_count, 5);
+        assert!(config.tunnel.proxies.is_empty());
+    }
+
+    #[test]
+    fn test_tunnel_legacy_toml_missing_section() {
+        // 旧配置文件无 [tunnel] 段 → 加载不失败，使用默认值（TNL-CFG-001）
+        let dir = std::env::temp_dir().join("kirin_desk_test_tunnel");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.toml");
+        std::fs::write(
+            &path,
+            "[device]\nid = \"old-device\"\nname = \"Old\"\n\
+             [godaddy]\napi_key = \"\"\napi_secret = \"\"\ndomain = \"example.com\"\n\
+             [network]\nport = 3389\n\
+             [media]\nencoder = \"auto\"\nframerate = 30\nbitrate = 5000\n\
+             [logging]\nlevel = \"info\"\nformat = \"text\"\n",
+        )
+        .unwrap();
+        let loaded = Config::load_from(&path).unwrap();
+        assert_eq!(loaded.device.id, "old-device");
+        assert!(!loaded.tunnel.enabled);
+        assert_eq!(loaded.tunnel.mode, "client");
+        assert_eq!(loaded.tunnel.bind_port, 7000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_tunnel_roundtrip() {
+        let mut config = Config::default();
+        config.tunnel.enabled = true;
+        config.tunnel.server_addr = "relay.example.com:7000".to_string();
+        config.tunnel.token = "secret-token".to_string();
+        config.tunnel.proxies.push(TunnelProxy {
+            name: "ssh".to_string(),
+            local_addr: "127.0.0.1".to_string(),
+            local_port: 22,
+            remote_port: 0,
+        });
+        config.tunnel.proxies.push(TunnelProxy {
+            name: "http".to_string(),
+            local_addr: "127.0.0.1".to_string(),
+            local_port: 8080,
+            remote_port: 60080,
+        });
+        let dir = std::env::temp_dir().join("kirin_desk_test_config_tunnel");
+        let path = dir.join("test.toml");
+        config.save_to(&path).unwrap();
+        let loaded = Config::load_from(&path).unwrap();
+        assert!(loaded.tunnel.enabled);
+        assert_eq!(loaded.tunnel.server_addr, "relay.example.com:7000");
+        assert_eq!(loaded.tunnel.token, "secret-token");
+        assert_eq!(loaded.tunnel.proxies.len(), 2);
+        assert_eq!(loaded.tunnel.proxies[0].name, "ssh");
+        assert_eq!(loaded.tunnel.proxies[0].local_port, 22);
+        assert_eq!(loaded.tunnel.proxies[0].remote_port, 0);
+        assert_eq!(loaded.tunnel.proxies[1].remote_port, 60080);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_tunnel_proxy_lines_parse() {
+        // 正常行 + remote_port 留空 + 注释/空行跳过 + 非法行跳过
+        let text = "\
+            ssh|127.0.0.1:22|6022\n\
+            rdp|192.168.1.5:3389\n\
+            # comment\n\
+            \n\
+            bad-line-no-pipe\n\
+            bad-port|127.0.0.1:not-a-port\n\
+            ipv6|[::1]:2222|6023\n";
+        let proxies = TunnelConfig::parse_proxy_lines(text);
+        assert_eq!(proxies.len(), 3);
+        assert_eq!(proxies[0].name, "ssh");
+        assert_eq!(proxies[0].local_addr, "127.0.0.1");
+        assert_eq!(proxies[0].local_port, 22);
+        assert_eq!(proxies[0].remote_port, 6022);
+        assert_eq!(proxies[1].name, "rdp");
+        assert_eq!(proxies[1].local_port, 3389);
+        assert_eq!(proxies[1].remote_port, 0);
+        assert_eq!(proxies[2].name, "ipv6");
+        assert_eq!(proxies[2].local_addr, "[::1]");
+        assert_eq!(proxies[2].local_port, 2222);
+        assert_eq!(proxies[2].remote_port, 6023);
+    }
+
+    #[test]
+    fn test_tunnel_proxy_lines_format_roundtrip() {
+        let proxies = vec![
+            TunnelProxy {
+                name: "ssh".to_string(),
+                local_addr: "127.0.0.1".to_string(),
+                local_port: 22,
+                remote_port: 0,
+            },
+            TunnelProxy {
+                name: "http".to_string(),
+                local_addr: "192.168.1.5".to_string(),
+                local_port: 8080,
+                remote_port: 60080,
+            },
+        ];
+        let text = TunnelConfig::format_proxy_lines(&proxies);
+        let parsed = TunnelConfig::parse_proxy_lines(&text);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].name, "ssh");
+        assert_eq!(parsed[0].remote_port, 0); // remote_port=0 省略第三段
+        assert_eq!(parsed[1].remote_port, 60080);
+    }
+
+    #[test]
+    fn test_default_toml_parses() {
+        // 项目模板 config/default.toml（含新增 [tunnel] 段）必须可被 Config 解析，
+        // 防止模板与结构体字段脱节。
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../config/default.toml");
+        let cfg = Config::load_from(&path).expect("default.toml should parse");
+        assert!(!cfg.tunnel.enabled);
+        assert_eq!(cfg.tunnel.mode, "client");
+        assert_eq!(cfg.tunnel.bind_port, 7000);
+        assert_eq!(cfg.tunnel.heartbeat_interval, 10);
     }
 
     // ---------- 白名单测试 ----------

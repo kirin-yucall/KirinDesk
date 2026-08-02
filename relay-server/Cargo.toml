@@ -1,0 +1,14 @@
+[package]
+name = "relay-server"
+version.workspace = true
+edition.workspace = true
+
+# M8-T026: 内网穿透服务端独立二进制（frps 等价）。
+# 薄壳包装 kirin-desk-relay lib：CLI 参数（bind-port/token/port-range/
+# server-key）+ 控制台日志/审计 + 优雅退出，便于部署在公网 VPS。
+# relay lib 自身保持 TNL-NF-004 轻量约束，日志/CLI 全部收在本 crate。
+[dependencies]
+kirin-desk-relay = { path = "../relay" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

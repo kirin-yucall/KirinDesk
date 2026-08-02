@@ -1,0 +1,26 @@
+[package]
+name = "kirin-desk-relay"
+version.workspace = true
+edition.workspace = true
+
+# M8-T026: 内网穿透（通用 TCP 反向代理，FRP 式）。
+# 极轻量级约束（TNL-NF-004）：不依赖 core crate（可独立复用），
+# 仅 tokio / serde / bincode / thiserror / tracing / uuid。
+# M8-T026-P2 新增：ed25519-dalek（服务器签名 ID-SEC-001）/ rand / base64 /
+# get-if-addrs（本地候选收集 ID-005）。
+# M8-T025（Windows 打包验收）新增：socket2——bind 前显式 IPV6_V6ONLY=false
+# 实现双栈（Windows 裸 AF_INET6 socket 默认 v6-only；tokio TcpSocket 未暴露
+# 该 setter；对齐 media/quic.rs 同款做法）。
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+bincode.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+ed25519-dalek = { workspace = true, features = ["pkcs8", "pem", "rand_core"] }
+rand.workspace = true
+base64 = "0.22"
+get_if_addrs = "0.5"
+# M8-T025（Windows 打包验收）：bind 前设置 IPV6_V6ONLY=false（见上注释）。
+socket2 = "0.6"

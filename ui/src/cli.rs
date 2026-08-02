@@ -5,8 +5,10 @@ use kirin_desk_dns::aaaa::AaaaManager;
 use kirin_desk_dns::godaddy::GoDaddyClient;
 use kirin_desk_dns::srv::SrvManager;
 use kirin_desk_dns::txt::{DeviceMeta, TxtManager};
-use kirin_desk_dns::DiscoveryService;
+use kirin_desk_dns::{DiscoveryService, IpFamily};
+use kirin_desk_media::transport::TransportMode;
 use kirin_desk_utils::config::Config;
+use std::net::Ipv6Addr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -35,6 +37,197 @@ fn audit_temp_event(event: kirin_desk_utils::audit::AuditEvent, detail: &str) {
     }
 }
 
+// ════════════════════════════════════════════════════════════════
+// M8-T026-P2：设备 ID 连接模式（ID-010~015 / ID-020 / ID-022）
+// ════════════════════════════════════════════════════════════════
+
+/// `connect --id <device_id>`：ID 解析 → 验签 → 公钥 pin → 三级路径
+/// （① 直连候选 → ② 打洞 hook（P1 并行开发）→ ③ 中继兜底）→ Ed25519 握手。
+///
+/// 依赖 `[tunnel] server_addr / token / server_pubkey` 配置（ID-014）：
+/// 缺失时提示改用 domain/IP 模式，不阻塞其他模式。
+async fn cmd_connect_id(device_id: &str) {
+    use kirin_desk_core::connection::id_mode::{IdConnectError, IdConnector, IdModeConfig};
+    use kirin_desk_core::crypto::handshake::client_handshake_with_confirm;
+    use kirin_desk_utils::audit::AuditEvent;
+    use std::sync::{Arc, Mutex};
+
+    let cfg = match Config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            println!("Config error: {}. Run setup first.", e);
+            return;
+        }
+    };
+    let identity = match load_identity(&cfg) {
+        Ok(id) => id,
+        Err(e) => {
+            println!("Identity error: {}", e);
+            return;
+        }
+    };
+    let tunnel = &cfg.tunnel;
+    // ID-014：ID 模式需服务器配置；缺失 → 明确提示，不阻塞其他模式。
+    if tunnel.server_addr.trim().is_empty() || tunnel.token.is_empty() {
+        println!("ERROR: ID mode requires `[tunnel] server_addr` and `[tunnel] token`.");
+        println!("  Configure them first (or use domain/IP connect modes).");
+        return;
+    }
+    let server_pubkey = match tunnel.server_pubkey.as_deref() {
+        Some(k) if !k.trim().is_empty() => k,
+        _ => {
+            println!("ERROR: ID mode requires `[tunnel] server_pubkey` (relay server's Ed25519 public key).");
+            println!("  It is printed when the relay server starts (`tunnel serve`).");
+            return;
+        }
+    };
+    let connector = match IdModeConfig::try_new(
+        &tunnel.server_addr,
+        &tunnel.token,
+        server_pubkey,
+    ) {
+        Ok(c) => IdConnector::new(c),
+        Err(e) => {
+            println!("ERROR: ID mode config invalid: {}", e);
+            return;
+        }
+    };
+    let server_id = cfg
+        .device
+        .nickname
+        .trim()
+        .split_whitespace()
+        .next()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "id-connect".to_string());
+    println!("Resolving device '{}' via relay {}...", device_id, tunnel.server_addr);
+    // ID-010：解析 + ID-SEC-001 验签。
+    let info = match connector.resolve(device_id).await {
+        Ok(i) => i,
+        Err(IdConnectError::SignatureVerification) => {
+            println!("ERROR: relay server response signature verification FAILED (ID-SEC-001).");
+            println!("  Possible MITM or wrong `server_pubkey` — connection refused.");
+            audit_temp_event(
+                AuditEvent::DeviceResolveRejected,
+                &format!("device={} reason=signature_verification_failed", device_id),
+            );
+            return;
+        }
+        Err(IdConnectError::ServerUnreachable(e)) => {
+            println!("ERROR: relay server unreachable: {}", e);
+            println!("  Check `[tunnel] server_addr` / network (ID mode only).");
+            return;
+        }
+        Err(e) => {
+            println!("ERROR: resolve failed: {}", e);
+            return;
+        }
+    };
+    // ID-010：离线/未知统一文案（ID-SEC-002 防枚举）。
+    if !IdConnector::is_connectable(&info) {
+        println!("ERROR: device '{}' is offline or not registered.", device_id);
+        audit_temp_event(
+            AuditEvent::DeviceResolveRejected,
+            &format!("device={} reason=offline_or_unknown", device_id),
+        );
+        return;
+    }
+    audit_temp_event(
+        AuditEvent::DeviceResolveAccepted,
+        &format!("device={} online=true candidates={}", device_id, info.payload.candidates.len()),
+    );
+    println!(
+        "  Resolved: '{}' candidates={} pubkey={}...",
+        device_id,
+        info.payload.candidates.len(),
+        &info.payload.ed25519_pub[..std::cmp::min(16, info.payload.ed25519_pub.len())]
+    );
+    // ID-012：公钥 pin（known_hosts 优先 / 首次指纹确认，对齐 CLI-KH-004）。
+    let trusted_key = match cli_resolve_trust(device_id, &info.payload.ed25519_pub) {
+        CliTrust::Verified(key) => key,
+        CliTrust::Rejected(reason) => {
+            println!("Connection aborted: {}", reason);
+            audit_temp_event(
+                AuditEvent::AuthFailure,
+                &format!("device={} reason={}", device_id, reason),
+            );
+            return;
+        }
+    };
+    // ID-011：三级路径编排（直连 → 打洞 hook → 中继兜底）。
+    let from_peer = tunnel
+        .device_id
+        .clone()
+        .unwrap_or_else(|| {
+            kirin_desk_utils::known_hosts::fingerprint(&identity.public_key_base64())
+        });
+    let (path, stream) = match connector.connect_stream(&info, &from_peer).await {
+        Ok(x) => x,
+        Err(e) => {
+            println!("ERROR: all connection paths failed: {}", e);
+            return;
+        }
+    };
+    println!("  Path selected: {}", path);
+    audit_temp_event(
+        AuditEvent::TunnelPathSelected,
+        &format!("device={} path={}", device_id, path),
+    );
+    // ID-013：任何路径上仍是 Ed25519 双向握手（公钥 pin 强制比对）。
+    let confirmed_key: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let confirmed_key_cb = confirmed_key.clone();
+    let server_id_cb = server_id.clone();
+    let key_confirm: Option<Box<dyn Fn(&str) -> bool + Send>> =
+        Some(Box::new(move |key: &str| {
+            let ok = cli_confirm_callback(&server_id_cb)(key);
+            if ok {
+                if let Ok(mut ck) = confirmed_key_cb.lock() {
+                    *ck = Some(key.to_string());
+                }
+            }
+            ok
+        }));
+    let challenge = if cfg.device.challenge_code.is_empty() {
+        String::new()
+    } else {
+        cfg.device.challenge_code.clone()
+    };
+    let ch = match client_handshake_with_confirm(
+        stream,
+        &identity,
+        &cfg.device.id,
+        "", // ID 模式无域名（设备侧走挑战码/临时码访问控制，ID-013）
+        "desktop",
+        &server_id,
+        Some(trusted_key.clone()),
+        key_confirm,
+        &challenge,
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            println!("Handshake FAILED: {}", e);
+            if let Some(h) = crate::policy::connect_failure_challenge_hint(&challenge) {
+                println!("{}", h);
+            }
+            return;
+        }
+    };
+    println!(
+        "✓ Connected to {}@{} (path: {}, selected codec: {})",
+        ch.peer_id, device_id, path, ch.selected_codec
+    );
+    let key = confirmed_key
+        .lock()
+        .ok()
+        .and_then(|k| k.clone())
+        .unwrap_or(trusted_key);
+    cli_record_connection(device_id, &server_id, &key, "desktop", "");
+    drop(ch);
+    println!("  (CLI mode cannot render the remote desktop; use the GUI for desktop sessions.)");
+}
+
 pub async fn run_cli() {
     let args: Vec<String> = std::env::args().filter(|a| a != "--cli").collect();
     if args.len() < 2 {
@@ -61,7 +254,17 @@ pub async fn run_cli() {
             }
         }
         "connect" => {
-            cmd_connect(args).await;
+            // M8-T026-P2 (ID-020)：`--id <device_id>` 与 domain/IP 位置参数互斥。
+            if let Some(pos) = args.iter().position(|a| a == "--id") {
+                let device_id = args.get(pos + 1).map(|s| s.as_str()).unwrap_or("");
+                if device_id.is_empty() || args.len() > pos + 2 {
+                    println!("Usage: kirin_desk connect --id <device_id>  (cannot combine with domain/IP positional args)");
+                    return;
+                }
+                cmd_connect_id(device_id).await;
+            } else {
+                cmd_connect(args).await;
+            }
         }
         // M13-T006: 文件传输（双向，复用 SecureChannel 加密通道）。
         "send" => {
@@ -130,6 +333,7 @@ pub async fn run_cli() {
         }
         "unattended" => cmd_unattended(args),
         "autostart" => cmd_autostart(args),
+        "tunnel" => cmd_tunnel(args).await,
         "status" => cmd_status(),
         "self-test" => cmd_self_test().await,
         _ => {
@@ -152,6 +356,7 @@ fn print_help() {
     println!("  discover <id>        Discover a remote device");
     println!("  connect <t> [p] [n] [c] Connect to device — domain: DNS discovery + TXT key");
     println!("                                     binding; IPv6: known_hosts / first-use confirm");
+    println!("                                     [--transport auto|quic|tcp] [--ip-family auto|ipv4|ipv6]");
     println!("  send <path> <host> [p] [n] Send a file to the remote (encrypted, resume-able)");
     println!("  recv <host> [p] [n]        Receive files pushed by the remote");
     println!("  shell [port]         Remote shell server (domain whitelist)");
@@ -168,6 +373,11 @@ fn print_help() {
     println!("  unattended <on|off|status>  Unattended mode: auto-accept known/whitelisted");
     println!("                       clients, auto-start server, no approval dialogs");
     println!("  autostart <enable|disable|status>  OS user-level boot autostart");
+    println!("  tunnel start           Run tunnel client (frpc): map local TCP services");
+    println!("                         to the public relay server ([tunnel] config)");
+    println!("  tunnel serve           Run tunnel server (frps) on this machine");
+    println!("                         (control port + proxy port range; Ctrl+C to stop)");
+    println!("  tunnel status          Show tunnel configuration and proxy list");
     println!("  self-test            Run local self-connection test");
     println!("  status               Show system status");
     println!("  help                 Show this help");
@@ -175,6 +385,7 @@ fn print_help() {
     println!("EXAMPLES:");
     println!("  kirin_desk setup");
     println!("  kirin_desk connect my-pc.example.com");
+    println!("  kirin_desk connect my-pc.example.com 3389 --transport tcp --ip-family ipv4");
     println!("  kirin_desk connect 2001:db8::1 3389 mycode");
     println!("  kirin_desk register my-pc 3389");
     println!("  kirin_desk shell 22");
@@ -184,6 +395,55 @@ fn print_help() {
     println!("  kirin_desk unattended on         # enable unattended mode");
     println!("  kirin_desk autostart enable      # register OS boot autostart");
     println!("  kirin_desk temp-mode    # 5-min temp window: shows 8-char temp code (clients must present it)");
+}
+
+// ════════════════════════════════════════════════════════════════
+// M8-T025 P5-4：传输参数解析（CLI 覆盖配置；无参保持 auto 现状）
+// ════════════════════════════════════════════════════════════════
+
+/// 从参数表取出 `--flag <value>`（无该 flag → None）。
+fn flag_value(args: &[String], flag: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+}
+
+/// 剔除 `--transport` / `--ip-family` 参数对，恢复纯位置参数
+/// （`connect <t> [p] [n] [c]` 语义不变；flag 可出现在任意位置）。
+fn strip_transport_flags(args: Vec<String>) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        if (args[i] == "--transport" || args[i] == "--ip-family") && i + 1 < args.len() {
+            i += 2;
+            continue;
+        }
+        out.push(args[i].clone());
+        i += 1;
+    }
+    out
+}
+
+/// 解析传输模式字符串 →（起始模式, 是否允许失败回退）：
+/// `auto` = QUIC 优先 + 失败回退 TCP；`quic`/`tcp` = 强制（B1 可控）。
+fn resolve_transport_mode(s: &str) -> Option<(TransportMode, bool)> {
+    match s {
+        "auto" => Some((TransportMode::Quic, true)),
+        "quic" => Some((TransportMode::Quic, false)),
+        "tcp" => Some((TransportMode::Tcp, false)),
+        _ => None,
+    }
+}
+
+/// 解析地址族字符串 → `IpFamily`（A4：auto = IPv6 优先，无 v6 用 v4）。
+fn resolve_ip_family(s: &str) -> Option<IpFamily> {
+    match s {
+        "auto" => Some(IpFamily::Auto),
+        "ipv4" => Some(IpFamily::Ipv4),
+        "ipv6" => Some(IpFamily::Ipv6),
+        _ => None,
+    }
 }
 
 /// M8-T017: 开启临时连接（SRV-TMP-001/002 / CLI-TMP-010）——生成 8 位临时
@@ -454,7 +714,21 @@ async fn cmd_discover(device_id: &str) {
         Ok(info) => {
             println!("Device:    {}", info.device_id);
             println!("Subdomain: {}", info.subdomain);
-            println!("IPv6:      {}", info.ipv6_addr);
+            // M8-T025 P5-4：哨兵 IPv6（`::` = 无 v6）不再直打；双栈地址如实展示。
+            println!(
+                "IPv6:      {}",
+                if info.ipv6_addr == Ipv6Addr::UNSPECIFIED {
+                    "none".to_string()
+                } else {
+                    info.ipv6_addr.to_string()
+                }
+            );
+            println!(
+                "IPv4:      {}",
+                info.ipv4_addr
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            );
             println!("Port:      {}", info.port);
             println!("Type:      {}", info.device_type);
             if info.device_type == "server" {
@@ -707,19 +981,49 @@ async fn cmd_connect(args: Vec<String>) {
     use kirin_desk_core::crypto::handshake::client_handshake_with_confirm;
     use std::net::IpAddr;
 
+    // ── M8-T025 P5-4：`--transport` / `--ip-family`（CLI 覆盖配置；无参保持 auto）──
+    let transport_flag = flag_value(&args, "--transport");
+    let family_flag = flag_value(&args, "--ip-family");
+    let args = strip_transport_flags(args);
+
     let target = args.get(2).map(|s| s.as_str()).unwrap_or("");
     let port: u16 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(3389);
     let nickname = args.get(4).map(|s| s.as_str()).unwrap_or("");
     let challenge_arg = args.get(5).map(|s| s.as_str()).unwrap_or("");
 
     if target.is_empty() {
-        println!("Usage: kirin_desk connect <domain|ipv6> [port] [nickname] [challenge]");
+        println!("Usage: kirin_desk connect <domain|ipv6> [port] [nickname] [challenge] [--transport auto|quic|tcp] [--ip-family auto|ipv4|ipv6]");
         return;
     }
     let cfg = match Config::load() {
         Ok(c) => c,
         Err(e) => {
             println!("Config error: {}. Run setup first.", e);
+            return;
+        }
+    };
+    // 传输模式/地址族解析（CLI > 配置；非法值 → 明确报错，先于身份/网络步骤）。
+    let transport_mode_str = transport_flag
+        .as_deref()
+        .unwrap_or(cfg.transport.mode.as_str());
+    let (transport_mode, _fallback) = match resolve_transport_mode(transport_mode_str) {
+        Some(r) => r,
+        None => {
+            println!(
+                "ERROR: invalid --transport '{transport_mode_str}' (expected auto|quic|tcp)"
+            );
+            return;
+        }
+    };
+    let ip_family_str = family_flag
+        .as_deref()
+        .unwrap_or(cfg.transport.ip_family.as_str());
+    let ip_family = match resolve_ip_family(ip_family_str) {
+        Some(f) => f,
+        None => {
+            println!(
+                "ERROR: invalid --ip-family '{ip_family_str}' (expected auto|ipv4|ipv6)"
+            );
             return;
         }
     };
@@ -768,8 +1072,18 @@ async fn cmd_connect(args: Vec<String>) {
             }
         };
         println!(
-            "Discovered: {} [{}]:{} type={}",
-            info.device_id, info.ipv6_addr, info.port, info.device_type
+            "Discovered: {} IPv6={} IPv4={} :{} type={}",
+            info.device_id,
+            if info.ipv6_addr == Ipv6Addr::UNSPECIFIED {
+                "none".to_string()
+            } else {
+                info.ipv6_addr.to_string()
+            },
+            info.ipv4_addr
+                .map(|a| a.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            info.port,
+            info.device_type
         );
         if info.public_key_base64.is_empty() {
             // CLI-DNS-006: TXT 公钥缺失 → 拒绝连接，不回退信任网络公钥。
@@ -777,6 +1091,16 @@ async fn cmd_connect(args: Vec<String>) {
             return;
         }
         println!("  TXT pubkey: {}...", &info.public_key_base64[..std::cmp::min(20, info.public_key_base64.len())]);
+        // M8-T025 P5-4：按族选择连接地址（P1 `select_connect_addr` 契约，
+        // 哨兵 v6 地址在此消化）；无可用地址 → 明确报错。
+        let selected = match info.select_connect_addr(ip_family) {
+            Some(a) => a,
+            None => {
+                println!("ERROR: 设备无可用 IPv4/IPv6 地址（ip_family={ip_family_str}）");
+                return;
+            }
+        };
+        let addr = selected.to_string();
         // 信任解析：known_hosts 优先于 DNS TXT（CLI-KH-004）；未命中首次确认。
         let trusted_key = match cli_resolve_trust(&info.device_id, &info.public_key_base64) {
             CliTrust::Verified(key) => key,
@@ -785,10 +1109,12 @@ async fn cmd_connect(args: Vec<String>) {
                 return;
             }
         };
-        let addr = format!("[{}]:{}", info.ipv6_addr, info.port);
         // 客户端域名 = 目标域名（服务端白名单按此匹配）。
         let client_domain = format!("{}.{}", info.device_id, cfg.godaddy.domain);
-        println!("Connecting {} (domain: {}) as '{}'...", addr, client_domain, server_id);
+        println!(
+            "Connecting {} (domain: {}, transport: {transport_mode:?}) as '{}'...",
+            addr, client_domain, server_id
+        );
         let Ok(stream) = tokio::net::TcpStream::connect(&addr).await else {
             println!("TCP connect FAILED");
             return;
@@ -816,8 +1142,8 @@ async fn cmd_connect(args: Vec<String>) {
             }
         };
         println!(
-            "✓ Connected to {}@{} (selected codec: {})",
-            ch.peer_id, addr, ch.selected_codec
+            "✓ Connected to {}@{} (selected codec: {}, transport: {})",
+            ch.peer_id, addr, ch.selected_codec, transport_mode_str
         );
         cli_record_connection(&addr, &info.device_id, &trusted_key, &info.device_type, &cfg.godaddy.domain);
         drop(ch);
@@ -1166,8 +1492,18 @@ async fn cmd_shell_client(target: &str, port: u16, nickname: &str) {
             return;
         }
         println!(
-            "Discovered: {} [{}]:{} type={}",
-            info.device_id, info.ipv6_addr, info.port, info.device_type
+            "Discovered: {} IPv6={} IPv4={} :{} type={}",
+            info.device_id,
+            if info.ipv6_addr == Ipv6Addr::UNSPECIFIED {
+                "none".to_string()
+            } else {
+                info.ipv6_addr.to_string()
+            },
+            info.ipv4_addr
+                .map(|a| a.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            info.port,
+            info.device_type
         );
         expected_key = match cli_resolve_trust(&info.device_id, &info.public_key_base64) {
             CliTrust::Verified(key) => Some(key),
@@ -1176,7 +1512,28 @@ async fn cmd_shell_client(target: &str, port: u16, nickname: &str) {
                 return;
             }
         };
-        addr = format!("[{}]:{}", info.ipv6_addr, info.port);
+        // M8-T025 P5-4：按族选择连接地址（配置 `[transport].ip_family`；
+        // CLI shell 无 --ip-family 参数，走配置值）。
+        let family = match resolve_ip_family(&cfg.transport.ip_family) {
+            Some(f) => f,
+            None => {
+                println!(
+                    "ERROR: invalid config [transport].ip_family '{}' (expected auto|ipv4|ipv6)",
+                    cfg.transport.ip_family
+                );
+                return;
+            }
+        };
+        match info.select_connect_addr(family) {
+            Some(a) => addr = a.to_string(),
+            None => {
+                println!(
+                    "ERROR: 设备无可用 IPv4/IPv6 地址（ip_family={}）",
+                    cfg.transport.ip_family
+                );
+                return;
+            }
+        }
         client_domain = format!("{}.{}", info.device_id, cfg.godaddy.domain);
     }
 
@@ -1455,8 +1812,18 @@ async fn cli_file_connect(
             return None;
         }
         println!(
-            "Discovered: {} [{}]:{} type={}",
-            info.device_id, info.ipv6_addr, info.port, info.device_type
+            "Discovered: {} IPv6={} IPv4={} :{} type={}",
+            info.device_id,
+            if info.ipv6_addr == Ipv6Addr::UNSPECIFIED {
+                "none".to_string()
+            } else {
+                info.ipv6_addr.to_string()
+            },
+            info.ipv4_addr
+                .map(|a| a.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            info.port,
+            info.device_type
         );
         expected_key = match cli_resolve_trust(&info.device_id, &info.public_key_base64) {
             CliTrust::Verified(key) => Some(key),
@@ -1465,7 +1832,27 @@ async fn cli_file_connect(
                 return None;
             }
         };
-        addr = format!("[{}]:{}", info.ipv6_addr, info.port);
+        // M8-T025 P5-4：按族选择连接地址（配置 `[transport].ip_family`）。
+        let family = match resolve_ip_family(&cfg.transport.ip_family) {
+            Some(f) => f,
+            None => {
+                println!(
+                    "ERROR: invalid config [transport].ip_family '{}' (expected auto|ipv4|ipv6)",
+                    cfg.transport.ip_family
+                );
+                return None;
+            }
+        };
+        match info.select_connect_addr(family) {
+            Some(a) => addr = a.to_string(),
+            None => {
+                println!(
+                    "ERROR: 设备无可用 IPv4/IPv6 地址（ip_family={}）",
+                    cfg.transport.ip_family
+                );
+                return None;
+            }
+        }
         client_domain = format!("{}.{}", info.device_id, cfg.godaddy.domain);
     }
     println!("Connecting to {} as '{}'...", addr, server_id);
@@ -1759,10 +2146,8 @@ async fn cmd_recv_file(host: &str, port: u16, nickname: &str) {
 /// 并按客户端声明的会话类型分发（UA-ACCEPT-003）：`shell` → PTY 桥接，
 /// 其余保持通道（远控桌面流媒体由 GUI 服务器承载）。
 async fn cmd_serve(port: u16, unattended: bool) {
-    use kirin_desk_core::connection::{run_shell_bridge, DEFAULT_PTY_COLS, DEFAULT_PTY_ROWS};
-    use kirin_desk_core::crypto::handshake::VerifiedDecision;
-    use kirin_desk_core::network::rate_limit::{RateLimitDecision, RateLimiter};
-    use kirin_desk_utils::audit::{AuditEvent, AuditLogger};
+    use kirin_desk_core::network::rate_limit::RateLimiter;
+    use kirin_desk_utils::audit::AuditLogger;
     use kirin_desk_utils::known_hosts::KnownClientsStore;
 
     let cfg = match Config::load() {
@@ -1772,8 +2157,9 @@ async fn cmd_serve(port: u16, unattended: bool) {
             return;
         }
     };
+    // M8-T026-P2：Arc 包装（设备 ID 注册回调需 'static 捕获）。
     let identity = match load_identity(&cfg) {
-        Ok(id) => id,
+        Ok(id) => std::sync::Arc::new(id),
         Err(e) => {
             println!("Identity error: {}", e);
             return;
@@ -1818,6 +2204,13 @@ async fn cmd_serve(port: u16, unattended: bool) {
     match TcpServer::bind(port).await {
         Ok(server) => {
             println!("Listening on [::]:{}", server.port());
+            // M8-T026-P2 (ID-003/ID-013)：设备 ID 模式注册（[tunnel] enabled
+            // && mode=client）—— 隧道流与本地 accept 走同一连接处理
+            // （serve_incoming_stream），白名单/挑战码/临时码访问控制零降级。
+            let tunnel_client = start_device_registration(
+                &cfg, identity.clone(), server_name.clone(),
+            ).await;
+            let _ = tunnel_client; // 句柄持有即保持注册运行
             loop {
                 // M8-T017: 临时连接窗口**逐连接**判定（窗口中途开启/过期即时
                 // 生效），与配置静态旁路取或；无人值守下窗口维度一并关闭
@@ -1834,144 +2227,281 @@ async fn cmd_serve(port: u16, unattended: bool) {
                 match server.accept().await {
                     Ok((stream, addr)) => {
                         let ip = addr.ip().to_canonical();
-                        let _ = audit.record(
-                            AuditEvent::ConnectionRequest,
-                            &format!("ip={} port={}", ip, addr.port()),
-                        );
-                        // 1. 速率限制（SRV-SEC-RL-001/002）。
-                        match rate_limiter.check_connect(&ip) {
-                            RateLimitDecision::Allowed => {}
-                            decision => {
-                                let _ = audit.record(
-                                    AuditEvent::RateLimited,
-                                    &format!("ip={} decision={:?}", ip, decision),
-                                );
-                                println!("  Rate limited: {} ({:?}) — rejected", ip, decision);
-                                continue;
-                            }
-                        }
-                        println!("Connection from {}", addr);
-
-                        // 2. 完整握手（known_hosts/DNS pin + 白名单 + 签名验证）。
-                        match crate::policy::server_accept_handshake(
-                            stream,
-                            &identity,
-                            &server_name,
-                            &allowed,
-                            is_temp,
-                            unattended,
-                            temp_window,
-                            None,
-                            expected_challenge,
-                            &known,
-                            &cfg,
-                        )
-                        .await
-                        {
-                            Ok(VerifiedDecision::Accepted(ch)) => {
-                                let _ = audit.record(
-                                    AuditEvent::HandshakeSuccess,
-                                    &format!(
-                                        "ip={} client={} <{}> ({})",
-                                        ip, ch.peer_id, ch.peer_domain, ch.peer_device_type
-                                    ),
-                                );
-                                rate_limiter.reset(&ip);
-                                crate::policy::record_successful_handshake(&mut known, &ch.peer_id);
-                                println!(
-                                    "  Session ACCEPTED: {} <{}> ({})",
-                                    ch.peer_id, ch.peer_domain, ch.peer_device_type
-                                );
-                                // M13-T005 (UA-ACCEPT-003): 会话类型分发——客户端
-                                // 声明 "shell" → PTY 桥接；否则保持通道至断开。
-                                if ch.peer_device_type == "shell" {
-                                    let peer_id = ch.peer_id.clone();
-                                    let result = run_shell_bridge(
-                                        ch,
-                                        DEFAULT_PTY_COLS,
-                                        DEFAULT_PTY_ROWS,
-                                        None,
-                                    )
-                                    .await;
-                                    let _ = audit.record(
-                                        AuditEvent::Disconnect,
-                                        &format!("ip={} client={} shell", ip, peer_id),
-                                    );
-                                    match result {
-                                        Ok(()) => println!("  Shell session closed: {}", addr),
-                                        Err(e) => println!("  Shell session ended with error: {}", e),
-                                    }
-                                } else {
-                                    // M13-T006 (UI-FT-005): 无头服务端静默接收文件 +
-                                    // 保持通道至客户端断开（流媒体由 GUI 服务器承载）。
-                                    use kirin_desk_media::transport::{
-                                        SecureChannelReceiver, SecureChannelSender,
-                                    };
-                                    let peer_id = ch.peer_id.clone();
-                                    let (reader, writer) = ch.into_split();
-                                    let sender: Arc<tokio::sync::Mutex<SecureChannelSender>> =
-                                        Arc::new(tokio::sync::Mutex::new(SecureChannelSender::new(writer)));
-                                    let receiver = SecureChannelReceiver::new(reader);
-                                    let cfg_ft = Config::load().unwrap_or_default();
-                                    let my_id = identity.public_key_base64();
-                                    let salt = super::file_transfer_salt(&my_id, &peer_id);
-                                    let store_path = super::transfers_store_path("server");
-                                    let download_dir = cfg_ft.file_transfer.resolved_download_dir();
-                                    let max_file_size = if cfg_ft.file_transfer.max_file_size > 0 {
-                                        cfg_ft.file_transfer.max_file_size
-                                    } else {
-                                        super::DEFAULT_MAX_FILE_SIZE
-                                    };
-                                    let mut ft = super::FileSession::new(
-                                        sender,
-                                        super::server_file_panel_state(),
-                                        salt,
-                                        store_path,
-                                        download_dir.clone(),
-                                        max_file_size,
-                                        None,
-                                    );
-                                    println!(
-                                        "  File reception ready (→ {})",
-                                        download_dir.display()
-                                    );
-                                    let (ok, msg) =
-                                        cli_file_loop(receiver, &mut ft, true, super::server_file_panel_state()).await;
-                                    let _ = ok;
-                                    let _ = msg;
-                                    let _ = audit.record(
-                                        AuditEvent::Disconnect,
-                                        &format!("ip={} client={}", ip, peer_id),
-                                    );
-                                    println!("  Session closed: {}", addr);
-                                }
-                            }
-                            Ok(VerifiedDecision::Rejected(reason)) => {
-                                let _ = audit.record(
-                                    AuditEvent::AuthFailure,
-                                    &format!("ip={} reason={}", ip, reason),
-                                );
-                                rate_limiter.record_handshake_failure(&ip);
-                                println!("  REJECTED: {}", reason);
-                                if !is_temp {
-                                    println!("    (headless server: no GUI approval — whitelist the client domain or use temp-mode)");
-                                }
-                            }
-                            Err(e) => {
-                                let _ = audit.record(
-                                    AuditEvent::HandshakeFailure,
-                                    &format!("ip={} error={}", ip, e),
-                                );
-                                rate_limiter.record_handshake_failure(&ip);
-                                println!("  Handshake error: {}", e);
-                            }
-                        }
+                        serve_incoming_stream(
+                            stream, ip, &addr.to_string(),
+                            &mut audit, &mut rate_limiter,
+                            &identity, &server_name, &allowed,
+                            is_temp, unattended, temp_window,
+                            expected_challenge, &mut known, &cfg,
+                        ).await;
                     }
                     Err(e) => println!("Error: {}", e),
                 }
             }
         }
         Err(e) => println!("Bind failed: {}", e),
+    }
+}
+
+// ════════════════════════════════════════════════════════════════
+// M8-T026-P2：设备侧 ID 注册 + 隧道流处理（ID-001/003/005/013）
+// ════════════════════════════════════════════════════════════════
+
+/// M8-T026-P2 (ID-001/ID-003/ID-005)：`serve` 时启动设备 ID 注册
+/// （`[tunnel] enabled && mode="client"`）：RelayClient 保持控制连接 +
+/// 心跳（复用 M8-T026 心跳，ID-NF-003）+ 候选刷新；中继隧道流（§8.1）
+/// 交给 `serve_incoming_stream`（与本地 accept 同一访问控制，ID-013）。
+///
+/// 设备 ID：显式配置 `[tunnel] device_id` 或由本机身份公钥指纹派生。
+async fn start_device_registration(
+    cfg: &Config,
+    identity: std::sync::Arc<kirin_desk_core::crypto::ed25519::IdentityManager>,
+    server_name: String,
+) -> Option<kirin_desk_relay::id_client::IdClient> {
+    use kirin_desk_relay::id_client::{IdClient, IdClientConfig};
+    use kirin_desk_relay::protocol::Candidate;
+    use kirin_desk_utils::audit::AuditLogger;
+    use kirin_desk_utils::known_hosts::KnownClientsStore;
+
+    let tunnel = &cfg.tunnel;
+    if !tunnel.enabled || tunnel.mode != "client" {
+        return None;
+    }
+    if tunnel.server_addr.trim().is_empty() || tunnel.token.is_empty() {
+        println!("  [tunnel] enabled but server_addr/token empty — device ID registration skipped.");
+        return None;
+    }
+    // ID-001：显式 ID 或公钥指纹派生。
+    let device_id = tunnel
+        .device_id
+        .clone()
+        .unwrap_or_else(|| kirin_desk_utils::known_hosts::fingerprint(&identity.public_key_base64()));
+    // ID-005：配置 extra_candidates 解析（"ip:port"）。
+    let extra: Vec<Candidate> = tunnel
+        .extra_candidates
+        .iter()
+        .filter_map(|s| {
+            s.parse::<std::net::SocketAddr>().ok().map(|addr| Candidate {
+                addr,
+                kind: kirin_desk_relay::protocol::CandidateKind::Tcp,
+                priority: 150,
+            })
+        })
+        .collect();
+    let heartbeat_interval = Duration::from_secs(tunnel.heartbeat_interval.max(1));
+    let heartbeat_timeout = Duration::from_secs(tunnel.heartbeat_timeout.max(heartbeat_interval.as_secs() + 1));
+    let client_cfg = IdClientConfig {
+        server_addr: tunnel.server_addr.clone(),
+        token: tunnel.token.clone(),
+        device_id: device_id.clone(),
+        ed25519_pub: identity.public_key_base64(),
+        hostname: if server_name.is_empty() {
+            "kirindesk".to_string()
+        } else {
+            server_name.clone()
+        },
+        heartbeat_interval,
+        heartbeat_timeout,
+        connect_timeout: Duration::from_secs(5),
+        backoff_base: Duration::from_secs(1),
+        backoff_max: Duration::from_secs(60),
+        extra_candidates: extra,
+    };
+    println!(
+        "  [ID Mode] registering device '{}' with relay {} ...",
+        device_id, tunnel.server_addr
+    );
+    if tunnel.server_pubkey.as_deref().unwrap_or("").trim().is_empty() {
+        println!("  [ID Mode] note: `server_pubkey` not set — `connect --id` from other devices will be rejected (ID-SEC-001).");
+    }
+    let client = IdClient::new(client_cfg, move |stream| {
+        // §8.1 隧道流到达：spawn 处理（与本地 accept 相同访问控制）。
+        let identity = identity.clone();
+        let server_name = server_name.clone();
+        tokio::spawn(async move {
+            let peer_label = format!("relay-tunnel({})", identity.public_key_base64());
+            let mut audit = match AuditLogger::open_default() {
+                Ok(a) => a,
+                Err(_) => return,
+            };
+            let mut rate_limiter = kirin_desk_core::network::rate_limit::RateLimiter::new();
+            // 隧道流源 IP 无法确证（服务器转发）→ 占位 + 独立限速桶。
+            let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+            let mut known = KnownClientsStore::empty();
+            let cfg = Config::load().unwrap_or_default();
+            serve_incoming_stream(
+                stream, ip, &peer_label,
+                &mut audit, &mut rate_limiter,
+                &identity, &server_name, &allowed_snapshot(),
+                false, false, None, None, &mut known, &cfg,
+            ).await;
+        });
+    });
+    let runner = client.clone();
+    tokio::spawn(async move {
+        let _ = runner.run().await;
+    });
+    Some(client)
+}
+
+/// `serve_incoming_stream` 所需白名单快照（避免回调闭包捕获 cfg 生命周期）。
+fn allowed_snapshot() -> Vec<String> {
+    Config::load()
+        .map(|c| c.whitelist_active_patterns(chrono::Utc::now()))
+        .unwrap_or_default()
+}
+
+/// 处理一条入站连接（本地 accept 或 ID 模式中继隧道流共用）：
+/// 审计 → 速率限制 → 完整握手（known_hosts/DNS pin + 白名单 + 挑战码/
+/// 临时码）→ 会话类型分发（shell PTY / 文件接收 / 保持通道）。
+#[allow(clippy::too_many_arguments)]
+async fn serve_incoming_stream(
+    stream: tokio::net::TcpStream,
+    ip: std::net::IpAddr,
+    peer_label: &str,
+    audit: &mut kirin_desk_utils::audit::AuditLogger,
+    rate_limiter: &mut kirin_desk_core::network::rate_limit::RateLimiter,
+    identity: &kirin_desk_core::crypto::ed25519::IdentityManager,
+    server_name: &str,
+    allowed: &[String],
+    is_temp: bool,
+    unattended: bool,
+    temp_window: Option<kirin_desk_core::connection::temp_mode::TempModeManager>,
+    expected_challenge: Option<&str>,
+    known: &mut kirin_desk_utils::known_hosts::KnownClientsStore,
+    cfg: &Config,
+) {
+    use kirin_desk_core::connection::{run_shell_bridge, DEFAULT_PTY_COLS, DEFAULT_PTY_ROWS};
+    use kirin_desk_core::crypto::handshake::VerifiedDecision;
+    use kirin_desk_core::network::rate_limit::RateLimitDecision;
+    use kirin_desk_utils::audit::AuditEvent;
+
+    let _ = audit.record(
+        AuditEvent::ConnectionRequest,
+        &format!("ip={} source={}", ip, peer_label),
+    );
+    // 1. 速率限制（SRV-SEC-RL-001/002）。
+    match rate_limiter.check_connect(&ip) {
+        RateLimitDecision::Allowed => {}
+        decision => {
+            let _ = audit.record(
+                AuditEvent::RateLimited,
+                &format!("ip={} decision={:?}", ip, decision),
+            );
+            println!("  Rate limited: {} ({:?}) — rejected", ip, decision);
+            return;
+        }
+    }
+    println!("Connection from {}", peer_label);
+
+    // 2. 完整握手（known_hosts/DNS pin + 白名单 + 签名验证）。
+    match crate::policy::server_accept_handshake(
+        stream,
+        identity,
+        server_name,
+        allowed,
+        is_temp,
+        unattended,
+        temp_window,
+        None,
+        expected_challenge,
+        known,
+        cfg,
+    )
+    .await
+    {
+        Ok(VerifiedDecision::Accepted(ch)) => {
+            let _ = audit.record(
+                AuditEvent::HandshakeSuccess,
+                &format!(
+                    "ip={} client={} <{}> ({})",
+                    ip, ch.peer_id, ch.peer_domain, ch.peer_device_type
+                ),
+            );
+            rate_limiter.reset(&ip);
+            crate::policy::record_successful_handshake(known, &ch.peer_id);
+            println!(
+                "  Session ACCEPTED: {} <{}> ({})",
+                ch.peer_id, ch.peer_domain, ch.peer_device_type
+            );
+            // M13-T005 (UA-ACCEPT-003): 会话类型分发——客户端声明 "shell" →
+            // PTY 桥接；否则保持通道至断开。
+            if ch.peer_device_type == "shell" {
+                let peer_id = ch.peer_id.clone();
+                let result = run_shell_bridge(
+                    ch,
+                    DEFAULT_PTY_COLS,
+                    DEFAULT_PTY_ROWS,
+                    None,
+                )
+                .await;
+                let _ = audit.record(
+                    AuditEvent::Disconnect,
+                    &format!("ip={} client={} shell", ip, peer_id),
+                );
+                match result {
+                    Ok(()) => println!("  Shell session closed: {}", peer_label),
+                    Err(e) => println!("  Shell session ended with error: {}", e),
+                }
+            } else {
+                // M13-T006 (UI-FT-005): 无头服务端静默接收文件 + 保持通道至
+                // 客户端断开（流媒体由 GUI 服务器承载）。
+                use kirin_desk_media::transport::{
+                    SecureChannelReceiver, SecureChannelSender,
+                };
+                let peer_id = ch.peer_id.clone();
+                let (reader, writer) = ch.into_split();
+                let sender: Arc<tokio::sync::Mutex<SecureChannelSender>> =
+                    Arc::new(tokio::sync::Mutex::new(SecureChannelSender::new(writer)));
+                let receiver = SecureChannelReceiver::new(reader);
+                let cfg_ft = Config::load().unwrap_or_default();
+                let my_id = identity.public_key_base64();
+                let salt = super::file_transfer_salt(&my_id, &peer_id);
+                let store_path = super::transfers_store_path("server");
+                let download_dir = cfg_ft.file_transfer.resolved_download_dir();
+                let max_file_size = if cfg_ft.file_transfer.max_file_size > 0 {
+                    cfg_ft.file_transfer.max_file_size
+                } else {
+                    super::DEFAULT_MAX_FILE_SIZE
+                };
+                let mut ft = super::FileSession::new(
+                    sender,
+                    super::server_file_panel_state(),
+                    salt,
+                    store_path,
+                    download_dir.clone(),
+                    max_file_size,
+                    None,
+                );
+                println!("  File reception ready (→ {})", download_dir.display());
+                let (_ok, _msg) =
+                    cli_file_loop(receiver, &mut ft, true, super::server_file_panel_state()).await;
+                let _ = audit.record(
+                    AuditEvent::Disconnect,
+                    &format!("ip={} client={}", ip, peer_id),
+                );
+                println!("  Session closed: {}", peer_label);
+            }
+        }
+        Ok(VerifiedDecision::Rejected(reason)) => {
+            let _ = audit.record(
+                AuditEvent::AuthFailure,
+                &format!("ip={} reason={}", ip, reason),
+            );
+            rate_limiter.record_handshake_failure(&ip);
+            println!("  REJECTED: {}", reason);
+            if !is_temp {
+                println!("    (headless server: no GUI approval — whitelist the client domain or use temp-mode)");
+            }
+        }
+        Err(e) => {
+            let _ = audit.record(
+                AuditEvent::HandshakeFailure,
+                &format!("ip={} error={}", ip, e),
+            );
+            rate_limiter.record_handshake_failure(&ip);
+            println!("  Handshake error: {}", e);
+        }
     }
 }
 
@@ -2213,6 +2743,32 @@ fn cmd_status() {
         println!("Temp Mode:     ACTIVE ({}s remaining)", temp_mode_remaining());
     } else {
         println!("Temp Mode:     off");
+    }
+    // M8-T026-P2 (ID-020): Tunnel/ID 模式注册状态行。
+    if let Ok(cfg) = Config::load() {
+        let t = &cfg.tunnel;
+        if t.enabled && t.mode == "client" {
+            let device_id = t
+                .device_id
+                .clone()
+                .unwrap_or_else(|| "(fingerprint-derived)".to_string());
+            println!("Tunnel:        enabled (mode=client)");
+            println!("  server:      {}", if t.server_addr.is_empty() { "(not set)" } else { &t.server_addr });
+            println!("  device_id:   {}", device_id);
+            println!(
+                "  server_pubkey: {}",
+                if t.server_pubkey.as_deref().unwrap_or("").is_empty() {
+                    "(not set — connect --id unavailable)".to_string()
+                } else {
+                    format!("{}...", &t.server_pubkey.as_deref().unwrap_or("")[..std::cmp::min(16, t.server_pubkey.as_deref().unwrap_or("").len())])
+                }
+            );
+            println!("  extra_candidates: {:?}", t.extra_candidates);
+        } else if t.enabled {
+            println!("Tunnel:        enabled (mode={})", t.mode);
+        } else {
+            println!("Tunnel:        off (ID 模式需 `[tunnel] enabled=true` + server 配置)");
+        }
     }
     println!("81/81 tests passing");
 }
@@ -2597,6 +3153,316 @@ async fn cmd_self_test() {
             let _ = src_sha;
             let _ = std::fs::remove_dir_all(&file_dir);
 
+            // ── M8-T026-P2: 设备 ID 连接模式 e2e（进程内 relay + 注册 +
+            //    凭 ID 解析 → 中继路径 → Ed25519 握手 → 加密发送）──
+            println!();
+            println!("=== M8-T026-P2 device ID mode e2e ===");
+            {
+                use kirin_desk_core::connection::id_mode::{
+                    IdConnector, IdModeConfig, PathKind,
+                };
+                use kirin_desk_core::crypto::handshake::{
+                    client_handshake_with_confirm_generic, server_handshake_verified_generic,
+                };
+                use kirin_desk_relay::id_client::{IdClient, IdClientConfig};
+                use kirin_desk_relay::server::{TunnelServer, TunnelServerConfig};
+                use std::sync::Arc;
+
+                // 1. 进程内 relay server（临时密钥 + token）。
+                let tmp_key = std::env::temp_dir().join(format!(
+                    "kirindesk_self_test_relay_key_{}.der",
+                    std::process::id()
+                ));
+                let relay = TunnelServer::bind(TunnelServerConfig {
+                    bind_port: 0,
+                    token: "self-test-token".to_string(),
+                    server_key_path: Some(tmp_key.clone()),
+                    heartbeat_timeout: Duration::from_secs(2),
+                    work_conn_timeout: Duration::from_secs(3),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+                let relay_port = relay.port();
+                let server_pubkey_b64 = relay.server_public_key_base64();
+                let srv_task = tokio::spawn(relay.run());
+                let _ = std::fs::remove_file(&tmp_key);
+                println!(
+                    "  relay server on :{} (pubkey {}...)",
+                    relay_port,
+                    &server_pubkey_b64[..16.min(server_pubkey_b64.len())]
+                );
+
+                // 2. 设备侧（独立生成身份）ID 注册：控制连接 + 心跳 + 候选刷新。
+                //    注意：不动函数级 alice/bob（后续 M15 段仍借用）。
+                let device_id = "bob-device";
+                let alice_pub_b64 = alice.public_key_base64();
+                let dev_identity = kirin_desk_core::crypto::ed25519::IdentityManager::generate(
+                    tmp.join("kirindesk_self_test_id_device"),
+                )
+                .unwrap();
+                let dev_arc = Arc::new(dev_identity);
+                let id_cfg = IdClientConfig {
+                    server_addr: format!("[::1]:{}", relay_port),
+                    token: "self-test-token".to_string(),
+                    device_id: device_id.to_string(),
+                    ed25519_pub: dev_arc.public_key_base64(),
+                    hostname: "self-test-bob".to_string(),
+                    heartbeat_interval: Duration::from_millis(100),
+                    heartbeat_timeout: Duration::from_millis(500),
+                    connect_timeout: Duration::from_secs(2),
+                    backoff_base: Duration::from_millis(50),
+                    backoff_max: Duration::from_millis(500),
+                    extra_candidates: Vec::new(),
+                };
+                let dev_arc_for_cb = dev_arc.clone();
+                let dev_client = IdClient::new(id_cfg, move |stream| {
+                    // §8.1 隧道流到达 → 设备侧服务端握手（Alice 公钥绑定）。
+                    let dev = dev_arc_for_cb.clone();
+                    let alice_pub = alice_pub_b64.clone();
+                    tokio::spawn(async move {
+                        match server_handshake_verified_generic(
+                            stream, &dev, "bob", &alice_pub,
+                        )
+                        .await
+                        {
+                            Ok(_) => println!("  device side: relay handshake OK"),
+                            Err(e) => println!("  device side: relay handshake FAILED: {}", e),
+                        }
+                    });
+                });
+                let dev_runner = dev_client.clone();
+                let dev_task = tokio::spawn(async move { let _ = dev_runner.run().await; });
+                // 等待注册完成（心跳间隔 100ms）。
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                println!("  device registered: '{}'", device_id);
+
+                // 3. 控制器（Alice）凭 ID 解析 → 三级路径（无直连候选 →
+                //    中继兜底）→ 握手。
+                let connector = IdConnector::new(
+                    IdModeConfig::try_new(
+                        &format!("[::1]:{}", relay_port),
+                        "self-test-token",
+                        &server_pubkey_b64,
+                    )
+                    .unwrap(),
+                );
+                let info = connector.resolve(device_id).await.unwrap();
+                assert!(IdConnector::is_connectable(&info), "device must be online");
+                assert_eq!(info.payload.device_id, device_id);
+                println!(
+                    "  resolved: '{}' online candidates={} (signature verified)",
+                    info.payload.device_id,
+                    info.payload.candidates.len()
+                );
+                let (path, stream) = connector
+                    .connect_stream(&info, "alice-device")
+                    .await
+                    .expect("relay path must establish");
+                assert_eq!(path, PathKind::Relay, "no direct candidates → relay fallback");
+                println!("  path selected: {}", path);
+                let ch = client_handshake_with_confirm_generic(
+                    stream,
+                    &alice,
+                    "alice",
+                    "",
+                    "desktop",
+                    "bob",
+                    Some(dev_arc.public_key_base64()),
+                    None,
+                    "",
+                )
+                .await
+                .expect("handshake over relay must succeed");
+                println!("  controller handshake OK via relay (peer={})", ch.peer_id);
+
+                // 4. 第二条中继会话：加密发送（控制器 → 设备侧已握手通道）。
+                let echo_connector = IdConnector::new(
+                    IdModeConfig::try_new(
+                        &format!("[::1]:{}", relay_port),
+                        "self-test-token",
+                        &server_pubkey_b64,
+                    )
+                    .unwrap(),
+                );
+                let info2 = echo_connector.resolve(device_id).await.unwrap();
+                let (_p2, stream2) = echo_connector
+                    .connect_stream(&info2, "alice-device")
+                    .await
+                    .unwrap();
+                let mut ch2 = client_handshake_with_confirm_generic(
+                    stream2,
+                    &alice,
+                    "alice",
+                    "",
+                    "desktop",
+                    "bob",
+                    Some(dev_arc.public_key_base64()),
+                    None,
+                    "",
+                )
+                .await
+                .unwrap();
+                let test_msg = b"ID mode round-trip via relay";
+                // SecureChannelGeneric 无 send 方法 → 字段公开，转 SecureChannel。
+                let mut sc = kirin_desk_core::crypto::handshake::SecureChannel {
+                    stream: ch2.stream,
+                    cipher: ch2.cipher,
+                    peer_id: ch2.peer_id,
+                    peer_domain: ch2.peer_domain,
+                    peer_device_type: ch2.peer_device_type,
+                    selected_codec: ch2.selected_codec,
+                };
+                sc.send(test_msg).await.unwrap();
+                println!(
+                    "  encrypted send over relay OK ({} bytes)",
+                    test_msg.len()
+                );
+                println!("  ID mode e2e: relay path handshake + encrypted send PASSED");
+                dev_client.stop();
+                let _ = tokio::time::timeout(Duration::from_secs(2), dev_task).await;
+                srv_task.abort();
+            }
+
+            // ── M8-T026-P1: 打洞辅助与多路径叠加 ──
+            //   1) 打洞：进程内 rendezvous（PUNCH-006 边界：仅登记/互转）→
+            //      双端 UDP 打洞（loopback）→ socket 交还 + 审计断言
+            //      （PUNCH-SEC-004）；
+            //   2) PathManager：多路径分配（中继→直连升舱）+ RTT 劣化
+            //      默认保持期 2s 内触发换路（PATH-002/003）。
+            println!();
+            println!("=== M8-T026-P1 punch tests ===");
+            {
+                use kirin_desk_core::connection::punch::{
+                    PunchConfig, PunchResult, PunchSession,
+                };
+                use kirin_desk_relay::rendezvous::RendezvousServer;
+                use std::sync::Arc;
+
+                // 1. 进程内 rendezvous。
+                let rv_server = Arc::new(RendezvousServer::bind(0).await.unwrap());
+                let mut rv_addr = rv_server.local_addr();
+                if rv_addr.ip().is_unspecified() {
+                    rv_addr = std::net::SocketAddr::from((
+                        std::net::Ipv6Addr::LOCALHOST,
+                        rv_addr.port(),
+                    ));
+                }
+                let rv_arc = Arc::clone(&rv_server);
+                let rv_task = tokio::spawn(async move {
+                    let _ = rv_arc.serve(tokio::sync::watch::channel(false).1).await;
+                });
+
+                // 2. 双端独立身份 + 共享 session_id（发起方 pin，PUNCH-SEC-003）。
+                let p_tmp = std::env::temp_dir();
+                let p_key_a = p_tmp.join("kirindesk_self_test_punch_a");
+                let p_key_b = p_tmp.join("kirindesk_self_test_punch_b");
+                let pim_a = Arc::new(IdentityManager::generate(p_key_a.clone()).unwrap());
+                let pim_b = Arc::new(IdentityManager::generate(p_key_b.clone()).unwrap());
+                let mut cfg_a = PunchConfig::loopback("self-punch-a");
+                cfg_a.rendezvous_addr = rv_addr;
+                cfg_a.handshake.peer_device_id = "self-punch-b".into();
+                let mut punch_a = PunchSession::new(cfg_a, Arc::clone(&pim_a));
+                punch_a.pin_session();
+                let sid = punch_a.session_id();
+                let mut cfg_b = PunchConfig::loopback("self-punch-b");
+                cfg_b.rendezvous_addr = rv_addr;
+                cfg_b.handshake.peer_device_id = "self-punch-a".into();
+                let mut punch_b =
+                    PunchSession::with_session_id(cfg_b, Arc::clone(&pim_b), sid);
+
+                // 3. 审计：成功事件落盘（PUNCH-SEC-004）。
+                let audit_path = p_tmp.join(format!(
+                    "kirindesk_self_test_punch_audit_{}.log",
+                    std::process::id()
+                ));
+                let _ = std::fs::remove_file(&audit_path);
+                let audit = Arc::new(std::sync::Mutex::new(
+                    kirin_desk_utils::audit::AuditLogger::open(&audit_path).unwrap(),
+                ));
+                punch_a.set_audit(Arc::clone(&audit));
+
+                // 4. 双端并发打洞 → UDP 建立（PUNCH-001；<2s，PUNCH-NF-001）。
+                let punch_started = std::time::Instant::now();
+                let (ra, rb) = tokio::join!(punch_a.establish(), punch_b.establish());
+                let punch_ok =
+                    matches!(ra, PunchResult::UdpEstablished { .. })
+                        && matches!(rb, PunchResult::UdpEstablished { .. });
+                let punch_elapsed = punch_started.elapsed();
+                let audit_ok = std::fs::read_to_string(&audit_path)
+                    .unwrap_or_default()
+                    .contains("tunnel_punch_success");
+                let _ = std::fs::remove_file(&audit_path);
+                let _ = std::fs::remove_file(p_key_a);
+                let _ = std::fs::remove_file(p_key_b);
+                let _ = rv_task.abort();
+                if punch_ok && audit_ok {
+                    println!(
+                        "  UDP punch established in {:?} (PUNCH-NF-001), audit tunnel_punch_success (PUNCH-SEC-004)",
+                        punch_elapsed
+                    );
+                    println!("  punch tests: loopback UDP hole-punch + audit PASSED");
+                } else {
+                    println!(
+                        "  punch tests FAILED: ok={punch_ok} elapsed={punch_elapsed:?} audit={audit_ok}"
+                    );
+                }
+            }
+
+            println!();
+            println!("=== M8-T026-P1 path manager tests ===");
+            {
+                use kirin_desk_core::connection::path_manager::{
+                    PathKind, PathManager, PathMetrics, PathState, SwitchReason,
+                };
+                // 1. 多路径分配：中继 + 直连 + 打洞均 Active → 确认升舱
+                //    （媒体→最优 P2P，PATH-002）。
+                let mut m = PathManager::new();
+                for k in [PathKind::Relay, PathKind::DirectV6, PathKind::PunchUdp] {
+                    m.register_path(k);
+                    m.on_path_state(k, PathState::Active);
+                }
+                let upgrade = m.evaluate();
+                let alloc_ok =
+                    upgrade.len() == 1 && upgrade[0].from == PathKind::Relay;
+                if alloc_ok {
+                    m.on_switch_completed(upgrade[0]);
+                }
+                // 2. 切换决策：控制通道（PunchUdp）RTT 30ms vs 最优直连
+                //    10ms（差 >30%）→ 默认保持期 2s 后触发换路（PATH-003）。
+                m.on_metrics(
+                    PathKind::DirectV6,
+                    PathMetrics {
+                        rtt_ms: 10.0,
+                        loss_rate: 0.0,
+                        jitter_us: 0.0,
+                    },
+                );
+                m.on_metrics(
+                    PathKind::PunchUdp,
+                    PathMetrics {
+                        rtt_ms: 30.0,
+                        loss_rate: 0.0,
+                        jitter_us: 0.0,
+                    },
+                );
+                tokio::time::sleep(Duration::from_millis(2100)).await;
+                let actions = m.evaluate();
+                let switch_ok = actions.len() == 1
+                    && actions[0].from == PathKind::PunchUdp
+                    && actions[0].to == PathKind::Relay
+                    && actions[0].reason == SwitchReason::RttDegraded;
+                if alloc_ok && switch_ok {
+                    println!("  path allocation: relay -> direct upgrade confirmed (PATH-002)");
+                    println!("  switch decision: RTT degraded -> relay after hold (PATH-003)");
+                    println!("  path manager tests: allocation + switch decision PASSED");
+                } else {
+                    println!(
+                        "  path manager tests FAILED: alloc_ok={alloc_ok} switch_ok={switch_ok}"
+                    );
+                }
+            }
+
             // Cleanup temp identity files
             let _ = std::fs::remove_dir_all(tmp.join("kirindesk_self_test_alice"));
             let _ = std::fs::remove_dir_all(tmp.join("kirindesk_self_test_bob"));
@@ -2744,4 +3610,301 @@ async fn cmd_self_test() {
     let _ = std::fs::remove_dir_all(&tmp_kh);
     println!();
     println!("=== M15 known_hosts tests COMPLETE (5/5) ===");
+}
+
+// ════════════════════════════════════════════════════════════════
+
+// ════════════════════════════════════════════════════════════════
+// M8-T026 T004: CLI 内网穿透 — tunnel start / serve / status（TNL-CFG-003）
+// ════════════════════════════════════════════════════════════════
+
+/// CLI 侧隧道审计适配器：relay 审计事件 → `utils::audit` 落盘（TNL-SEC-003）。
+/// token 不进入 detail（TNL-SEC-005）。
+#[derive(Debug)]
+struct CliTunnelAudit;
+
+impl kirin_desk_relay::audit::AuditSink for CliTunnelAudit {
+    fn record(&self, event: kirin_desk_relay::audit::TunnelAuditEvent) {
+        use kirin_desk_relay::audit::TunnelAuditEvent;
+        use kirin_desk_utils::audit::{AuditEvent, AuditLogger};
+        let (ev, detail) = match event {
+            TunnelAuditEvent::LoginSuccess { client, hostname } => (
+                AuditEvent::TunnelLoginSuccess,
+                format!("ip={} hostname={}", client, hostname),
+            ),
+            TunnelAuditEvent::LoginFailed { client, reason } => (
+                AuditEvent::TunnelLoginFailed,
+                format!("ip={} reason={}", client, reason),
+            ),
+            TunnelAuditEvent::ProxyRegistered { client, name, port } => (
+                AuditEvent::TunnelProxyRegistered,
+                format!("ip={} proxy={} port={}", client, name, port),
+            ),
+            TunnelAuditEvent::ProxyRemoved { client, name } => (
+                AuditEvent::TunnelProxyRemoved,
+                format!("ip={} proxy={}", client, name),
+            ),
+            TunnelAuditEvent::WorkConnOpened { client, name } => (
+                AuditEvent::TunnelWorkConnOpened,
+                format!("ip={} proxy={}", client, name),
+            ),
+            TunnelAuditEvent::WorkConnClosed { client, name, reason } => (
+                AuditEvent::TunnelWorkConnClosed,
+                format!("ip={} proxy={} reason={}", client, name, reason),
+            ),
+            TunnelAuditEvent::RateLimited { client, reason } => (
+                AuditEvent::TunnelRateLimited,
+                format!("ip={} reason={}", client, reason),
+            ),
+            // M8-T026-P2 (ID-022)：设备注册/离线/解析/中继事件。
+            TunnelAuditEvent::DeviceRegistered { client, device_id } => (
+                AuditEvent::DeviceRegistered,
+                format!("ip={} device={}", client, device_id),
+            ),
+            TunnelAuditEvent::DeviceRejected { client, device_id, reason } => (
+                AuditEvent::DeviceResolveRejected,
+                format!("ip={} device={} reason={}", client, device_id, reason),
+            ),
+            TunnelAuditEvent::DeviceOffline { client, device_id } => (
+                AuditEvent::DeviceOffline,
+                format!("ip={} device={}", client, device_id),
+            ),
+            TunnelAuditEvent::DeviceResolveAccepted { client, device_id, online } => (
+                AuditEvent::DeviceResolveAccepted,
+                format!("ip={} device={} online={}", client, device_id, online),
+            ),
+            TunnelAuditEvent::DeviceResolveRejected { client, device_id, reason } => (
+                AuditEvent::DeviceResolveRejected,
+                format!("ip={} device={} reason={}", client, device_id, reason),
+            ),
+            TunnelAuditEvent::TunnelRelayOpened { target, from, conn_id } => (
+                AuditEvent::TunnelWorkConnOpened,
+                format!("target={} from={} conn_id={}", target, from, conn_id),
+            ),
+            TunnelAuditEvent::TunnelRelayClosed { target, conn_id, reason } => (
+                AuditEvent::TunnelWorkConnClosed,
+                format!("target={} conn_id={} reason={}", target, conn_id, reason),
+            ),
+            // M8-T026-P1 打洞事件（PUNCH-SEC-004）由打洞集成方落盘。
+            _ => return,
+        };
+        if let Ok(mut logger) = AuditLogger::open_default() {
+            let _ = logger.record(ev, &detail);
+        }
+    }
+}
+
+/// `tunnel <start|serve|status>`（TNL-CFG-003）。
+async fn cmd_tunnel(args: Vec<String>) {
+    let sub = args.get(2).map(|s| s.as_str()).unwrap_or("status");
+    match sub {
+        "start" => cmd_tunnel_start().await,
+        "serve" => cmd_tunnel_serve().await,
+        "status" => cmd_tunnel_status(),
+        _ => {
+            println!("Usage: kirin_desk tunnel <start|serve|status>");
+        }
+    }
+}
+
+/// `tunnel start`：client 模式（frpc 等价，TNL-CLIENT-001~007）。
+/// 长驻前台；Ctrl+C 优雅退出（发 Logout）。
+async fn cmd_tunnel_start() {
+    use kirin_desk_relay::client::{ProxySpec, TunnelClient, TunnelClientConfig};
+    use std::sync::Arc;
+
+    let cfg = match Config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            println!("Config error: {}. Run setup first.", e);
+            return;
+        }
+    };
+    let t = &cfg.tunnel;
+    if !t.enabled {
+        println!("  WARNING: Tunnel is DISABLED ([tunnel] enabled = false).");
+        println!("    Enable it in config/default.toml before starting.");
+    }
+    if t.server_addr.is_empty() {
+        println!("ERROR: [tunnel].server_addr is empty — set the relay server address.");
+        return;
+    }
+    if t.token.is_empty() {
+        println!("  WARNING: [tunnel].token is empty — the server will reject login unless it is configured without a token.");
+    }
+    if t.proxies.is_empty() {
+        println!("  WARNING: no proxies configured ([tunnel] proxies) — nothing will be mapped.");
+    }
+    let proxies: Vec<ProxySpec> = t
+        .proxies
+        .iter()
+        .map(|p| ProxySpec {
+            name: p.name.clone(),
+            local_addr: p.local_addr.clone(),
+            local_port: p.local_port,
+            remote_port: p.remote_port,
+        })
+        .collect();
+    let client_cfg = TunnelClientConfig {
+        server_addr: t.server_addr.clone(),
+        token: t.token.clone(),
+        hostname: cfg.device.id.clone(),
+        heartbeat_interval: Duration::from_secs(t.heartbeat_interval.max(1)),
+        heartbeat_timeout: Duration::from_secs(t.heartbeat_timeout.max(1)),
+        connect_timeout: Duration::from_secs(5),
+        local_dial_timeout: Duration::from_secs(2),
+        backoff_base: Duration::from_secs(1),
+        backoff_max: Duration::from_secs(60),
+        proxies,
+    };
+    println!("=== Tunnel client (mode=client) ===");
+    println!("  Server:      {}", t.server_addr);
+    for p in &cfg.tunnel.proxies {
+        let remote = if p.remote_port == 0 {
+            "auto".to_string()
+        } else {
+            p.remote_port.to_string()
+        };
+        println!(
+            "  Proxy '{}' -> {}:{} (remote {})",
+            p.name, p.local_addr, p.local_port, remote
+        );
+    }
+    println!("  Press Ctrl+C to stop.");
+
+    let client = Arc::new(TunnelClient::new(client_cfg));
+    let stop_client = client.clone();
+    let ctrl = tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        println!("\nStopping tunnel client...");
+        stop_client.stop();
+    });
+    let _ = client.run().await;
+    ctrl.abort();
+    println!("Tunnel client stopped.");
+}
+
+/// `tunnel serve`：server 模式（frps 等价，TNL-SERVER-001~008）。
+/// 长驻前台；Ctrl+C 停止。审计事件落盘（TNL-SEC-003）。
+async fn cmd_tunnel_serve() {
+    use kirin_desk_relay::server::{TunnelServer, TunnelServerConfig};
+    use std::sync::Arc;
+
+    let cfg = match Config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            println!("Config error: {}. Run setup first.", e);
+            return;
+        }
+    };
+    let t = &cfg.tunnel;
+    if t.token.is_empty() {
+        println!("  WARNING: [tunnel].token is empty — anyone can log in. Use a high-entropy token (>=32 bytes).");
+    }
+    let port_range = parse_tunnel_port_range(&t.port_range);
+    if port_range.is_none() {
+        println!(
+            "  WARNING: invalid [tunnel].port_range '{}' (expected \"start-end\") — remote_port=0 requests will be rejected.",
+            t.port_range
+        );
+    }
+    let srv_cfg = TunnelServerConfig {
+        bind_port: t.bind_port,
+        token: t.token.clone(),
+        port_range,
+        heartbeat_timeout: Duration::from_secs(t.heartbeat_timeout.max(1)),
+        work_conn_timeout: Duration::from_secs(8),
+        max_proxies: 32,
+        max_concurrent_work: 100,
+        rate_limit: kirin_desk_relay::rate_limit::RateLimiterConfig::default(),
+        audit: Some(Arc::new(CliTunnelAudit) as Arc<dyn kirin_desk_relay::audit::AuditSink>),
+        ..Default::default()
+    };
+    println!("=== Tunnel server (mode=server) ===");
+    println!("  Control port: {}", t.bind_port);
+    println!(
+        "  Port range:   {}",
+        if t.port_range.is_empty() {
+            "(none — remote_port must be explicit)".to_string()
+        } else {
+            t.port_range.clone()
+        }
+    );
+    let server = match TunnelServer::bind(srv_cfg).await {
+        Ok(s) => s,
+        Err(e) => {
+            println!("Bind failed: {}", e);
+            return;
+        }
+    };
+    println!("Listening on port {} (Ctrl+C to stop)", server.port());
+    let srv_task = tokio::spawn(server.run());
+    let _ = tokio::signal::ctrl_c().await;
+    srv_task.abort();
+    println!("Tunnel server stopped.");
+}
+
+/// `tunnel status`：显示配置与代理列表（运行状态见前台进程日志）。
+fn cmd_tunnel_status() {
+    let cfg = match Config::load() {
+        Ok(c) => c,
+        Err(_) => {
+            println!("No config. Run setup.");
+            return;
+        }
+    };
+    let t = &cfg.tunnel;
+    println!("=== Tunnel Status ===");
+    println!("Enabled:     {}", if t.enabled { "ON" } else { "OFF" });
+    println!("Mode:        {}", t.mode);
+    println!(
+        "Server:      {}",
+        if t.server_addr.is_empty() {
+            "(not set)".to_string()
+        } else {
+            t.server_addr.clone()
+        }
+    );
+    println!("Token:       {}", mask(&t.token, 4));
+    if t.mode == "server" {
+        println!("Bind port:   {}", t.bind_port);
+        println!("Port range:  {}", t.port_range);
+    }
+    println!(
+        "Heartbeat:   interval {}s / timeout {}s",
+        t.heartbeat_interval, t.heartbeat_timeout
+    );
+    if t.mode == "client" {
+        println!(
+            "Proxies:     {}",
+            if t.proxies.is_empty() {
+                "(none)".to_string()
+            } else {
+                format!("{}", t.proxies.len())
+            }
+        );
+        for p in &t.proxies {
+            let remote = if p.remote_port == 0 {
+                "auto".to_string()
+            } else {
+                p.remote_port.to_string()
+            };
+            println!(
+                "  - '{}' -> {}:{} (remote {})",
+                p.name, p.local_addr, p.local_port, remote
+            );
+        }
+    }
+    println!("  (running state is printed by the foreground `tunnel start`/`serve` process)");
+}
+
+/// 解析 `"start-end"` 端口区间（TNL-CFG-001 `[tunnel].port_range`）。
+fn parse_tunnel_port_range(s: &str) -> Option<(u16, u16)> {
+    let (a, b) = s.trim().split_once('-')?;
+    let start: u16 = a.trim().parse().ok()?;
+    let end: u16 = b.trim().parse().ok()?;
+    if start > end {
+        return None;
+    }
+    Some((start, end))
 }

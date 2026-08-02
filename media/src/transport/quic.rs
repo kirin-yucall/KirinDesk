@@ -11,7 +11,8 @@ use std::time::Duration;
 use quinn::TransportConfig;
 use rustls::pki_types::CertificateDer;
 use rustls::pki_types::ServerName;
-use tracing::debug;
+use socket2::{Domain, Protocol, Socket, Type};
+use tracing::{debug, warn};
 
 use crate::transport::TransportError;
 
@@ -124,7 +125,9 @@ pub fn make_client_config() -> quinn::ClientConfig {
         .expect("QuicClientConfig from rustls ClientConfig");
 
     let mut transport = TransportConfig::default();
-    transport.max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()));
+    // M8-T025 P5-3：idle 超时 30s → 10s —— 会话降级判定辅助（QUIC 失效时
+    // is_alive() 尽快翻转 false，配合会话层 500ms 轮询触发 TCP 重建；M8-T009 §12.2）。
+    transport.max_idle_timeout(Some(Duration::from_secs(10).try_into().unwrap()));
 
     let mut config = quinn::ClientConfig::new(Arc::new(quic_client_config));
     config.transport_config(Arc::new(transport));
@@ -151,7 +154,8 @@ pub fn make_server_config(
         .map_err(|e| TransportError::Quic(format!("QuicServerConfig: {e}")))?;
 
     let mut transport = TransportConfig::default();
-    transport.max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()));
+    // M8-T025 P5-3：同客户端 —— idle 10s，会话降级判定辅助。
+    transport.max_idle_timeout(Some(Duration::from_secs(10).try_into().unwrap()));
 
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(quic_server_config));
     config.transport_config(Arc::new(transport));
@@ -314,6 +318,16 @@ impl QuicConnection {
         )
     }
 
+    /// 本地地址（M8-T026-P1 PATH-007 路径采样：识别当前源地址/映射变化）。
+    pub fn local_ip(&self) -> Option<std::net::IpAddr> {
+        self.conn.local_ip()
+    }
+
+    /// 对端地址（PATH-007 采样：当前路径对端端点）。
+    pub fn remote_address(&self) -> SocketAddr {
+        self.conn.remote_address()
+    }
+
     /// UDP 收发统计（诊断用）：`(tx_datagrams, tx_bytes, rx_datagrams, rx_bytes)`。
     pub fn udp_stats(&self) -> (u64, u64, u64, u64) {
         let s = self.conn.stats();
@@ -330,39 +344,89 @@ impl QuicConnection {
 // QuicEndpoint
 // ════════════════════════════════════════════════════════════════
 
+/// 绑定 UDP socket：优先双栈（`[::]:port` + IPV6_V6ONLY=false，可收 v4-mapped），
+/// 平台不支持双栈（socket 创建/bind 失败或 `set_only_v6(false)` 失败）→ 回退
+/// `0.0.0.0:port`（仅 v4，`warn!` 告警）。见 M8-T025_P3 Task P3-1。
+///
+/// 说明：`std::net::UdpSocket` 没有 `set_only_v6`（仅 `TcpSocket` 有），
+/// 双栈 socket 需经 socket2 预建（bind 前设 V6ONLY=false，与 quinn 内部一致）。
+fn bind_udp_socket(port: u16) -> std::io::Result<std::net::UdpSocket> {
+    bind_udp_socket_inner(port, true)
+}
+
+/// `try_dual_stack=false` 仅供测试注入（模拟双栈不可用，直接验证 v4 回退路径）。
+fn bind_udp_socket_inner(
+    port: u16,
+    try_dual_stack: bool,
+) -> std::io::Result<std::net::UdpSocket> {
+    if try_dual_stack {
+        if let Ok(socket) = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)) {
+            let dual_ok = socket.set_only_v6(false).is_ok()
+                && socket
+                    .bind(&SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port)).into())
+                    .is_ok();
+            if dual_ok {
+                // 双栈 socket 转回 std，交给 quinn::Endpoint::new 包装
+                return Ok(socket.into());
+            }
+        }
+        warn!(
+            "dual-stack bind [::]:{port} unavailable on this platform, \
+             falling back to IPv4-only 0.0.0.0:{port}"
+        );
+    }
+    std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, port))
+}
+
 /// QUIC 传输端点。
 pub struct QuicEndpoint {
     endpoint: quinn::Endpoint,
 }
 
 impl QuicEndpoint {
-    /// 绑定 UDP 端口。
+    /// 绑定 UDP 端口（双栈优先；平台不支持 → 回退仅 v4）。
     pub async fn bind(
         port: u16,
         cert_der: Vec<u8>,
         key_der: Vec<u8>,
     ) -> Result<Self, TransportError> {
         let server_config = make_server_config(cert_der, key_der)?;
-        let addr: SocketAddr = ([0, 0, 0, 0, 0, 0, 0, 0], port).into();
+        let socket = bind_udp_socket(port)?;
+        let runtime = quinn::default_runtime()
+            .ok_or_else(|| TransportError::Quic("no quinn runtime available".into()))?;
 
-        let endpoint =
-            quinn::Endpoint::server(server_config, addr).map_err(|e| TransportError::Io(e))?;
+        // `Endpoint::server` 内部走 `Endpoint::new` + 默认 config；此处直接
+        // `new` 以便传入预建的双栈 socket（语义等价，双栈由 socket 决定）。
+        let endpoint = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(server_config),
+            socket,
+            runtime,
+        )
+        .map_err(|e| TransportError::Io(e))?;
 
         debug!(
-            "QuicEndpoint::bind -> UDP [::]:{}",
-            endpoint.local_addr()?.port()
+            "QuicEndpoint::bind -> UDP {}",
+            endpoint.local_addr()?
         );
         Ok(Self { endpoint })
     }
 
-    /// 拨号到远程端点。
+    /// 拨号到远程端点（v4/v6 均可）。
     pub async fn connect(
         addr: SocketAddr,
         device_id: &str,
     ) -> Result<QuicConnection, TransportError> {
         let client_config = make_client_config();
-        let endpoint = quinn::Endpoint::client(SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 0)))
-            .map_err(|e| TransportError::Io(e))?;
+        // 按目标地址族选择客户端端点绑定地址：v6-mapped 拨号存在平台差异
+        // （Linux 需 IPV6_V6ONLY=0 且行为不一致），按族绑定最稳。
+        let bind_addr = if addr.is_ipv4() {
+            SocketAddr::from(([0, 0, 0, 0], 0)) // v4 目标 → v4 端点
+        } else {
+            SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 0)) // v6 目标 → v6 端点
+        };
+        let endpoint =
+            quinn::Endpoint::client(bind_addr).map_err(|e| TransportError::Io(e))?;
 
         let conn = endpoint
             .connect_with(client_config, addr, device_id)
@@ -372,6 +436,76 @@ impl QuicEndpoint {
 
         debug!("QuicEndpoint::connect -> {addr} connected");
         Ok(QuicConnection::new(conn))
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // M8-T026-P1 (PUNCH-001 / PATH-004): 预建 socket 端点（打洞路径复用）
+    // ════════════════════════════════════════════════════════════
+
+    /// 服务端：在**外部预建的 socket**（打洞成功后交还的 UDP socket）上建端点。
+    ///
+    /// 打洞 socket 的 NAT 映射已通过探测建立（PUNCH-001），QUIC 直接复用
+    /// 该映射（同五元组），无需新建 socket——连接迁移（PATH-004）的落点。
+    pub async fn from_socket(
+        socket: std::net::UdpSocket,
+        cert_der: Vec<u8>,
+        key_der: Vec<u8>,
+    ) -> Result<Self, TransportError> {
+        let server_config = make_server_config(cert_der, key_der)?;
+        let runtime = quinn::default_runtime()
+            .ok_or_else(|| TransportError::Quic("no quinn runtime available".into()))?;
+        let endpoint = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(server_config),
+            socket,
+            runtime,
+        )
+        .map_err(|e| TransportError::Io(e))?;
+        debug!("QuicEndpoint::from_socket -> UDP {}", endpoint.local_addr()?);
+        Ok(Self { endpoint })
+    }
+
+    /// 客户端：在外部预建的 socket（打洞 socket）上建**客户端**端点。
+    pub async fn client_on(socket: std::net::UdpSocket) -> Result<Self, TransportError> {
+        let runtime = quinn::default_runtime()
+            .ok_or_else(|| TransportError::Quic("no quinn runtime available".into()))?;
+        let endpoint = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            None,
+            socket,
+            runtime,
+        )
+        .map_err(|e| TransportError::Io(e))?;
+        debug!("QuicEndpoint::client_on -> UDP {}", endpoint.local_addr()?);
+        Ok(Self { endpoint })
+    }
+
+    /// 客户端：从本端点（打洞 socket 端点）拨号到对端打洞地址。
+    pub async fn connect_on(
+        &self,
+        addr: SocketAddr,
+        device_id: &str,
+    ) -> Result<QuicConnection, TransportError> {
+        let client_config = make_client_config();
+        let conn = self
+            .endpoint
+            .connect_with(client_config, addr, device_id)
+            .map_err(|e| TransportError::Quic(e.to_string()))?
+            .await
+            .map_err(|e| TransportError::Quic(e.to_string()))?;
+        debug!("QuicEndpoint::connect_on -> {addr} connected");
+        Ok(QuicConnection::new(conn))
+    }
+
+    /// NAT 重绑（RFC 9000 连接迁移 / PATH-004）：换本地 socket 而不重建连接。
+    ///
+    /// quinn 0.11：客户端换源地址后，服务端侧（`server_config.migration` 默认
+    /// 开启）经 PATH_CHALLENGE 自动验证并迁移，**无重握手、近乎零中断**。
+    /// 用于打洞映射老化（PUNCH-004 重打洞）或接口切换场景。
+    pub fn rebind(&self, socket: std::net::UdpSocket) -> Result<(), TransportError> {
+        self.endpoint
+            .rebind(socket)
+            .map_err(|e| TransportError::Io(e))
     }
 
     /// 等待并接受连接。
@@ -447,5 +581,79 @@ mod tests {
         }
         let result = cipher.decrypt(&encrypted);
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_bind_dual_stack_port() {
+        let (cert, key) = generate_quic_cert("test-device").unwrap();
+        let endpoint = QuicEndpoint::bind(0, cert, key).await.unwrap();
+        let addr = endpoint.local_addr().unwrap();
+        assert_ne!(addr.port(), 0, "bind(0) must assign a real port");
+        // 平台支持双栈（IPV6_V6ONLY=false 生效）时应绑在 [::]；否则回退 v4 —— 两者皆合法
+        let probe = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+        if probe.set_only_v6(false).is_ok() {
+            assert!(addr.is_ipv6(), "dual-stack platform should bind [::], got {addr}");
+        }
+    }
+
+    #[test]
+    fn test_bind_v4_fallback() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        // 捕获 warn 日志，验证回退路径告警
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let logs: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_logs = Arc::clone(&logs);
+        let sink = move || Sink(Arc::clone(&sink_logs));
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(sink)
+                .finish(),
+        );
+
+        // 1) 注入：跳过双栈尝试 → 直接验证 v4 回退绑定（跨平台确定性）
+        let injected = bind_udp_socket_inner(0, false).unwrap();
+        assert!(injected.local_addr().unwrap().is_ipv4());
+        assert_ne!(injected.local_addr().unwrap().port(), 0);
+
+        // 2) 真实回退：用 v6-only socket 占住 [::]:port → 双栈 bind 应失败 → warn + v4
+        //    （Windows 允许 UDP 重复 bind，无法构造确定性冲突时跳过日志断言，
+        //     该部分在 Linux 等平台上生效）
+        let blocker = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+        let conflict_constructible = blocker.set_only_v6(true).is_ok()
+            && blocker
+                .bind(&SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0)).into())
+                .is_ok();
+        if conflict_constructible {
+            let port = blocker.local_addr().unwrap().as_socket().unwrap().port();
+            let probe = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+            let _ = probe.set_only_v6(false);
+            let dup_conflicts = probe
+                .bind(&SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port)).into())
+                .is_err();
+            if dup_conflicts {
+                let socket = bind_udp_socket(port).unwrap();
+                let addr = socket.local_addr().unwrap();
+                assert!(addr.is_ipv4(), "fallback should bind IPv4, got {addr}");
+                assert_eq!(addr.port(), port, "fallback should keep requested port");
+                let captured = String::from_utf8_lossy(&logs.lock().unwrap()).to_string();
+                assert!(
+                    captured.contains("falling back to IPv4-only"),
+                    "expected fallback warning, got: {captured}"
+                );
+            }
+        }
     }
 }

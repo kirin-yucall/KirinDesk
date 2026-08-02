@@ -27,6 +27,9 @@ ed25519-dalek.workspace = true
 rand.workspace = true
 quinn = "0.11"
 quinn-proto = "0.11"
+# socket2：QUIC 双栈 bind 需在 bind 前设置 IPV6_V6ONLY=false
+# （std::net::UdpSocket 无 set_only_v6，仅 TcpSocket 有；见 M8-T025_P3）
+socket2 = "0.6"
 # ring feature：rustls 0.23 需要进程级 CryptoProvider（quic.rs ensure_crypto_provider）
 rustls = { version = "0.23", features = ["ring"] }
 rustls-pki-types = "1"
@@ -80,6 +83,8 @@ required-features = []
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
+# M8-T026-P1: 打洞路径集成测试（进程内 rendezvous 服务端）。
+kirin-desk-relay = { path = "../relay" }
 
 # P1G §T7.1：编码层三场景基准（合成帧驱动，跨平台）。
 [[bin]]

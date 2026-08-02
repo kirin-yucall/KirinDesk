@@ -2,6 +2,8 @@
 
 P2P Remote Desktop - IPv6 + GoDaddy DNS + Zero Trust
 
+> 💜 **Made with love by an individual developer — a non-profit, open-source project with no monetization of any kind. No ads, no tracking, no subscriptions. Free, forever.**
+
 ## Windows Desktop App
 
 Native Windows GUI (egui) with CLI fallback.

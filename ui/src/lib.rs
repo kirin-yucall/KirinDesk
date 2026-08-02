@@ -1198,7 +1198,7 @@ async fn run_client_shell_session(
     };
     tracing::info!("[shell] Handshake SUCCESS! Channel to '{}'", server_id);
     if let Ok(mut s) = connection_status().lock() {
-        *s = format!("[shell] Connected to {}@{}", server_id, addr);
+        *s = format!("[shell] Connected to {}@{} (transport: TCP)", server_id, addr);
     }
 
     // M15 (CLI-KH-002): 连接成功 → 记录 known_hosts + 自动保存设备。
@@ -2165,9 +2165,6 @@ async fn run_client_session(
     domain: String,
     device_type: &str,
 ) {
-    use kirin_desk_core::crypto::handshake::client_handshake_with_confirm;
-    // M8-T021 P1: 会话标识（窗口键控状态 key；窗口 id 与之解耦）。
-    let session_id = next_session_id();
     tracing::info!("TCP connecting to {} ...", addr);
     if let Ok(mut s) = connection_status().lock() {
         *s = format!("Connecting: {} ...", addr);
@@ -2180,6 +2177,25 @@ async fn run_client_session(
         return;
     };
     tracing::info!("TCP connected to {}", addr);
+    run_client_session_with_stream(stream, addr, server_id, trust, challenge, domain, device_type)
+        .await;
+}
+
+/// M8-T026-P2 (ID-021)：会话入口的**已连接流**变体 —— 供设备 ID 模式
+/// （`connect_stream` 已建立直连/中继流）与既有 connect 路径共用同一套
+/// 握手 + 媒体会话逻辑（ID-013 访问控制零降级）。
+async fn run_client_session_with_stream(
+    stream: tokio::net::TcpStream,
+    addr_label: String,
+    server_id: String,
+    trust: ClientTrust,
+    challenge: String,
+    domain: String,
+    device_type: &str,
+) {
+    use kirin_desk_core::crypto::handshake::client_handshake_with_confirm;
+    // M8-T021 P1: 会话标识（窗口键控状态 key；窗口 id 与之解耦）。
+    let session_id = next_session_id();
 
     let Some(client_id) = global_identity().get() else {
         tracing::error!("No device identity loaded, can't handshake");
@@ -2190,7 +2206,7 @@ async fn run_client_session(
 
     // 握手阶段状态（Domain 模式将用 TXT 公钥强制验证服务端身份）。
     if let Ok(mut s) = connection_status().lock() {
-        *s = format!("Handshaking: {}@{} ...", server_id, addr);
+        *s = format!("Handshaking: {}@{} ...", server_id, addr_label);
     }
     let server_name = if server_id.is_empty() {
         "gui-server"
@@ -2274,7 +2290,9 @@ async fn run_client_session(
         server_id
     );
     if let Ok(mut s) = connection_status().lock() {
-        *s = format!("Connected to {}@{}", server_id, addr);
+        // M8-T025 P5-4 (B5)：连接状态显示传输模式（GUI 会话走 TCP/SecureChannel 路径；
+        // QUIC 主路径经 media 会话接入后由 stats.transport_mode 驱动同一状态位）。
+        *s = format!("Connected to {}@{} (transport: TCP)", server_id, addr_label);
     }
 
     // M15 (CLI-KH-002): 连接成功 → 记录 known_hosts。
@@ -2285,7 +2303,7 @@ async fn run_client_session(
     // M10-T003: 连接成功后自动保存设备（按 id 去重 + last_seen 刷新由 DeviceStore 维护）。
     if let Some(key) = &trusted_key {
         record_known_host(&server_id, key);
-        save_device_to_store(&addr, &server_id, key, device_type, &domain);
+        save_device_to_store(&addr_label, &server_id, key, device_type, &domain);
     }
 
     // M9: 拆分通道为读写半通道——视频接收（读半）与输入发送（写半）
@@ -2390,7 +2408,7 @@ async fn run_client_session(
     if let Ok(mut w) = add_window_signal().lock() {
         w.push(DesktopWindowSignal {
             session_id,
-            addr: addr.clone(),
+            addr: addr_label.clone(),
             bridge: bridge.clone(),
             input_tx,
             file_tx: file_cmd_tx.clone(),
@@ -2726,6 +2744,125 @@ async fn run_client_session(
     cleanup_session_state(session_id);
 }
 
+/// M8-T026-P2 (ID-021): GUI 设备 ID 模式连接线程 —— 解析（ID-010）→ 服务器
+/// 签名验签（ID-SEC-001）→ 公钥 pin（known_hosts 命中强制比对 / 未命中首次
+/// 指纹确认，ID-012）→ 三级路径编排（ID-011：直连 → 打洞 hook → 中继兜底）
+/// → 复用 `run_client_session_with_stream` 握手 + 媒体会话（ID-013）。
+async fn run_client_session_by_id(device_id: String, ctx: egui::Context) {
+    use kirin_desk_core::connection::id_mode::{IdConnectError, IdConnector, IdModeConfig};
+    use kirin_desk_utils::audit::{AuditEvent, AuditLogger};
+    use kirin_desk_utils::known_hosts::{FingerprintStatus, KnownHostsStore};
+
+    let cfg = kirin_desk_utils::config::Config::load().unwrap_or_default();
+    let tunnel = cfg.tunnel.clone();
+    let Some(client_id) = global_identity().get() else {
+        if let Ok(mut s) = connection_status().lock() {
+            *s = "设备 ID 模式：未加载本机身份".to_string();
+        }
+        return;
+    };
+    // ID-014：ID 模式需服务器配置。
+    let server_pubkey = match tunnel.server_pubkey.as_deref() {
+        Some(k) if !k.trim().is_empty() => k.to_string(),
+        _ => {
+            if let Ok(mut s) = connection_status().lock() {
+                *s = "ID 模式未配置 server_pubkey（tunnel serve 启动时输出）".to_string();
+            }
+            return;
+        }
+    };
+    let connector = match IdModeConfig::try_new(&tunnel.server_addr, &tunnel.token, &server_pubkey)
+    {
+        Ok(c) => IdConnector::new(c),
+        Err(e) => {
+            if let Ok(mut s) = connection_status().lock() {
+                *s = format!("ID 模式配置错误: {}", e);
+            }
+            return;
+        }
+    };
+    // ID-010 + ID-SEC-001：解析 + 验签。
+    let info = match connector.resolve(&device_id).await {
+        Ok(i) => i,
+        Err(IdConnectError::SignatureVerification) => {
+            if let Ok(mut s) = connection_status().lock() {
+                *s = "解析响应签名校验失败（ID-SEC-001）— 可能 server_pubkey 错误或中间人".to_string();
+            }
+            return;
+        }
+        Err(e) => {
+            if let Ok(mut s) = connection_status().lock() {
+                *s = format!("解析失败: {}", e);
+            }
+            return;
+        }
+    };
+    // ID-010：离线/未知统一文案（ID-SEC-002）。
+    if !IdConnector::is_connectable(&info) {
+        if let Ok(mut s) = connection_status().lock() {
+            *s = format!("设备 '{}' 离线或未注册", device_id);
+        }
+        return;
+    }
+    // ID-012：公钥 pin（known_hosts 三态：命中一致 → Verified；命中不一致 →
+    // 拒绝；未命中 → Confirm 首次指纹确认）。
+    let trust = match KnownHostsStore::load() {
+        Ok(store) => match store.check(&device_id, &info.payload.ed25519_pub) {
+            FingerprintStatus::Match => ClientTrust::Verified(info.payload.ed25519_pub.clone()),
+            FingerprintStatus::Mismatch => {
+                if let Ok(mut s) = connection_status().lock() {
+                    *s = format!(
+                        "known_hosts 指纹不匹配 '{}' — 拒绝连接（MITM 防护）",
+                        device_id
+                    );
+                }
+                return;
+            }
+            FingerprintStatus::Unknown => ClientTrust::Confirm,
+        },
+        Err(_) => ClientTrust::Confirm,
+    };
+    // ID-011：三级路径编排（直连 → 打洞 hook → 中继兜底）。
+    let from_peer = tunnel
+        .device_id
+        .clone()
+        .unwrap_or_else(|| kirin_desk_utils::known_hosts::fingerprint(&client_id.public_key_base64()));
+    if let Ok(mut s) = connection_status().lock() {
+        *s = format!("Connecting: {} (relay {}) ...", device_id, tunnel.server_addr);
+    }
+    let (path, stream) = match connector.connect_stream(&info, &from_peer).await {
+        Ok(x) => x,
+        Err(e) => {
+            if let Ok(mut s) = connection_status().lock() {
+                *s = format!("连接失败（全部路径）: {}", e);
+            }
+            return;
+        }
+    };
+    tracing::info!("ID mode: path selected = {} for '{}'", path, device_id);
+    if let Ok(mut logger) = AuditLogger::open_default() {
+        let _ = logger.record(
+            AuditEvent::TunnelPathSelected,
+            &format!("device={} path={}", device_id, path),
+        );
+    }
+    let challenge = cfg.device.challenge_code.clone();
+    let ctx2 = ctx.clone();
+    let device_id2 = device_id.clone();
+    // 复用会话入口（握手 + 媒体会话）；首次连接指纹确认由内部 key_confirm 弹窗。
+    run_client_session_with_stream(
+        stream,
+        format!("{} (via relay, {})", device_id, path),
+        device_id2,
+        trust,
+        challenge,
+        String::new(),
+        "desktop",
+    )
+    .await;
+    let _ = ctx2;
+}
+
 #[derive(Default)]
 struct KirinDeskApp {
     current_tab: Tab,
@@ -2738,6 +2875,10 @@ struct KirinDeskApp {
     connect_nickname: String,
     connect_challenge: String,
     connect_status: String,
+    /// M8-T026-P2 (ID-021): 设备 ID 模式输入框。
+    connect_device_id: String,
+    /// M8-T026-P2 (ID-021): 设备 ID 模式选中态（三态：IP / Domain / ID）。
+    connect_id_mode: bool,
     // Settings fields
     api_key: String,
     api_secret: String,
@@ -2782,6 +2923,13 @@ struct KirinDeskApp {
     unattended_enabled: bool,
     unattended_autostart: bool,
     unattended_auto_server: bool,
+    // M8-T026: 内网穿透设置（Settings 页 Tunnel (内网穿透) 分组）
+    tunnel_enabled: bool,
+    tunnel_mode: String,
+    tunnel_server_addr: String,
+    tunnel_token: String,
+    tunnel_proxies: String,
+    show_secret_tunnel_token: bool,
     /// 本次启动是否由系统开机自启拉起（`--autostart`）——用于窗口最小化启动。
     autostart_launched: bool,
     /// 无人值守自动开启服务端是否已执行（一次性标记）。
@@ -2793,7 +2941,12 @@ struct KirinDeskApp {
     temp_window_was_active: bool,
     /// 卡片内操作结果提示（enable 失败等）。
     temp_status: String,
+    /// M8-T028 (UI-BTY-028): 复制成功浮出提示（(预览文案, 点击时刻)，2s 自动消失）。
+    copied_feedback: Option<(String, std::time::Instant)>,
 }
+
+/// M8-T028 (UI-BTY-028): 状态栏「Copied: …」浮出提示持续时间。
+const COPY_TOAST_DURATION: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(PartialEq)]
 enum Tab {
@@ -2911,6 +3064,16 @@ impl eframe::App for KirinDeskApp {
         let theme = self.theme_mode.resolve(system_dark);
         theme::apply_theme(ctx, &theme);
 
+        // M8-T028 (UI-BTY-028): 复制成功浮出提示 2s 自动消失；
+        // 提示存活期间持续请求重绘，避免窗口无输入时提示残留。
+        if let Some((_, t)) = &self.copied_feedback {
+            if t.elapsed() >= COPY_TOAST_DURATION {
+                self.copied_feedback = None;
+            } else {
+                ctx.request_repaint();
+            }
+        }
+
         // M10-T003: 连接线程自动保存设备后刷新列表（跨线程信号，非每帧读盘）。
         if devices_dirty().swap(false, Ordering::Relaxed) {
             self.reload_devices();
@@ -2994,6 +3157,8 @@ impl eframe::App for KirinDeskApp {
                             egui::Label::new(egui::RichText::new(&pc.client_id).strong())
                                 .selectable(true),
                         );
+                        // M8-T028 (UI-BTY-026): 设备名（client_id）一键复制。
+                        self.copied_button(ui, &theme, &pc.client_id);
                         badge(ui, &theme, &pc.device_type, BadgeKind::Info);
                     });
                     ui.horizontal(|ui| {
@@ -3005,6 +3170,8 @@ impl eframe::App for KirinDeskApp {
                             )
                             .selectable(true),
                         );
+                        // M8-T028 (UI-BTY-026): Domain 一键复制（空值按钮自动禁用）。
+                        self.copied_button(ui, &theme, &pc.client_domain);
                     });
                     // 指纹等宽显示（远端设备标识即指纹，无独立 pubkey 字段）
                     ui.horizontal(|ui| {
@@ -3017,6 +3184,8 @@ impl eframe::App for KirinDeskApp {
                             )
                             .selectable(true),
                         );
+                        // M8-T028 (UI-BTY-026): 指纹一键复制（与设备 ID 同源显示）。
+                        self.copied_button(ui, &theme, &pc.client_id);
                     });
                     ui.separator();
                     ui.horizontal(|ui| {
@@ -3218,6 +3387,18 @@ impl eframe::App for KirinDeskApp {
                     status_dot_char(ui, theme.fg_weak, "○", "Server: Stopped");
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // M8-T028 (UI-BTY-028): 复制成功浮出提示（右侧弱色，2s 自动消失）。
+                    if let Some((value, _)) = &self.copied_feedback {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!("Copied: {value}"))
+                                    .monospace()
+                                    .size(theme.small_size)
+                                    .color(theme.fg_weak),
+                            )
+                            .selectable(false),
+                        );
+                    }
                     ui.add(
                         egui::Label::new(
                             egui::RichText::new("81/81 tests")
@@ -4187,6 +4368,13 @@ impl KirinDeskApp {
             self.unattended_enabled = cfg.unattended.enabled;
             self.unattended_autostart = cfg.unattended.auto_start_on_boot;
             self.unattended_auto_server = cfg.unattended.auto_start_server;
+            // M8-T026: 内网穿透设置（Settings 页 Tunnel 分组回填；proxies 转多行文本）。
+            self.tunnel_enabled = cfg.tunnel.enabled;
+            self.tunnel_mode = cfg.tunnel.mode.clone();
+            self.tunnel_server_addr = cfg.tunnel.server_addr.clone();
+            self.tunnel_token = cfg.tunnel.token.clone();
+            self.tunnel_proxies =
+                kirin_desk_utils::config::TunnelConfig::format_proxy_lines(&cfg.tunnel.proxies);
         }
         // M10-T003: 启动时加载已保存设备列表（文件不存在 → 空列表）。
         self.reload_devices();
@@ -4250,6 +4438,29 @@ impl KirinDeskApp {
         }
     }
 
+    /// M8-T028 (UI-BTY-028): 复制成功反馈——记录状态栏浮出提示
+    /// （`Copied: <值前 24 字符>…`，2s 自动消失；空值不提示）。
+    fn notify_copied(&mut self, value: &str) {
+        if value.is_empty() {
+            return;
+        }
+        let preview: String = value.chars().take(24).collect();
+        let shown = if preview.chars().count() < value.chars().count() {
+            format!("{preview}…")
+        } else {
+            preview
+        };
+        self.copied_feedback = Some((shown, std::time::Instant::now()));
+    }
+
+    /// M8-T028: 📋 复制按钮 + 成功反馈（空值禁用由 `copy_button` 内部处理）。
+    fn copied_button(&mut self, ui: &mut egui::Ui, theme: &Theme, text: &str) {
+        let (_, copied) = copy_button(ui, theme, text);
+        if copied {
+            self.notify_copied(text);
+        }
+    }
+
     fn show_dashboard(&mut self, ui: &mut egui::Ui, theme: &Theme) {
         ui.heading("Dashboard");
         ui.separator();
@@ -4265,7 +4476,9 @@ impl KirinDeskApp {
         } else {
             "Ready"
         };
-        stat_card(
+        // M8-T028 (UI-BTY-024): 身份卡三行（Device ID / IPv6 / Domain）均带 📋；
+        // stat_card 返回本帧复制的内容 → 状态栏浮出提示（UI-BTY-028）。
+        if let Some(copied) = stat_card(
             ui,
             theme,
             "Identity",
@@ -4292,7 +4505,7 @@ impl KirinDeskApp {
                     key: "Domain:",
                     value: self.domain.clone(),
                     mono: true,
-                    copy: false,
+                    copy: true,
                 },
                 StatRow {
                     key: "Listen Port:",
@@ -4313,7 +4526,9 @@ impl KirinDeskApp {
                     copy: false,
                 },
             ],
-        );
+        ) {
+            self.notify_copied(&copied);
+        }
         ui.add_space(theme.spacing);
 
         // M15-T008: ② 服务器控制卡（大号主/次按钮 + StatusDot + Temp Mode Badge）
@@ -4449,13 +4664,13 @@ impl KirinDeskApp {
                     );
                 });
                 ui.add_space(4.0);
-                match &self.temp_code {
+                match self.temp_code.clone() {
                     Some(code) => {
-                        // 大号等宽码（UI-BTY-004）+ 一键复制。
+                        // 大号等宽码（UI-BTY-004）+ 一键复制（M8-T028 成功反馈）。
                         ui.horizontal(|ui| {
                             ui.add(
                                 egui::Label::new(
-                                    egui::RichText::new(code)
+                                    egui::RichText::new(&code)
                                         .monospace()
                                         .size(theme.mono_size + 6.0)
                                         .strong()
@@ -4463,7 +4678,7 @@ impl KirinDeskApp {
                                 )
                                 .selectable(true),
                             );
-                            copy_button(ui, theme, code);
+                            self.copied_button(ui, theme, &code);
                         });
                     }
                     None => {
@@ -5466,6 +5681,21 @@ impl KirinDeskApp {
                     // M15-T008: 设备卡片——StatusDot + 设备名@IP + 类型徽标 + 上次在线。
                     // 状态点：SavedDevice 无实时 status 字段 → 中性停止态（fg_weak "saved"，
                     // 方案 §3.1 停止态映射；实时在线状态待 M9 联调期补充）。
+                    // M8-T028 (UI-BTY-025): 主标题整串（昵称@域名 / 昵称@[IPv6]:端口）与
+                    // 地址行纯连接地址（[IPv6]:端口）各带 📋；行内预留 32px（26 按钮 + 6 间距），
+                    // 按钮在卡片点击层之后注册（同层后注册者优先命中）→ 不改变单击填入/右键菜单。
+                    let name = if d.domain.is_empty() {
+                        format!("{}@[{}]:{}", d.nickname, d.ipv6, d.port)
+                    } else {
+                        format!("{}@{}", d.nickname, d.domain)
+                    };
+                    let addr = if d.domain.is_empty() {
+                        None
+                    } else {
+                        Some(format!("[{}]:{}", d.ipv6, d.port))
+                    };
+                    let mut title_rect: Option<egui::Rect> = None;
+                    let mut addr_rect: Option<egui::Rect> = None;
                     let card = egui::Frame::none()
                         .fill(theme.bg_panel)
                         .stroke(egui::Stroke::new(theme.border_width, theme.border))
@@ -5474,15 +5704,12 @@ impl KirinDeskApp {
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 status_dot(ui, theme.fg_weak, "saved");
-                                let name = if d.domain.is_empty() {
-                                    format!("{}@[{}]:{}", d.nickname, d.ipv6, d.port)
-                                } else {
-                                    format!("{}@{}", d.nickname, d.domain)
-                                };
-                                ui.add(
-                                    egui::Label::new(egui::RichText::new(name).strong())
+                                let tr = ui.add(
+                                    egui::Label::new(egui::RichText::new(&name).strong())
                                         .selectable(true),
                                 );
+                                title_rect = Some(tr.rect);
+                                ui.add_space(32.0); // 📋 预留
                                 // 类型徽标（server=info / desktop=neutral）
                                 let (kind, label) = if d.device_type == "server" {
                                     (BadgeKind::Info, "server")
@@ -5490,19 +5717,18 @@ impl KirinDeskApp {
                                     (BadgeKind::Neutral, "desktop")
                                 };
                                 badge(ui, theme, label, kind);
-                                if !d.domain.is_empty() {
-                                    ui.add(
+                                if let Some(addr) = &addr {
+                                    let ar = ui.add(
                                         egui::Label::new(
-                                            egui::RichText::new(format!(
-                                                "[{}]:{}",
-                                                d.ipv6, d.port
-                                            ))
-                                            .monospace()
-                                            .size(theme.small_size)
-                                            .color(theme.fg_weak),
+                                            egui::RichText::new(addr)
+                                                .monospace()
+                                                .size(theme.small_size)
+                                                .color(theme.fg_weak),
                                         )
                                         .selectable(true),
                                     );
+                                    addr_rect = Some(ar.rect);
+                                    ui.add_space(32.0); // 📋 预留
                                 }
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
@@ -5526,6 +5752,32 @@ impl KirinDeskApp {
                         ui.id().with(("dev_card", i)),
                         egui::Sense::click(),
                     );
+                    // M8-T028: 📋 按钮注册于卡片点击层之后（同层后注册者优先命中）——
+                    // 按钮可点，卡片单击填入/右键菜单行为不变。
+                    let mut copied: Option<String> = None;
+                    let mut place_btn = |ui: &mut egui::Ui, r: egui::Rect, text: &str| {
+                        let (_, was_copied) = ui
+                            .allocate_ui_at_rect(
+                                egui::Rect::from_min_size(
+                                    egui::pos2(r.max.x + 6.0, r.center().y - 10.0),
+                                    egui::vec2(26.0, 20.0),
+                                ),
+                                |ui| copy_button(ui, theme, text),
+                            )
+                            .inner;
+                        if was_copied {
+                            copied = Some(text.to_owned());
+                        }
+                    };
+                    if let Some(r) = title_rect {
+                        place_btn(ui, r, &name);
+                    }
+                    if let (Some(r), Some(addr)) = (addr_rect, &addr) {
+                        place_btn(ui, r, addr);
+                    }
+                    if let Some(v) = copied {
+                        self.notify_copied(&v);
+                    }
                     if click.hovered() {
                         ui.painter().rect_stroke(
                             rect,
@@ -5564,15 +5816,19 @@ impl KirinDeskApp {
                 .collapsible(false)
                 .resizable(false)
                 .show(ui.ctx(), |ui| {
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(format!("设备 ID: {}", id))
-                                .monospace()
-                                .size(theme.mono_size)
-                                .color(theme.fg_weak),
-                        )
-                        .selectable(true),
-                    );
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(format!("设备 ID: {}", id))
+                                    .monospace()
+                                    .size(theme.mono_size)
+                                    .color(theme.fg_weak),
+                            )
+                            .selectable(true),
+                        );
+                        // M8-T028 (UI-BTY-027): 设备 ID 只读行一键复制。
+                        self.copied_button(ui, theme, &id);
+                    });
                     ui.separator();
                     labeled_input(
                         ui,
@@ -5723,17 +5979,26 @@ impl KirinDeskApp {
         }
 
         // M15-T008: 模式行改 SegmentedControl（IP/Domain，选中项品牌色底）
-        let mut mode = if self.ip_mode_allowed { 0 } else { 1 };
+        // M8-T026-P2 (ID-021): 新增第三段「ID Mode」（relay 设备 ID）。
+        let mut mode = if self.connect_id_mode {
+            2
+        } else if self.ip_mode_allowed {
+            0
+        } else {
+            1
+        };
         if segmented_control(
             ui,
             theme,
             &[
                 "IP Mode (direct IPv6 connection)",
                 "Domain Mode (DNS-based discovery)",
+                "ID Mode (relay device ID)",
             ],
             &mut mode,
         ) {
             self.ip_mode_allowed = mode == 0;
+            self.connect_id_mode = mode == 2;
         }
         ui.separator();
 
@@ -5944,6 +6209,119 @@ impl KirinDeskApp {
                 )
                 .selectable(false),
             );
+        } else if self.connect_id_mode {
+            // M8-T026-P2 (ID-021): 设备 ID 模式 —— 经 relay 服务器按 ID 解析 +
+            // 三级路径（直连/打洞/中继）连接（ID-010~013）。
+            let id_ok = !self.connect_device_id.trim().is_empty();
+            let tunnel_cfg = kirin_desk_utils::config::Config::load()
+                .map(|c| c.tunnel)
+                .unwrap_or_default();
+            let tunnel_ok = !tunnel_cfg.server_addr.trim().is_empty()
+                && !tunnel_cfg.token.is_empty()
+                && tunnel_cfg
+                    .server_pubkey
+                    .as_deref()
+                    .map(|k| !k.trim().is_empty())
+                    .unwrap_or(false);
+            labeled_input(
+                ui,
+                theme,
+                "Device ID:",
+                &mut self.connect_device_id,
+                "pc-abc123",
+                if id_ok {
+                    Validity::Valid
+                } else {
+                    Validity::Invalid("Device ID is required")
+                },
+                None,
+                true,
+            );
+            if !tunnel_ok {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(
+                            "ID 模式需配置 [tunnel] server_addr / token / server_pubkey",
+                        )
+                        .color(theme.danger)
+                        .size(theme.small_size),
+                    )
+                    .selectable(false),
+                );
+            } else {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!(
+                            "via relay {}",
+                            tunnel_cfg.server_addr
+                        ))
+                        .size(theme.small_size)
+                        .color(theme.fg_weak),
+                    )
+                    .selectable(false),
+                );
+            }
+            ui.add_space(6.0);
+            // 连接中 → Stepper（解析→直连/中继→握手→已连接）
+            let step = if status.starts_with("Resolving") {
+                Some(0)
+            } else if status.starts_with("Connecting") {
+                Some(1)
+            } else if status.starts_with("Handshaking") {
+                Some(2)
+            } else if status.starts_with("Connected") {
+                Some(3)
+            } else {
+                None
+            };
+            if let Some(cur) = step {
+                stepper(
+                    ui,
+                    theme,
+                    &["Resolving", "Connecting", "Handshaking", "Connected"],
+                    cur,
+                );
+                ui.add_space(6.0);
+            }
+            let busy = matches!(step, Some(0) | Some(1) | Some(2));
+            let can_connect = id_ok && tunnel_ok;
+            let state = if busy {
+                ButtonState::Busy
+            } else if can_connect {
+                ButtonState::Enabled
+            } else {
+                ButtonState::Disabled
+            };
+            if action_button(ui, theme, ButtonKind::Primary, "Connect", state).clicked() {
+                let device_id = self.connect_device_id.trim().to_string();
+                if device_id.is_empty() {
+                    self.connect_status = "Enter the device ID".to_string();
+                } else if !tunnel_ok {
+                    self.connect_status =
+                        "ID 模式未配置：请在 config 中设置 [tunnel] server_addr/token/server_pubkey".to_string();
+                } else {
+                    // M8-T026-P2: ID 模式连接线程：解析 → 验签 → pin → 三级路径 →
+                    // 握手 → 会话（复用 run_client_session_with_stream）。
+                    self.connect_status = format!("Resolving: {} ...", device_id);
+                    tracing::info!("Connect button (ID mode): device={}", device_id);
+                    let ctx = ui.ctx().clone();
+                    std::thread::spawn(move || {
+                        let rt = tokio::runtime::Runtime::new().expect("connect rt");
+                        rt.block_on(run_client_session_by_id(device_id, ctx));
+                    });
+                }
+            }
+            ui.separator();
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(
+                        "ID mode: relay server resolves the device; direct → punch → relay paths.",
+                    )
+                    .size(theme.small_size)
+                    .color(theme.fg_weak),
+                )
+                .selectable(false),
+            );
         } else {
             // M10-T002: 无 GoDaddy API 配置 → 友好提示 + 直接跳转 Settings。
             if self.api_key.trim().is_empty() || self.api_secret.trim().is_empty() {
@@ -6082,14 +6460,65 @@ impl KirinDeskApp {
                             };
                             match discovery_res {
                                 Ok(info) => {
+                                    // M8-T025 P5-4：地址族按配置 `[transport].ip_family`
+                                    // 选择（P1 `select_connect_addr` 契约；哨兵 IPv6 在
+                                    // 此消化）；无可用地址 → 明确报错。
+                                    let cfg = kirin_desk_utils::config::Config::load()
+                                        .unwrap_or_default();
+                                    let family = match cfg.transport.ip_family.as_str() {
+                                        "auto" => Some(kirin_desk_dns::IpFamily::Auto),
+                                        "ipv4" => Some(kirin_desk_dns::IpFamily::Ipv4),
+                                        "ipv6" => Some(kirin_desk_dns::IpFamily::Ipv6),
+                                        _ => None,
+                                    };
+                                    let family = match family {
+                                        Some(f) => f,
+                                        None => {
+                                            if let Ok(mut s) = connection_status().lock() {
+                                                *s = format!(
+                                                    "配置错误: [transport].ip_family='{}'（应为 auto|ipv4|ipv6）",
+                                                    cfg.transport.ip_family
+                                                );
+                                            }
+                                            return;
+                                        }
+                                    };
+                                    let selected = match info.select_connect_addr(family) {
+                                        Some(a) => a,
+                                        None => {
+                                            tracing::error!(
+                                                "Discovered '{}' has no usable IPv4/IPv6 address \
+                                                 (ip_family={})",
+                                                info.device_id,
+                                                cfg.transport.ip_family
+                                            );
+                                            if let Ok(mut s) = connection_status().lock() {
+                                                *s = format!(
+                                                    "设备 '{}' 无可用 IPv4/IPv6 地址",
+                                                    info.device_id
+                                                );
+                                            }
+                                            return;
+                                        }
+                                    };
+                                    let addr = selected.to_string();
                                     tracing::info!(
-                                        "Discovered '{}': IPv6={}, port={}, type={}",
+                                        "Discovered '{}': IPv6={}, IPv4={}, port={}, type={}, family={}",
                                         info.device_id,
-                                        info.ipv6_addr,
+                                        if info.ipv6_addr
+                                            == std::net::Ipv6Addr::UNSPECIFIED
+                                        {
+                                            "none".to_string()
+                                        } else {
+                                            info.ipv6_addr.to_string()
+                                        },
+                                        info.ipv4_addr
+                                            .map(|a| a.to_string())
+                                            .unwrap_or_else(|| "none".to_string()),
                                         info.port,
-                                        info.device_type
+                                        info.device_type,
+                                        cfg.transport.ip_family
                                     );
-                                    let addr = format!("[{}]:{}", info.ipv6_addr, info.port);
                                     let kind = if info.device_type == "server" {
                                         WindowKind::Shell
                                     } else {
@@ -6309,6 +6738,105 @@ impl KirinDeskApp {
                     egui::Label::new(
                         egui::RichText::new(
                             "Temp mode skips whitelist check. Use for Linux headless servers.",
+                        )
+                        .size(theme.small_size)
+                        .color(theme.fg_weak),
+                    )
+                    .selectable(false),
+                );
+            });
+
+            // M8-T026 (TNL-CFG-004): 内网穿透设置——客户端填写 relay 服务器
+            // 地址 / token / 代理列表；服务端参数（bind_port/port_range/heartbeat）
+            // 不占 GUI，在 config/default.toml 配置，穿透服务端走 CLI `tunnel serve`。
+            egui::CollapsingHeader::new("Tunnel (内网穿透)").show(ui, |ui| {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(
+                            "内网穿透：被控端主动出站连接公网 relay 服务器，把内网 TCP 服务\
+                             （SSH/RDP/HTTP）映射到公网端口——P2P 直连不可达时的兜底。\
+                             默认关闭，仅在有公网服务器（自建 relay）时启用。",
+                        )
+                        .size(theme.small_size)
+                        .color(theme.fg_weak),
+                    )
+                    .selectable(false),
+                );
+                ui.add_space(4.0);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new("Enabled:")
+                            .size(theme.small_size)
+                            .color(theme.fg_weak),
+                    )
+                    .selectable(false),
+                );
+                let mut te = if self.tunnel_enabled { 1 } else { 0 };
+                if segmented_control(ui, theme, &["Off", "On"], &mut te) {
+                    self.tunnel_enabled = te == 1;
+                }
+                ui.add_space(4.0);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new("Mode:")
+                            .size(theme.small_size)
+                            .color(theme.fg_weak),
+                    )
+                    .selectable(false),
+                );
+                let mut tm = if self.tunnel_mode == "server" { 1 } else { 0 };
+                if segmented_control(ui, theme, &["Client", "Server"], &mut tm) {
+                    self.tunnel_mode = if tm == 1 { "server" } else { "client" }.to_string();
+                }
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(
+                            "Client = 被控端主动出站（推荐）；Server = 公网 relay 服务端\
+                             （也可用 CLI `tunnel serve`，服务端参数在 default.toml）。",
+                        )
+                        .size(theme.small_size)
+                        .color(theme.fg_weak),
+                    )
+                    .selectable(false),
+                );
+                ui.add_space(4.0);
+                labeled_input(
+                    ui,
+                    theme,
+                    "Server Address:",
+                    &mut self.tunnel_server_addr,
+                    "relay.example.com:7000",
+                    Validity::None,
+                    None,
+                    true,
+                );
+                labeled_input(
+                    ui,
+                    theme,
+                    "Token:",
+                    &mut self.tunnel_token,
+                    "required",
+                    Validity::None,
+                    Some(&mut self.show_secret_tunnel_token),
+                    false,
+                );
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new("Proxies (one per line):")
+                            .size(theme.small_size)
+                            .color(theme.fg_weak),
+                    )
+                    .selectable(false),
+                );
+                egui::TextEdit::multiline(&mut self.tunnel_proxies)
+                    .desired_rows(3)
+                    .desired_width(ui.available_width())
+                    .show(ui);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(
+                            "Format: name|local_addr:port|remote_port  (remote_port 留空 = 服务端自动分配)\
+                             \ne.g. ssh|127.0.0.1:22|6022",
                         )
                         .size(theme.small_size)
                         .color(theme.fg_weak),
@@ -6728,6 +7256,16 @@ impl KirinDeskApp {
                     cfg.unattended.enabled = self.unattended_enabled;
                     cfg.unattended.auto_start_server = self.unattended_auto_server;
                     cfg.unattended.auto_start_on_boot = self.unattended_autostart;
+                    // M8-T026 (TNL-CFG-004): 内网穿透设置持久化（proxies 多行文本
+                    // 解析回 Vec<TunnelProxy>；服务端参数保留配置默认值）。
+                    cfg.tunnel.enabled = self.tunnel_enabled;
+                    cfg.tunnel.mode = self.tunnel_mode.clone();
+                    cfg.tunnel.server_addr = self.tunnel_server_addr.clone();
+                    cfg.tunnel.token = self.tunnel_token.clone();
+                    cfg.tunnel.proxies =
+                        kirin_desk_utils::config::TunnelConfig::parse_proxy_lines(
+                            &self.tunnel_proxies,
+                        );
                     match cfg.save() {
                         Ok(()) => {
                             self.settings_status = "Saved".to_string();

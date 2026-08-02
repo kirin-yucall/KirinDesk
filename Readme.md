@@ -6,6 +6,17 @@
 
 ---
 
+## 💜 Made with Love — A Non-Profit Passion Project
+
+KirinDesk is built and maintained by an individual developer in their spare time, purely out of love for the craft. **It is a 100% non-profit project with no monetization of any kind:**
+
+- **No fees** — no subscriptions, no paid tiers, no "Pro" version
+- **No ads, no tracking, no telemetry** — no data collection, no analytics
+- **No account system, no vendor lock-in** — your devices belong entirely to you
+- **Fully open source** — free to use, study, modify, and share under the [License](#license)
+
+The only "currency" that keeps this project running is ❤️. If KirinDesk helps you, the best way to give back is a star ⭐, a bug report, or passing it on to someone who needs it.
+
 ## The Vision
 
 Every device should be able to reach every other device directly — securely, privately, with no third party standing between them. That simple conviction is the entire reason KirinDesk exists. We believe the remote-control experience of the future does not route through corporate cloud farms, does not beg a relay server to stay online, and does not lean on an obscure chain of certificates. It is two devices shaking hands across the open Internet and speaking only to each other.
@@ -265,3 +276,5 @@ format = "text"
 ## License
 
 Apache 2.0 (KirinDesk core) + LGPL (FFmpeg libraries, dynamically loaded)
+
+> KirinDesk is a non-profit passion project by an individual developer (用爱发电) — no monetization, no ads, no telemetry. Ever.

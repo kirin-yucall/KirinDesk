@@ -21,8 +21,8 @@ use crate::transport::{
     datagram,
     reassembly::FrameReassembly,
     stream::{self, ChannelTag, PacketHeader, TransError},
-    ControlMessage, FramePacket, LossDetector, LossStats, MediaCipher, QuicConnection,
-    QuicEndpoint, TransportError,
+    ControlMessage, FramePacket, LossDetector, LossStats, MediaCipher, MediaTransport,
+    QuicConnection, QuicEndpoint, TcpMediaTransport, TransportError, TransportMode,
 };
 
 use kirin_desk_core::crypto::ed25519::IdentityManager;
@@ -32,6 +32,16 @@ use kirin_desk_core::crypto::handshake::{SecureChannel, SecureChannelReader, Sec
 // ════════════════════════════════════════════════════════════════
 // QuicMediaTransport
 // ════════════════════════════════════════════════════════════════
+
+/// 控制流就绪标记（1 字节，置于控制帧流之外）。
+///
+/// quinn 的流以**首个 STREAM 帧**隐式建立：`open_bi` 只分配流 ID，不产生
+/// 任何网络数据。若服务端 accept 后不立即写控制流（如 M8-T026-P1 打洞
+/// 升舱/迁移场景服务端只收不发），客户端 `accept_bi` 将永久挂起直至空闲
+/// 超时（既有测试靠服务端立即发 VideoFormat 隐式规避）。服务端 open_bi
+/// 后立即写本标记强制 STREAM 帧发出，connect 端在 accept_bi 后同步消费
+/// （标记在长度前缀+密文控制帧格式之外，不影响后续帧流解析）。
+const CONTROL_STREAM_READY: u8 = 0xAA;
 
 /// QUIC 媒体传输——核心实现。
 pub struct QuicMediaTransport {
@@ -319,6 +329,10 @@ impl super::MediaTransport for QuicMediaTransport {
         self.conn.close("transport closed");
         Ok(())
     }
+
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -358,7 +372,13 @@ pub async fn accept_quic_transport(
     .await
     .map_err(|e| TransportError::Handshake(e.to_string()))?;
 
-    let (ctrl_send, ctrl_recv) = conn.open_bi().await?;
+    let (mut ctrl_send, ctrl_recv) = conn.open_bi().await?;
+    // 控制流就绪标记（见 `CONTROL_STREAM_READY`）：服务端是控制流打开方，
+    // 必须实际写 1 字节才能让对端 `accept_bi` 返回。
+    ctrl_send
+        .write_all(&[CONTROL_STREAM_READY])
+        .await
+        .map_err(|e| TransportError::Quic(format!("control stream ready: {e}")))?;
     let mut transport = QuicMediaTransport::new(conn, MediaCipher::new_from_aead(ch.cipher));
     transport.set_control_streams(ctrl_send, ctrl_recv);
 
@@ -401,11 +421,67 @@ pub async fn connect_quic_transport(
     .await
     .map_err(|e| TransportError::Handshake(e.to_string()))?;
 
-    let (ctrl_send, ctrl_recv) = conn.accept_bi().await?;
+    let (ctrl_send, mut ctrl_recv) = conn.accept_bi().await?;
+    // 消费服务端控制流就绪标记（与 accept_quic_transport 的
+    // CONTROL_STREAM_READY 配对；标记在控制帧格式之外，直接丢弃）。
+    let mut ready = [0u8; 1];
+    ctrl_recv
+        .read_exact(&mut ready)
+        .await
+        .map_err(|e| TransportError::Quic(format!("control stream ready: {e}")))?;
     let mut transport = QuicMediaTransport::new(conn, MediaCipher::new_from_aead(ch.cipher));
     transport.set_control_streams(ctrl_send, ctrl_recv);
 
     debug!("connect_quic_transport: ready to {addr}");
+    Ok(transport)
+}
+
+/// 创建 QUIC 传输（客户端在**预建端点**上拨号——打洞路径，M8-T026-P1）。
+///
+/// 与 [`connect_quic_transport`] 的唯一区别：连接从外部预建的
+/// `QuicEndpoint`（`QuicEndpoint::client_on` 建于打洞 socket 之上）发起，
+/// 保证 QUIC 复用打洞建立的 NAT 映射（PUNCH-001）；Ed25519 握手流程一致
+/// （PUNCH-SEC-001：打洞路径不弱化身份校验）。
+pub async fn connect_quic_transport_on(
+    endpoint: &QuicEndpoint,
+    addr: SocketAddr,
+    client_identity: &IdentityManager,
+    client_id: &str,
+    client_domain: &str,
+    client_device_type: &str,
+    server_id: &str,
+    _server_pubkey_base64: &str,
+    challenge: &str,
+) -> Result<QuicMediaTransport, TransportError> {
+    let conn = endpoint.connect_on(addr, client_id).await?;
+    let (send, recv) = conn.open_bi().await?;
+    let stream = QuicBiStream::new(send, recv);
+
+    let ch = core_handshake::client_handshake_generic(
+        stream,
+        client_identity,
+        client_id,
+        client_domain,
+        client_device_type,
+        server_id,
+        _server_pubkey_base64,
+        challenge,
+    )
+    .await
+    .map_err(|e| TransportError::Handshake(e.to_string()))?;
+
+    let (ctrl_send, mut ctrl_recv) = conn.accept_bi().await?;
+    // 消费服务端控制流就绪标记（与 accept_quic_transport 的
+    // CONTROL_STREAM_READY 配对；标记在控制帧格式之外，直接丢弃）。
+    let mut ready = [0u8; 1];
+    ctrl_recv
+        .read_exact(&mut ready)
+        .await
+        .map_err(|e| TransportError::Quic(format!("control stream ready: {e}")))?;
+    let mut transport = QuicMediaTransport::new(conn, MediaCipher::new_from_aead(ch.cipher));
+    transport.set_control_streams(ctrl_send, ctrl_recv);
+
+    debug!("connect_quic_transport_on: ready to {addr} (punch path)");
     Ok(transport)
 }
 
@@ -474,8 +550,8 @@ pub struct SecureChannelReceiver {
 /// 双任务并发（如客户端"视频接收 + 输入发送"）时用 [`SecureChannelTransport::into_split`]
 /// 拆成两个半传输，各自独占一个方向、互不阻塞。
 pub struct SecureChannelTransport {
-    sender: SecureChannelSender,
-    receiver: SecureChannelReceiver,
+    sender: Option<SecureChannelSender>,
+    receiver: Option<SecureChannelReceiver>,
 }
 
 impl SecureChannelSender {
@@ -607,31 +683,79 @@ impl SecureChannelTransport {
     pub fn new(channel: SecureChannel) -> Self {
         let (reader, writer) = channel.into_split();
         Self {
-            sender: SecureChannelSender::new(writer),
-            receiver: SecureChannelReceiver::new(reader),
+            sender: Some(SecureChannelSender::new(writer)),
+            receiver: Some(SecureChannelReceiver::new(reader)),
         }
     }
 
     /// 拆分为独立的发送/接收半传输（M9：双任务并发场景，各方向单任务独占）。
     pub fn into_split(self) -> (SecureChannelReceiver, SecureChannelSender) {
-        (self.receiver, self.sender)
+        (
+            self.receiver.expect("receiver already taken"),
+            self.sender.expect("sender already taken"),
+        )
+    }
+
+    /// 拆出**写半**（发送半通道），本传输保留读半（接收媒体帧）。
+    ///
+    /// P5 会话层用：客户端反馈 task 独占写半（send_control），主循环保留读半
+    /// （recv_frame）。拆出后本传输不再能 send_*（返回 `ConnectionClosed`）。
+    pub fn take_sender(&mut self) -> Option<SecureChannelSender> {
+        self.sender.take()
+    }
+
+    /// 拆出**读半**（接收半通道），本传输保留写半（发送媒体/控制）。
+    ///
+    /// P5 会话层用：服务端控制 task 独占读半（recv_control），主循环保留写半
+    /// （send_window / send_control）。拆出后本传输不再能 recv_*。
+    pub fn take_receiver(&mut self) -> Option<SecureChannelReceiver> {
+        self.receiver.take()
     }
 
     /// 发送一批 EncodedPacket（委托给发送半传输）。
     pub async fn send_packets(&mut self, pkts: &[EncodedPacket]) -> Result<(), TransportError> {
-        self.sender.send_packets(pkts).await
+        let sender = self.sender.as_mut().ok_or_else(|| {
+            TransportError::ConnectionClosed {
+                reason: "sender already taken (TCP write half moved)".into(),
+            }
+        })?;
+        sender.send_packets(pkts).await
+    }
+
+    /// 发送一个**大帧** EncodedPacket（委托给发送半传输，M13-T006 文件传输）。
+    ///
+    /// 语义同 [`SecureChannelSender::send_big_packet`]：跳过
+    /// [`stream::MAX_PACKET_PAYLOAD`] 小分片检查，payload 上限
+    /// [`stream::MAX_FILE_FRAME_PAYLOAD`]（16 MiB）。
+    pub async fn send_big_packet(&mut self, pkt: &EncodedPacket) -> Result<(), TransportError> {
+        let sender = self.sender.as_mut().ok_or_else(|| {
+            TransportError::ConnectionClosed {
+                reason: "sender already taken (TCP write half moved)".into(),
+            }
+        })?;
+        sender.send_big_packet(pkt).await
     }
 
     /// 接收一帧（任意 tag，委托给接收半传输）。
     pub async fn recv_tagged(
         &mut self,
     ) -> Result<(ChannelTag, PacketHeader, Vec<u8>), TransportError> {
-        self.receiver.recv_tagged().await
+        let receiver = self.receiver.as_mut().ok_or_else(|| {
+            TransportError::ConnectionClosed {
+                reason: "receiver already taken (TCP read half moved)".into(),
+            }
+        })?;
+        receiver.recv_tagged().await
     }
 
     /// 接收一条键鼠事件 wire bytes（委托给接收半传输）。
     pub async fn recv_input_payload(&mut self) -> Result<Vec<u8>, TransportError> {
-        self.receiver.recv_input_payload().await
+        let receiver = self.receiver.as_mut().ok_or_else(|| {
+            TransportError::ConnectionClosed {
+                reason: "receiver already taken (TCP read half moved)".into(),
+            }
+        })?;
+        receiver.recv_input_payload().await
     }
 }
 
@@ -648,6 +772,269 @@ fn trans_err_to_transport(e: TransError) -> TransportError {
             reason: "transport not connected".into(),
         },
     }
+}
+
+// ════════════════════════════════════════════════════════════════
+// 动态建连工厂（M8-T025 P5-2）
+// ════════════════════════════════════════════════════════════════
+
+/// 双栈 TCP 监听：优先 `[::]:port`（IPV6_V6ONLY=false，可收 v4-mapped 连接），
+/// 平台不支持 → 回退 `0.0.0.0:port`（仅 v4）。供 P5-2 工厂与服务端会话
+/// 降级接收共用（不依赖 core `TcpServer`——P2 侧冻结，且其 Windows 双栈
+/// 行为与 QUIC 双栈不一致）。
+pub fn bind_dual_stack_tcp_listener(port: u16) -> std::io::Result<tokio::net::TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    if let Ok(socket) = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP)) {
+        let dual_ok = socket.set_only_v6(false).is_ok()
+            && socket
+                .bind(&SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port)).into())
+                .is_ok();
+        if dual_ok {
+            socket.listen(128)?;
+            return tokio::net::TcpListener::from_std(socket.into());
+        }
+        warn!(
+            "dual-stack TCP bind [::]:{port} unavailable on this platform, \
+             falling back to IPv4-only 0.0.0.0:{port}"
+        );
+    }
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port))?;
+    listener.set_nonblocking(true)?;
+    tokio::net::TcpListener::from_std(listener)
+}
+
+/// 把泛型握手结果（`SecureChannelGeneric<TcpStream>`）收敛为 TCP 专用
+/// [`SecureChannel`]（字段一一对应；工厂与测试基建共用）。
+#[allow(dead_code)]
+fn secure_channel_from_generic(
+    ch: kirin_desk_core::crypto::handshake::SecureChannelGeneric<tokio::net::TcpStream>,
+) -> SecureChannel {
+    SecureChannel {
+        stream: ch.stream,
+        cipher: ch.cipher,
+        peer_id: ch.peer_id,
+        peer_domain: ch.peer_domain,
+        peer_device_type: ch.peer_device_type,
+        selected_codec: ch.selected_codec,
+    }
+}
+
+/// 把 `core::network::tcp::TcpError` 映射为传输层错误。
+fn tcp_err_to_transport(e: kirin_desk_core::network::tcp::TcpError) -> TransportError {
+    use kirin_desk_core::network::tcp::TcpError;
+    match e {
+        TcpError::Bind { source, .. } | TcpError::Connect { source, .. } => {
+            TransportError::Io(source)
+        }
+        TcpError::Timeout { remote: _ } => TransportError::Timeout,
+        TcpError::Io(e) => TransportError::Io(e),
+    }
+}
+
+/// 客户端统一建连（M8-T025 §3.4 建连流程）。
+///
+/// - `mode = Quic` + `allow_fallback = true`：QUIC 拨号 + 完整握手优先；
+///   失败/超时（`connect_timeout`，默认 3s）→ 记日志 → TCP SecureChannel 拨号
+///   + 完整握手 → `TcpMediaTransport`。
+/// - `mode = Quic` + `allow_fallback = false`：仅 QUIC，失败报错（B 需求可控）。
+/// - `mode = Tcp`：仅 TCP（`--transport tcp` 强制路径）。
+///
+/// 两条路径走**同一完整握手**（`client_handshake_generic`），身份凭据
+/// （昵称/挑战码/公钥绑定）完全一致——不引入新协议字段（主文档 §3.4）。
+pub async fn connect_media_transport(
+    addr: SocketAddr,
+    mode: TransportMode,
+    allow_fallback: bool,
+    client_identity: &IdentityManager,
+    client_id: &str,
+    client_domain: &str,
+    client_device_type: &str,
+    server_id: &str,
+    server_pubkey_base64: &str,
+    challenge: &str,
+    connect_timeout: Duration,
+) -> Result<Box<dyn MediaTransport>, TransportError> {
+    let connect_tcp = async {
+        connect_tcp_transport(
+            addr,
+            client_identity,
+            client_id,
+            client_domain,
+            client_device_type,
+            server_id,
+            server_pubkey_base64,
+            challenge,
+            connect_timeout,
+        )
+        .await
+    };
+
+    match mode {
+        TransportMode::Quic => {
+            let quic = tokio::time::timeout(connect_timeout, connect_quic_transport(
+                addr,
+                client_identity,
+                client_id,
+                client_domain,
+                client_device_type,
+                server_id,
+                server_pubkey_base64,
+                challenge,
+            ))
+            .await;
+            match quic {
+                Ok(Ok(t)) => Ok(Box::new(t)),
+                Ok(Err(e)) if allow_fallback => {
+                    warn!("QUIC connect to {addr} failed: {e} — falling back to TCP");
+                    connect_tcp.await
+                }
+                Ok(Err(e)) => Err(e),
+                Err(_) if allow_fallback => {
+                    warn!(
+                        "QUIC connect to {addr} timed out after {connect_timeout:?} — falling back to TCP"
+                    );
+                    connect_tcp.await
+                }
+                Err(_) => Err(TransportError::Timeout),
+            }
+        }
+        TransportMode::Tcp => connect_tcp.await,
+    }
+}
+
+/// TCP（SecureChannel）建连：`TcpClient::connect_with_timeout`（P2 签名）→
+/// 完整握手 → `TcpMediaTransport`。
+async fn connect_tcp_transport(
+    addr: SocketAddr,
+    client_identity: &IdentityManager,
+    client_id: &str,
+    client_domain: &str,
+    client_device_type: &str,
+    server_id: &str,
+    server_pubkey_base64: &str,
+    challenge: &str,
+    connect_timeout: Duration,
+) -> Result<Box<dyn MediaTransport>, TransportError> {
+    use kirin_desk_core::network::tcp::TcpClient;
+
+    let timeout_secs = connect_timeout.as_secs().max(1);
+    let stream = TcpClient::connect_with_timeout(addr, timeout_secs)
+        .await
+        .map_err(tcp_err_to_transport)?;
+
+    let ch = core_handshake::client_handshake_generic(
+        stream,
+        client_identity,
+        client_id,
+        client_domain,
+        client_device_type,
+        server_id,
+        server_pubkey_base64,
+        challenge,
+    )
+    .await
+    .map_err(|e| TransportError::Handshake(e.to_string()))?;
+
+    let transport = TcpMediaTransport::new(secure_channel_from_generic(ch));
+    debug!("connect_tcp_transport: ready to {addr}");
+    Ok(Box::new(transport))
+}
+
+/// 服务端统一 accept：UDP（QUIC）+ TCP 双监听，**先到者胜**。
+///
+/// - QUIC 分支带 2s 超时：对端 QUIC 不可达/握手过慢不阻塞 TCP 回退
+///   （客户端回退逻辑驱动，服务端无状态）。
+/// - TCP 分支：`server_handshake_verified_with_nickname_generic`（昵称/挑战码/
+///   白名单凭据与 QUIC 路径一致）→ `TcpMediaTransport`。
+///
+/// `tcp_listener` 由调用方持有（双栈绑定见 [`bind_dual_stack_tcp_listener`]）；
+/// 会话中途降级时同一监听器交给会话的降级接收（P5-3）。
+pub async fn accept_media_transport(
+    quic_endpoint: &QuicEndpoint,
+    tcp_listener: &tokio::net::TcpListener,
+    server_identity: &IdentityManager,
+    server_id: &str,
+    client_pubkey_base64: &str,
+    expected_nickname: Option<&str>,
+    expected_challenge: Option<&str>,
+) -> Result<Box<dyn MediaTransport>, TransportError> {
+    const QUIC_ACCEPT_TIMEOUT: Duration = Duration::from_secs(2);
+
+    let quic_fut = async {
+        match tokio::time::timeout(
+            QUIC_ACCEPT_TIMEOUT,
+            accept_quic_transport(
+                quic_endpoint,
+                server_identity,
+                server_id,
+                client_pubkey_base64,
+                expected_nickname,
+                expected_challenge,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(t)) => Some(Box::new(t) as Box<dyn MediaTransport>),
+            Ok(Err(e)) => {
+                warn!("QUIC accept failed: {e} — waiting on TCP");
+                None
+            }
+            Err(_) => {
+                warn!("QUIC accept timed out after {QUIC_ACCEPT_TIMEOUT:?} — waiting on TCP");
+                None
+            }
+        }
+    };
+
+    tokio::select! {
+        q = quic_fut => {
+            if let Some(t) = q {
+                return Ok(t);
+            }
+            // QUIC 无连接/失败/超时 → 等 TCP（对端回退路径驱动）
+            let t = accept_tcp_transport(
+                tcp_listener, server_identity, server_id, client_pubkey_base64,
+                expected_nickname, expected_challenge,
+            ).await?;
+            Ok(Box::new(t) as Box<dyn MediaTransport>)
+        }
+        t = accept_tcp_transport(
+            tcp_listener, server_identity, server_id, client_pubkey_base64,
+            expected_nickname, expected_challenge,
+        ) => {
+            let t = t?;
+            Ok(Box::new(t) as Box<dyn MediaTransport>)
+        }
+    }
+}
+
+/// TCP（SecureChannel）accept：接受连接 → 完整握手（昵称/挑战码可选）→
+/// `TcpMediaTransport`。
+async fn accept_tcp_transport(
+    tcp_listener: &tokio::net::TcpListener,
+    server_identity: &IdentityManager,
+    server_id: &str,
+    client_pubkey_base64: &str,
+    expected_nickname: Option<&str>,
+    expected_challenge: Option<&str>,
+) -> Result<TcpMediaTransport, TransportError> {
+    let (stream, remote) = tcp_listener.accept().await?;
+    debug!("accept_tcp_transport: accepted from {remote}");
+
+    let ch = core_handshake::server_handshake_verified_with_nickname_generic(
+        stream,
+        server_identity,
+        server_id,
+        client_pubkey_base64,
+        expected_nickname,
+        expected_challenge,
+    )
+    .await
+    .map_err(|e| TransportError::Handshake(e.to_string()))?;
+
+    let transport = TcpMediaTransport::new(secure_channel_from_generic(ch));
+    debug!("accept_tcp_transport: ready from {remote}");
+    Ok(transport)
 }
 
 #[cfg(test)]

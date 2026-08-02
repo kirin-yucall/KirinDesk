@@ -5,6 +5,8 @@ members = [
     "dns",
     "media",
     "input",
+    "relay",
+    "relay-server",
     "ui",
     "updater",
     "utils",

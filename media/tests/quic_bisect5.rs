@@ -86,7 +86,7 @@ async fn bisect5() {
         ).await.unwrap();
         let encoder = VideoEncoderPipeline::new(Codec::H264, None).unwrap();
         let capture: Box<dyn ScreenCaptureSource> = Box::new(SyntheticCapture::new(W, H));
-        run_server_session(t, capture, encoder, SessionConfig::default(), stop_server).await.unwrap()
+        run_server_session(Box::new(t), capture, encoder, SessionConfig::default(), None, None, stop_server).await.unwrap()
     });
 
     tokio::time::sleep(Duration::from_millis(200)).await;

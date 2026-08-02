@@ -29,6 +29,7 @@ pub mod state_machine;
 use std::time::Instant;
 
 use crate::proto::EncodeConfig;
+use crate::transport::TransportMode;
 
 pub use adjuster::select_frames;
 pub use adjuster::Adjuster;
@@ -56,11 +57,19 @@ pub struct AdaptiveEngine {
     recovery: RecoveryController,
     /// 最近一次 QUIC 拥塞窗口（恢复条件 C 用）
     last_cwnd: Option<u64>,
+    /// M8-T025 P5-1：传输模式分支——TCP 模式跳过状态机/恢复，固定默认档
+    /// （§3.5 主文档：避免基于伪数据的错误降级）。
+    mode: TransportMode,
 }
 
 impl AdaptiveEngine {
-    /// 创建引擎。
+    /// 创建引擎（QUIC 模式，兼容既有调用方）。
     pub fn new(screen_w: u32, screen_h: u32) -> Self {
+        Self::new_with_mode(screen_w, screen_h, TransportMode::Quic)
+    }
+
+    /// 创建引擎（按传输模式分支：Quic = 完整闭环；Tcp = 固定默认档）。
+    pub fn new_with_mode(screen_w: u32, screen_h: u32, mode: TransportMode) -> Self {
         Self {
             state_machine: AdaptiveStateMachine::new(),
             adjuster: Adjuster::new(screen_w, screen_h),
@@ -69,13 +78,20 @@ impl AdaptiveEngine {
             consecutive_timeouts: 0,
             recovery: RecoveryController::new(),
             last_cwnd: None,
+            mode,
         }
     }
 
     /// 收到客户端反馈报告时调用。
     ///
     /// 返回 `Some(EncodeConfig)` 表示配置需要更新。
+    ///
+    /// TCP 模式（M8-T025 §3.5）：可靠传输丢包恒 0，状态机/恢复基于伪数据
+    /// 只会产生错误降级 → 直接返回 None，编码配置固定默认档。
     pub fn on_feedback(&mut self, report: &FeedbackReport) -> Option<EncodeConfig> {
+        if self.mode == TransportMode::Tcp {
+            return None;
+        }
         // 1. 构建 NetworkSample
         let sample = NetworkSample {
             loss_rate: report.loss_rate,
@@ -133,7 +149,12 @@ impl AdaptiveEngine {
     /// 收到 QUIC 连接统计时调用（RTT、CWND）。
     ///
     /// `cwnd` 单位为字节。当拥塞窗口小于一个 MTU 时强制降级。
+    ///
+    /// TCP 模式（M8-T025 §3.5）：拥塞控制在内核（无应用层 cwnd 概念）→ no-op。
     pub fn on_quic_stats(&mut self, rtt_ms: f64, cwnd: u64) -> Option<EncodeConfig> {
+        if self.mode == TransportMode::Tcp {
+            return None;
+        }
         const MIN_CWND: u64 = 1200; // 1 个 MTU
 
         // 恢复策略的 cwnd 趋势（条件 C / 快速路径）
@@ -168,11 +189,17 @@ impl AdaptiveEngine {
     ///
     /// 恢复期间连续 2 个静默窗口 → 直接跳至良好（T009 §6.6.3 静默窗口加速）。
     pub fn on_silent_window(&mut self) {
+        if self.mode == TransportMode::Tcp {
+            return;
+        }
         self.recovery.record_silent_window();
     }
 
     /// 记录一个活跃窗口（重置静默计数）。
     pub fn on_active_window(&mut self) {
+        if self.mode == TransportMode::Tcp {
+            return;
+        }
         self.recovery.record_active_window();
     }
 
@@ -194,7 +221,12 @@ impl AdaptiveEngine {
     /// 通知编码结束（含耗时）。
     ///
     /// 当编码超时（>70ms）时自动降级。
+    ///
+    /// TCP 模式（M8-T025 §3.5）：编码配置固定默认档，不做任何调整 → 恒 None。
     pub fn on_encode_complete(&mut self, encode_ms: f64) -> Option<EncodeConfig> {
+        if self.mode == TransportMode::Tcp {
+            return None;
+        }
         if encode_ms > 70.0 {
             self.consecutive_timeouts += 1;
             let new_config = self.adjuster.handle_encode_timeout(encode_ms);
@@ -477,5 +509,40 @@ mod tests {
         assert!(config.is_some());
         assert_eq!(config.unwrap().qp, 35);
         assert!(engine.is_recovering());
+    }
+
+    // ── M8-T025 P5-1：TCP 模式分支（§3.5 固定"良好"档）────────────
+
+    /// TCP 模式：反馈（含高丢包）不触发状态机/恢复，配置恒默认档。
+    #[test]
+    fn test_engine_tcp_mode_fixed_default() {
+        let mut engine = AdaptiveEngine::new_with_mode(1920, 1080, TransportMode::Tcp);
+        assert_eq!(engine.current_config.qp, 22);
+        assert_eq!(engine.current_config.frame_ratio, 1.0);
+
+        // 高丢包反馈（QUIC 下必降级）→ TCP 下不产生任何配置变更。
+        let bad = FeedbackReport {
+            loss_rate: 0.2,
+            rtt_ms: 500.0,
+            jitter_us: 10_000.0,
+            bandwidth_bps: 100_000,
+            last_frame_id: 1,
+            missing_frames: vec![],
+            urgent_reduce: true,
+            decode_stats: None,
+        };
+        for _ in 0..10 {
+            assert!(engine.on_feedback(&bad).is_none(), "TCP: no feedback-driven config");
+        }
+        assert_eq!(engine.network_state(), NetworkState::Good, "TCP: fixed Good");
+        assert!(!engine.is_recovering());
+
+        // QUIC stats / 编码超时同样不产生降级。
+        assert!(engine.on_quic_stats(100.0, 100).is_none());
+        assert!(engine.on_encode_complete(200.0).is_none());
+        engine.on_silent_window();
+        engine.on_active_window();
+        assert_eq!(engine.current_config.qp, 22);
+        assert_eq!(engine.current_config.frame_ratio, 1.0);
     }
 }

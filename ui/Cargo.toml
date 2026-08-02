@@ -10,6 +10,7 @@ kirin-desk-core = { path = "../core" }
 kirin-desk-dns = { path = "../dns" }
 kirin-desk-input = { path = "../input" }
 kirin-desk-media = { path = "../media" }
+kirin-desk-relay = { path = "../relay" }
 kirin-desk-updater = { path = "../updater" }
 kirin-desk-utils = { path = "../utils" }
 tokio = { workspace = true, features = ["rt", "macros", "process", "io-util", "net"] }
