@@ -74,7 +74,7 @@ body = m.group(1).rstrip() + "\n"
 release_section = f"## [{tag}] - {date}\n{body}\n"
 new_unreleased = "## [Unreleased]\n\n### Added\n\n（开发中功能，发布时移入版本段）\n"
 text = text.replace(m.group(0), release_section + new_unreleased, 1)
-text += f"[{tag}]: https://github.com/kirin-yucall/kirin_desk/releases/tag/{tag}\n"
+text += f"[{tag}]: https://github.com/kirin-yucall/KirinDesk/releases/tag/{tag}\n"
 open(p, "w", encoding="utf-8").write(text)
 print(f"CHANGELOG.md: [Unreleased] → [{tag}] - {date}")
 EOF
@@ -172,4 +172,4 @@ gh release create "${TAG}" \
     exit 1
 }
 
-echo "✅ 发布完成: https://github.com/kirin-yucall/kirin_desk/releases/tag/${TAG}"
+echo "✅ 发布完成: https://github.com/kirin-yucall/KirinDesk/releases/tag/${TAG}"
