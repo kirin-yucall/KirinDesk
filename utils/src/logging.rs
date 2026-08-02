@@ -106,8 +106,25 @@ pub fn init_logging_with(
     // Clean up old logs
     cleanup_old_logs(log_dir, keep_days);
 
-    let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
+    // S-23（F-28）：`RUST_LOG` 超长上限提示 —— 超长过滤器串（> 4 KiB）
+    // 可能是环境注入/误配置，直接忽略并回退默认级别（日志初始化零信任）。
+    const RUST_LOG_MAX_LEN: usize = 4096;
+    if std::env::var("RUST_LOG")
+        .map(|v| v.len() > RUST_LOG_MAX_LEN)
+        .unwrap_or(false)
+    {
+        eprintln!(
+            "[logging] WARN: RUST_LOG exceeds {} chars — ignored, using level '{}' (S-23)",
+            RUST_LOG_MAX_LEN, level
+        );
+    }
+    let env_filter = match std::env::var("RUST_LOG") {
+        Ok(v) if !v.is_empty() && v.len() <= RUST_LOG_MAX_LEN => {
+            EnvFilter::try_new(&v).unwrap_or_else(|_| EnvFilter::new(level))
+        }
+        Ok(v) if !v.is_empty() => EnvFilter::new(level),
+        _ => EnvFilter::new(level),
+    };
 
     // Console layer (stderr)
     let timer = LocalTimer;
@@ -323,13 +340,16 @@ fn append_to_log_file(msg: &str) {
 
 /// 追加打开日志文件（S-07b：Unix 新建日志 0600——日志可能含敏感信息；
 /// 追加打开不改变既有文件权限）。
+///
+/// S-23（F-28）：Unix 加 `O_NOFOLLOW`——日志路径可被 symlink 指向任意
+/// 文件（含覆盖写/追加污染），拒绝跟随。
 fn open_log_append(path: &Path) -> io::Result<File> {
     let mut opts = OpenOptions::new();
     opts.create(true).append(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     opts.open(path)
 }

@@ -113,7 +113,9 @@ KirinDesk's Server mode gives headless machines — Ubuntu servers, VPSes, cloud
 
 ### Windows
 
-Download `KirinDesk.exe` from [release](release/) and double-click — or use the CLI:
+Download `KirinDesk.exe` from **GitHub Releases / CI artifacts**（S-28 / F-33：
+发布二进制不再入库跟踪，发布走 CI release job 的 artifacts + checksums.txt 校验）
+and double-click — or use the CLI:
 
 ```batch
 KirinDesk.exe --cli setup          # interactive setup wizard

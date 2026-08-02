@@ -12,3 +12,5 @@ thiserror.workspace = true
 tracing.workspace = true
 rand.workspace = true
 get_if_addrs = "0.4"
+# S-27（F-32）：TXT 公钥 base64 解码校验（Ed25519 公钥必须恰为 32 字节）
+base64 = "0.22"

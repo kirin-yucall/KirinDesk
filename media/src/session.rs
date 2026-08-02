@@ -847,6 +847,10 @@ pub async fn run_server_session(
                                 warn!("server session: degrade swap failed — ending session");
                                 break;
                             }
+                            // R-03 缺陷修复（ZM-05 回归暴露）：swap 应用后必须
+                            // 复位 degrading——否则服务端永久停在降级等待分支，
+                            // 不再发送媒体（与客户端侧同缺陷，见 apply 调用处）。
+                            degrading = false;
                         }
                         None => break, // 调用方不再注入（会话结束）
                     }
@@ -1466,6 +1470,11 @@ where
                                 &mut client_audio,
                                 config.audio.enabled,
                             );
+                            // R-03 缺陷修复（ZM-05 回归暴露）：swap 应用后必须
+                            // 复位 degrading——否则主循环永久停在降级等待分支
+                            // （swap_rx 已空），媒体不流动，直到 13s 超时误报
+                            // "TCP reconnect wait timed out" 结束会话。
+                            degrading = false;
                         }
                         None => break,
                     }

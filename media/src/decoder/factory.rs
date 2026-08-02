@@ -28,11 +28,64 @@
 //! vaapi/videotoolbox），无需 `#[cfg]` 平台门控——FFmpeg 自身会拒绝不可用
 //! 的解码器。
 
+use std::sync::Mutex;
 use std::sync::OnceLock;
 
-use crate::decoder::video::VideoDecoderPipeline;
+use crate::decoder::video::ffmpeg_sw::FfmpegSwDecoder;
+use crate::decoder::video::{VideoBackend, VideoDecoderPipeline};
 use crate::decoder::{DecodeError, VideoDecoder};
 use crate::encoder::types::Codec;
+
+/// 进程级 hw 后端黑名单（P0-2 强化 / ZM-05 回归暴露）。
+///
+/// 触发条件：hw 后端"open 成功但**首帧解码失败**"（本机 h264_qsv MFX 会话
+/// 建不起来，首包才报 -9）。此类后端每次失败都走 FFmpeg 内部失败路径，
+/// 实测 3~17 次失败后**偶发堆损坏原生崩溃**（0xc0000005）——重复尝试不可
+/// 接受。黑名单后：新建管线（[`VideoDecoderPipeline::new`]）与重建
+/// （`try_rebuild`）均跳过该后端，直接软解兜底。
+///
+/// 健康后端不受影响：首帧（IDR）即成功解码，永不入黑名单。
+static BROKEN_HW_BACKENDS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
+/// 记录一个已损坏的 hw 后端（首帧解码失败）。
+pub(crate) fn blacklist_backend(name: &str) {
+    let mut g = BROKEN_HW_BACKENDS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap();
+    if !g.iter().any(|n| n == name) {
+        g.push(name.to_string());
+        tracing::warn!(
+            "VideoDecoder: backend '{name}' blacklisted (first-packet decode failure)"
+        );
+    }
+}
+
+/// 查询后端是否已被黑名单（软解名永不入黑名单）。
+pub(crate) fn is_backend_blacklisted(name: &str) -> bool {
+    BROKEN_HW_BACKENDS
+        .get()
+        .map(|g| g.lock().unwrap().iter().any(|n| n == name))
+        .unwrap_or(false)
+}
+
+/// 是否禁用硬件解码（环境变量 `KIRIN_DISABLE_HW_DECODE`，值 `1`/`true`/`yes`）。
+///
+/// 用途（ZM-05 回归暴露登记）：hw 解码器**驱动损坏**的机器（本机
+/// `h264_qsv` MFX 会话建不起来，FFmpeg 失败路径实测 3~17 次失败后偶发
+/// 堆损坏原生崩溃 0xc0000005——即使黑名单把失败次数降到 4 次仍偶发）与
+/// CI 环境。禁用后解码链直接落软解（h264/hevc），会话不受影响。
+///
+/// 正常机器无需设置：hw 解码首帧成功即永不走此路径。
+pub fn hw_decode_disabled() -> bool {
+    match std::env::var("KIRIN_DISABLE_HW_DECODE") {
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => false,
+    }
+}
 
 /// H.264 回退链：FFmpeg 解码器名，按优先级排序（软解兜底）。
 ///
@@ -129,6 +182,24 @@ pub fn create_video_decoder(codec: Codec) -> Result<Box<dyn VideoDecoder>, Decod
     Ok(Box::new(pipe))
 }
 
+/// 显式创建软解解码器（跳过 hw 回退链）。
+///
+/// P0-2 / P2-3 同源："open 成功但解码坏"的 hw 后端（本机 h264_qsv MFX 会话
+/// 建不起来、h264_cuvid 收包后静默零产出）在 open 阶段无法区分，需显式软解
+/// 入口——集成测试（`quic_bisect`）与上层会话在 hw 连续失败后直接落软解，
+/// 不再重走回退链（首选仍是 hw，名不副实）。
+///
+/// # Edge Cases
+///
+/// - 软解不可用（FFmpeg 无 h264/hevc 解码器）→ `Err(CodecNotFound)` 等
+/// - FFmpeg DLL 未加载 → `Err(InitFailed)`
+pub fn create_software_decoder(codec: Codec) -> Result<Box<dyn VideoDecoder>, DecodeError> {
+    let name = software_decoder_name(codec);
+    let backend = FfmpegSwDecoder::open(codec, name)?;
+    let pipe = VideoDecoderPipeline::with_backend(Box::new(backend), codec);
+    Ok(Box::new(pipe))
+}
+
 // ════════════════════════════════════════════════════════════════
 // Tests（P2A §T1.2：factory 3 例）
 // ════════════════════════════════════════════════════════════════
@@ -178,5 +249,25 @@ mod tests {
         }
         // 回退链结构本身仍可用。
         assert!(fallback_chain_for(Codec::H264).contains(&"h264"));
+    }
+
+    /// 显式软解：可创建且 name()=="h264"（P0-2 入口，不经 hw 回退链）。
+    #[test]
+    fn test_create_software_decoder_explicit() {
+        match create_software_decoder(Codec::H264) {
+            Ok(dec) => {
+                assert_eq!(dec.name(), "h264", "显式软解应落 h264（不经 hw 链）");
+                assert!(!dec.is_hardware());
+                assert_eq!(dec.codec(), Codec::H264);
+                // 管线可正常构造（decode 语义由 video::tests 覆盖）。
+                assert_eq!(dec.stats().frames_decoded, 0);
+            }
+            Err(DecodeError::InitFailed(_)) | Err(DecodeError::CodecNotFound(_)) => {
+                // 无 DLL / 无解码器环境（CI）：Err（不是 panic）。
+                eprintln!("create_software_decoder: unavailable (no FFmpeg DLLs/h264 decoder)");
+            }
+            Err(other) => panic!("期望 Ok 或 InitFailed/CodecNotFound，实际: {other}"),
+        }
+        assert_eq!(software_decoder_name(Codec::H265), "hevc");
     }
 }

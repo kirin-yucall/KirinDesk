@@ -20,7 +20,7 @@
 //! `set_private_permissions`（占位实现，注释"待 S-07 write_private 收口"）
 //! 在 S-07 合并后薄封装到本模块（见 keystore.rs）。
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 
 /// 私密文件写入（S-07a）：Unix `0600` + 父目录 `0700` + `O_NOFOLLOW`；
@@ -59,6 +59,29 @@ pub fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
     }
     result
+}
+
+/// 私密文件读取（S-23 / F-28）：Unix 下 `O_NOFOLLOW` 打开——**绝不跟随
+/// 符号链接**读取（日志/配置可被 symlink 指向任意文件 → 拒绝打开）；
+/// Windows 无等价打开标志（依赖用户目录 ACL，见模块文档）。
+///
+/// 写入侧已由 [`write_private`] 的 O_NOFOLLOW + 原子替换覆盖；本函数补
+/// 读侧漏洞（S-07 后补漏项）。
+pub fn read_private(path: &Path) -> std::io::Result<Vec<u8>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true).custom_flags(libc::O_NOFOLLOW);
+        let mut file = opts.open(path)?;
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf)?;
+        return Ok(buf);
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::read(path)
+    }
 }
 
 /// 同目录随机名临时文件（`<name>.tmp.<16 位十六进制>`）——随机后缀使攻击者
@@ -203,6 +226,26 @@ mod tests {
         set_private_permissions(&path).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// S-23 (F-28)：`read_private` O_NOFOLLOW —— symlink 指向任意文件 →
+    /// 拒绝打开（不跟随）；普通文件正常读取。
+    #[cfg(unix)]
+    #[test]
+    fn read_private_rejects_symlink() {
+        let root = temp_root("nofollow");
+        let target = root.join("victim.txt");
+        std::fs::write(&target, b"secret").unwrap();
+        let link = root.join("config.link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        // symlink → 拒绝（O_NOFOLLOW）。
+        let err = read_private(&link).expect_err("symlink must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+
+        // 普通文件 → 正常读取。
+        assert_eq!(read_private(&target).unwrap(), b"secret");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

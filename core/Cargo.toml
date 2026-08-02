@@ -18,6 +18,8 @@ sha2.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 base64 = "0.22"
+# S-18 (F-23): 常量时间比较（固定挑战码比对，防时序侧信道）
+subtle = "2"
 zeroize = { version = "1", features = ["zeroize_derive"] }
 tracing.workspace = true
 get-if-addrs = { version = "0.5", package = "get_if_addrs" }

@@ -818,6 +818,17 @@ impl VideoEncoder for FfmpegHwEncoder {
     /// 必须 IDR（置位 `force_idr_next` 双保险）。仅当已发过帧时才 flush
     /// —— QSV 等编码器在空状态重置 / drain 有 heap corruption 风险
     /// （见 Drop 的守卫注释）。
+    ///
+    /// **ZM-01 S2 实测结论（2026-08-02，Intel UHD 770 开发机）**：
+    /// - `h264_qsv`：连续 3 窗口各编码 1 帧 + `avcodec_flush_buffers` 边界
+    ///   flush，无错误无崩溃 → **保持现状**（QSV 支持该调用）。
+    /// - `h264_nvenc`：本机不可测——FFmpeg 8.1.2 要求 nvenc API 13.1 /
+    ///   NVIDIA 驱动 ≥610.00，本机驱动不满足（仅 Intel iGPU）。
+    ///   注意：nvenc open 失败路径本身会堆损坏崩溃（0xc0000005/0xc0000374），
+    ///   为既有隐患；生产路径（软编优先 factory + qsv 兜底）在本机不触达，
+    ///   不在本批次修复范围，登记观察。
+    /// - 软编（libx264）同问题已修复（见 `ffmpeg_sw.rs::flush_buffers`，改
+    ///   send-null + drain）。
     fn flush_buffers(&mut self) {
         if self.sent_first && !self.ctx.is_null() {
             // ctx 在本结构体为不透明 `*mut c_void`（hw_device 场景），

@@ -18,7 +18,7 @@
 //!   改为索引引用，不再 clone。
 
 use crate::adaptive::{tile_activity, FpsGovernor, FpsGovernorConfig};
-use crate::encoder::types::{Codec, Timestamp};
+use crate::encoder::types::Timestamp;
 use crate::encoder::video::EncodeError;
 use crate::encoder::VideoEncoderPipeline;
 use crate::proto::{EncodeConfig, EncodedWindow, RawFrame, WindowConfig};
@@ -354,7 +354,10 @@ impl WindowPipeline {
 
         Ok(Some(EncodedWindow {
             window_id: wid,
-            frame_count: kept.len() as u32,
+            // P1-1 修正：报告**实际编码**帧数（超时打断后 `kept` 是输入帧数，
+            // `encoded_frames` 才是编码数）。消费方 session.rs 仅做
+            // `frames_encoded += frame_count` 统计，语义兼容。
+            frame_count: encoded_frames.len() as u32,
             base_w,
             base_h,
             aligned_w,
@@ -523,6 +526,7 @@ mod bridge_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encoder::types::Codec;
     use crate::proto::RawFrame;
     use std::sync::Arc;
     use std::time::Duration;
@@ -1014,7 +1018,8 @@ mod tests {
     }
 
     /// 单窗口编码累计耗时 ≥ 窗口预算 → 打断剩余帧（至少保留首帧）。
-    /// 慢编码器 30ms/帧 + 预算 50ms → 2 帧（60ms）后必打断。
+    /// 慢编码器 30ms/帧 + 预算 50ms → 第 3 帧检查时已超 60ms → 恰好编码
+    /// 2 帧。
     #[test]
     fn test_encode_window_timeout_break() {
         if crate::ffmpeg::ensure_loaded().is_err() {
@@ -1041,10 +1046,12 @@ mod tests {
             assert!(r.is_none(), "5 frames < max 10, no close yet");
         }
         let window = pipe.flush_window().unwrap().expect("flush should encode");
-        // 5 帧 × 30ms = 150ms >> 50ms 预算 → 必然打断。
-        assert!(
-            window.frame_count < 5,
-            "timeout protection must drop frames, got {}",
+        // P1-1 修正后：frame_count 报告**实际编码**帧数（5 帧输入 × 30ms =
+        // 150ms >> 50ms 预算 → 打断）。断言精确值 2，防止改回 kept.len()
+        // （会报 5）的回归。
+        assert_eq!(
+            window.frame_count, 2,
+            "timeout protection must report actually-encoded frames, got {}",
             window.frame_count
         );
         // 首帧永远编码（避免空窗口）。
@@ -1052,6 +1059,11 @@ mod tests {
     }
 
     /// 超时保护不误伤正常窗口：预算充足时所有帧完整编码。
+    ///
+    /// 按实现语义（P2-1 修正登记，`proto.rs::WindowConfig::max_frames_per_window`）：
+    /// **先入帧、后检查 `len >= max`** → 第 3 帧推入时（i==2）即达上限
+    /// 立即关闭返回 `Some`（frame_count==3）；第 4 次 push 是新窗口首帧
+    /// （未达上限 → `None`）。
     #[test]
     fn test_encode_window_timeout_preserves_normal_path() {
         let encoder = match VideoEncoderPipeline::new(Codec::H264, None) {
@@ -1069,15 +1081,19 @@ mod tests {
 
         for i in 0..3u8 {
             let r = pipe.push_frame(make_test_frame(640, 480, i * 40)).unwrap();
-            if i < 2 {
+            if i == 2 {
+                let window = r
+                    .expect("3rd frame push reaches len >= max -> close on the spot");
+                assert_eq!(window.frame_count, 3, "normal window encodes all frames");
+            } else {
                 assert!(r.is_none(), "frame {} should not close window", i);
             }
         }
-        let window = pipe
+        // 第 4 次 push：新窗口开始（仅 1 帧，未达上限 → 不关闭）。
+        let r4 = pipe
             .push_frame(make_test_frame(640, 480, 120))
-            .unwrap()
-            .expect("3 frames -> close");
-        assert_eq!(window.frame_count, 3, "normal window encodes all frames");
+            .unwrap();
+        assert!(r4.is_none(), "4th frame starts a new window, not closed yet");
     }
 
     // ════════════════════════════════════════════════════════════
@@ -1086,6 +1102,11 @@ mod tests {
 
     /// 静帧场景：首窗口编码后，后续相同内容窗口被频率门控节流
     /// （push 返回 None、不触碰编码器）；flush 显式编码不受门控。
+    ///
+    /// P2-2（方案 A）对齐：EMA 衰减需 ~24 个静态窗口才 ≤ `static_ratio`
+    /// （首帧 activity=1.0 → EMA=0.2，之后 ×0.8^n），再 +3 窗口确认才降频
+    /// ——测试推 30 个静态帧覆盖完整迟滞序列（原 5-6 帧断言降频与实现
+    /// 默认配置不相容）。
     #[test]
     fn test_fps_governor_static_throttles() {
         let encoder = match VideoEncoderPipeline::new(Codec::H264, None) {
@@ -1106,9 +1127,10 @@ mod tests {
         assert!(r1.is_some(), "first window must encode");
         assert_eq!(pipe.target_fps(), 30.0, "初始运动档");
 
-        // 连续推送相同内容：目标帧率降至静态档，窗口被节流（None）。
+        // 连续推送相同内容 ~30 帧：覆盖 EMA 衰减至 ≤ static_ratio + 3 窗口
+        // 确认（迟滞序列）。目标帧率降至静态档，窗口被节流（None）。
         let mut throttled = 0;
-        for _ in 0..5 {
+        for _ in 0..30 {
             if pipe.push_frame(make_test_frame(640, 480, 128)).unwrap().is_none() {
                 throttled += 1;
             }
@@ -1130,6 +1152,9 @@ mod tests {
     }
 
     /// 运动恢复：内容变化 → 目标帧率立即回升到 30fps。
+    ///
+    /// P2-2（方案 A）：静态段同样推 ~30 帧（覆盖降频确认序列），运动帧
+    /// （不同内容 → activity=1.0 → EMA 冲高）立即升回 30fps。
     #[test]
     fn test_fps_governor_motion_recovers() {
         let encoder = match VideoEncoderPipeline::new(Codec::H264, None) {
@@ -1145,8 +1170,8 @@ mod tests {
         };
         let mut pipe = WindowPipeline::new(config, encoder);
 
-        // 静态一段时间（降频确认）。
-        for _ in 0..6 {
+        // 静态一段时间（~30 帧：EMA 0.2×0.8^n 衰减至 ≤0.001 + 3 窗口降频确认）。
+        for _ in 0..30 {
             let _ = pipe.push_frame(make_test_frame(640, 480, 64)).unwrap();
         }
         assert!(pipe.target_fps() <= 10.0, "静态后应降频");

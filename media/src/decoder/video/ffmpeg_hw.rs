@@ -446,6 +446,21 @@ mod tests {
     use crate::encoder::types::{GpuTexture, Timestamp};
     use crate::encoder::VideoEncoderPipeline;
 
+    /// hw 解码测试的机器级跳过（ZM-05 登记）：`KIRIN_DISABLE_HW_DECODE=1`
+    /// 表示本机 hw 解码损坏（如本机 qsv MFX -9——open2 成功但解码必失败，
+    /// FFmpeg 失败路径偶发堆损坏崩溃 0xc0000005）。此类机器上 hw 解码测试
+    /// 无法安全执行（与"无 QSV 环境自动 skip"同款语义），统一跳过。
+    fn hw_decode_tests_disabled() -> bool {
+        if crate::decoder::factory::hw_decode_disabled() {
+            eprintln!(
+                "Skipping: KIRIN_DISABLE_HW_DECODE=1 (本机 hw 解码损坏, qsv MFX -9)"
+            );
+            true
+        } else {
+            false
+        }
+    }
+
     /// 编码一帧（IDR）返回 Annex B。
     fn encode_test_frame(rgba: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
         let mut pipe = VideoEncoderPipeline::new(Codec::H264, None).ok()?;
@@ -482,6 +497,9 @@ mod tests {
     /// h264_qsv 创建（Intel GPU 环境下）。
     #[test]
     fn test_hw_decoder_create_qsv() {
+        if hw_decode_tests_disabled() {
+            return;
+        }
         match FfmpegHwDecoder::open(Codec::H264, "h264_qsv") {
             Ok(dec) => {
                 assert_eq!(dec.name(), "h264_qsv");
@@ -498,6 +516,9 @@ mod tests {
     /// 编码 → hw 解码 → RGBA 正确（需 hw 环境）。
     #[test]
     fn test_hw_decode_roundtrip() {
+        if hw_decode_tests_disabled() {
+            return;
+        }
         let mut dec = match FfmpegHwDecoder::open(Codec::H264, "h264_qsv") {
             Ok(d) => d,
             Err(e) => {
@@ -628,6 +649,9 @@ mod tests {
     /// extradata 变更后 hw 解码正常（hw 环境）。
     #[test]
     fn test_hw_extradata_reopen() {
+        if hw_decode_tests_disabled() {
+            return;
+        }
         let mut dec = match FfmpegHwDecoder::open(Codec::H264, "h264_qsv") {
             Ok(d) => d,
             Err(e) => {

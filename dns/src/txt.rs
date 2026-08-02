@@ -77,6 +77,18 @@ impl DeviceMeta {
     }
 }
 
+/// S-27（F-32）：TXT 公钥 base64 校验 —— Ed25519 公钥必须**恰为 32 字节**
+/// （标准 base64 编码长度恒为 44）。DNS TXT 数据来自外部（攻击者可写入
+/// 任意长度字符串），解码失败/长度不符 → 拒绝（防脏数据撑爆后续握手、
+/// 防解析歧义）。
+pub fn is_valid_ed25519_pubkey_b64(public_key_base64: &str) -> bool {
+    use base64::Engine as _;
+    match base64::engine::general_purpose::STANDARD.decode(public_key_base64) {
+        Ok(bytes) => bytes.len() == 32,
+        Err(_) => false,
+    }
+}
+
 /// Manage device metadata via TXT records on the device's subdomain root.
 ///
 /// Each device gets its own subdomain (`{device_id}.{domain}`).
@@ -147,6 +159,16 @@ impl<'a> TxtManager<'a> {
                     "public key exceeds {} chars (got {})",
                     MAX_PUBLIC_KEY_LEN,
                     meta.raw_public_key().map_or(0, |k| k.len())
+                ),
+            });
+        }
+        // S-27 (F-32): 读侧公钥 base64 **恰为 32 字节**（Ed25519）——DNS 数据
+        // 可被外部写入任意长度/畸形字符串，长度不符直接拒绝。
+        if meta.raw_public_key().map_or(true, |k| !is_valid_ed25519_pubkey_b64(k)) {
+            return Err(GoDaddyError::InvalidParameters {
+                body: format!(
+                    "public key is not a valid Ed25519 key (base64 must decode to 32 bytes, got '{}')",
+                    meta.raw_public_key().unwrap_or("")
                 ),
             });
         }
@@ -230,5 +252,43 @@ mod tests {
         assert!(json.contains("\"key\":\"ed25519:testkey\""));
         assert!(json.contains("\"proto\":\"ip6desk\""));
         assert!(json.contains("\"ver\":\"1\""));
+    }
+
+    /// S-27（F-32）：TXT 公钥 base64 == 32 字节校验 —— 合法 44 字符 key 通过；
+    /// 长度不符/畸形 base64/空串拒绝（读写侧同规则）。
+    #[test]
+    fn test_ed25519_pubkey_b64_validation() {
+        use base64::Engine as _;
+        // 32 字节全零 → base64 恰 44 字符。
+        let valid = base64::engine::general_purpose::STANDARD
+            .encode([0u8; 32]);
+        assert_eq!(valid.len(), 44);
+        assert!(is_valid_ed25519_pubkey_b64(&valid), "32-byte key must pass");
+
+        // 长度不符：31/33 字节。
+        let short = base64::engine::general_purpose::STANDARD.encode([1u8; 31]);
+        assert!(!is_valid_ed25519_pubkey_b64(&short), "31-byte key must fail");
+        let long = base64::engine::general_purpose::STANDARD.encode([1u8; 33]);
+        assert!(!is_valid_ed25519_pubkey_b64(&long), "33-byte key must fail");
+
+        // 畸形 base64 / 空串 / 非 base64 文本。
+        assert!(!is_valid_ed25519_pubkey_b64("not-base64!!!"));
+        assert!(!is_valid_ed25519_pubkey_b64(""));
+        assert!(!is_valid_ed25519_pubkey_b64("AAA="), "AAA= decodes to 2 bytes");
+
+        // 44 字符但非 32 字节：33 字节 → 44 字符无填充；43 字符（非法长度）。
+        assert_eq!(base64::engine::general_purpose::STANDARD.encode([1u8; 33]).len(), 44);
+        assert!(!is_valid_ed25519_pubkey_b64("A".repeat(43).as_str()), "43 chars cannot be 32 bytes");
+    }
+
+    /// S-27（F-32）：`DeviceMeta::raw_public_key` 与校验函数联动（带
+    /// `ed25519:` 前缀解析）。
+    #[test]
+    fn test_raw_key_validation_roundtrip() {
+        use base64::Engine as _;
+        let valid = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+        let meta = DeviceMeta::new(&valid);
+        assert_eq!(meta.raw_public_key(), Some(valid.as_str()));
+        assert!(is_valid_ed25519_pubkey_b64(meta.raw_public_key().unwrap()));
     }
 }

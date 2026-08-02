@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use kirin_desk_core::crypto::ed25519::IdentityManager;
 use kirin_desk_media::capture::{CaptureError, CaptureFrame, MonitorInfo, ScreenCaptureSource};
-use kirin_desk_media::decoder::factory::create_video_decoder;
+use kirin_desk_media::decoder::factory::{create_software_decoder, create_video_decoder};
 use kirin_desk_media::decoder::DecoderPacket;
 use kirin_desk_media::encoder::types::Codec;
 use kirin_desk_media::encoder::VideoEncoderPipeline;
@@ -141,6 +141,7 @@ async fn client_inline_loop() {
         // 接收循环（与 run_client_session 主循环一致，但内联）
         let mut got = 0u32;
         let mut decoded_frames = 0u32;
+        let mut sw = false;
         loop {
             if stop_client.load(Ordering::Relaxed) { break; }
             match t.recv_frame().await {
@@ -156,11 +157,21 @@ async fn client_inline_loop() {
                     }) {
                         Ok(_rgba) => { decoded_frames += 1; *decoded_task.lock().unwrap() += 1; }
                         Err(e) => {
-                            // 重建解码器（回退链已在 create 时内建）
-                            eprintln!("CLIENT decode err: {e} — recreating decoder");
-                            match create_video_decoder(Codec::H264) {
-                                Ok(sw) => { decoder = sw; }
-                                Err(_) => {}
+                            if !sw {
+                                // P2-3 同源（quic_bisect）：fallback 必须显式软解
+                                // ——create_video_decoder 重走回退链仍选回 h264_qsv
+                                // （open2 成功但 MFX 会话失败），名不副实。
+                                eprintln!(
+                                    "CLIENT decode err on '{}': {e} — explicit sw fallback",
+                                    decoder.name()
+                                );
+                                match create_software_decoder(Codec::H264) {
+                                    Ok(d) => {
+                                        decoder = d;
+                                        sw = true;
+                                    }
+                                    Err(fe) => eprintln!("CLIENT sw fallback failed: {fe}"),
+                                }
                             }
                         }
                     }

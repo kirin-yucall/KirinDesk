@@ -13,7 +13,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use kirin_desk_media::capture::{CaptureError, CaptureFrame, ScreenCaptureSource};
+use kirin_desk_media::capture::ScreenCaptureSource;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

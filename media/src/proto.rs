@@ -97,7 +97,9 @@ pub struct DisplayInfo {
 pub struct WindowConfig {
     /// 窗口时长（毫秒，默认 70ms）
     pub window_duration_ms: u64,
-    /// 窗口内最大帧数（默认 10）
+    /// 窗口内最大帧数（默认 10）。语义（P2-1 修正登记）：**先入帧、后检查
+    /// `len >= max`** —— 推入第 max 帧时窗口立即关闭（达到上限即关，延迟
+    /// 更低），而非第 max+1 帧才关。
     pub max_frames_per_window: u32,
     /// 空闲超时——无画面变化时提前关闭窗口（毫秒，默认 200ms）
     pub idle_timeout_ms: u64,

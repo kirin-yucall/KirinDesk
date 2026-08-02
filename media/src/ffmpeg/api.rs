@@ -876,6 +876,9 @@ pub const SWS_FAST_BILINEAR: i32 = 1;
 pub const SWS_POINT: i32 = 0x10;
 pub const SWS_AREA: i32 = 0x20;
 
+// sws_* 保持 C 命名（不能 snake_case 改名——动态链接符号必须与 DLL 导出一致，
+// 见 dlls.rs FnTable 字段；ZM-05 警告清理登记）。
+#[allow(non_snake_case)]
 pub fn sws_getContext(
     src_w: i32,
     src_h: i32,
@@ -935,6 +938,7 @@ pub fn sws_scale(
     }
 }
 
+#[allow(non_snake_case)]
 pub fn sws_freeContext(ctx: *mut SwsContext) {
     if ctx.is_null() {
         return;

@@ -85,7 +85,9 @@ pub struct AudioPcm {
 pub struct OpusDecoder {
     /// AVCodecContext*（opus；不透明，配置走 av_opt_set*）。
     ctx: *mut ffmpeg::AVCodecContext,
-    /// AVCodec*（opus decoder；仅持有引用，不释放）。
+    /// AVCodec*（opus decoder；仅持有引用，不释放。当前实现经 ctx 调用，
+    /// 字段保留供未来上下文重建路径使用——ZM-05 警告清理登记）。
+    #[allow(dead_code)]
     decoder: *const ffmpeg::AVCodec,
     /// 复用 AVFrame（解码输出 float32 packed）。
     frame: *mut ffmpeg::AVFrame,

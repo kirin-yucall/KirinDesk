@@ -802,11 +802,17 @@ impl Config {
     /// Load configuration from a specific path
     pub fn load_from(path: &std::path::Path) -> Result<Self, ConfigError> {
         tracing::debug!("Config: reading from {:?}", path);
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| ConfigError::IoError {
-                path: path.to_path_buf(),
-                source: e,
-            })?;
+        // S-23 (F-28)：读侧 O_NOFOLLOW（`fsutil::read_private`）——配置含
+        // challenge/token/GoDaddy 凭据，symlink 指向任意文件时拒绝读取
+        // （S-07 后补漏项；写侧已由 write_private 覆盖）。
+        let bytes = crate::fsutil::read_private(path).map_err(|e| ConfigError::IoError {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        let content = String::from_utf8(bytes).map_err(|e| ConfigError::IoError {
+            path: path.to_path_buf(),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidData, e),
+        })?;
         let config: Config = toml::from_str(&content)
             .map_err(|e| ConfigError::ParseError {
                 path: path.to_path_buf(),

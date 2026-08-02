@@ -242,6 +242,7 @@ pub fn tile_activity(
                 (x1, y1),
                 ((x0 + x1) / 2, (y0 + y1) / 2),
             ];
+            debug_assert_eq!(pts.len(), SAMPLES_PER_TILE, "采样点数须与常量一致");
             let mut tile_changed = false;
             for &(sx, sy) in pts.iter() {
                 let off = sy as usize * stride + sx as usize * 4;

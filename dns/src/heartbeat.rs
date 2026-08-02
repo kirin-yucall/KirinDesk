@@ -11,6 +11,9 @@ use tokio::sync::watch;
 use tracing::{error, info, warn};
 
 const DEFAULT_INTERVAL_SECS: u64 = 30;
+/// S-27（F-32）：心跳间隔**下限 10s**——过短间隔会放大对 GoDaddy API 的
+/// 调用（配额/滥用风险），配置值低于下限一律收敛到下限。
+const MIN_INTERVAL_SECS: u64 = 10;
 
 /// Heartbeat service — keeps device DNS records alive.
 ///
@@ -45,8 +48,9 @@ impl HeartbeatService {
             device_id: device_id.into(),
             port,
             dns_ttl,
+            // S-27（F-32）：间隔下限 10s（低于下限收敛，防 API 滥用放大）。
             interval: Duration::from_secs(if interval_secs > 0 {
-                interval_secs
+                interval_secs.max(MIN_INTERVAL_SECS)
             } else {
                 DEFAULT_INTERVAL_SECS
             }),
@@ -357,6 +361,25 @@ mod tests {
         let hb = HeartbeatService::new(client, "my-pc", "example.com", 3389, 30, 600);
         assert_eq!(hb.device_id, "my-pc");
         assert_eq!(hb.port, 3389);
+        assert_eq!(hb.interval, Duration::from_secs(30));
+    }
+
+    /// S-27（F-32）：心跳间隔下限 —— 配置低于 10s → 收敛到 10s；0/负 → 默认 30s。
+    #[test]
+    fn test_heartbeat_interval_floor() {
+        let client = Arc::new(GoDaddyClient::new("k", "s", "https://api.godaddy.com"));
+        let hb = HeartbeatService::new(client.clone(), "pc", "example.com", 3389, 5, 600);
+        assert_eq!(
+            hb.interval,
+            Duration::from_secs(MIN_INTERVAL_SECS),
+            "interval below floor must clamp to 10s (S-27)"
+        );
+        let hb = HeartbeatService::new(client.clone(), "pc", "example.com", 3389, 10, 600);
+        assert_eq!(hb.interval, Duration::from_secs(10));
+        let hb = HeartbeatService::new(client.clone(), "pc", "example.com", 3389, 120, 600);
+        assert_eq!(hb.interval, Duration::from_secs(120), "above floor unchanged");
+        let hb = HeartbeatService::new(client, "pc", "example.com", 3389, 0, 600);
+        assert_eq!(hb.interval, Duration::from_secs(DEFAULT_INTERVAL_SECS));
     }
 
     // S-14b / F-18: 非法 device_id 早退，不产生任何 API 调用

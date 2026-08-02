@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use kirin_desk_core::crypto::ed25519::IdentityManager;
 use kirin_desk_media::adaptive::AdaptiveEngine;
 use kirin_desk_media::capture::{CaptureError, CaptureFrame, MonitorInfo, ScreenCaptureSource};
-use kirin_desk_media::decoder::factory::create_video_decoder;
+use kirin_desk_media::decoder::factory::{create_software_decoder, create_video_decoder};
 use kirin_desk_media::decoder::DecoderPacket;
 use kirin_desk_media::encoder::types::{Codec, EncodedPacket, EncodeDecision, GpuTexture, Timestamp};
 use kirin_desk_media::encoder::video::EncodeError;
@@ -418,13 +418,19 @@ async fn bisect3() {
                         }
                         Err(e) => {
                             if !sw {
-                                eprintln!("CLIENT hw decode err: {e} — sw fallback");
-                                match create_video_decoder(Codec::H264) {
+                                // P2-3：fallback 必须显式软解——create_video_decoder
+                                // 重走回退链仍选回 h264_qsv（open 成功但解码坏），
+                                // 名不副实。
+                                eprintln!(
+                                    "CLIENT decode err on '{}': {e} — explicit sw fallback",
+                                    decoder.name()
+                                );
+                                match create_software_decoder(Codec::H264) {
                                     Ok(d) => {
                                         decoder = d;
                                         sw = true;
                                     }
-                                    Err(_) => {}
+                                    Err(fe) => eprintln!("CLIENT sw fallback failed: {fe}"),
                                 }
                             }
                         }
@@ -552,13 +558,19 @@ async fn bisect4() {
                         }
                         Err(e) => {
                             if !sw {
-                                eprintln!("CLIENT hw decode err: {e} — sw fallback");
-                                match create_video_decoder(Codec::H264) {
+                                // P2-3：fallback 必须显式软解——create_video_decoder
+                                // 重走回退链仍选回 h264_qsv（open 成功但解码坏），
+                                // 名不副实。
+                                eprintln!(
+                                    "CLIENT decode err on '{}': {e} — explicit sw fallback",
+                                    decoder.name()
+                                );
+                                match create_software_decoder(Codec::H264) {
                                     Ok(d) => {
                                         decoder = d;
                                         sw = true;
                                     }
-                                    Err(_) => {}
+                                    Err(fe) => eprintln!("CLIENT sw fallback failed: {fe}"),
                                 }
                             }
                         }
@@ -715,8 +727,9 @@ async fn bisect5() {
                         is_key,
                         extradata: None,
                     }) {
-                        eprintln!("CLIENT decode err: {e}");
-                        if let Ok(sw) = create_video_decoder(Codec::H264) {
+                        eprintln!("CLIENT decode err on '{}': {e}", decoder.name());
+                        // P2-3 同源：显式软解（不再重走回退链首选 hw）。
+                        if let Ok(sw) = create_software_decoder(Codec::H264) {
                             decoder = sw;
                         }
                     } else {

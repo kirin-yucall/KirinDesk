@@ -302,11 +302,15 @@ mod tests {
     use crate::test_support::MockDns;
     use crate::txt::DeviceMeta;
 
+    /// S-27 (F-32)：32 字节 Ed25519 公钥的标准 base64（44 字符）——
+    /// 测试夹具必须用合法长度 key（读侧校验拒绝畸形 key）。
+    const TEST_PUBKEY_B64: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=";
+
     /// Seed SRV + TXT (always required) plus optional AAAA/A records.
     fn seed_device(mock: &MockDns, device_id: &str, with_v6: bool, with_v4: bool) {
         let srv = format!("0 1 3389 {}.example.com.", device_id);
         mock.set_records("SRV", &format!("_remote._tcp.{}", device_id), &[&srv], 600);
-        let txt = DeviceMeta::new("testkey").to_txt();
+        let txt = DeviceMeta::new(TEST_PUBKEY_B64).to_txt();
         mock.set_records("TXT", device_id, &[&txt], 600);
         if with_v6 {
             mock.set_records("AAAA", device_id, &["2001:db8::1"], 600);
@@ -331,7 +335,7 @@ mod tests {
             ipv6_addr: "2001:db8::1".parse().unwrap(),
             ipv4_addr: None,
             port: 3389,
-            public_key_base64: "testkey".to_string(),
+            public_key_base64: TEST_PUBKEY_B64.to_string(),
             device_type: "desktop".to_string(),
         };
         assert_eq!(info.subdomain, "my-pc.example.com");
@@ -352,7 +356,7 @@ mod tests {
         assert_eq!(info.ipv4_addr, Some("203.0.113.7".parse().unwrap()));
         assert_eq!(info.port, 3389);
         assert_eq!(info.device_type, "desktop");
-        assert_eq!(info.public_key_base64, "testkey");
+        assert_eq!(info.public_key_base64, TEST_PUBKEY_B64);
     }
 
     #[tokio::test]
@@ -402,7 +406,7 @@ mod tests {
             ipv6_addr: ipv6,
             ipv4_addr: ipv4,
             port: 3389,
-            public_key_base64: "testkey".to_string(),
+            public_key_base64: TEST_PUBKEY_B64.to_string(),
             device_type: "desktop".to_string(),
         }
     }

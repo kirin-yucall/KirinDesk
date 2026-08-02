@@ -30,7 +30,10 @@
 pub mod ffmpeg_hw;
 pub mod ffmpeg_sw;
 
-use super::factory::{fallback_chain_for, software_decoder_name};
+use super::factory::{
+    blacklist_backend, fallback_chain_for, hw_decode_disabled, is_backend_blacklisted,
+    software_decoder_name,
+};
 use crate::decoder::{DecodeError, DecodeStats, DecodedFrame, DecoderPacket, VideoDecoder};
 use crate::encoder::types::Codec;
 
@@ -71,6 +74,10 @@ pub struct VideoDecoderPipeline {
     /// 是否尚未成功送入任何包（首包必须是 IDR 或携带 extradata；
     /// 首包失败后 P 帧仍被拒——上层应等待首个 IDR，重建后端也依赖此语义）。
     first_packet: bool,
+    /// 是否刚重建过后端（P0-2 静默零产出防护标记）：重建后的首个 IDR
+    /// 产出 0 帧 → 计 1 次错误（防"open 成功但解码坏"的后端收包零产出、
+    /// 无错误 → 永不重建）；首个 IDR 产出帧即清除。
+    rebuilt: bool,
 }
 
 impl VideoDecoderPipeline {
@@ -79,7 +86,29 @@ impl VideoDecoderPipeline {
     /// 链形状：`fallback_chain_for(codec)`（qsv → cuvid → d3d11va → vt →
     /// vaapi → 软解）；`open` 真实可用性（hw device 创建失败 → 下一项）。
     pub fn new(codec: Codec) -> Result<Self, DecodeError> {
+        // KIRIN_DISABLE_HW_DECODE=1（驱动损坏机器/CI）：解码链直接落软解，
+        // 不再尝试任何 hw 后端（本机 qsv MFX -9 的 FFmpeg 失败路径偶发
+        // 堆损坏崩溃，见 factory::hw_decode_disabled）。
+        if hw_decode_disabled() {
+            let name = software_decoder_name(codec);
+            return match ffmpeg_sw::FfmpegSwDecoder::open(codec, name) {
+                Ok(b) => {
+                    tracing::info!(
+                        "decoder pipeline: hw decode disabled (KIRIN_DISABLE_HW_DECODE) — selected software '{name}'"
+                    );
+                    Ok(Self::with_backend(Box::new(b), codec))
+                }
+                Err(e) => Err(e),
+            };
+        }
         for name in fallback_chain_for(codec) {
+            // 进程级黑名单（P0-2/ZM-05）："open 成功但首帧解码失败"的 hw
+            // 后端（本机 qsv MFX -9）跳过——重复尝试有 FFmpeg 失败路径
+            // 堆损坏崩溃风险。
+            if is_backend_blacklisted(name) {
+                tracing::debug!("decoder pipeline: '{}' blacklisted, skipping", name);
+                continue;
+            }
             let backend: Box<dyn VideoBackend> = if *name == software_decoder_name(codec) {
                 match ffmpeg_sw::FfmpegSwDecoder::open(codec, name) {
                     Ok(b) => Box::new(b),
@@ -109,6 +138,7 @@ impl VideoDecoderPipeline {
                 current_extradata: None,
                 consecutive_errors: 0,
                 first_packet: true,
+                rebuilt: false,
             });
         }
         Err(DecodeError::CodecNotFound(format!(
@@ -149,20 +179,56 @@ impl VideoDecoderPipeline {
             }
         }
         // 2. send + receive（流式）。
-        self.backend.send_packet(packet)?;
+        let first_packet = self.first_packet;
+        if let Err(e) = self.backend.send_packet(packet) {
+            // P0-2 强化（ZM-05 回归暴露）：hw 后端**首帧即失败** = "open
+            // 成功但解码坏"（本机 h264_qsv MFX 会话建不起来，首包才报
+            // -9）——立即进程级黑名单 + 软解兜底，**不等 3 次错误阈值**：
+            // 每次失败尝试都走 FFmpeg 失败路径，实测 3~17 次后偶发堆损坏
+            // 原生崩溃（0xc0000005）。符合 try_rebuild 注释既定意图
+            // "hw 首帧失败 → 回退软解"。
+            if first_packet && self.backend.is_hardware() {
+                self.rebuild_after_first_failure();
+            }
+            return Err(e);
+        }
         self.first_packet = false;
-        let frames = self.backend.receive_frames()?;
+        let frames = match self.backend.receive_frames() {
+            Ok(f) => f,
+            Err(e) => {
+                // 同上：首帧 receive 失败同样视为后端损坏（MFX -9 可能在
+                // get_buffer / 首帧产出路径暴露）。
+                if first_packet && self.backend.is_hardware() {
+                    self.rebuild_after_first_failure();
+                }
+                return Err(e);
+            }
+        };
         // 3. 统计 + 错误重置（空产出 = 解码器缓冲中，不计为错误）。
         self.stats.frames_decoded += frames.len() as u64;
         if !frames.is_empty() {
             self.consecutive_errors = 0;
+            // 重建后的后端首个 IDR 产出帧 → 恢复（清除重建标记）。
+            self.rebuilt = false;
+        } else if packet.is_key && self.rebuilt {
+            // P0-2 静默零产出防护：重建后的后端首个 IDR 仍 0 产出 → 计 1 次
+            // 错误——"open 成功但解码坏"的后端（本机 h264_cuvid）收包后
+            // 静默返回 Ok(空) 无错误，consecutive_errors 不涨 → 永不重建。
+            // 非 IDR 空产出是正常"参考帧缓冲中"语义，不计。达阈值后由上层
+            // report_error 再次触发重建（软解兜底）。
+            self.consecutive_errors += 1;
+            tracing::warn!(
+                "VideoDecoder: rebuilt backend '{}' produced 0 frames on IDR (silent-zero guard)",
+                self.backend.name()
+            );
         }
         Ok(frames)
     }
 
     /// 测试/注入用：直接指定后端构造管线。
-    #[cfg(test)]
-    fn with_backend(backend: Box<dyn VideoBackend>, codec: Codec) -> Self {
+    /// `pub(crate)`：供 [`factory::create_software_decoder`](crate::decoder::factory::create_software_decoder)
+    /// 显式软解构造（集成测试与上层显式软解入口，P0-2）。
+    pub(crate) fn with_backend(backend: Box<dyn VideoBackend>, codec: Codec) -> Self {
         Self {
             backend,
             codec,
@@ -170,37 +236,71 @@ impl VideoDecoderPipeline {
             current_extradata: None,
             consecutive_errors: 0,
             first_packet: true,
+            rebuilt: false,
         }
     }
 
-    /// 按回退链重开后端（跳过当前失败项；软解兜底）。
+    /// 按回退链重开后端（软解优先兜底）。
     /// [`report_error`](crate::decoder::VideoDecoder::report_error) 达阈值时调用。
+    ///
+    /// **P0-2 修复**：hw 后端连续失败 → **优先软解兜底**（符合注释既定意图
+    /// "hw 首帧失败 → 回退软解"）。旧实现按链跳过当前项会落到下一个 open
+    /// 成功的 hw 后端——R-06 设备串绑定后 h264_cuvid 也能 open 成功，但收包
+    /// 后**静默零产出**（无错误）→ `consecutive_errors` 不涨 → 永不重建
+    /// （本机实测：qsv MFX 会话失败 → 重建落 cuvid → 0 帧）。软解 open 失败
+    /// 才回退原链其余 hw 项（黑名单项跳过）。
     fn try_rebuild(&mut self) -> Option<Box<dyn VideoBackend>> {
         let current = self.backend.name().to_string();
+        let sw_name = software_decoder_name(self.codec);
+        if current != sw_name {
+            if let Ok(b) = ffmpeg_sw::FfmpegSwDecoder::open(self.codec, sw_name) {
+                tracing::warn!(
+                    "decoder rebuild: hw '{}' failed — rebuilt to software '{}'",
+                    current,
+                    sw_name
+                );
+                return Some(Box::new(b));
+            }
+        }
+        // 软解不可用（或当前已是软解）→ 按回退链跳过当前项、软解项与
+        // 黑名单项，逐项重开 hw。
         for name in fallback_chain_for(self.codec) {
-            if *name == current {
+            if *name == current || *name == sw_name || is_backend_blacklisted(name) {
                 continue;
             }
-            let backend: Box<dyn VideoBackend> = if *name == software_decoder_name(self.codec) {
-                match ffmpeg_sw::FfmpegSwDecoder::open(self.codec, name) {
-                    Ok(b) => Box::new(b),
-                    Err(e) => {
-                        tracing::debug!("decoder rebuild: sw '{}' failed: {e}", name);
-                        continue;
-                    }
+            match ffmpeg_hw::FfmpegHwDecoder::open(self.codec, name) {
+                Ok(b) => return Some(Box::new(b)),
+                Err(e) => {
+                    tracing::debug!("decoder rebuild: hw '{}' failed: {e}", name);
+                    continue;
                 }
-            } else {
-                match ffmpeg_hw::FfmpegHwDecoder::open(self.codec, name) {
-                    Ok(b) => Box::new(b),
-                    Err(e) => {
-                        tracing::debug!("decoder rebuild: hw '{}' failed: {e}", name);
-                        continue;
-                    }
-                }
-            };
-            return Some(backend);
+            }
         }
         None
+    }
+    /// 首帧失败后的即时兜底（P0-2 强化 / ZM-05）：黑名单当前 hw 后端 +
+    /// 立即重建（软解优先）。
+    ///
+    /// 与 `report_error` 的 3 次错误阈值互补：阈值路径应对中段瞬时错误
+    /// （丢包/参考链断裂），本路径应对"open 成功但解码坏"的**确定性损坏**
+    /// 后端（本机 qsv MFX -9）——每次失败尝试都走 FFmpeg 失败路径，实测
+    /// 3~17 次后偶发堆损坏原生崩溃（0xc0000005），重复尝试不可接受。
+    fn rebuild_after_first_failure(&mut self) {
+        let broken = self.backend.name().to_string();
+        blacklist_backend(&broken);
+        if let Some(b) = self.try_rebuild() {
+            tracing::warn!(
+                "VideoDecoder: first-packet failure on '{}' — rebuilt to '{}' (broken backend blacklisted)",
+                broken,
+                b.name()
+            );
+            self.backend = b;
+            // 新后端未应用 extradata 且未收包 → 置 None + first_packet
+            // （强制下个带 extradata 的包重配；否则等首个 IDR 恢复）。
+            self.current_extradata = None;
+            self.first_packet = true;
+            self.rebuilt = true;
+        }
     }
 }
 
@@ -244,6 +344,9 @@ impl VideoDecoder for VideoDecoderPipeline {
                     // （强制下个带 extradata 的包重配；否则等首个 IDR 恢复）。
                     self.current_extradata = None;
                     self.first_packet = true;
+                    // P0-2 静默零产出防护：重建后首个 IDR 若 0 产出计错误
+                    // （见 decode() 空产出分支）。
+                    self.rebuilt = true;
                 }
             }
             self.request_keyframe();

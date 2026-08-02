@@ -213,8 +213,9 @@ pub fn record_successful_handshake(known: &mut KnownClientsStore, client_id: &st
 /// 安全约束：不泄露服务端窗口状态（HK-002/SRV-SEC-WL）——文案对
 /// 「固定码错误 / 临时码过期 / 临时码错误」统一覆盖，不做线上区分；
 /// 仅当本次连接确实携带了挑战码时输出（无码失败不误导）。
-/// `temp_code_like` 为尽力而为的格式提示（方案 B）：8 位且全部字符
-/// 属于临时码字符集（不含 0/O/1/I）时，优先提示临时码场景。
+/// `temp_code_like` 为尽力而为的格式提示（方案 B）：10 位且全部字符
+/// 属于临时码字符集（不含 0/O/1/I）时，优先提示临时码场景（S-20 / F-25：
+/// 码长 8 → 10）。
 ///
 /// 字符集与 `core/src/connection/temp_mode.rs` 的 `CODE_CHARSET`
 /// 保持一致（跨 crate 无法直接引用私有常量，单测固定断言）。
@@ -222,7 +223,7 @@ pub fn connect_failure_challenge_hint(challenge: &str) -> Option<String> {
     if challenge.is_empty() {
         return None;
     }
-    let temp_like = challenge.len() == 8
+    let temp_like = challenge.len() == 10
         && challenge
             .chars()
             .all(|c| "ABCDEFGHJKLMNPQRSTUVWXYZ23456789".contains(c));
@@ -613,21 +614,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// M8-T017-P2 (CLI-TMP-003): 8 位且全字符属于临时码字符集
-    /// （A-Z 去 O/I + 2-9 去 0/1）→ 优先提示临时码场景（方案 B 格式判定）。
+    /// M8-T017-P2 (CLI-TMP-003): 10 位且全字符属于临时码字符集
+    /// （A-Z 去 O/I + 2-9 去 0/1）→ 优先提示临时码场景（方案 B 格式判定；
+    /// S-20 / F-25：码长 8 → 10）。
     #[test]
     fn test_hint_temp_code_like_uses_temp_wording() {
-        let hint = connect_failure_challenge_hint("A2B3C4D5").expect("hint for 8-char code");
+        let hint =
+            connect_failure_challenge_hint("A2B3C4D5E6").expect("hint for 10-char code");
         assert!(hint.contains("临时连接码格式"), "hint: {}", hint);
         assert!(hint.contains("temp-mode"), "hint: {}", hint);
         assert!(hint.contains("0/O/1/I"), "hint: {}", hint);
         assert!(hint.contains("Temp Mode: ACTIVE"), "hint: {}", hint);
-        // 全数字/字母混合且长度 8 → 同样命中格式（尽力而为的猜测）。
-        let hint2 = connect_failure_challenge_hint("ABCD2345").expect("hint");
+        // 全数字/字母混合且长度 10 → 同样命中格式（尽力而为的猜测）。
+        let hint2 = connect_failure_challenge_hint("ABCD2345E6").expect("hint");
         assert!(hint2.contains("临时连接码格式"), "hint: {}", hint2);
     }
 
-    /// M8-T017-P2 (CLI-TMP-003): 长度非 8 或含 0/1/O/I 的码 →
+    /// M8-T017-P2 (CLI-TMP-003): 长度非 10 或含 0/1/O/I 的码 →
     /// 走通用文案（不误判为临时码）。
     #[test]
     fn test_hint_non_temp_format_uses_generic_wording() {
@@ -635,10 +638,14 @@ mod tests {
         assert!(!hint.contains("临时连接码格式"), "hint: {}", hint);
         assert!(hint.contains("固定挑战码错误"), "hint: {}", hint);
         assert!(hint.contains("challenge_code"), "hint: {}", hint);
-        // 长度 8 但含被排除字符 0/1 → 通用文案。
-        let hint2 = connect_failure_challenge_hint("ABC01234").expect("hint");
+        // 长度 10 但含被排除字符 0/1 → 通用文案。
+        let hint2 = connect_failure_challenge_hint("ABC01234E5").expect("hint");
         assert!(!hint2.contains("临时连接码格式"), "hint: {}", hint2);
         assert!(hint2.contains("固定挑战码错误"), "hint: {}", hint2);
+        // 长度 8（旧版临时码长度）→ 通用文案（新码为 10 位，S-20）。
+        let hint3 = connect_failure_challenge_hint("A2B3C4D5").expect("hint");
+        assert!(!hint3.contains("临时连接码格式"), "hint: {}", hint3);
+        assert!(hint3.contains("固定挑战码错误"), "hint: {}", hint3);
     }
 
     /// M8-T017-P2 (CLI-TMP-003): 未提供挑战码 → 无提示（固定码未配置的

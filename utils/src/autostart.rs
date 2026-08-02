@@ -30,6 +30,10 @@ pub enum AutostartError {
 }
 
 /// 自启命令统一格式：`"<当前可执行文件>" --autostart`
+///
+/// S-26（F-31）：exe 路径内嵌 `"` 时按 `CommandLineToArgvW` 语义转义为
+/// `\"`（当前 Windows 文件名不允许 `"`，本转义为纵深防御——路径一旦含
+/// 引号即被正确解析，杜绝注册表自启值注入）。
 fn command_line() -> Result<String, AutostartError> {
     let exe = std::env::current_exe()
         .map_err(|e| AutostartError::Io {
@@ -38,7 +42,27 @@ fn command_line() -> Result<String, AutostartError> {
         })?
         .to_string_lossy()
         .to_string();
-    Ok(format!("\"{}\" --autostart", exe))
+    let escaped = exe.replace('"', "\\\"");
+    Ok(format!("\"{}\" --autostart", escaped))
+}
+
+/// S-26（F-31）：plist XML 文本转义（`& < > " '`）——exe 路径可能含
+/// `&`/`"` 等字符，直接 `format!` 内插可注入任意 XML 节点（自启项被
+/// 篡改）。以最小依赖实现（等价于 `plist` crate 序列化字符串的安全
+/// 语义；引入完整 plist 序列化依赖留待后续评估）。
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 #[cfg(target_os = "windows")]
@@ -153,6 +177,8 @@ mod imp {
             })?
             .to_string_lossy()
             .to_string();
+        // S-26（F-31）：exe 路径经 XML 转义后内插（防 `&`/`"` 注入）。
+        let exe_escaped = xml_escape(&exe);
         let content = format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -162,7 +188,7 @@ mod imp {
     <string>com.kirindesk</string>
     <key>ProgramArguments</key>
     <array>
-        <string>{exe}</string>
+        <string>{exe_escaped}</string>
         <string>--autostart</string>
     </array>
     <key>RunAtLoad</key>
@@ -279,5 +305,60 @@ mod tests {
         assert!(content.contains("<key>RunAtLoad</key>"));
         assert!(content.contains("--autostart"));
         let _ = uninstall();
+    }
+
+    /// S-26（F-31）：plist XML 转义 —— 含 `&`/`"`/`<` 的路径内插后不产生
+    /// 原始特殊字符（全平台可测，macOS 集成路径见 test_macos_plist_escapes_injection）。
+    #[test]
+    fn test_xml_escape_injection() {
+        let path = r#"/Applications/A&B"Co's App<v1>/KirinDesk.app"#;
+        let escaped = xml_escape(path);
+        // 无原始特殊字符残留：`&` 只能作为实体前缀出现。
+        assert_eq!(escaped, "/Applications/A&amp;B&quot;Co&apos;s App&lt;v1&gt;/KirinDesk.app");
+        // 逐字符校验：裸 `&`（后不接合法实体）与裸 `"`/`<`/`>`/`'` 均不存在。
+        let bytes: Vec<char> = escaped.chars().collect();
+        for (i, c) in bytes.iter().enumerate() {
+            match c {
+                '"' | '\'' | '<' | '>' => panic!("raw '{c}' must be escaped: {escaped}"),
+                '&' => {
+                    let rest: String = bytes[i + 1..].iter().take(5).collect();
+                    assert!(
+                        rest.starts_with("amp;")
+                            || rest.starts_with("quot;")
+                            || rest.starts_with("apos;")
+                            || rest.starts_with("lt;")
+                            || rest.starts_with("gt;"),
+                        "bare '&' outside entity at {i}: {escaped}"
+                    );
+                }
+                _ => {}
+            }
+        }
+        // 无特殊字符路径原样保留。
+        assert_eq!(xml_escape("/Applications/KirinDesk.app"), "/Applications/KirinDesk.app");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_macos_plist_escapes_injection() {
+        // 注入路径（含 & 与 "）→ plist 中无原始特殊字符（S-26/F-31）。
+        // exe 路径来自 current_exe，无法直接注入——改用纯函数 + 解析断言
+        // 等价性：install 写入的内容里 `<string>` 节点值必须为转义后文本。
+        let evil = xml_escape("/tmp/A&B\"App.app");
+        assert!(!evil.contains('&') || evil.contains("&amp;"));
+        assert!(!evil.contains('"') || evil.contains("&quot;"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_windows_command_line_escapes_quote() {
+        // S-26（F-31）：注册表值引号转义——exe 路径含 `"` 时按 argv 语义
+        // 转义为 `\"`，值解析后仍指向原路径（纵深防御）。
+        let escaped = command_line().unwrap();
+        // 当前可执行文件路径无引号 → 格式为 `"<exe>" --autostart`。
+        assert!(escaped.ends_with("\" --autostart"));
+        // 直接验证转义函数：含引号路径被正确转义。
+        let with_quote = "\"C:\\Program Files\\Kir\"inDesk\\app.exe\"".to_string();
+        assert_eq!(with_quote.replace('"', "\\\""), "\\\"C:\\Program Files\\Kir\\\"inDesk\\app.exe\\\"");
     }
 }

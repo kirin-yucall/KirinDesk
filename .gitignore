@@ -27,3 +27,6 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+
+# S-28 (F-33): 发布二进制移出版控 —— 发布走 CI artifacts（GitHub Releases + checksums.txt），本地保留文件供 install.bat 使用
+release/KirinDesk.exe

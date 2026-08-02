@@ -570,8 +570,9 @@ fn resolve_ip_family(s: &str) -> Option<IpFamily> {
     }
 }
 
-/// M8-T017: 开启临时连接（SRV-TMP-001/002 / CLI-TMP-010）——生成 8 位临时
-/// 挑战码，窗口期内白名单跳过且连接须携带该码。明文码仅在本次输出一次
+/// M8-T017: 开启临时连接（SRV-TMP-001/002 / CLI-TMP-010）——生成 10 位临时
+/// 挑战码（S-20 / F-25：8 → 10），窗口期内白名单跳过且连接须携带该码。
+/// 明文码仅在本次输出一次
 /// （TMP-SEC-001，状态文件只存哈希），窗口期内再次调用只输出剩余时间。
 fn cmd_temp_mode() {
     let cfg = Config::load().unwrap_or_default();
@@ -3390,7 +3391,6 @@ fn cmd_status() {
             println!("Tunnel:        off (ID 模式需 `[tunnel] enabled=true` + server 配置)");
         }
     }
-    println!("81/81 tests passing");
 }
 
 /// 凭据掩码（S-07c，F-8）：显示 `****` + 明文末 4 位（challenge / token /
@@ -3451,7 +3451,16 @@ async fn cmd_self_test() {
     println!("=== KirinDesk Self-Connection Test ===");
     println!("Generating test identities...");
 
-    let tmp = std::env::temp_dir();
+    // S-24 (F-29)：自测产物（身份密钥/relay 密钥/状态文件）收敛到**单一临时
+    // 子目录** `temp_dir()/kirin_desk_self_test_<pid>/`——不再散落 %TEMP% 根部；
+    // 中断（含 Ctrl+C）残留只落在该可识别目录，下次运行自动清理（自愈）；
+    // 正常退出整目录删除（"self-test 后临时目录为空"）。
+    let tmp = std::env::temp_dir().join(format!(
+        "kirin_desk_self_test_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).expect("create self-test temp dir");
     let alice = match IdentityManager::generate(tmp.join("kirindesk_self_test_alice")) {
         Ok(v) => {
             println!("  Alice: OK (pubkey: {}...)", &v.public_key_base64()[..16]);
@@ -3597,7 +3606,7 @@ async fn cmd_self_test() {
             println!("=== M8-T017 temp-mode tests ===");
             {
                 use kirin_desk_core::connection::temp_mode::TempModeManager;
-                let tmp_tm = std::env::temp_dir().join("kirin_desk_self_test_temp_mode.json");
+                let tmp_tm = tmp.join("kirin_desk_self_test_temp_mode.json");
                 let _ = std::fs::remove_file(&tmp_tm);
                 let mgr = TempModeManager::with_state_file(tmp_tm.clone());
 
@@ -3608,11 +3617,11 @@ async fn cmd_self_test() {
                         return;
                     }
                 };
-                assert_eq!(code.chars().count(), 8, "temp code must be 8 chars");
+                assert_eq!(code.chars().count(), 10, "temp code must be 10 chars (S-20)");
                 assert!(mgr.is_active(), "window must be active after enable");
                 assert!(mgr.verify_challenge(&code), "correct code must verify");
                 assert!(
-                    !mgr.verify_challenge("XXXXXXXX"),
+                    !mgr.verify_challenge("XXXXXXXXXX"),
                     "wrong code must be rejected"
                 );
                 println!("  1. enable + verify (correct/wrong) OK ✓");
@@ -4035,12 +4044,15 @@ async fn cmd_self_test() {
                 use std::sync::Arc;
 
                 // 1. 进程内 relay server（临时密钥 + token）。
-                let tmp_key = std::env::temp_dir().join(format!(
+                let tmp_key = tmp.join(format!(
                     "kirindesk_self_test_relay_key_{}.der",
                     std::process::id()
                 ));
                 let relay = TunnelServer::bind(TunnelServerConfig {
                     bind_port: 0,
+                    // S-24 (F-29)：自测 relay 仅绑回环（127.0.0.1），
+                    // 不暴露全接口（token 为已知测试值）。
+                    bind_addr: Some("127.0.0.1:0".parse().unwrap()),
                     token: "self-test-token".to_string(),
                     server_key_path: Some(tmp_key.clone()),
                     heartbeat_timeout: Duration::from_secs(2),
@@ -4069,7 +4081,8 @@ async fn cmd_self_test() {
                 .unwrap();
                 let dev_arc = Arc::new(dev_identity);
                 let id_cfg = IdClientConfig {
-                    server_addr: format!("[::1]:{}", relay_port),
+                    // S-24 (F-29)：relay 绑 127.0.0.1 → 客户端也走 IPv4 回环。
+                    server_addr: format!("127.0.0.1:{}", relay_port),
                     token: "self-test-token".to_string(),
                     device_id: device_id.to_string(),
                     ed25519_pub: dev_arc.public_key_base64(),
@@ -4107,7 +4120,8 @@ async fn cmd_self_test() {
                 //    中继兜底）→ 握手。
                 let connector = IdConnector::new(
                     IdModeConfig::try_new(
-                        &format!("[::1]:{}", relay_port),
+                        // S-24 (F-29)：relay 绑 127.0.0.1 → 客户端也走 IPv4 回环。
+                        &format!("127.0.0.1:{}", relay_port),
                         "self-test-token",
                         &server_pubkey_b64,
                     )
@@ -4151,7 +4165,8 @@ async fn cmd_self_test() {
                 // 4. 第二条中继会话：加密发送（控制器 → 设备侧已握手通道）。
                 let echo_connector = IdConnector::new(
                     IdModeConfig::try_new(
-                        &format!("[::1]:{}", relay_port),
+                        // S-24 (F-29)：relay 绑 127.0.0.1 → 客户端也走 IPv4 回环。
+                        &format!("127.0.0.1:{}", relay_port),
                         "self-test-token",
                         &server_pubkey_b64,
                     )
@@ -4221,7 +4236,8 @@ async fn cmd_self_test() {
                 });
 
                 // 2. 双端独立身份 + 共享 session_id（发起方 pin，PUNCH-SEC-003）。
-                let p_tmp = std::env::temp_dir();
+                // S-24 (F-29)：打洞身份密钥收敛到自测子目录。
+                let p_tmp = tmp.clone();
                 let p_key_a = p_tmp.join("kirindesk_self_test_punch_a");
                 let p_key_b = p_tmp.join("kirindesk_self_test_punch_b");
                 let pim_a = Arc::new(IdentityManager::generate(p_key_a.clone()).unwrap());
@@ -4349,7 +4365,7 @@ async fn cmd_self_test() {
     };
     use kirin_desk_utils::known_hosts::{FingerprintStatus, KnownHostsStore};
 
-    let tmp_kh = std::env::temp_dir().join("kirindesk_self_test_known_hosts");
+    let tmp_kh = tmp.join("kirindesk_self_test_known_hosts");
     let kh_path = tmp_kh.join("known_hosts");
     let _ = std::fs::remove_dir_all(&tmp_kh);
 
@@ -4614,6 +4630,12 @@ async fn cmd_self_test() {
         }
     }
     println!("=== R-03 disconnect/reconnect tests COMPLETE (2/2) ===");
+
+    // S-24 (F-29)：正常退出清理自测临时子目录（含全部密钥/状态文件）——
+    // "self-test 后临时目录为空"。中断残留由下次运行的开头清理兜底。
+    let _ = std::fs::remove_dir_all(&tmp);
+    println!();
+    println!("=== Self-test COMPLETE (temp artifacts cleaned: {}) ===", tmp.display());
 }
 
 // ════════════════════════════════════════════════════════════════

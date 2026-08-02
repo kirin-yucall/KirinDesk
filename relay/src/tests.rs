@@ -84,6 +84,7 @@ fn server_cfg_on(
     let range_base = 40000 + (uuid::Uuid::new_v4().as_u128() % 2000) as u16;
     TunnelServerConfig {
         bind_port,
+        bind_addr: None, // S-24 (F-29)：默认双栈；自测显式回环绑定
         token: token.to_string(),
         port_range: Some((range_base, range_base + 256)),
         heartbeat_timeout: Duration::from_millis(500),

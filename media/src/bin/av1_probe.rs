@@ -32,6 +32,8 @@ struct Bench {
     note: String,
     frames: usize,
     bytes: usize,
+    /// 总耗时（ms；诊断字段，输出走 kbps/avg_frame_ms——ZM-05 警告清理登记）
+    #[allow(dead_code)]
     elapsed_ms: f64,
     kbps: f64,
     /// 平均每帧编码耗时（ms；不含帧合成）。

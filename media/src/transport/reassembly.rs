@@ -29,7 +29,8 @@ pub struct FrameReassembly {
 }
 
 struct ReassemblyBuffer {
-    /// 总分片数
+    /// 总分片数（构造时校验用；S-11c/F-15 上限断言 + 测试用例，运行时不再读取）
+    #[allow(dead_code)]
     total_packets: u16,
     /// 各分片数据（None = 未收到）
     packets: Vec<Option<Vec<u8>>>,

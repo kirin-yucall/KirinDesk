@@ -6,6 +6,7 @@ use crate::crypto::aead::AeadCipher;
 use crate::network::tcp::{send_message, receive_message, read_length_prefixed, TcpError};
 use ed25519_dalek::Signature;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -509,7 +510,11 @@ fn verify_server_init_inner(
     //    - 仅窗口（无固定码）→ **临时码必填**（杜绝窗口期内无凭据旁路）；
     //    - 固定码 + 窗口 → 任一正确即通过。
     let fixed_expected = expected_challenge.filter(|s| !s.is_empty());
-    let fixed_ok = fixed_expected.map_or(true, |f| init.challenge == f);
+    // S-18 (F-23)：固定码比对改**常量时间**（先 SHA-256 归一到 32B，再
+    // `subtle` ct_eq —— `==` 逐字节短路返回存在时序侧信道，可被远程枚举
+    // 挑战码）。长度不匹配路径同样只泄露"是否相等"，不泄露前缀差异；
+    // 对齐临时码实现（`TempModeManager::verify_challenge` 的哈希后比较）。
+    let fixed_ok = fixed_expected.map_or(true, |f| challenge_eq(&init.challenge, f));
     let temp_ok = temp_window.map_or(true, |t| t.verify_challenge(&init.challenge));
     let client_pinned = !expected_client_key_base64.is_empty();
     let challenge_ok = match (fixed_expected.is_some(), temp_window.is_some()) {
@@ -557,6 +562,18 @@ pub async fn server_handshake_respond_generic<S: AsyncRead + AsyncWrite + Unpin 
     selected_codec: &str,
 ) -> Result<SecureChannelGeneric<S>, HandshakeError> {
     server_handshake_inner_generic(stream, server_identity, server_id, init, selected_codec).await
+}
+
+/// S-18 (F-23)：挑战码**常量时间**相等比较。
+///
+/// 对齐临时码实现：先 `sha256` 归一到固定 32 字节（输入长度差异只影响
+/// 哈希分块数，不影响比较分支），再用 `subtle::ConstantTimeEq` 比较摘要
+/// —— 比较耗时与两输入内容无关，杜绝 `==` 的逐字节短路时序侧信道。
+fn challenge_eq(a: &str, b: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    let ha = Sha256::digest(a.as_bytes());
+    let hb = Sha256::digest(b.as_bytes());
+    bool::from(ha.as_slice().ct_eq(hb.as_slice()))
 }
 
 /// 域名白名单匹配（SRV-SEC-WL-004）。
@@ -1391,6 +1408,39 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// S-18 (F-23): 固定挑战码常量时间比较 —— 相等/不相等/长度不匹配/空串
+    /// 路径全部覆盖；`challenge_eq` 耗时与内容无关（摘要定长 + ct_eq）。
+    #[test]
+    fn test_challenge_eq_constant_time_compare() {
+        // 相等
+        assert!(challenge_eq("FIXED-CODE", "FIXED-CODE"));
+        // 不同（等长）→ 不相等
+        assert!(!challenge_eq("FIXED-CODE", "FIXED-CODe"));
+        // 长度不匹配路径（F-23 验收项）→ 不相等，不 panic
+        assert!(!challenge_eq("FIXED-CODE", "FIXED"));
+        assert!(!challenge_eq("AB", "ABCDEFGHIJ"));
+        // 空串 vs 非空（verify 主路径空固定码已被 filter 短路，此处覆盖兜底）
+        assert!(!challenge_eq("", "X"));
+        assert!(challenge_eq("", ""));
+        // 与逐字节 `==` 语义一致（行为等价性回归）
+        let cases: &[(&str, &str)] = &[
+            ("a", "a"),
+            ("a", "b"),
+            ("ABC123", "ABC124"),
+            ("ABC123", "ABC123"),
+            ("0123456789", "012345678"),
+            ("longer-code-here", "longer-code-here"),
+        ];
+        for (a, b) in cases {
+            assert_eq!(
+                challenge_eq(a, b),
+                a == b,
+                "challenge_eq({a:?},{b:?}) must match == semantics"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_server_read_init_pin_mismatch_rejected() {
         let dir = std::env::temp_dir().join("kirin_hs_read_init_mismatch");

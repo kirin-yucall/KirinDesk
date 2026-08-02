@@ -448,17 +448,26 @@ impl VideoEncoder for FfmpegSwEncoder {
 
     /// 窗口边界清参考帧（M8-T011 T2.3）。
     ///
-    /// `avcodec_flush_buffers` 重置编码器内部状态（丢弃未输出缓冲帧与参考帧）。
-    /// flush 后下一帧**必须**为 IDR —— 这里直接置位 `force_idr_next` 双保险
-    /// （WindowPipeline 每窗口首帧本就强制 IDR）。仅当已发过帧时才 flush：
-    /// 从未编码时无状态可清（与 Drop 的守卫一致，规避 QSV 等编码器在空状态
-    /// 重置/触发 drain 的 heap corruption 问题）。
+    /// **P0-1 修复后的正确语义：软编 no-op。** 历史实现（`avcodec_flush_buffers`，
+    /// 解码器语义）对活动中的 libx264 调用会摧毁编码器：第 2 个窗口起
+    /// `avcodec_send_frame` 返回 `AVERROR_EXTERNAL (-542398533)`，
+    /// `transport_degrade` 甚至原生崩溃（STATUS_ACCESS_VIOLATION 0xc0000005）。
+    /// 修复计划建议的 send-null + drain 亦不可行（2026-08-02 实测：null 帧
+    /// 后 FFmpeg 置内部 draining 标志，下一个真实帧 `avcodec_send_frame`
+    /// 直接返回 `AVERROR_EOF`，同一 ctx 不可复用——该序列只适用于 Drop /
+    /// `ensure_codec_dims` 这种随后释放 ctx 的场景）。
+    ///
+    /// 为何 no-op 安全：`tune=zerolatency` + `rc-lookahead=0` + `threads=2` +
+    /// `max_b_frames=0` → 编码器内**无延迟帧、无跨窗口缓冲**；每窗口首帧强制
+    /// IDR（`force_idr_next` + WindowPipeline `force_idr`），IDR 自身重置
+    /// 参考链，窗口自包含性由 IDR 保证。实测 3 窗口直接序列全部成功
+    /// （`Z_media模块检查与修复计划_2026-08-02.md` P0-1 实证）。
     fn flush_buffers(&mut self) {
-        if self.sent_first && !self.ctx.is_null() {
-            ffmpeg::avcodec_flush_buffers(self.ctx);
-            self.force_idr_next = true;
-            tracing::debug!("FfmpegSwEncoder: flushed buffers (window boundary)");
-        }
+        // 软编窗口边界无需清参考帧：zerolatency 无缓冲延迟帧，下一窗口
+        // 首帧强制 IDR 即重置参考链（P0-1 实证；HW QSV 保留
+        // avcodec_flush_buffers，见 ffmpeg_hw.rs 实测登记）。
+        self.force_idr_next = true;
+        tracing::debug!("FfmpegSwEncoder: flushed buffers (window boundary) — no-op for zerolatency software encoder");
     }
 }
 
@@ -612,5 +621,42 @@ mod tests {
             .encode(&tex, Timestamp::now(), EncodeDecision::Static)
             .unwrap();
         assert!(packets.is_empty());
+    }
+
+    /// 连续 3 窗口编码（每窗口边界调用 flush_buffers）全部成功——P0-1 回归
+    /// 防护：原实现窗口边界调 `avcodec_flush_buffers`（解码器语义），第 2 个
+    /// 窗口起 x264 lookahead 线程状态损坏 → `avcodec_send_frame` 返回
+    /// `AVERROR_EXTERNAL (-542398533)`（严重时原生崩溃）。修复后窗口边界
+    /// 走 send-null + drain 的编码器正确 flush，3 窗口全部正常出码。
+    #[test]
+    fn test_sw_encoder_multi_window_flush() {
+        if ffmpeg::ensure_loaded().is_err() {
+            eprintln!("FFmpeg libraries not available; test_sw_encoder_multi_window_flush skipped");
+            return;
+        }
+        let Ok(mut enc) = FfmpegSwEncoder::create(Codec::H264) else {
+            return;
+        };
+        let (w, h) = (320u32, 240u32);
+        let tex = GpuTexture::new(0x1usize as *mut _, w, h);
+        for window in 0..3u32 {
+            // 每窗口不同内容（真实场景窗口间画面变化）。
+            let rgba = vec![(window as u8 + 1) * 16; (w * h * 4) as usize];
+            enc.set_cpu_frame(&rgba, w, h, true);
+            let packets = enc
+                .encode(
+                    &tex,
+                    Timestamp::now(),
+                    EncodeDecision::FullFrame(DirtyTileMap::default()),
+                )
+                .unwrap_or_else(|e| panic!("window {window} encode must succeed: {e}"));
+            assert!(
+                !packets.is_empty(),
+                "window {window} must produce ≥1 packet"
+            );
+            assert!(packets[0].is_key, "window {window} first packet is IDR");
+            // 窗口边界 flush（与 WindowPipeline 每窗口调用一致）。
+            enc.flush_buffers();
+        }
     }
 }

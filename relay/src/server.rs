@@ -54,6 +54,9 @@ const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct TunnelServerConfig {
     /// 控制端口（0 = 系统分配，测试用）。
     pub bind_port: u16,
+    /// S-24（F-29）：显式绑定地址（None = 默认 `[::]` 双栈 + `0.0.0.0` 回退）。
+    /// 自测/受限环境传 `Some(127.0.0.1:0)` 仅监听回环——默认行为零变更。
+    pub bind_addr: Option<SocketAddr>,
     /// token 认证（TNL-SEC-001）。
     pub token: String,
     /// 自动分配端口范围（`remote_port: 0` 时使用，TNL-SERVER-003）。
@@ -87,6 +90,7 @@ impl Default for TunnelServerConfig {
     fn default() -> Self {
         Self {
             bind_port: DEFAULT_BIND_PORT,
+            bind_addr: None,
             token: String::new(),
             port_range: None,
             heartbeat_timeout: DEFAULT_HEARTBEAT_TIMEOUT,
@@ -242,18 +246,25 @@ impl TunnelServer {
         self.shutdown_handle().shutdown();
     }
 
-    /// 绑定控制端口（`[::]` 优先 + `0.0.0.0` 回退，对齐 M8-T025 双栈）。
+    /// 绑定控制端口（`[::]` 优先 + `0.0.0.0` 回退，对齐 M8-T025 双栈；
+    /// S-24 / F-29：`cfg.bind_addr` 显式指定时仅绑定该地址——自测 relay
+    /// 绑 `127.0.0.1`，不暴露全接口）。
     ///
     /// 显式设置 `SO_REUSEADDR`（tokio `TcpSocket`，零新依赖）：对齐 FRP/Go
     /// 默认行为——服务端重启（含优雅关闭后的 TIME_WAIT 窗口）可立即重绑
     /// 同端口（TNL-STAB-003 重连场景的生产前提）。
     pub async fn bind(cfg: TunnelServerConfig) -> Result<Self, TunnelServerError> {
         let port = cfg.bind_port;
-        let listener = match bind_reuseaddr(port).await {
-            Ok(l) => l,
-            Err(_) => bind_reuseaddr_v4(port).await.map_err(|e| {
+        let listener = match cfg.bind_addr {
+            Some(addr) => bind_reuseaddr_addr(addr).await.map_err(|e| {
                 TunnelServerError::Bind { port, source: e }
             })?,
+            None => match bind_reuseaddr(port).await {
+                Ok(l) => l,
+                Err(_) => bind_reuseaddr_v4(port).await.map_err(|e| {
+                    TunnelServerError::Bind { port, source: e }
+                })?,
+            },
         };
         let rate_limit_cfg = cfg.rate_limit.clone();
         let tunnel_conn_rate_limit_cfg = cfg.tunnel_conn_rate_limit.clone();
@@ -1258,6 +1269,18 @@ async fn bind_one(port: u16) -> Result<TcpListener, String> {
     }
     bind_reuseaddr_v4(port).await
         .map_err(|e| format!("bind :{} failed: {}", port, e))
+}
+
+/// S-24（F-29）：绑定**显式地址**（SO_REUSEADDR；测试/受限环境回环绑定）。
+async fn bind_reuseaddr_addr(addr: SocketAddr) -> Result<TcpListener, std::io::Error> {
+    let socket = if addr.is_ipv6() {
+        tokio::net::TcpSocket::new_v6()?
+    } else {
+        tokio::net::TcpSocket::new_v4()?
+    };
+    socket.set_reuseaddr(true)?;
+    socket.bind(addr)?;
+    socket.listen(1024)
 }
 
 /// 绑定 `[::]:port`（SO_REUSEADDR；Windows 上 TIME_WAIT 端口可立即重绑）。

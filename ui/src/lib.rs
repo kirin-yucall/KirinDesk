@@ -685,6 +685,9 @@ struct PendingConnection {
     client_id: String,
     client_domain: String,
     device_type: String,
+    /// S-21 (F-26)：客户端自报 Ed25519 公钥（base64）——审批弹窗展示其
+    /// 真实指纹（而非自报 id）；审批前已解析校验，解析失败不弹窗直接拒绝。
+    client_pubkey_base64: String,
     status: PendingStatus,
 }
 
@@ -3790,20 +3793,49 @@ impl eframe::App for KirinDeskApp {
                         // M8-T028 (UI-BTY-026): Domain 一键复制（空值按钮自动禁用）。
                         self.copied_button(ui, &theme, &pc.client_domain);
                     });
-                    // 指纹等宽显示（远端设备标识即指纹，无独立 pubkey 字段）
-                    ui.horizontal(|ui| {
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(format!("Fingerprint: {}", pc.client_id))
-                                    .monospace()
-                                    .size(theme.mono_size)
-                                    .color(theme.fg),
+                    // S-21 (F-26)：指纹 = 客户端**公钥**的真实 SHA-256 指纹
+                    // （对齐 known_hosts 指纹格式），不再把自报 client_id 当
+                    // 指纹展示——审批人据此核实"批准的是谁"。
+                    let client_fp = kirin_desk_utils::known_hosts::fingerprint(
+                        &pc.client_pubkey_base64,
+                    );
+                    ui.add_space(2.0);
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!("Fingerprint: {}", client_fp))
+                                .monospace()
+                                .size(theme.mono_size)
+                                .color(theme.fg),
+                        )
+                        .selectable(true),
+                    );
+                    // M8-T028 (UI-BTY-026): 指纹一键复制（真实公钥指纹）。
+                    self.copied_button(ui, &theme, &client_fp);
+                    ui.add_space(2.0);
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(
+                                "批准后此公钥写入 known_clients，下次同设备连接自动放行",
                             )
-                            .selectable(true),
-                        );
-                        // M8-T028 (UI-BTY-026): 指纹一键复制（与设备 ID 同源显示）。
-                        self.copied_button(ui, &theme, &pc.client_id);
-                    });
+                            .size(theme.small_size)
+                            .color(theme.fg_weak),
+                        )
+                        .selectable(false),
+                    );
+                    ui.add_space(2.0);
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!(
+                                "Pubkey: {}…",
+                                &pc.client_pubkey_base64
+                                    [..pc.client_pubkey_base64.len().min(24)]
+                            ))
+                            .monospace()
+                            .size(theme.small_size)
+                            .color(theme.fg_weak),
+                        )
+                        .selectable(true),
+                    );
                     ui.separator();
                     ui.horizontal(|ui| {
                         if action_button(
@@ -5389,8 +5421,8 @@ impl KirinDeskApp {
         });
         ui.add_space(theme.spacing);
 
-        // M8-T017 (UI-TMP-001~006): ③ 临时连接卡片——开启生成 8 位临时挑战码，
-        // 窗口期内跳过域名白名单；开启态展示码 + 倒计时 + 关闭按钮。
+        // M8-T017 (UI-TMP-001~006): ③ 临时连接卡片——开启生成 10 位临时挑战码
+        // （S-20 / F-25：8 → 10），窗口期内跳过域名白名单；开启态展示码 + 倒计时 + 关闭按钮。
         card(ui, theme, "临时连接", |ui| {
             if self.unattended_enabled {
                 // UI-TMP-006: 无人值守下禁用（UA-ACCEPT-004）。
@@ -5431,7 +5463,10 @@ impl KirinDeskApp {
                 ui.add_space(4.0);
                 match self.temp_code.clone() {
                     Some(code) => {
-                        // 大号等宽码（UI-BTY-004）+ 一键复制（M8-T028 成功反馈）。
+                        // S-22 (F-27)：对齐 CLI「显示 1 次」语义——大号等宽码
+                        // （UI-BTY-004）+ 一键复制（M8-T028）+ 「隐藏临时码」
+                        // 折叠按钮（防肩窥：隐藏后本窗口期不再展示，重新查看
+                        // 需重新开启生成新码）。
                         ui.horizontal(|ui| {
                             ui.add(
                                 egui::Label::new(
@@ -5444,14 +5479,28 @@ impl KirinDeskApp {
                                 .selectable(true),
                             );
                             self.copied_button(ui, theme, &code);
+                            if action_button(
+                                ui,
+                                theme,
+                                ButtonKind::Secondary,
+                                "隐藏临时码",
+                                ButtonState::Enabled,
+                            )
+                            .clicked()
+                            {
+                                self.temp_code = None;
+                                self.temp_status = "临时码已隐藏（仅展示一次）".to_string();
+                            }
                         });
                     }
                     None => {
-                        // 窗口由 CLI/其他进程开启：码仅在开启时展示一次（TMP-SEC-001）。
+                        // 窗口由 CLI/其他进程开启或已隐藏：码仅在开启时展示
+                        // 一次（TMP-SEC-001 / S-22）；再次查看需重新开启。
                         ui.add(
                             egui::Label::new(
                                 egui::RichText::new(
-                                    "临时码已在开启时展示一次，未落盘保存（TMP-SEC-001）。",
+                                    "临时码已在开启时展示一次，未落盘保存（TMP-SEC-001）；\
+                                     再次查看需重新开启（生成新码）。",
                                 )
                                 .size(theme.small_size)
                                 .color(theme.fg_weak),
@@ -5514,7 +5563,7 @@ impl KirinDeskApp {
                 ui.add(
                     egui::Label::new(
                         egui::RichText::new(
-                            "临时授权访问：开启后生成 8 位临时挑战码，窗口期内跳过域名白名单，任何持有此码的客户端均可连接（默认 5 分钟，过期自动失效）。",
+                            "临时授权访问：开启后生成 10 位临时挑战码，窗口期内跳过域名白名单，任何持有此码的客户端均可连接（默认 5 分钟，过期自动失效）。",
                         )
                         .size(theme.small_size)
                         .color(theme.fg_weak),
@@ -5951,6 +6000,9 @@ impl KirinDeskApp {
                 || allowed_ids
                     .iter()
                     .any(|id| id_matches_whitelist(&init.client_id, id));
+            // S-21 (F-26)：本连接是否经人工审批（通过后才把公钥写入
+            // known_clients——仅审批放行的连接落 pin，白名单/旁路路径不落）。
+            let mut was_approved = false;
             if !skip && !is_whitelisted && expected_key.is_none() {
                 // M13-T005 (UA-ACCEPT-002): 无人值守下
                 // 未知设备自动拒绝——无人工审批弹窗，
@@ -5974,11 +6026,35 @@ impl KirinDeskApp {
                 let id = pending_next_id();
                 let (dec_tx, dec_rx) = tokio::sync::oneshot::channel::<bool>();
                 pending_decisions().lock().unwrap().insert(id, dec_tx);
+                // S-21 (F-26)：审批**前**解析客户端公钥——伪造/损坏公钥直接
+                // 拒绝（不弹窗，杜绝"审批先于签名校验"被刷弹窗骚扰/投毒）。
+                let client_pubkey_b64 = init.client_ed25519_pub_base64.clone();
+                if kirin_desk_core::crypto::ed25519::IdentityManager::parse_public_key(
+                    &client_pubkey_b64,
+                )
+                .is_err()
+                {
+                    audit_record(
+                        &mut audit,
+                        kirin_desk_utils::audit::AuditEvent::AuthFailure,
+                        &format!(
+                            "ip={} client={} reason=unparsable_client_pubkey",
+                            ip, init.client_id
+                        ),
+                    );
+                    rate_limiter.lock().unwrap().record_handshake_failure(&ip);
+                    warn!(
+                        "Rejected {}: unparsable client public key '{}' — refused before approval (S-21/F-26)",
+                        addr, init.client_id
+                    );
+                    return;
+                }
                 let pc = PendingConnection {
                     id,
                     client_id: init.client_id.clone(),
                     client_domain: init.client_domain.clone(),
                     device_type: init.client_device_type.clone(),
+                    client_pubkey_base64: client_pubkey_b64,
                     status: PendingStatus::Waiting,
                 };
                 if let Some(tx) = pending_conn_tx().get() {
@@ -5986,7 +6062,7 @@ impl KirinDeskApp {
                 }
                 // 等待用户决策（60s 超时）。
                 match tokio::time::timeout(std::time::Duration::from_secs(60), dec_rx).await {
-                    Ok(Ok(true)) => {} // 用户接受 → 继续握手
+                    Ok(Ok(true)) => {} // 用户接受 → 继续握手（签名校验通过后落 known_clients）
                     _ => {
                         audit_record(
                             &mut audit,
@@ -6000,6 +6076,9 @@ impl KirinDeskApp {
                         return;
                     }
                 }
+                // S-21 (F-26)：审批通过 → 标记，待 Ed25519 签名校验通过后把
+                // 客户端公钥写入 known_clients（下次同 id 凭 pin 自动放行）。
+                was_approved = true;
             }
             // 4) pin/nickname/challenge/签名校验 + 应答。
             // M8-T017 (SRV-TMP-HK-001/003): 挑战码二态——固定
@@ -6021,6 +6100,24 @@ impl KirinDeskApp {
                 );
                 rate_limiter.lock().unwrap().record_handshake_failure(&ip);
                 return;
+            }
+            // S-21 (F-26)：审批通过 + Ed25519 签名校验通过（公钥真实性已
+            // 验证）→ 客户端公钥写入 known_clients——弹窗承诺"批准后此公钥
+            // 写入 known_clients"在此兑现；下次同 id 连接凭 pin 自动放行。
+            if was_approved {
+                if let Ok(mut k) = known.lock() {
+                    k.upsert(&init.client_id, &init.client_ed25519_pub_base64);
+                    if let Err(e) = k.save() {
+                        warn!(
+                            "known_clients save failed after approval for '{}': {}",
+                            init.client_id, e
+                        );
+                    }
+                    info!(
+                        "Approved client '{}' pinned in known_clients (S-21/F-26)",
+                        init.client_id
+                    );
+                }
             }
             let g =
                 match server_handshake_respond_generic(stream, server_id, &server_name, &init, "")

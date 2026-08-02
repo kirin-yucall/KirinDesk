@@ -123,7 +123,7 @@ pub async fn send_control_msg(
     buf.extend_from_slice(&len.to_le_bytes());
     buf.extend_from_slice(&encrypted);
 
-    use tokio::io::AsyncWriteExt;
+    // quinn 0.11 SendStream 自带 inherent write_all（AsyncWriteExt 无需引入）。
     stream
         .write_all(&buf)
         .await
@@ -147,8 +147,7 @@ pub async fn recv_control_msg(
     stream: &mut quinn::RecvStream,
     cipher: &MediaCipher,
 ) -> Result<ControlMessage, TransportError> {
-    use tokio::io::AsyncReadExt;
-
+    // quinn 0.11 RecvStream 自带 inherent read_exact（AsyncReadExt 无需引入）。
     let mut len_buf = [0u8; 4];
     stream
         .read_exact(&mut len_buf)

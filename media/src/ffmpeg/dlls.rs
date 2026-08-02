@@ -349,6 +349,8 @@ pub(super) struct Libraries {
 /// Resolved function pointer table. Held alive for program lifetime by
 /// [`INIT`]; field order matches FFmpeg symbol resolution order in
 /// [`load_all`].
+// sws_* 保持 C 命名（不能 snake_case 改名——动态链接符号必须与 DLL 导出一致）。
+#[allow(non_snake_case)]
 pub(super) struct FnTable {
     pub(super) avcodec_version: AvcodecVersionFn,
     pub(super) avcodec_find_encoder: AvcodecFindEncoderFn,

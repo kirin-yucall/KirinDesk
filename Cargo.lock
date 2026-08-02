@@ -2666,6 +2666,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "subtle",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
@@ -2678,6 +2679,7 @@ dependencies = [
 name = "kirin-desk-dns"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "get_if_addrs 0.4.1",
  "rand 0.8.7",
  "reqwest",

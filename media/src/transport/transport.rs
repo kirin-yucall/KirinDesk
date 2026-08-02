@@ -191,7 +191,7 @@ impl QuicMediaTransport {
                 record.extend_from_slice(&body_len.to_be_bytes());
                 record.push(tag as u8);
                 record.extend_from_slice(&framed);
-                use tokio::io::AsyncWriteExt;
+                // quinn 0.11 SendStream 自带 inherent write_all。
                 sender.write_all(&record).await.map_err(|e| {
                     TransportError::Quic(format!("input reliable stream write: {e}"))
                 })?;
