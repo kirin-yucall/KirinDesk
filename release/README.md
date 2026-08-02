@@ -18,6 +18,7 @@ Native Windows GUI (egui) with CLI fallback.
 - Connect - Domain mode or IP mode
 - Settings - API keys, nickname, challenge, domain whitelist
 - Auto-detect device type (desktop/server)
+- Auto-rotating logs - daily files in `%USERPROFILE%\.kirin_desk\logs\`, auto-cleanup after 7 days
 
 ### Connect Modes
 
@@ -79,5 +80,5 @@ kirin_desk help           # Show help
 
 ```bash
 cargo test
-# 77 tests passing
+# 81 tests passing
 ```

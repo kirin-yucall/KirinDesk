@@ -1,5 +1,16 @@
+//! KirinDesk 自动更新器 — M14-T005。
+//!
+//! 检查 GitHub Releases 获取新版本，下载更新并准备安装：
+//! - 按平台挑选 release asset（windows/macos/linux 关键字 + 扩展名偏好）
+//! - `download_update_with_progress` 流式下载并回报进度
+//! - `should_auto_check` / `record_auto_check` 支持每周后台静默检查
+//!
+//! 安装流程（Windows）：下载 → 写替换脚本 → 启动脚本 → 退出应用
+//! （脚本等待旧进程退出后覆盖 exe 并重启，见 `ui/src/lib.rs` 的
+//!  `install_update`）。
+
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Current application version (from Cargo.toml).
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -15,6 +26,57 @@ pub enum UpdateChannel {
     Beta,
 }
 
+/// 目标平台（决定挑选哪个 release asset）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Platform {
+    Windows,
+    MacOS,
+    Linux,
+    Other,
+}
+
+impl Platform {
+    /// 当前编译目标平台。
+    pub fn current() -> Self {
+        #[cfg(target_os = "windows")]
+        {
+            Platform::Windows
+        }
+        #[cfg(target_os = "macos")]
+        {
+            Platform::MacOS
+        }
+        #[cfg(target_os = "linux")]
+        {
+            Platform::Linux
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+        {
+            Platform::Other
+        }
+    }
+
+    /// asset 名称关键字（命中越多得分越高）。
+    fn asset_keywords(&self) -> &'static [&'static str] {
+        match self {
+            Platform::Windows => &["windows"],
+            Platform::MacOS => &["macos", "darwin", ".dmg"],
+            Platform::Linux => &["linux", ".deb", ".tar"],
+            Platform::Other => &[],
+        }
+    }
+
+    /// 扩展名偏好（可执行/安装包优先于压缩包），无则返回空串。
+    fn preferred_extension(&self) -> &'static str {
+        match self {
+            Platform::Windows => ".exe",
+            Platform::MacOS => ".dmg",
+            Platform::Linux => ".deb",
+            Platform::Other => "",
+        }
+    }
+}
+
 /// Information about an available release.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReleaseInfo {
@@ -23,6 +85,9 @@ pub struct ReleaseInfo {
     pub checksum: String,
     pub release_date: String,
     pub release_notes: String,
+    /// 所选 asset 的文件名（展示用）。
+    #[serde(default)]
+    pub asset_name: String,
 }
 
 /// Update check result.
@@ -53,10 +118,17 @@ pub enum UpdateError {
 ///
 /// Checks GitHub releases for new versions, downloads updates,
 /// and prepares them for installation.
+#[derive(Clone)]
 pub struct Updater {
     current_version: String,
     channel: UpdateChannel,
     data_dir: PathBuf,
+}
+
+/// 上次自动检查时间戳（`{data_dir}/last_check.json`）。
+#[derive(Serialize, Deserialize)]
+struct LastCheck {
+    epoch_secs: u64,
 }
 
 impl Updater {
@@ -105,8 +177,9 @@ impl Updater {
             return UpdateStatus::UpToDate;
         }
 
-        // Find the asset (first one)
-        let asset = match release.assets.first() {
+        // 按平台挑选 asset（M14-T005：替代"取第一个"）
+        let platform = Platform::current();
+        let asset = match pick_asset(&release.assets, platform) {
             Some(a) => a,
             None => return UpdateStatus::Error("No assets in release".to_string()),
         };
@@ -117,11 +190,27 @@ impl Updater {
             checksum: String::new(), // GitHub doesn't provide checksums by default
             release_date: release.published_at.clone(),
             release_notes: release.body.clone(),
+            asset_name: asset.name.clone(),
         })
     }
 
-    /// Download an update to the data directory.
+    /// Download an update to the data directory (without progress reporting).
     pub async fn download_update(&self, release: &ReleaseInfo) -> Result<PathBuf, UpdateError> {
+        self.download_update_with_progress(release, |_, _| {}).await
+    }
+
+    /// Download an update to the data directory, reporting progress.
+    ///
+    /// `on_progress(received_bytes, total_bytes)` 在每块下载后被调用；
+    /// `total_bytes` 在服务器未提供 Content-Length 时为 `None`。
+    pub async fn download_update_with_progress<F>(
+        &self,
+        release: &ReleaseInfo,
+        on_progress: F,
+    ) -> Result<PathBuf, UpdateError>
+    where
+        F: Fn(u64, Option<u64>) + Send + 'static,
+    {
         let dest = self.data_dir.join(format!("kirin_desk-{}.exe", release.version));
 
         let client = reqwest::Client::builder()
@@ -129,33 +218,95 @@ impl Updater {
             .build()
             .map_err(|e| UpdateError::Network(e.to_string()))?;
 
-        let response = client
+        let mut response = client
             .get(&release.download_url)
             .send()
             .await
             .map_err(|e| UpdateError::Network(e.to_string()))?;
+        if !response.status().is_success() {
+            return Err(UpdateError::Network(format!(
+                "HTTP {}",
+                response.status()
+            )));
+        }
 
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| UpdateError::Network(e.to_string()))?;
+        let total = response.content_length();
 
         // Ensure parent directory exists
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
-        tokio::fs::write(&dest, &bytes)
+        let mut file = tokio::fs::File::create(&dest).await.map_err(UpdateError::Io)?;
+        let mut received: u64 = 0;
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| UpdateError::Network(e.to_string()))?
+        {
+            received += chunk.len() as u64;
+            tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
+                .await
+                .map_err(UpdateError::Io)?;
+            on_progress(received, total);
+        }
+        tokio::io::AsyncWriteExt::flush(&mut file)
             .await
             .map_err(UpdateError::Io)?;
 
         Ok(dest)
     }
 
+    /// 距上次自动检查是否已超过 `interval_days`（文件缺失视为需要检查）。
+    pub fn should_auto_check(&self, interval_days: u64) -> bool {
+        let now = unix_now_secs();
+        let last = self
+            .last_check_secs()
+            .unwrap_or(0);
+        now.saturating_sub(last) >= interval_days.saturating_mul(86400)
+    }
+
+    /// 记录一次自动检查时间（检查成功后调用；失败不记录以便下次重试）。
+    pub fn record_auto_check(&self) -> Result<(), UpdateError> {
+        let path = self.last_check_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let stamp = LastCheck {
+            epoch_secs: unix_now_secs(),
+        };
+        std::fs::write(&path, serde_json::to_string(&stamp).map_err(|e| {
+            UpdateError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        })?)?;
+        Ok(())
+    }
+
     /// Get the current version string.
     pub fn current_version(&self) -> &str {
         &self.current_version
     }
+
+    /// 数据目录（下载目录 + last_check.json 所在目录）。
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    fn last_check_path(&self) -> PathBuf {
+        self.data_dir.join("last_check.json")
+    }
+
+    fn last_check_secs(&self) -> Option<u64> {
+        let text = std::fs::read_to_string(self.last_check_path()).ok()?;
+        serde_json::from_str::<LastCheck>(&text).ok().map(|l| l.epoch_secs)
+    }
+}
+
+/// 当前 unix epoch 秒。
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// GitHub API release response.
@@ -175,6 +326,38 @@ struct GitHubAsset {
     browser_download_url: String,
     #[serde(default)]
     name: String,
+}
+
+/// 按平台挑选 asset：关键字命中数计分，平分时扩展名偏好胜出；
+/// 全部不命中则退回第一个 asset。
+fn pick_asset<'a>(assets: &'a [GitHubAsset], platform: Platform) -> Option<&'a GitHubAsset> {
+    if assets.is_empty() {
+        return None;
+    }
+    let keywords = platform.asset_keywords();
+    let preferred = platform.preferred_extension();
+
+    let mut best: Option<(&GitHubAsset, i32)> = None;
+    for asset in assets {
+        let name = asset.name.to_ascii_lowercase();
+        let mut score = 0i32;
+        for kw in keywords {
+            if name.contains(kw) {
+                score += 1;
+            }
+        }
+        if !preferred.is_empty() && name.ends_with(preferred) {
+            score += 1;
+        }
+        let replace = match best {
+            None => score > 0,
+            Some((_, best_score)) => score > best_score,
+        };
+        if replace {
+            best = Some((asset, score));
+        }
+    }
+    best.map(|(a, _)| a).or_else(|| assets.first())
 }
 
 /// Simple semver comparison: returns true if `new` > `current`.
@@ -235,10 +418,91 @@ mod tests {
             checksum: "abc123".to_string(),
             release_date: "2024-01-01".to_string(),
             release_notes: "Bug fixes".to_string(),
+            asset_name: "KirinDesk-1.0.0-windows-x86_64.exe".to_string(),
         };
         let json = serde_json::to_string(&info).unwrap();
         assert!(json.contains("1.0.0"));
         let parsed: ReleaseInfo = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.version, "1.0.0");
+        assert_eq!(parsed.asset_name, "KirinDesk-1.0.0-windows-x86_64.exe");
+        // 旧格式（无 asset_name 字段）也能解析
+        let old: ReleaseInfo = serde_json::from_str(
+            r#"{"version":"1.0.0","download_url":"https://x/y","checksum":"","release_date":"","release_notes":""}"#,
+        )
+        .unwrap();
+        assert_eq!(old.asset_name, "");
+    }
+
+    #[test]
+    fn test_pick_asset_windows_prefers_exe() {
+        let assets = vec![
+            asset("KirinDesk-1.0.0-windows-x86_64.zip"),
+            asset("KirinDesk-1.0.0-windows-x86_64.exe"),
+            asset("KirinDesk-1.0.0-linux-amd64.deb"),
+            asset("KirinDesk-1.0.0-universal.dmg"),
+        ];
+        let picked = pick_asset(&assets, Platform::Windows).unwrap();
+        assert_eq!(picked.name, "KirinDesk-1.0.0-windows-x86_64.exe");
+    }
+
+    #[test]
+    fn test_pick_asset_platform_keyword() {
+        let assets = vec![
+            asset("KirinDesk-1.0.0-universal.dmg"),
+            asset("KirinDesk-1.0.0-windows-x86_64.exe"),
+        ];
+        assert_eq!(
+            pick_asset(&assets, Platform::MacOS).unwrap().name,
+            "KirinDesk-1.0.0-universal.dmg"
+        );
+        assert_eq!(
+            pick_asset(&assets, Platform::Linux).unwrap().name,
+            "KirinDesk-1.0.0-universal.dmg" // 无 linux 资产 → 退回第一个
+        );
+    }
+
+    #[test]
+    fn test_pick_asset_empty_falls_back_first() {
+        let assets = vec![
+            asset("KirinDesk-1.0.0-source.tar.gz"),
+            asset("KirinDesk-1.0.0-checksums.txt"),
+        ];
+        assert_eq!(
+            pick_asset(&assets, Platform::Windows).unwrap().name,
+            "KirinDesk-1.0.0-source.tar.gz"
+        );
+        assert!(pick_asset(&[], Platform::Windows).is_none());
+    }
+
+    #[test]
+    fn test_auto_check_interval_and_record() {
+        let dir = std::env::temp_dir().join(format!("kirin_desk-update-check-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let updater = Updater::new(dir.clone(), UpdateChannel::Stable);
+
+        // 无记录 → 需要检查
+        assert!(updater.should_auto_check(7));
+        updater.record_auto_check().unwrap();
+        // 刚记录 → 不需要检查
+        assert!(!updater.should_auto_check(7));
+        // 间隔拉满（1 天间隔、刚检查过）→ 仍不需要
+        assert!(!updater.should_auto_check(1));
+
+        // 伪造 8 天前的检查记录 → 需要检查
+        let path = updater.last_check_path();
+        let old = LastCheck {
+            epoch_secs: unix_now_secs() - 8 * 86400,
+        };
+        std::fs::write(&path, serde_json::to_string(&old).unwrap()).unwrap();
+        assert!(updater.should_auto_check(7));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn asset(name: &str) -> GitHubAsset {
+        GitHubAsset {
+            browser_download_url: format!("https://example.com/{name}"),
+            name: name.to_string(),
+        }
     }
 }

@@ -1,5 +1,6 @@
 use crate::godaddy::{GoDaddyClient, GoDaddyError, Record};
 use serde::{Deserialize, Serialize};
+use tracing::{debug, trace};
 
 /// Kirin-style device metadata stored as a JSON TXT record on the device's subdomain root.
 ///
@@ -98,6 +99,8 @@ impl<'a> TxtManager<'a> {
         meta: &DeviceMeta,
         ttl: u32,
     ) -> Result<(), GoDaddyError> {
+        debug!("TXT register: device={}, device_type={}, ttl={}", device_id, meta.device_type, ttl);
+        trace!("TXT register: device={}, full_key={}", device_id, meta.key);
         let records = vec![Record {
             data: meta.to_txt(),
             ttl,
@@ -110,6 +113,7 @@ impl<'a> TxtManager<'a> {
 
     /// Query the device metadata from its subdomain TXT record.
     pub async fn query(&self, device_id: &str) -> Result<DeviceMeta, GoDaddyError> {
+        debug!("TXT query: device={}", device_id);
         let records = self
             .client
             .get_records(self.domain, "TXT", device_id)

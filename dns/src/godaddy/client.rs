@@ -6,6 +6,7 @@ use reqwest::Response;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
+use tracing::{debug, trace};
 
 /// Maximum number of retries for rate-limited requests.
 const MAX_RETRIES: u32 = 3;
@@ -109,6 +110,7 @@ impl GoDaddyClient {
         name: &str,
     ) -> Result<Vec<Record>, GoDaddyError> {
         let url = self.record_url(domain, record_type, name);
+        debug!("GoDaddy GET {} {} {}", record_type, domain, name);
         let response = self.execute_with_retry(|| {
             let client = self.client.clone();
             let url = url.clone();
@@ -117,6 +119,7 @@ impl GoDaddyClient {
         .await?;
 
         let records: Vec<Record> = response.json().await?;
+        debug!("GoDaddy GET {} {} {} -> {} records", record_type, domain, name, records.len());
         Ok(records)
     }
 
@@ -132,6 +135,7 @@ impl GoDaddyClient {
     ) -> Result<(), GoDaddyError> {
         let url = self.record_url(domain, record_type, name);
         let body = serde_json::to_string(records)?;
+        trace!("GoDaddy PUT {} {} {} -> body={}", record_type, domain, name, body);
 
         let _response = self
             .execute_with_retry(|| {
@@ -142,6 +146,7 @@ impl GoDaddyClient {
             })
             .await?;
 
+        debug!("GoDaddy PUT {} {} {} -> OK", record_type, domain, name);
         Ok(())
     }
 
@@ -153,6 +158,7 @@ impl GoDaddyClient {
         name: &str,
     ) -> Result<(), GoDaddyError> {
         let url = self.record_url(domain, record_type, name);
+        debug!("GoDaddy DELETE {} {} {}", record_type, domain, name);
 
         let response = self
             .execute_with_retry(|| {
@@ -181,10 +187,14 @@ impl GoDaddyClient {
             let response = request_fn().await?;
 
             if response.status().is_success() {
+                trace!("GoDaddy API response: {} {}", response.status().as_u16(), response.url());
                 return Ok(response);
             }
 
-            if response.status().as_u16() == 429 {
+            let status = response.status().as_u16();
+            debug!("GoDaddy API error response: {} {}", status, response.url());
+
+            if status == 429 {
                 let error = GoDaddyError::from_response(response).await;
                 tracing::warn!(
                     "Rate limited by GoDaddy API (attempt {}/{}), backing off...",

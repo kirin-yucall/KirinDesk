@@ -1,0 +1,36 @@
+# 跨平台（Linux / macOS / Windows）统一换行符策略：
+# 所有文本文件在仓库内与检出时一律使用 LF，保证三平台行为完全一致，
+# 同时消除 "LF will be replaced by CRLF / CRLF will be replaced by LF" 警告。
+* text=auto eol=lf
+
+# --- 二进制文件：禁止任何换行符转换 ---
+*.dll binary
+*.exe binary
+*.node binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.bmp binary
+*.webp binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary
+*.eot binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.tar binary
+*.7z binary
+*.rar binary
+*.db binary
+*.sqlite binary
+*.mp3 binary
+*.mp4 binary
+*.avi binary
+*.mov binary
+
+# .gitattributes 本身始终以 LF 存储
+/.gitattributes text eol=lf

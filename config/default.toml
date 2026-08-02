@@ -1,6 +1,8 @@
 [device]
 id = "default-device"
 name = "My Device"
+nickname = ""
+challenge_code = ""
 
 [godaddy]
 api_key = ""
@@ -12,6 +14,8 @@ api_url = "https://api.godaddy.com"
 port = 3389
 heartbeat_interval = 30
 dns_ttl = 600
+# M8-T017: 临时连接窗口时长（秒，范围 60–3600，默认 300 = 5 分钟）
+temp_mode_ttl_secs = 300
 
 [media]
 encoder = "auto"
@@ -21,3 +25,9 @@ bitrate = 5000
 [logging]
 level = "info"
 format = "text"
+
+[file_transfer]
+# M13-T006: 接收文件落盘目录（留空 = 默认 ~/Downloads/KirinDesk）
+download_dir = ""
+# 单文件大小上限（字节，默认 4 GiB）
+max_file_size = 4294967296

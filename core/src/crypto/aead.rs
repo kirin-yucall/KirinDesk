@@ -25,6 +25,14 @@ pub struct AeadCipher {
     cipher: Aes256Gcm,
 }
 
+impl std::fmt::Debug for AeadCipher {
+    /// 摘要 Debug：`Aes256Gcm`（aead crate）本身不实现 Debug，且会话密钥
+    /// 属敏感数据——禁止输出密钥材料到日志/测试输出。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AeadCipher").finish_non_exhaustive()
+    }
+}
+
 impl AeadCipher {
     /// Create a new AEAD cipher from a 32-byte session key.
     pub fn new(key: &[u8; 32]) -> Self {

@@ -10,6 +10,8 @@ pub enum Ipv6Error {
     InterfaceError(String),
 }
 
+use tracing::{debug, trace};
+
 /// Get the global unicast IPv6 address(es) for this machine.
 ///
 /// Filters out:
@@ -22,8 +24,10 @@ pub enum Ipv6Error {
 pub fn get_global_ipv6_addrs() -> Result<Vec<Ipv6Addr>, Ipv6Error> {
     let mut addrs = Vec::new();
 
-    let ifaces = get_if_addrs::get_if_addrs()
-        .map_err(|e| Ipv6Error::InterfaceError(e.to_string()))?;
+    let ifaces =
+        get_if_addrs::get_if_addrs().map_err(|e| Ipv6Error::InterfaceError(e.to_string()))?;
+
+    debug!("IPv6 detection: found {} network interfaces", ifaces.len());
 
     for iface in &ifaces {
         if let get_if_addrs::IfAddr::V6(ifv6) = &iface.addr {
@@ -31,29 +35,36 @@ pub fn get_global_ipv6_addrs() -> Result<Vec<Ipv6Addr>, Ipv6Error> {
 
             // Skip loopback
             if v6.is_loopback() {
+                trace!("IPv6 detection: skip loopback {}", v6);
                 continue;
             }
             // Skip link-local (fe80::/10)
             let octets = v6.octets();
             if octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80 {
+                trace!("IPv6 detection: skip link-local {}", v6);
                 continue;
             }
             // Skip multicast
             if v6.is_multicast() {
+                trace!("IPv6 detection: skip multicast {}", v6);
                 continue;
             }
             // Skip unspecified
             if v6.is_unspecified() {
+                trace!("IPv6 detection: skip unspecified {}", v6);
                 continue;
             }
 
+            trace!("IPv6 detection: accept global {}", v6);
             addrs.push(v6);
         }
     }
 
     if addrs.is_empty() {
+        debug!("IPv6 detection: no global IPv6 address found");
         Err(Ipv6Error::NoGlobalIpv6)
     } else {
+        debug!("IPv6 detection: found {} global IPv6 address(es): {:?}", addrs.len(), addrs);
         Ok(addrs)
     }
 }

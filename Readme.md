@@ -1,74 +1,195 @@
-# KirinDesk — P2P Remote Desktop
+# 🦄 KirinDesk — The P2P Remote Desktop Built to Retire SSH
 
-**IPv6 + Zero Trust 加密 + 去中心化 DNS 发现**
+**Fully Decentralized · Pure P2P Direct Connect · Zero Relay Servers · Zero TLS Certificates · End-to-End Encrypted**
 
-KirinDesk 是一个基于 IPv6 直连的 P2P 远程桌面/远程 Shell 软件。无需中继服务器，不依赖传统 TLS 证书 — 通过 **GoDaddy DNS API** 管理 SRV（端口）、AAAA（IPv6 地址）和 TXT（设备公钥）记录，实现去中心化设备发现与端到端加密。
+> **中文版:** [Readme_CN.md](Readme_CN.md) ｜ **English:** This file
 
-## 核心特性
+---
 
-- **IPv6 直连** — 利用 IPv6 全球可达性，无需 STUN/TURN/中继
-- **零信任加密** — Ed25519 身份密钥 + X25519 ECDH + AEAD（AES-256-GCM），每次会话独立派生密钥
-- **DNS 去中心化发现** — 通过 GoDaddy DNS 自动注册/发现设备（SRV + AAAA + TXT 三路并行查询）
-- **双模式连接** — 域名模式（DNS 发现，推荐） 或 IP 模式（直连 IPv6）
-- **远程桌面** — 跨平台屏幕捕获 + 硬件编码（NVENC/VAAPI）+ 远程输入注入
-- **远程 Shell** — 无头 Ubuntu Server 远程终端（替代 SSH）
-- **域名白名单** — 严格模式仅允许白名单域名发起连接
-- **跨平台** — Windows GUI（egui）/ 命令行 / Linux Server
+## The Vision
 
-## 快速开始
+Every device should be able to reach every other device directly — securely, privately, with no third party standing between them. That simple conviction is the entire reason KirinDesk exists. We believe the remote-control experience of the future does not route through corporate cloud farms, does not beg a relay server to stay online, and does not lean on an obscure chain of certificates. It is two devices shaking hands across the open Internet and speaking only to each other.
+
+KirinDesk turns that belief into working software by standing on three pillars that are anything but exotic: **IPv6** gives every device a globally reachable address; **the DNS system** becomes a decentralized, censorship-resistant bulletin board where devices publish where they are and who they are; and **modern public-key cryptography** replaces the entire legacy TLS certificate apparatus with something simpler, stronger, and truly zero-trust. No relay servers. No STUN/TURN. No port forwarding. No certificate authorities. Just devices, DNS, and math.
+
+## Why the World Needs KirinDesk
+
+### SSH: a quarter-century of brute force and patchwork defense
+
+For over 25 years, SSH has been the workhorse of remote administration — and for over 25 years, port 22 has been scanned by every botnet on the planet. Password brute-force attacks never stop; your only defenses are patchwork like fail2ban, nonstandard ports that amount to security by obscurity, and constant vigilance. SSH was designed in an era when the Internet was smaller and more trusting. It was never designed to face the always-on, globally scanned attack surface of today's world.
+
+### RDP / VNC: centralized authentication, 24/7 exposure
+
+RDP and VNC carry their own burdens. Authentication leans on centralized directory services, the control port sits exposed around the clock, and traffic frequently lacks true end-to-end encryption. They are LAN-era tools asked to do an Internet-era job — and it shows.
+
+### Commercial remote control: your screen rides someone else's highway
+
+TeamViewer, AnyDesk, and their peers route every pixel of your screen through vendor-owned relay infrastructure. That means a third party always can — or at least could — see what you see. It means a vendor outage becomes your outage. And it means the privacy of your remote session depends on someone else's promises.
+
+**KirinDesk was built to retire all three.**
+
+## The KirinDesk Answer: Pure P2P, Zero Middlemen
+
+When you connect with KirinDesk, your device reaches out directly to the target device — not to a relay, not through a broker. The two endpoints negotiate a mutually authenticated, end-to-end encrypted tunnel and talk to each other for the life of the session. Nothing in between can read, block, or log your traffic, because nothing is in between.
+
+```
+Legacy approach                               KirinDesk
+────────────────                               ─────────
+device ──▶ central server ──▶ device           device ──▶ device
+          (relay / outage /                    (direct / zero
+           sniffable)                          middlemen)
+```
+
+With IPv6, every device is globally reachable — no NAT traversal tricks, no STUN/TURN servers, no manual port forwarding on routers that refuse to cooperate. The address is just there, and KirinDesk connects to it. It is the closest thing the Internet has to the way networking was always meant to work.
+
+## Security Reimagined: Zero Trust, Zero Certificates
+
+KirinDesk throws away the legacy TLS certificate system — no certificate authorities, no certificate chains, no expiry ceremonies, no PKI infrastructure to maintain. Instead, every device mints its own cryptographic identity at first run:
+
+- An **Ed25519 long-term identity keypair** is generated on the device. The private key never leaves it (encrypted at rest), while the public key is published to the device's DNS TXT record — an unforgeable calling card.
+- When two devices meet, they perform a **mutual authentication handshake**: challenge-response signed with Ed25519, key agreement via **X25519 ECDH**, and a session key derived with HKDF.
+- Every byte of the session is sealed with **AEAD encryption (AES-256-GCM / ChaCha20-Poly1305)** — and every session derives a fresh key, giving the channel **perfect forward secrecy**. Even if a long-term key is ever compromised, past sessions stay sealed forever.
+
+The result is a security model with a far smaller attack surface than the status quo: no passwords to brute-force over the wire, no certificates to forge, no trust anchor you didn't personally mint. The math does the talking.
+
+## Domain Whitelists: Access Control That Follows Devices, Not Addresses
+
+Access control is where KirinDesk makes one of its most elegant — and most practical — departures from convention: **whitelists are expressed in domain names, not IP addresses.**
+
+IP-address whitelists are a maintenance nightmare. Addresses change under you — DHCP renumbering, IPv6 privacy extensions, roaming laptops, cloud instances recreated overnight. A whitelist entry that works today silently fails tomorrow, and the usual "fix" is loosening the list until it stops meaning anything. IP addresses are also meaningless to humans: a wall of `2001:db8::f3a2`-looking strings tells you nothing about who is actually allowed in.
+
+Domain whitelists fix every one of those problems at once:
+
+- **They are human-readable.** `alice.example.com` says exactly who is welcome — no lookup table required.
+- **They survive address changes.** A device's IPv6 address may churn, but its domain name is stable by design. The whitelist keeps working while the address changes underneath it.
+- **They are cryptographically verifiable.** DNS isn't just a phone book here — it is the identity registry. The whitelist entry, the published public key, and the resolved address all come from the same authoritative source, so a domain name is a real identity claim, not a guess.
+- **They are enforceable with zero exposure.** In strict mode, the server simply refuses any connection that does not originate from a whitelisted domain — your access list is a list of trusted identities, not a list of addresses that happen to be correct today.
+
+That is the kind of design that feels obvious in hindsight: move the whitelist from the layer that changes (IP) to the layer that doesn't (names), and convenience and security improve at once.
+
+## A True SSH Replacement
+
+KirinDesk's Server mode gives headless machines — Ubuntu servers, VPSes, cloud instances — a remote administration channel that makes legacy SSH look positively medieval. No fixed port to scan, no password to brute-force: connections are gated by the domain whitelist and proven by a challenge code plus an Ed25519 signature. Traffic rides the same end-to-end encrypted, forward-secret tunnel as the remote desktop. And because the device publishes its own DNS records, even a machine behind a brand-new IPv6 address is found by name, instantly. The remote shell runs over a PTY on the encrypted channel — the terminal you love, with security you never had.
+
+## At a Glance: KirinDesk vs. The Old Guard
+
+| Aspect | Traditional SSH | RDP / VNC | Commercial Remote Desktop | **KirinDesk** |
+|--------|-----------------|-----------|---------------------------|---------------|
+| Connectivity | Direct port | Direct port | Central server relay | **Pure P2P direct** |
+| Relay server | None | None | Required | **None at all** |
+| Port exposure | 22, globally scanned | Scannable | None | **No fixed port exposure** |
+| Authentication | Password / key | Password / cert | Vendor account | Challenge code + Ed25519 signature |
+| Encryption | Transport-level | Weak / none | Vendor-dependent | **End-to-end AEAD, forward-secret** |
+| Access control | — | — | Vendor accounts | **Domain whitelist (strict mode)** |
+| Privacy | — | — | Traffic via third party | **Zero middlemen** |
+| Decentralized | ✗ | ✗ | ✗ | **✓ Fully decentralized** |
+
+## Core Features
+
+- **Pure P2P over IPv6** — direct device-to-device tunnels; no relay, no STUN/TURN, no port forwarding
+- **Zero-trust cryptography** — Ed25519 identities, X25519 ECDH, AEAD (AES-256-GCM / ChaCha20-Poly1305), per-session keys with perfect forward secrecy
+- **DNS as the decentralized registry** — devices self-register and self-discover via GoDaddy DNS (SRV + AAAA + TXT queried in parallel), with heartbeat keep-alive
+- **Domain whitelist (strict mode)** — only whitelisted domains may initiate connections
+- **Dual connection modes** — domain mode (DNS discovery, recommended) or direct IPv6 mode
+- **Remote desktop** — FFmpeg libavcodec H.264/H.265 encode/decode with hardware acceleration (NVENC/AMF/QSV/VAAPI/libx264), QSV hardware decode with software fallback
+- **Adaptive media pipeline** — 70 ms windowed delivery over QUIC (datagram + reliable-stream transport, loss detection) with a feedback loop that adjusts encoding in real time
+- **Remote shell (PTY)** — a full SSH replacement for headless servers
+- **Cross-platform** — Windows (egui GUI + CLI), Linux (pipewire capture, VAAPI, uinput), macOS (zed-scap, VideoToolbox, Keychain identity storage)
+- **Automatic logging** — daily rotating logs with automatic cleanup
+- **Packaged for the real world** — NSIS installer (Windows), .deb with systemd service (Ubuntu), universal .app + .dmg (macOS), and in-app auto-update
+
+## Quick Start
 
 ### Windows
 
-从 [release](release/) 下载 `KirinDesk.exe`，双击启动 GUI。  
-或使用命令行模式：
+Download `KirinDesk.exe` from [release](release/) and double-click — or use the CLI:
 
 ```batch
-KirinDesk.exe --cli setup          # 交互式配置向导
-KirinDesk.exe --cli register my-pc # 注册设备到 DNS
-KirinDesk.exe --cli serve 3389     # 启动服务端
+KirinDesk.exe --cli setup          # interactive setup wizard
+KirinDesk.exe --cli register my-pc # register device to DNS
+KirinDesk.exe --cli serve 3389     # start server
 ```
 
 ### Ubuntu Server
 
 ```bash
-# 依赖
+# Dependencies
 sudo apt install build-essential libssl-dev pkg-config \
   libx11-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-  libxkbcommon-dev libwayland-dev libpipewire-0.3-dev \
-  libpulse-dev libudev-dev ffmpeg libavcodec-dev
+  libxkbcommon-dev libwayland-dev libavcodec-dev \
+  libavutil-dev libswscale-dev
 
 git clone <repo>
 cd KirinDesk
 cargo build --release -p kirin-desk-ui
 
-# 配置与服务端
+# Configure & run the server
 ./target/release/kirin-desk-ui --cli setup
 ./target/release/kirin-desk-ui --cli register my-server 22
-./target/release/kirin-desk-ui --cli serve 22    # 远程 Shell 模式
+./target/release/kirin-desk-ui --cli serve 22
 ```
 
-### 客户端连接
+### Client Connection
 
 ```bash
-# 域名模式（DNS 自动发现端口 + IPv6 + 公钥）
+# Domain mode (DNS auto-discovers port + IPv6 + public key)
 KirinDesk.exe --cli connect my-server.example.com 22 mynickname
 
-# IP 模式（直接指定 IPv6 + 端口）
+# IP mode (direct IPv6 + port)
 KirinDesk.exe --cli connect 2001:db8::1 3389 mynickname
 ```
 
-## GUI 操作
+## GUI Overview
 
-| 标签页 | 功能 |
-|--------|------|
-| **Dashboard** | 设备信息总览（Device ID、IPv6、端口、域名白名单） |
-| **Connect** | 连接远程设备 — 支持 IPv6+Port 或 Domain+Nickename+Challenge 两种表单 |
-| **Settings** | 配置 Device ID、Nickname、Challenge Code、GoDaddy API、域名白名单、连接模式 |
-| **Devices** | 已发现/连接的设备列表 |
+| Tab | Function |
+|-----|----------|
+| **Dashboard** | Device overview (Device ID, IPv6, port, domain whitelist) |
+| **Connect** | Connect to a remote device — IPv6+Port or Domain+Nickname+Challenge forms |
+| **Settings** | Configure Device ID, Nickname, Challenge Code, GoDaddy API, domain whitelist, connection mode |
+| **Devices** | List of discovered / connected devices |
 
-在 Settings 中切换 **IP Mode** 和 **Domain Mode** 后，Connect 页会自动切换对应表单。
+## Security Architecture
 
-## 命令行命令
+```
++---------------------------+       +---------------------------+
+|  Client (controller)      |       |  Server (controlled)      |
+|                           |       |                           |
+|  FFmpeg libavcodec decode |       |  FFmpeg libavcodec encode |
+|  ├─ h264_qsv / h264       |       |  ├─ h264_nvenc            |
+|  ├─ hevc_qsv / hevc       |       |  ├─ h264_amf              |
+|  └─ swscale YUV→RGBA      |       |  ├─ h264_qsv              |
+|                           |       |  ├─ h264_vaapi            |
+|                           |       |  └─ libx264               |
+|        ↕                  |       |        ↕                  |
+|  KirinDesk P2P secure     |──────▶│  KirinDesk P2P secure     |
+|  tunnel                   |  P2P  │  tunnel                   |
+|  ├─ Ed25519 identity      |  IPv6 │  ├─ Ed25519 identity      |
+|  ├─ X25519 ECDH key exch. |       │  ├─ X25519 ECDH key exch. |
+|  └─ AEAD AES-256-GCM      |       │  └─ AEAD AES-256-GCM      |
++---------------------------+       +---------------------------+
+            ↑                                ↑
+            │        GoDaddy DNS             │
+            │  (SRV + AAAA + TXT records)    │
+            +────────────────────────────────+
+```
+
+## Project Structure
+
+```
+KirinDesk/
+├── core/          # Zero-trust crypto (Ed25519/X25519/AEAD/handshake), IPv6 networking, connection management
+├── dns/           # GoDaddy API client, SRV/AAAA/TXT management, service discovery & heartbeat
+├── media/         # Screen/audio capture, FFmpeg libavcodec encode/decode, QUIC transport, adaptive feedback
+├── input/         # Remote input: Windows SendInput / Linux uinput / macOS CGEvent
+├── ui/            # egui desktop GUI + clap CLI
+├── updater/       # Auto-update (check / download / install)
+├── utils/         # Config, logging, error types
+├── ffmpeg/        # FFmpeg 8.1.2 shared libraries (avcodec-62/avutil-60/swscale-9)
+├── config/        # Configuration structures & defaults
+└── release/       # Installers & packaging (NSIS / deb / dmg)
+```
+
+## CLI Commands
 
 ```
 kirin_desk <command> [options]
@@ -81,93 +202,11 @@ kirin_desk <command> [options]
   shell [port]         Remote shell server (domain whitelist)
   serve [port]         Start listening for connections
   status               Show system status
+  self-test            End-to-end self test
   help                 Show this help
 ```
 
-## 安全架构
-
-```
-+---------------------------+       +---------------------------+
-|  Client (控制端)          |       |  Server (被控端)           |
-|                           |       |                           |
-|  1. 查询 DNS TXT 获取公钥 |       |  1. Ed25519 身份密钥对    |
-|  2. 生成 X25519 临时密钥   |──────▶|  2. 验签 + 挑战码验证      |
-|  3. ECDH 派生会话密钥     |  P2P  |  3. ECDH 派生会话密钥     |
-|  4. AEAD 加密音视频/控制  | IPv6  |  4. AEAD 解密并响应       |
-+---------------------------+       +---------------------------+
-            ↑                                ↑
-            |        GoDaddy DNS             |
-            |  (SRV + AAAA + TXT 记录)       |
-            +────────────────────────────────+
-```
-
-- **Ed25519** — 长期身份密钥，公钥存 DNS TXT 记录
-- **X25519** — 临时会话密钥交换（ECDH）
-- **AEAD** — AES-256-GCM / ChaCha20，每次会话独立派生
-- **前向安全** — 长期密钥泄露不影响历史会话
-
-## 项目结构
-
-```
-KirinDesk/
-├── core/          # 核心：加密（Ed25519/X25519/AEAD/握手）、网络（TCP/IPv6）
-├── dns/           # DNS 模块：GoDaddy API 客户端、SRV/AAAA/TXT 管理、服务发现
-├── media/         # 媒体处理：屏幕捕获、FFmpeg 硬件编码、音频、流传输
-├── input/         # 远程输入：Windows SendInput / Linux uinput
-├── ui/            # 用户界面：egui（桌面 GUI） + CLI
-├── updater/       # 自动更新
-├── utils/         # 工具库：配置、日志、错误类型
-└── tests/         # 集成测试
-```
-
-## Ubuntu Server 模式（远程 Shell）
-
-KirinDesk 可作为 SSH 的安全替代方案运行在无头服务器上。
-
-| 特性 | 传统 SSH | KirinDesk Server |
-|------|---------|------------------|
-| 端口暴露 | 22/tcp，全球可扫 | 自定义端口，仅白名单域名可连 |
-| 认证 | 密码/密钥 | 昵称 + 挑战码 + Ed25519 签名 |
-| 域名限制 | 无 | 域名白名单（严格模式） |
-| 加密 | SSH 传输加密 | AES-256-GCM AEAD + X25519 ECDH |
-| 前向安全 | 依赖 KEX 算法 | ✓ 会话级 |
-| IPv6 | 需额外配置 | ✓ 原生 |
-
-```bash
-# 服务端
-./kirin-desk-ui --cli serve 22
-
-# 客户端
-KirinDesk.exe --cli connect my-server.example.com 22 mynickname
-```
-
-## 从源码构建
-
-```bash
-git clone <repo>
-cd KirinDesk
-
-# 所有 crate
-cargo build --release
-
-# 仅 GUI/CLI 二进制
-cargo build --release -p kirin-desk-ui
-
-# 运行测试
-cargo test --target-dir /tmp/kirin-target
-```
-
-### Windows 构建要求
-
-- Build Tools for Visual Studio（MSVC 工具链）
-- FFmpeg Shared Build（设置 `FFMPEG_DIR` 环境变量）
-- Rust 工具链：`rustup default stable`
-
-## 配置
-
-配置文件位于 `~/.config/kirin_desk/default.toml`（Linux）或 `%APPDATA%/kirin_desk/default.toml`（Windows）。
-
-主要配置项：
+## Configuration
 
 ```toml
 [device]
@@ -184,8 +223,19 @@ domain = "example.com"
 port = 3389
 allowed_domains = ["example.com"]
 ip_mode_allowed = false
+
+[codec]
+# Encoding settings
+h264_bitrate = 5000000    # target bitrate (bps)
+framerate = 30            # target frame rate
+# Decoding settings
+enable_hw_decode = true   # enable hardware decode (DXVA/VAAPI)
+
+[logging]
+level = "info"
+format = "text"
 ```
 
 ## License
 
-MIT
+Apache 2.0 (KirinDesk core) + LGPL (FFmpeg libraries, dynamically loaded)

@@ -6,6 +6,7 @@ use std::net::Ipv6Addr;
 use std::time::{Duration, Instant};
 use std::collections::HashMap;
 use std::sync::Mutex;
+use tracing::{debug, info, trace};
 
 /// Information about a discovered device.
 ///
@@ -96,12 +97,17 @@ impl<'a> DiscoveryService<'a> {
             let cache = self.cache.lock().unwrap();
             if let Some(entry) = cache.get(device_id) {
                 if entry.expires_at > Instant::now() {
+                    debug!("Discovery cache hit for '{}' (expires in {:?})", device_id, entry.expires_at - Instant::now());
                     return Ok(entry.info.clone());
                 }
+                debug!("Discovery cache expired for '{}'", device_id);
+            } else {
+                trace!("Discovery cache miss for '{}'", device_id);
             }
         }
 
         let subdomain = format!("{}.{}", device_id, self.domain);
+        debug!("Discovering '{}' via parallel SRV+TXT+AAAA on domain '{}'", device_id, self.domain);
 
         // Triple parallel: SRV (port) + TXT (key) + AAAA (IP)
         let (srv_res, txt_res, aaaa_res) = tokio::join!(
@@ -109,6 +115,23 @@ impl<'a> DiscoveryService<'a> {
             self.txt_mgr.query(device_id),
             self.aaaa_mgr.query(device_id),
         );
+
+        // Log each result individually for debugging which one fails
+        match &srv_res {
+            Ok(srv_list) => debug!("Discovery SRV for '{}': {} records, first port={}", device_id, srv_list.len(), srv_list.first().map(|s| s.port).unwrap_or(0)),
+            Err(e) => debug!("Discovery SRV for '{}' FAILED: {}", device_id, e),
+        }
+        match &txt_res {
+            Ok(meta) => {
+                let pk = meta.raw_public_key().unwrap_or("<none>");
+                trace!("Discovery TXT for '{}': key={}, device_type={}", device_id, pk, meta.device_type);
+            }
+            Err(e) => debug!("Discovery TXT for '{}' FAILED: {}", device_id, e),
+        }
+        match &aaaa_res {
+            Ok(addrs) => debug!("Discovery AAAA for '{}': {} addresses, first={:?}", device_id, addrs.len(), addrs.first()),
+            Err(e) => debug!("Discovery AAAA for '{}' FAILED: {}", device_id, e),
+        }
 
         let srv_list = srv_res.map_err(|_| DiscoveryError::SrvNotFound(device_id.to_string()))?;
         let meta = txt_res.map_err(|_| DiscoveryError::TxtNotFound(device_id.to_string()))?;
@@ -124,6 +147,16 @@ impl<'a> DiscoveryService<'a> {
             .raw_public_key()
             .ok_or_else(|| DiscoveryError::InvalidPublicKey(device_id.to_string()))?
             .to_string();
+
+        info!(
+            "Discovered '{}': IPv6={}, port={}, type={}",
+            device_id, ipv6_addr, srv_data.port, meta.device_type
+        );
+        trace!(
+            "Discovery '{}' pubkey (first 16): {}...",
+            device_id,
+            &public_key_base64[..public_key_base64.len().min(16)]
+        );
 
         let info = DeviceInfo {
             device_id: device_id.to_string(),

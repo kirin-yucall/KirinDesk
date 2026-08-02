@@ -12,6 +12,13 @@ pub mod x25519;
 pub mod aead;
 pub mod handshake;
 
+// M12-MAC MAC-T006：macOS Keychain 身份存储（可选后端，默认文件式 PKCS#8）。
+#[cfg(target_os = "macos")]
+pub mod macos_keychain;
+
 pub use ed25519::{Ed25519Error, IdentityManager};
 pub use x25519::{EphemeralSession, X25519Error};
 pub use aead::{AeadCipher, AeadError};
+
+#[cfg(target_os = "macos")]
+pub use macos_keychain::{KeychainError, MacosKeychain};

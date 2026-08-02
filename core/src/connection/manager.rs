@@ -1,6 +1,6 @@
 use std::net::Ipv6Addr;
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Connection state.
 #[derive(Debug, Clone, PartialEq)]
@@ -122,6 +122,7 @@ impl ConnectionManager {
         let mut conns = self.connections.lock().await;
         match event {
             ConnectionEvent::ConnectRequest { peer_id, .. } => {
+                debug!("ConnectionManager: ConnectRequest for '{}'", peer_id);
                 if let Some(conn) = conns.iter_mut().find(|c| c.peer_id == *peer_id) {
                     conn.apply_event(event);
                 } else {
@@ -131,6 +132,7 @@ impl ConnectionManager {
                 }
             }
             _ => {
+                debug!("ConnectionManager: broadcasting event {:?}", event);
                 for conn in conns.iter_mut() {
                     conn.apply_event(event);
                 }

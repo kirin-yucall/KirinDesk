@@ -1,0 +1,127 @@
+name: CI
+
+# M14-T001: 自动化构建/测试 + release 打包。
+# - ci job（push/PR/workflow_dispatch）：三平台 build(debug) + test + build(release)。
+# - release job（workflow_dispatch 或 v* tag）：三平台 release 打包并上传 artifacts：
+#     Windows → zip（exe + FFmpeg DLL + default.toml）
+#     Ubuntu  → .deb（release/debian/build_deb.sh，含 systemd 服务）
+#     macOS   → .app（lipo 通用二进制 + ad-hoc codesign）→ .dmg
+# 注：CARGO_TARGET_DIR 固定为 target-ci，规避中文路径问题（M14-T001 要求）。
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # M14-T001: 固定 target 目录（本地中文路径规避 + rust-cache 可命中）
+  CARGO_TARGET_DIR: target-ci
+
+jobs:
+  # ── CI：构建 + 测试（三平台） ──────────────────────────────
+  ci:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+        include:
+          - os: macos-latest
+            targets: aarch64-apple-darwin   # M12-MAC：Intel runner 上交叉 check
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.targets }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: target-ci
+      - name: Build (debug)
+        run: cargo build --workspace
+      - name: Test
+        run: cargo test --workspace
+      - name: Build (release)
+        run: cargo build --release --workspace
+      # M12-MAC 验收：aarch64-apple-darwin 交叉编译检查
+      # （cargo check 不链接，Apple Silicon target 在 Intel runner 上可验证
+      #  编译期正确性；完整构建 + lipo 通用二进制由 release job 完成。）
+      - name: Check aarch64-apple-darwin
+        if: runner.os == 'macOS'
+        run: cargo check --workspace --target aarch64-apple-darwin
+
+  # ── Release：三平台打包产物上传（手动或 v* tag 触发） ──────
+  release:
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    needs: ci
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            pkg: windows
+          - os: ubuntu-latest
+            pkg: ubuntu
+          - os: macos-latest
+            pkg: macos
+            # lipo 通用二进制需要双架构 target（原生 + 交叉）
+            targets: aarch64-apple-darwin x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.targets }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: target-ci
+
+      # 版本号取自 workspace Cargo.toml（tag 形如 v0.1.0）
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: echo "version=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import sys,json; print(json.load(sys.stdin)["packages"][0]["version"])')" >> "$GITHUB_OUTPUT"
+
+      - name: Build release
+        run: cargo build --release --workspace
+
+      # ── Windows：exe + FFmpeg DLL + 配置 → zip（另附独立 exe 供自动更新安装） ──
+      - name: Package Windows
+        if: matrix.pkg == 'windows'
+        shell: pwsh
+        run: |
+          $dist = "release/dist"
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          Copy-Item "target-ci/release/kirin-desk-ui.exe" "$dist/KirinDesk.exe"
+          Copy-Item "config/default.toml" "$dist/default.toml"
+          Copy-Item "ffmpeg/ffmpeg-8.1.2-full_build-shared/bin/*.dll" "$dist/ffmpeg/" -ErrorAction SilentlyContinue
+          Copy-Item "ffmpeg/ffmpeg-8.1.2-full_build-shared/LICENSE" "$dist/ffmpeg/LICENSE" -ErrorAction SilentlyContinue
+          Compress-Archive -Path "$dist/*" -DestinationPath "KirinDesk-${{ steps.ver.outputs.version }}-windows-x86_64.zip" -Force
+          # 独立 exe 资产：updater 按平台选 asset 时优先 .exe（M14-T005）
+          Copy-Item "$dist/KirinDesk.exe" "KirinDesk-${{ steps.ver.outputs.version }}-windows-x86_64.exe"
+
+      # ── Ubuntu：.deb（release/debian/build_deb.sh） ──
+      - name: Package Ubuntu (.deb)
+        if: matrix.pkg == 'ubuntu'
+        run: bash release/debian/build_deb.sh "${{ steps.ver.outputs.version }}"
+
+      # ── macOS：lipo 通用二进制 → .app → .dmg ──
+      - name: Package macOS (universal .app + .dmg)
+        if: matrix.pkg == 'macos'
+        run: |
+          bash release/macos/build_universal.sh "${{ steps.ver.outputs.version }}"
+          bash release/macos/create_dmg.sh "release/dist" "${{ steps.ver.outputs.version }}"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kirindesk-${{ matrix.pkg }}
+          path: |
+            KirinDesk-${{ steps.ver.outputs.version }}-*.zip
+            KirinDesk-${{ steps.ver.outputs.version }}-windows-x86_64.exe
+            release/dist/*.deb
+            release/dist/*.dmg
+          if-no-files-found: error

@@ -1,7 +1,29 @@
 //! Connection management
+pub mod file_transfer;
 pub mod manager;
+pub mod multiplex;
+pub mod privacy;
 pub mod reconnection;
 pub mod secure_channel;
+pub mod shell_bridge;
+pub mod temp_mode;
 
+pub use file_transfer::{
+    block_len, block_offset, derive_transfer_id, sanitize_filename, sha256_bytes, sha256_file,
+    total_blocks_for, unique_target_path, validate_block_count, ChunkReceiver, FileOfferMeta,
+    FileOp, FileTransferError, FileTransferFrame, SlideWindowSender, StoredTransfer,
+    TransferScheduler, TransferStatus, TransferStore, BLOCK_SIZE, BLOCK_TIMEOUT,
+    DEFAULT_MAX_FILE_SIZE, IDLE_TIMEOUT, MAX_CONCURRENT, WINDOW_SIZE,
+};
 pub use manager::{ConnectionManager, ConnectionState, ConnectionEvent, ManagedConnection};
+// M8-T019: 隐私模式（黑屏 / 锁屏）状态机与平台执行器。
+pub use privacy::{platform_is_locked, platform_lock_screen, PrivacyController, PrivacyLevel, PrivacyOutcome};
+pub use multiplex::{
+    decode_header, encode_frame, spawn_demux_loop, Demultiplexer, MultiplexError, MultiplexType,
+    Multiplexer,
+};
 pub use secure_channel::SecureChannel;
+pub use shell_bridge::{
+    run_shell_bridge, PtySession, ShellError, ShellMessage, DEFAULT_PTY_COLS, DEFAULT_PTY_ROWS,
+};
+pub use temp_mode::{TempModeError, TempModeManager, TempModeState};

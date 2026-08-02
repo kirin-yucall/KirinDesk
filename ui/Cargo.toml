@@ -12,6 +12,17 @@ kirin-desk-input = { path = "../input" }
 kirin-desk-media = { path = "../media" }
 kirin-desk-updater = { path = "../updater" }
 kirin-desk-utils = { path = "../utils" }
-tokio = { workspace = true, features = ["rt", "macros", "process", "io-util"] }
+tokio = { workspace = true, features = ["rt", "macros", "process", "io-util", "net"] }
+bincode.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+dirs-next = "2.0"
 egui = "0.28"
 eframe = "0.28"
+
+# M11: 远程 Shell PTY 模式 — ANSI 解析/终端模拟器 + CLI raw mode
+vt100 = "0.16"
+crossterm = "0.29"
+
+# M13-T003: 剪贴板共享（客户端 ⇄ 服务端）
+arboard = "3.4"

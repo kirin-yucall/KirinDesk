@@ -7,8 +7,12 @@ edition.workspace = true
 tokio.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+bincode.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+libloading = "0.8"   # macOS 注入：dlopen CoreGraphics/ApplicationServices framework（M12-MAC MAC-T002）
+# M8-T020 SKEY-SEC-003: 锁屏调用单一实现 = M8-T019 privacy::platform_lock_screen（core 无 input 依赖，无环）。
+kirin-desk-core = { path = "../core" }
 
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["winuser", "impl-default"] }
+winapi = { version = "0.3", features = ["winuser", "impl-default", "errhandlingapi"] }

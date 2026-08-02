@@ -184,6 +184,59 @@ impl IdentityManager {
     pub fn signing_key(&self) -> &SigningKey {
         &self.signing_key
     }
+
+    /// Load from disk, or generate + save if not found.
+    /// Uses SHA-256(device_id) as encryption key.
+    pub fn load_or_generate(key_path: PathBuf, device_id: &str) -> Result<Self, Ed25519Error> {
+        if key_path.exists() {
+            let enc_key = derive_identity_key(device_id);
+            Self::load(key_path, &enc_key)
+        } else {
+            let id = Self::generate(key_path)?;
+            let enc_key = derive_identity_key(device_id);
+            id.save(&enc_key)?;
+            Ok(id)
+        }
+    }
+
+    /// Default identity file path: ~/.kirin_desk/identity/ed25519.json
+    pub fn default_path() -> Result<PathBuf, Ed25519Error> {
+        let home = dirs_next::home_dir()
+            .ok_or_else(|| Ed25519Error::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound, "no home dir")))?;
+        Ok(home.join(".kirin_desk").join("identity").join("ed25519.json"))
+    }
+}
+
+/// Derive a 32-byte encryption key from a device ID.
+fn derive_identity_key(device_id: &str) -> [u8; 32] {
+    use sha2::{Sha256, Digest};
+    let mut hasher = Sha256::new();
+    hasher.update(b"kirindesk-identity-key:");
+    hasher.update(device_id.as_bytes());
+    let result = hasher.finalize();
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&result);
+    key
+}
+
+/// 公钥指纹（M15 / SRV-SEC-KH-003）：base64 公钥 → SHA-256 → 小写十六进制、
+/// 每 4 字符冒号分组（如 `a1b2:c3d4:...`，64 位十六进制 = 16 组）。
+///
+/// 与 `kirin-desk-utils::known_hosts::fingerprint` 算法一致（两侧均以
+/// base64 公钥为输入），用于服务端返回指纹（`HandshakeResponse.server_fingerprint`）
+/// 与客户端 known_hosts 指纹比对。
+pub fn fingerprint(public_key_base64: &str) -> String {
+    use sha2::{Sha256, Digest};
+    let mut hasher = Sha256::new();
+    hasher.update(public_key_base64.as_bytes());
+    let digest = hasher.finalize();
+    let hex: String = digest.iter().map(|b| format!("{:02x}", b)).collect();
+    hex.as_bytes()
+        .chunks(4)
+        .map(|c| String::from_utf8_lossy(c).to_string())
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
 impl Drop for IdentityManager {

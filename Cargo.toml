@@ -14,7 +14,7 @@ members = [
 edition = "2021"
 version = "0.1.0"
 authors = ["KirinDesk Team"]
-license = "MIT"
+license = "Apache-2.0"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }

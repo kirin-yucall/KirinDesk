@@ -1,4 +1,5 @@
 use crate::godaddy::{GoDaddyClient, GoDaddyError, Record, SrvData};
+use tracing::debug;
 
 /// SRV record name format: `_remote._tcp.{device_id}.{domain}`
 ///
@@ -35,6 +36,7 @@ impl<'a> SrvManager<'a> {
         ttl: u32,
     ) -> Result<(), GoDaddyError> {
         let name = srv_record_name(device_id);
+        debug!("SRV register: device={}, name={}, port={}, target={}, ttl={}", device_id, name, port, target, ttl);
         let data = SrvData {
             priority: 0,
             weight: 1,
@@ -55,6 +57,7 @@ impl<'a> SrvManager<'a> {
     /// Query SRV records for a device.
     pub async fn query(&self, device_id: &str) -> Result<Vec<SrvData>, GoDaddyError> {
         let name = srv_record_name(device_id);
+        debug!("SRV query: device={}, record_name={}", device_id, name);
         let records = self
             .client
             .get_records(self.domain, "SRV", &name)

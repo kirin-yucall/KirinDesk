@@ -1,133 +1,194 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
-use tracing::{info, warn};
+//! 跨平台屏幕捕获抽象层。
+//!
+//! # 后端（与 task_docs 设计一致，M8-T008 §Step 1）
+//!
+//! | 平台 | 后端 | 状态 |
+//! |------|------|------|
+//! | Windows | `windows-capture` crate（唯一后端，无 WGC/DXGI/GDI 回退链） | ✅ 已实现 |
+//! | macOS | `zed-scap` crate（ScreenCaptureKit，M12-MAC MAC-T001） | ✅ 已实现 |
+//! | Linux | `zed-scap` | ⏳ M12（见 远控服务端_需求文档 §3.2.2） |
+//!
+//! 旧后端（wgc/dxgi/gdi/pipewire）已按 M8-T008 设计删除。
 
-/// A single captured frame.
-#[derive(Debug, Clone)]
-pub struct Frame {
-    /// RGBA pixel data.
+pub mod factory;
+
+#[cfg(target_os = "windows")]
+pub mod windows_capture;
+
+#[cfg(target_os = "macos")]
+pub mod zed_scap;
+
+pub use factory::{create_capture_source, enumerate_monitors, list_monitors};
+
+use std::time::Instant;
+
+use crate::proto::DirtyRect;
+
+// ════════════════════════════════════════════════════════════════
+// CaptureFrame
+// ════════════════════════════════════════════════════════════════
+
+/// 一次捕获的结果。
+pub enum CaptureFrame {
+    /// windows-capture crate 帧（Windows 唯一后端）。
+    WindowsCapture(WindowsCaptureFrame),
+    /// zed-scap crate 帧（macOS，ScreenCaptureKit）。
+    ZedScap(ZedScapFrame),
+}
+
+impl CaptureFrame {
+    pub fn data(&self) -> &[u8] {
+        match self {
+            CaptureFrame::WindowsCapture(f) => &f.data,
+            CaptureFrame::ZedScap(f) => &f.data,
+        }
+    }
+
+    pub fn width(&self) -> u32 {
+        match self {
+            CaptureFrame::WindowsCapture(f) => f.width,
+            CaptureFrame::ZedScap(f) => f.width,
+        }
+    }
+
+    pub fn height(&self) -> u32 {
+        match self {
+            CaptureFrame::WindowsCapture(f) => f.height,
+            CaptureFrame::ZedScap(f) => f.height,
+        }
+    }
+
+    pub fn timestamp(&self) -> Instant {
+        match self {
+            CaptureFrame::WindowsCapture(f) => f.timestamp,
+            CaptureFrame::ZedScap(f) => f.timestamp,
+        }
+    }
+
+    /// 返回此帧的 dirty rects 列表。
+    ///
+    /// windows-capture 的 `Frame::dirty_regions()` 提供 dirty rects；
+    /// zed-scap（ScreenCaptureKit）不暴露脏区信息 → 恒空列表
+    /// （捕获层无完整 dirty rects 信息 → Tile-Hash Diff 仍是前置优化层，
+    /// 见 M8-T008 §Step 1）。
+    pub fn dirty_rects(&self) -> &[DirtyRect] {
+        match self {
+            CaptureFrame::WindowsCapture(f) => &f.dirty_rects,
+            CaptureFrame::ZedScap(f) => &f.dirty_rects,
+        }
+    }
+}
+
+/// windows-capture crate 捕获帧。
+pub struct WindowsCaptureFrame {
+    /// RGBA pixel data
     pub data: Vec<u8>,
-    /// Frame width.
+    /// 宽度（像素）
     pub width: u32,
-    /// Frame height.
+    /// 高度（像素）
     pub height: u32,
-    /// Capture timestamp.
+    /// dirty rects（通过 windows-capture 的 Frame::dirty_regions() 获取）
+    pub dirty_rects: Vec<DirtyRect>,
+    /// 捕获线程回调内处理耗时（不含等待）
+    pub processing_time: std::time::Duration,
+    /// 捕获时间戳
     pub timestamp: Instant,
 }
 
-/// Screen capture configuration.
+/// zed-scap crate 捕获帧（macOS，ScreenCaptureKit）。
+///
+/// 结构体本身平台无关（与 [`WindowsCaptureFrame`] 同模式，定义在此处），
+/// macOS 后端实现在 `zed_scap.rs`（`cfg(target_os = "macos")` 门控）。
+pub struct ZedScapFrame {
+    /// RGBA pixel data（zed-scap 原生 BGRA，已转 RGBA 对齐统一管线）
+    pub data: Vec<u8>,
+    /// 宽度（像素）
+    pub width: u32,
+    /// 高度（像素）
+    pub height: u32,
+    /// dirty rects（zed-scap 无脏区信息 → 恒空，上游 diff 层兜底）
+    pub dirty_rects: Vec<DirtyRect>,
+    /// 捕获时间戳（帧到达时刻）
+    pub timestamp: Instant,
+}
+
+// ════════════════════════════════════════════════════════════════
+// CaptureError
+// ════════════════════════════════════════════════════════════════
+
+/// 捕获操作错误。
 #[derive(Debug, Clone)]
-pub struct CaptureConfig {
-    pub framerate: u32,
-    pub monitor_index: usize,
-}
-
-impl Default for CaptureConfig {
-    fn default() -> Self {
-        Self { framerate: 30, monitor_index: 0 }
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
 pub enum CaptureError {
-    #[error("No monitors found")]
-    NoMonitors,
-    #[error("Monitor index {0} out of range")]
-    MonitorNotFound(usize),
-    #[error("Capture failed: {0}")]
-    CaptureFailed(String),
+    /// 捕获超时（指定等待时间内无屏幕变化）。
+    Timeout,
+    /// 连接丢失（需 recreate）。
+    AccessLost,
+    /// 通用捕获失败。
+    Capture(String),
+    /// 无可用显示器。
+    NoMonitor,
+    /// 无效的显示器索引。
+    InvalidMonitor,
 }
 
-/// Screen capture session using DXGI (Windows) via `screenshots` crate.
-pub struct ScreenCapture {
-    pub config: CaptureConfig,
-    running: Arc<AtomicBool>,
-}
-
-impl ScreenCapture {
-    pub fn new(config: CaptureConfig) -> Self {
-        Self { config, running: Arc::new(AtomicBool::new(false)) }
-    }
-
-    /// Capture a single frame.
-    pub fn capture_frame(config: &CaptureConfig) -> Result<Frame, CaptureError> {
-        let screens = screenshots::Screen::all()
-            .map_err(|e| CaptureError::CaptureFailed(e.to_string()))?;
-
-        let screen = screens.get(config.monitor_index)
-            .ok_or(CaptureError::MonitorNotFound(config.monitor_index))?;
-
-        let image = screen.capture()
-            .map_err(|e| CaptureError::CaptureFailed(e.to_string()))?;
-
-        Ok(Frame {
-            data: image.rgba().clone(),
-            width: image.width(),
-            height: image.height(),
-            timestamp: Instant::now(),
-        })
-    }
-
-    /// Start continuous capture loop.
-    pub async fn start<F>(&self, mut on_frame: F) -> Result<(), CaptureError>
-    where
-        F: FnMut(Frame),
-    {
-        self.running.store(true, Ordering::SeqCst);
-        let frame_duration = std::time::Duration::from_secs_f64(1.0 / self.config.framerate as f64);
-        info!("Screen capture started: monitor={}, {}fps", self.config.monitor_index, self.config.framerate);
-
-        while self.running.load(Ordering::SeqCst) {
-            let start = Instant::now();
-            match Self::capture_frame(&self.config) {
-                Ok(frame) => on_frame(frame),
-                Err(e) => warn!("Frame capture failed: {}", e),
-            }
-            let elapsed = start.elapsed();
-            if elapsed < frame_duration {
-                tokio::time::sleep(frame_duration - elapsed).await;
-            }
+impl std::fmt::Display for CaptureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CaptureError::Timeout => write!(f, "capture timeout (no screen change)"),
+            CaptureError::AccessLost => write!(f, "capture access lost — recreate required"),
+            CaptureError::Capture(s) => write!(f, "capture failed: {s}"),
+            CaptureError::NoMonitor => write!(f, "no monitor available"),
+            CaptureError::InvalidMonitor => write!(f, "invalid monitor index"),
         }
-        info!("Screen capture stopped");
-        Ok(())
-    }
-
-    pub fn stop(&self) { self.running.store(false, Ordering::SeqCst); }
-
-    /// List available monitors.
-    pub fn list_monitors() -> Result<Vec<MonitorInfo>, CaptureError> {
-        let screens = screenshots::Screen::all()
-            .map_err(|e| CaptureError::CaptureFailed(e.to_string()))?;
-        Ok(screens.iter().map(|s| MonitorInfo {
-            width: s.display_info.width as u32,
-            height: s.display_info.height as u32,
-            is_primary: s.display_info.is_primary,
-        }).collect())
     }
 }
 
+impl std::error::Error for CaptureError {}
+
+// ════════════════════════════════════════════════════════════════
+// MonitorInfo
+// ════════════════════════════════════════════════════════════════
+
+/// 显示器信息。
 #[derive(Debug, Clone)]
 pub struct MonitorInfo {
+    pub id: usize,
+    pub name: String,
     pub width: u32,
     pub height: u32,
     pub is_primary: bool,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+// ════════════════════════════════════════════════════════════════
+// ScreenCaptureSource trait
+// ════════════════════════════════════════════════════════════════
 
-    #[test]
-    fn test_config_default() {
-        let cfg = CaptureConfig::default();
-        assert_eq!(cfg.framerate, 30);
+/// 跨平台屏幕捕获接口。
+pub trait ScreenCaptureSource: Send {
+    /// 阻塞直到屏幕有实际变化，返回最新帧。
+    ///
+    /// - windows-capture 模式：后台线程回调推帧，此处阻塞接收。
+    fn wait_for_frame(&mut self) -> Result<CaptureFrame, CaptureError>;
+
+    /// M8-T018（MON-NF-002）：带超时的等待——静默屏幕（长时间无画面变化）
+    /// 时，上层可定期醒来处理显示器切换命令；超时返回 [`CaptureError::Timeout`]。
+    /// 默认实现等价旧行为（无限等待）；Windows 后端用 `recv_timeout` 实现。
+    fn wait_for_frame_timeout(
+        &mut self,
+        _timeout: std::time::Duration,
+    ) -> Result<CaptureFrame, CaptureError> {
+        self.wait_for_frame()
     }
 
-    #[test]
-    fn test_monitor_info() {
-        let m = MonitorInfo { width: 1920, height: 1080, is_primary: true };
-        assert_eq!(m.width, 1920);
-        assert!(m.is_primary);
-    }
+    /// 当前捕获分辨率 `(width, height)`。
+    fn resolution(&self) -> (u32, u32);
+
+    /// 显示器信息列表。
+    fn monitor_info(&self) -> &[MonitorInfo];
+
+    /// 切换到指定显示器（按索引）。
+    fn switch_monitor(&mut self, index: usize) -> Result<(), CaptureError>;
+
+    /// 重建捕获源（AccessLost / 分辨率变更后调用）。
+    fn recreate(&mut self) -> Result<(), CaptureError>;
 }

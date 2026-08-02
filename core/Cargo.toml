@@ -20,5 +20,10 @@ uuid.workspace = true
 base64 = "0.22"
 zeroize = { version = "1", features = ["zeroize_derive"] }
 tracing.workspace = true
-get-if-addrs = { version = "0.4", package = "get_if_addrs" }
+get-if-addrs = { version = "0.5", package = "get_if_addrs" }
+dirs-next = "2.0"
+libloading = "0.8"   # M12-MAC MAC-T006：macOS Keychain 经 dlopen Security/CoreFoundation
 kirin-desk-dns = { path = "../dns" }
+
+# M11: 远程 Shell PTY 模式 — 跨平台 PTY（Windows=ConPTY / Unix=forkpty+openpty）
+portable-pty = "0.9"

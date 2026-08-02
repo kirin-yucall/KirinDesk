@@ -1,5 +1,6 @@
 use crate::godaddy::{GoDaddyClient, GoDaddyError, Record};
 use std::net::Ipv6Addr;
+use tracing::debug;
 
 /// Manage AAAA (IPv6 address) records.
 pub struct AaaaManager<'a> {
@@ -19,6 +20,7 @@ impl<'a> AaaaManager<'a> {
         ipv6_addr: Ipv6Addr,
         ttl: u32,
     ) -> Result<(), GoDaddyError> {
+        debug!("AAAA register: device={}, ipv6={}, ttl={}", device_id, ipv6_addr, ttl);
         let records = vec![Record {
             data: ipv6_addr.to_string(),
             ttl,
@@ -31,6 +33,7 @@ impl<'a> AaaaManager<'a> {
 
     /// Query AAAA records for a device.
     pub async fn query(&self, device_id: &str) -> Result<Vec<Ipv6Addr>, GoDaddyError> {
+        debug!("AAAA query: device={}", device_id);
         let records = self
             .client
             .get_records(self.domain, "AAAA", device_id)

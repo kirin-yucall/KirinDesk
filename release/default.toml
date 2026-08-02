@@ -1,6 +1,8 @@
 [device]
 id = "default-device"
 name = "My Device"
+nickname = ""
+challenge_code = ""
 
 [godaddy]
 api_key = ""
@@ -21,3 +23,9 @@ bitrate = 5000
 [logging]
 level = "info"
 format = "text"
+
+[unattended]
+# 无人值守模式：开机自启 + 自动开启服务端 + 受信任设备自动接受连接（PTY/远控）
+enabled = false
+auto_start_on_boot = false
+auto_start_server = true

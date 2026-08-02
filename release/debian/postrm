@@ -1,0 +1,11 @@
+#!/bin/sh
+# KirinDesk postrm — M14-T003
+set -e
+
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl stop kirindesk.service >/dev/null 2>&1 || true
+    systemctl disable kirindesk.service >/dev/null 2>&1 || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+
+exit 0

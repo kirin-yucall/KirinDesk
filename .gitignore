@@ -1,2 +1,28 @@
-gitignore
-target/
+# Rust / Cargo 构建产物
+/target/
+
+# 前端 node 依赖(由 package.json + package-lock.json 还原)
+ui/frontend/node_modules/
+
+# FFmpeg 二进制发行包(可由 ffmpeg/bin/download.ps1 重新下载)
+ffmpeg/ffmpeg-8.1.2-full_build-shared/
+release/ffmpeg/
+
+# 编译产物与发布临时文件
+release/*.exe
+release/*.exe.bak-*
+release/bench_results*.json
+
+# 日志与临时文件
+*.log
+*.tmp
+*.bak
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp

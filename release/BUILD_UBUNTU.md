@@ -67,7 +67,7 @@ cargo build --release -p kirin-desk-ui
 
 ```bash
 cargo test
-# 77 tests passing
+# 81 tests passing
 ```
 
 ## Config

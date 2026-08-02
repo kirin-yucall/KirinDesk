@@ -2,10 +2,87 @@
 name = "kirin-desk-media"
 version.workspace = true
 edition.workspace = true
+build = "build.rs"
+
+# 告知 rustc 自定义 cfg（由 build.rs 按工具链可用性 emit），消除
+# "unexpected cfg condition name" 警告。
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kirin_gpu_linked)"] }
 
 [dependencies]
-tokio = { workspace = true, features = ["time"] }
-serde.workspace = true
+# ── 基础与异步运行时 ────────────────────────────────
+tokio = { workspace = true, features = ["time", "net", "io-util", "sync"] } # 补充了 sync，跨线程传帧必用
+serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
 tracing.workspace = true
-screenshots = "0.6"
+bincode.workspace = true
+async-trait = "0.1"
+
+# ── 媒体管道核心依赖 ────────────────────────────────
+bytes = { version = "1", features = ["serde"] }  # 零拷贝字节切片，用于 RawFrame 和 EncodedWindow
+libloading = "0.8"       # 运行时动态加载打包目录下的 FFmpeg DLL
+
+# ── 加密与 QUIC 传输层 (Phase 3) ────────────────────
+ed25519-dalek.workspace = true
+rand.workspace = true
+quinn = "0.11"
+quinn-proto = "0.11"
+# ring feature：rustls 0.23 需要进程级 CryptoProvider（quic.rs ensure_crypto_provider）
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pki-types = "1"
+rcgen = "0.13"
+time = "0.3"             # QUIC/TLS 握手与证书时间戳处理
+
+# ── 内部核心模块复用 ────────────────────────────────
+kirin-desk-core = { path = "../core" }
+
+# ══════════════════════════════════════════════════════════════════
+# 跨平台屏幕捕获后端依赖（M8-T008 §Step 1）
+# Windows: windows-capture crate（唯一后端，旧 WGC/DXGI/GDI 已删）
+# macOS: zed-scap（M12-MAC 落地，见 远控服务端_需求文档 §3.2.3）
+# Linux: zed-scap（M12 落地时添加）
+# ══════════════════════════════════════════════════════════════════
+
+# macOS 捕获后端（M12-MAC）：zed-scap crate（ScreenCaptureKit 封装，macOS 12+）
+# 版本 =0.0.8-zed（crates.io 上 zed-industries/scap 的发布版；预发布号需精确匹配）。
+[target.'cfg(target_os = "macos")'.dependencies]
+zed-scap = "=0.0.8-zed"
+
+# Windows 捕获后端 (windows-capture crate)
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-capture = "2.0.0"# WASAPI 环回音频捕获（P1D）。features 对应 Win32_Media_Audio（IMMDeviceEnumerator
+# / IAudioClient / IAudioCaptureClient）、Win32_System_Com（CoInitialize）、
+# Win32_Devices_Properties（PROPERTYKEY）。
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_Media_KernelStreaming",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_Devices_Properties",
+] }
+
+# ══════════════════════════════════════════════════════════════════
+# Features
+# ══════════════════════════════════════════════════════════════════
+# gpu-kernel（默认 off）：构建并链接根级 libkirin_gpu/（C++ D3D11 零拷贝
+#   GPU 内核）。开启后由 build.rs 探测 CMake + MSVC；任一缺失则自动降级为
+#   CPU-only（不阻断 cargo build）。详见 M8-T008_P1B。
+[features]
+default = []
+gpu-kernel = []
+
+[[bin]]
+name = "capture-test"
+path = "src/bin/capture_test.rs"
+required-features = []
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+# P1G §T7.1：编码层三场景基准（合成帧驱动，跨平台）。
+[[bin]]
+name = "codec_bench"
+path = "src/bin/codec_bench.rs"
+required-features = []
