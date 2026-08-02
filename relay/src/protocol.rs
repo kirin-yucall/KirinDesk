@@ -16,10 +16,19 @@
 //! 帧上限 16 MiB（对齐 `multiplex.rs` `DEFAULT_MAX_FRAME_LEN`）；超限 /
 //! 未知 type / bincode 解码失败 → 连接判死关闭（TNL-PROTO-007）。
 
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
+
+/// HMAC-SHA256 别名（挑战-响应认证，TNL-PROTO-013）。
+type HmacSha256 = Hmac<Sha256>;
 
 /// 协议主版本（TNL-PROTO-008：主版本不兼容 → 登录拒绝）。
-pub const PROTOCOL_VERSION: &str = "1.0.0";
+///
+/// M8-T026-P3（TNL-PROTO-009）：1.0.0 → 1.1.0 —— `Login`/`LoginResp` 追加
+/// auth 字段（serde default 向后兼容）+ 枚举末尾追加 `AuthChallenge` 变体
+/// （不影响既有 wire 变体索引）；major 仍为 1，版本协商不受影响。
+pub const PROTOCOL_VERSION: &str = "1.1.0";
 
 /// 帧类型：控制消息（`ControlMsg` 的 bincode 负载）。
 pub const TYPE_CONTROL: u8 = 0x01;
@@ -240,6 +249,12 @@ pub enum ControlMsg {
     /// M8-T026-P2（ID-001）：`device_id` / `ed25519_pub` 为设备 ID 模式
     /// 注册字段 —— 有 `device_id` 时服务器登记在线表；`None` 为纯控制
     /// 连接（如仅解析）。`device_id` 优先显式配置，否则由公钥指纹派生。
+    ///
+    /// M8-T026-P3（TNL-PROTO-011）：`auth_nonce` / `auth_digest` 为挑战-
+    /// 响应认证字段（TNL-SEC-006，口令永不明文上线）—— 探测帧携带
+    /// `auth_nonce`（客户端随机数，token 恒为空串），证明帧携带
+    /// `auth_digest`（HMAC-SHA256 证明）；旧载荷（无此二字段）serde
+    /// default 补缺，向后兼容。
     Login {
         token: String,
         version: String,
@@ -248,12 +263,21 @@ pub enum ControlMsg {
         device_id: Option<String>,
         #[serde(default)]
         ed25519_pub: Option<String>,
+        #[serde(default)]
+        auth_nonce: Option<[u8; 16]>,
+        #[serde(default)]
+        auth_digest: Option<Vec<u8>>,
     },
     /// frps → frpc：登录应答（TNL-PROTO-002）。
+    ///
+    /// M8-T026-P3（TNL-PROTO-012）：`auth_digest` 为服务端回执（双向认证，
+    /// TNL-SEC-007），仅 `ok=true` 时携带。
     LoginResp {
         ok: bool,
         err: Option<String>,
         server_version: String,
+        #[serde(default)]
+        auth_digest: Option<Vec<u8>>,
     },
     /// frpc → frps：注册/更新代理（TNL-PROTO-003；`remote_port: 0` = 服务端分配）。
     NewProxy {
@@ -283,6 +307,13 @@ pub enum ControlMsg {
     Ping { ts: u64 },
     /// 双向心跳应答（TNL-PROTO-005）。
     Pong { ts: u64 },
+    /// M8-T026-P3（TNL-PROTO-010）：服务端挑战（口令模式两阶段握手，
+    /// TNL-SEC-006）—— `nonce` 为每次连接全新随机数（16 字节 CSPRNG，
+    /// TNL-NF-006 防重放，无需服务端 nonce 去重缓存）。
+    ///
+    /// ⚠️ 枚举**末尾**追加（追加不影响既有 wire 变体索引；后续变体继续
+    /// 追加，勿插入中间）。
+    AuthChallenge { nonce: [u8; 16] },
 }
 
 /// work 连接首帧（frpc 回连后第一条消息，TNL-PROTO-004）。
@@ -448,6 +479,38 @@ where
     Ok(())
 }
 
+/// 旧版 Login 载荷（v1.0，5 字段：token/version/hostname/device_id/ed25519_pub）。
+///
+/// bincode 对结构体按字段序定长读取、**不支持** `#[serde(default)]` 补缺
+/// （缺字段 → 越界读 "io error"），因此 TNL-PROTO-011 的旧载荷兼容需
+/// 显式回退解码：剥离变体标记后按旧结构重解（见 [`decode_legacy_login`]）。
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct LegacyLogin {
+    pub token: String,
+    pub version: String,
+    pub hostname: String,
+    #[serde(default)]
+    pub device_id: Option<String>,
+    #[serde(default)]
+    pub ed25519_pub: Option<String>,
+}
+
+/// 兼容解码旧版 Login 载荷（TNL-PROTO-011 / T6）：
+/// `[variant:u32 LE][5 字段]` → [`LegacyLogin`]。失败 = 非旧版载荷。
+pub fn decode_legacy_login(payload: &[u8]) -> Result<LegacyLogin, ProtocolError> {
+    if payload.len() < 4 {
+        return Err(ProtocolError::Bincode("payload too short for variant tag".to_string()));
+    }
+    // bincode 枚举变体标记：u32 小端（ControlMsg::Login = 0）。
+    let variant = u32::from_le_bytes(payload[..4].try_into().unwrap());
+    if variant != 0 {
+        return Err(ProtocolError::Bincode(format!(
+            "not a Login payload (variant {variant})"
+        )));
+    }
+    bincode::deserialize(&payload[4..]).map_err(|e| ProtocolError::Bincode(e.to_string()))
+}
+
 /// 协议版本主版本号（"1.0.0" → "1"）；协商不兼容判定用（TNL-PROTO-008）。
 pub fn major_version(version: &str) -> u64 {
     version
@@ -455,6 +518,19 @@ pub fn major_version(version: &str) -> u64 {
         .next()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0)
+}
+
+/// HMAC-SHA256 摘要（TNL-PROTO-013）：挑战-响应认证的证明/回执原语。
+///
+/// - 客户端证明：`client_digest = HMAC-SHA256(token, server_nonce ‖ client_nonce)`；
+/// - 服务端回执：`server_digest = HMAC-SHA256(token, client_nonce)`；
+/// - 两端均常数时间比较（防时序侧信道，TNL-SEC-001 延续）。
+///
+/// HMAC 接受任意长度密钥，`new_from_slice` 不会失败（RFC 2104 §2）。
+pub fn auth_digest(key: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(data);
+    mac.finalize().into_bytes().to_vec()
 }
 
 #[cfg(test)]
@@ -470,6 +546,8 @@ mod tests {
                 hostname: "pc-a".into(),
                 device_id: Some("pc-a-id".into()),
                 ed25519_pub: Some("pub-a".into()),
+                auth_nonce: None,
+                auth_digest: None,
             },
             ControlMsg::Login {
                 token: "tok-123".into(),
@@ -477,16 +555,20 @@ mod tests {
                 hostname: "resolver".into(),
                 device_id: None,
                 ed25519_pub: None,
+                auth_nonce: None,
+                auth_digest: None,
             },
             ControlMsg::LoginResp {
                 ok: true,
                 err: None,
                 server_version: PROTOCOL_VERSION.into(),
+                auth_digest: None,
             },
             ControlMsg::LoginResp {
                 ok: false,
                 err: Some("bad token".into()),
                 server_version: PROTOCOL_VERSION.into(),
+                auth_digest: None,
             },
             ControlMsg::NewProxy {
                 name: "ssh".into(),
@@ -508,6 +590,23 @@ mod tests {
             ControlMsg::Logout,
             ControlMsg::Ping { ts: 12345 },
             ControlMsg::Pong { ts: 12345 },
+            // M8-T026-P3：挑战帧 + 带 auth 字段的登录消息。
+            ControlMsg::Login {
+                token: String::new(),
+                version: PROTOCOL_VERSION.into(),
+                hostname: "pc-a".into(),
+                device_id: Some("pc-a-id".into()),
+                ed25519_pub: Some("pub-a".into()),
+                auth_nonce: Some([7; 16]),
+                auth_digest: Some(vec![1, 2, 3, 4]),
+            },
+            ControlMsg::LoginResp {
+                ok: true,
+                err: None,
+                server_version: PROTOCOL_VERSION.into(),
+                auth_digest: Some(vec![9, 8, 7, 6]),
+            },
+            ControlMsg::AuthChallenge { nonce: [3; 16] },
         ]
     }
 
@@ -727,6 +826,8 @@ mod tests {
                 hostname: "h".into(),
                 device_id: None,
                 ed25519_pub: None,
+                auth_nonce: None,
+                auth_digest: None,
             })
             .unwrap(),
         );
@@ -738,6 +839,100 @@ mod tests {
             }
             other => panic!("unexpected msg: {other:?}"),
         }
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // M8-T026-P3：挑战-响应认证（TNL-PROTO-009~013）
+    // ════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_old_login_payload_auth_fields_default() {
+        // 旧载荷（5 字段 Login，无 auth_nonce/auth_digest）兼容解码
+        // （TNL-PROTO-011 / T6）：bincode 不支持 serde(default) 补缺，
+        // 走显式回退 [`decode_legacy_login`]（剥离变体标记 + 旧结构重解）。
+        #[derive(serde::Serialize)]
+        struct OldLogin<'a> {
+            token: &'a str,
+            version: &'a str,
+            hostname: &'a str,
+            device_id: Option<&'a str>,
+            ed25519_pub: Option<&'a str>,
+        }
+        let old_bytes = bincode::serialize(&OldLogin {
+            token: "t",
+            version: "1.0.0",
+            hostname: "h",
+            device_id: Some("pc-a-id"),
+            ed25519_pub: Some("pub-a"),
+        })
+        .unwrap();
+        // 旧客户端 wire 载荷 = 枚举变体标记 u32(Login=0) + 5 字段。
+        let mut wire = 0u32.to_le_bytes().to_vec();
+        wire.extend_from_slice(&old_bytes);
+        // 完整帧 = [type][len][payload]；decode_control 对旧载荷越界失败
+        // （预期），回退解码成功。
+        let frame = wrap_frame(TYPE_CONTROL, &wire);
+        let (ty, payload) = decode_frame(&frame).unwrap();
+        assert!(decode_control(ty, payload).is_err(), "7 字段结构无法读 5 字段旧载荷");
+        let legacy = decode_legacy_login(payload).unwrap();
+        assert_eq!(legacy.token, "t");
+        assert_eq!(legacy.version, "1.0.0");
+        assert_eq!(legacy.hostname, "h");
+        assert_eq!(legacy.device_id.as_deref(), Some("pc-a-id"));
+        assert_eq!(legacy.ed25519_pub.as_deref(), Some("pub-a"));
+
+        // 非 Login 变体 / 垃圾 → 拒绝。
+        let mut not_login = wire.clone();
+        not_login[..4].copy_from_slice(&3u32.to_le_bytes()); // NewProxy 变体标记
+        let frame = wrap_frame(TYPE_CONTROL, &not_login);
+        let (_, payload) = decode_frame(&frame).unwrap();
+        assert!(decode_legacy_login(payload).is_err());
+        assert!(decode_legacy_login(&[0u8; 2]).is_err());
+        assert!(decode_legacy_login(b"garbage-data-here").is_err());
+    }
+
+    #[test]
+    fn test_auth_digest_rfc4231_vectors() {
+        // HMAC-SHA256 已知向量（RFC 4231 §4.2/4.3，TNL-PROTO-013 验收）。
+        // 测试用例 1：key = 0x0b × 20，data = "Hi There"。
+        let key = [0x0bu8; 20];
+        let digest = auth_digest(&key, b"Hi There");
+        let expect: [u8; 32] = [
+            0xb0, 0x34, 0x4c, 0x61, 0xd8, 0xdb, 0x38, 0x53, 0x5c, 0xa8, 0xaf, 0xce, 0xaf, 0x0b,
+            0xf1, 0x2b, 0x88, 0x1d, 0xc2, 0x00, 0xc9, 0x83, 0x3d, 0xa7, 0x26, 0xe9, 0x37, 0x6c,
+            0x2e, 0x32, 0xcf, 0xf7,
+        ];
+        assert_eq!(digest, expect.to_vec(), "RFC 4231 TC1");
+        // 测试用例 2：key = "Jefe"，data = "what do ya want for nothing?"。
+        let digest = auth_digest(b"Jefe", b"what do ya want for nothing?");
+        let expect: [u8; 32] = [
+            0x5b, 0xdc, 0xc1, 0x46, 0xbf, 0x60, 0x75, 0x4e, 0x6a, 0x04, 0x24, 0x26, 0x08, 0x95,
+            0x75, 0xc7, 0x5a, 0x00, 0x3f, 0x08, 0x9d, 0x27, 0x39, 0x83, 0x9d, 0xec, 0x58, 0xb9,
+            0x64, 0xec, 0x38, 0x43,
+        ];
+        assert_eq!(digest, expect.to_vec(), "RFC 4231 TC2");
+        // 长度恒为 32 字节（HMAC-SHA256 输出）。
+        assert_eq!(auth_digest(b"", b"").len(), 32);
+        assert_eq!(auth_digest(&[0u8; 64], &[0u8; 100]).len(), 32);
+    }
+
+    #[test]
+    fn test_auth_digest_deterministic() {
+        // 同输入 → 同输出；不同 nonce 组合 → 不同输出（防重放语义基础）。
+        let token = b"super-secret-token";
+        let s1 = [1u8; 16];
+        let s2 = [2u8; 16];
+        let c = [3u8; 16];
+        let d1 = auth_digest(token, &[s1, c].concat());
+        assert_eq!(d1, auth_digest(token, &[s1, c].concat()));
+        // 服务器 nonce 变化 → digest 变化（旧对重放必然失败）。
+        assert_ne!(d1, auth_digest(token, &[s2, c].concat()));
+        // 客户端 nonce 变化 → digest 变化（回执也随 client_nonce 变）。
+        assert_ne!(d1, auth_digest(token, &[s1, [4u8; 16]].concat()));
+        assert_ne!(
+            auth_digest(token, &c),
+            auth_digest(token, &[c, [5u8; 16]].concat())
+        );
     }
 
     // ════════════════════════════════════════════════════════════

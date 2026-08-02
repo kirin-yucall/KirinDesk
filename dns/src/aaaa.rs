@@ -1,4 +1,5 @@
 use crate::godaddy::{GoDaddyClient, GoDaddyError, Record};
+use crate::validate;
 use std::net::Ipv6Addr;
 use tracing::debug;
 
@@ -13,6 +14,19 @@ impl<'a> AaaaManager<'a> {
         Self { client, domain }
     }
 
+    /// S-14b / F-18: device_id 统一校验（拒绝 '.' 子域注入等非法字符）。
+    fn check_device_id(&self, device_id: &str) -> Result<(), GoDaddyError> {
+        if !validate::validate_device_id(device_id) {
+            return Err(GoDaddyError::InvalidParameters {
+                body: format!(
+                    "invalid device_id '{}' (charset [a-zA-Z0-9:_-], len 1..=128, no '.' allowed)",
+                    device_id
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// Register or update an AAAA record for a device.
     pub async fn register(
         &self,
@@ -20,6 +34,7 @@ impl<'a> AaaaManager<'a> {
         ipv6_addr: Ipv6Addr,
         ttl: u32,
     ) -> Result<(), GoDaddyError> {
+        self.check_device_id(device_id)?;
         debug!("AAAA register: device={}, ipv6={}, ttl={}", device_id, ipv6_addr, ttl);
         let records = vec![Record {
             data: ipv6_addr.to_string(),
@@ -33,6 +48,7 @@ impl<'a> AaaaManager<'a> {
 
     /// Query AAAA records for a device.
     pub async fn query(&self, device_id: &str) -> Result<Vec<Ipv6Addr>, GoDaddyError> {
+        self.check_device_id(device_id)?;
         debug!("AAAA query: device={}", device_id);
         let records = self
             .client
@@ -62,6 +78,7 @@ impl<'a> AaaaManager<'a> {
 
     /// Delete AAAA records for a device.
     pub async fn remove(&self, device_id: &str) -> Result<(), GoDaddyError> {
+        self.check_device_id(device_id)?;
         self.client
             .delete_record(self.domain, "AAAA", device_id)
             .await

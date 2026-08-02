@@ -39,7 +39,10 @@ async fn make_channel_pair() -> (SecureChannelReader, SecureChannelWriter, Secur
             let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
             client_handshake(
                 stream, &client_im, "e2e-client", "e2e.local", "desktop", "e2e-server",
-                &server_pub, "",
+                // R-02：真实 pin 比对（`Exact` 强类型）。
+                kirin_desk_core::crypto::handshake::PinExpectation::exact_from_base64(&server_pub)
+                    .expect("server pubkey"),
+                "",
             )
             .await
             .unwrap()

@@ -6,6 +6,16 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
+/// S-11c（F-15）：单帧最大分片数。`total_packets` 为网络可控 u16，
+/// 超限（含 0）直接弃帧，不建缓冲（防 64 帧 × 65535 片 ≈ 100MB/连接 放大）。
+/// 合法帧：发送侧按 ≤1157B/片 分片（[`crate::transport::datagram`]），
+/// 64 片 ≈ 74KB，正常编码帧远低于此。
+pub const MAX_TOTAL_PACKETS: u16 = 64;
+
+/// S-11c（F-15）：单帧重组累计字节上限（8 MiB）。
+/// 完成帧超过此值不进解码器（原最坏 ~75MB/帧），合法帧 ≤ 74KB 远低于此。
+pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+
 /// 帧重组缓冲区。
 pub struct FrameReassembly {
     /// frame_id → 重组缓冲区
@@ -23,6 +33,8 @@ struct ReassemblyBuffer {
     total_packets: u16,
     /// 各分片数据（None = 未收到）
     packets: Vec<Option<Vec<u8>>>,
+    /// 已存储分片的累计字节数（含替换调整，用于每帧字节上限检查）
+    received_bytes: usize,
     /// 标志位
     flags: u16,
     /// 插入时间
@@ -61,6 +73,15 @@ impl FrameReassembly {
         flags: u16,
         payload: Vec<u8>,
     ) -> Option<(u64, u16, Vec<u8>)> {
+        // S-11c（F-15）：total_packets 网络可控——非法（0）或超限（> 64）
+        // 直接弃帧，不建缓冲（防 u16 极值放大内存）。
+        if total_packets == 0 || total_packets > MAX_TOTAL_PACKETS {
+            return None;
+        }
+        // S-11c（F-15）：单片即超过单帧累计上限 → 该帧永远不可能合法，直接弃。
+        if payload.len() > MAX_FRAME_BYTES {
+            return None;
+        }
         // 检查是否已有缓冲区
         if !self.buffers.contains_key(&frame_id) {
             // 限制待处理帧数
@@ -74,6 +95,7 @@ impl FrameReassembly {
                 ReassemblyBuffer {
                     total_packets,
                     packets: vec![None; total_packets as usize],
+                    received_bytes: 0,
                     flags,
                     inserted_at: Instant::now(),
                 },
@@ -87,6 +109,18 @@ impl FrameReassembly {
 
         // 存储分片
         if (packet_idx as usize) < buf.packets.len() {
+            // S-11c（F-15）：每帧累计字节上限——含同槽替换的差值校正，
+            // 超限 → 连同缓冲一起弃帧（完成帧 ≤ 8 MiB 才进解码器）。
+            let old_len = buf.packets[packet_idx as usize].as_ref().map_or(0, Vec::len);
+            let new_total = buf
+                .received_bytes
+                .saturating_add(payload.len())
+                .saturating_sub(old_len);
+            if new_total > MAX_FRAME_BYTES {
+                self.buffers.remove(&frame_id);
+                return None;
+            }
+            buf.received_bytes = new_total;
             buf.packets[packet_idx as usize] = Some(payload);
         }
 
@@ -286,5 +320,69 @@ mod tests {
         );
         // Frame 3: partial
         assert!(ra.add_packet(3, 0, 2, 0x00, vec![0x33]).is_none());
+    }
+
+    #[test]
+    fn test_reassembly_rejects_huge_total_packets() {
+        // S-11d（F-15）：恶意 total_packets=65535（网络可控 u16 极值）→
+        // 弃帧，不建缓冲、不分配 65535 槽位。
+        let mut ra = FrameReassembly::new();
+
+        let result = ra.add_packet(1, 0, u16::MAX, 0x00, vec![0x01]);
+        assert!(result.is_none());
+        assert_eq!(ra.pending_count(), 0, "不残留缓冲");
+
+        // 后续合法帧不受影响
+        assert_eq!(
+            ra.add_packet(2, 0, 1, 0x02, vec![0xAB]),
+            Some((2, 0x02, vec![0xAB]))
+        );
+    }
+
+    #[test]
+    fn test_reassembly_rejects_zero_total_packets() {
+        // S-11d（F-15）：total_packets=0 为畸形输入（无任何分片可言），弃帧。
+        let mut ra = FrameReassembly::new();
+        assert!(ra.add_packet(1, 0, 0, 0x00, vec![0x01]).is_none());
+        assert_eq!(ra.pending_count(), 0);
+    }
+
+    #[test]
+    fn test_reassembly_frame_byte_limit() {
+        // S-11d（F-15）：每帧累计字节 > MAX_FRAME_BYTES → 帧连同缓冲被丢弃。
+        let mut ra = FrameReassembly::new();
+
+        // 4 MiB + (4 MiB + 1) 片 → 累计超 8 MiB → 弃帧
+        let half = MAX_FRAME_BYTES / 2;
+        assert!(ra.add_packet(1, 0, 2, 0x00, vec![0xAA; half]).is_none());
+        assert!(ra.add_packet(1, 1, 2, 0x00, vec![0xBB; half + 1]).is_none());
+        assert_eq!(ra.pending_count(), 0, "超限帧应连同缓冲一起丢弃");
+
+        // 单片即超限 → 直接弃
+        assert!(ra.add_packet(2, 0, 1, 0x00, vec![0xCC; MAX_FRAME_BYTES + 1]).is_none());
+        assert_eq!(ra.pending_count(), 0);
+
+        // 超限后其他帧仍可正常重组
+        assert_eq!(
+            ra.add_packet(3, 0, 1, 0x02, vec![0xDD]),
+            Some((3, 0x02, vec![0xDD]))
+        );
+    }
+
+    #[test]
+    fn test_reassembly_at_byte_limit_completes() {
+        // S-11d（回归）：恰好等于 8 MiB 上限的合法帧仍可完成（不误伤）。
+        let mut ra = FrameReassembly::new();
+        let chunk = vec![0xEEu8; MAX_FRAME_BYTES / MAX_TOTAL_PACKETS as usize]; // 128 KiB × 64
+
+        let mut result = None;
+        for i in 0..MAX_TOTAL_PACKETS {
+            result = ra.add_packet(7, i, MAX_TOTAL_PACKETS, 0x00, chunk.clone());
+        }
+
+        let (fid, _, data) = result.expect("恰好 ≤ 8 MiB 应完成");
+        assert_eq!(fid, 7);
+        assert_eq!(data.len(), MAX_FRAME_BYTES);
+        assert_eq!(data[0], 0xEE);
     }
 }

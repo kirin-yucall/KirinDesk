@@ -12,12 +12,49 @@
 //! | `transport` | MediaTransport trait + QuicMediaTransport + SecureChannelTransport（tag 分帧/输入通道） |
 //! | `stream` | P1F：EncodedPacket 帧头（Annex B）+ 通道分派（SecureChannel 前缀 / QUIC DATAGRAM） |
 //! | `priority` | P1F：DATAGRAM 优先级调度（键鼠 > 音频 > 视频；拥塞丢视频） |
+//!
+//! # S-17 QUIC 接线门禁（F-22 · 接线前必读）
+//!
+//! `quic` 模块的 rustls 客户端校验（`SkipServerVerification`）**全放行是有意设计**
+//! （仅协议合规），安全完全依赖上层 Ed25519 握手（审计报告 2026-08-02 §4 F-22）。
+//! 因此**任何未来把 QUIC 传输接入主流程的改动，必须先满足下方门禁，否则禁止接线**：
+//!
+//! 1. **服务端策略层校验**：白名单 / 审批 / pin 校验，与 `accept_quic_transport`
+//!    （`server_handshake_verified_with_nickname_generic`）对齐，不得绕过或占位；
+//! 2. **客户端侧服务端身份校验**：`connect_quic_transport` 必须携带强制校验的
+//!    `server_pin: PinExpectation`（R-02 已把旧的 `_server_pubkey_base64` 占位参数
+//!    改为类型化强制校验，不存在"无期望跳过"路径）——禁止恢复"空串 / 忽略 pin"
+//!    之类的快捷方式；
+//! 3. 保持职责分离现状不变：TLS 全放行 + 上层 Ed25519 强制 pin 校验。
+//!
+//! 完整门禁注释见 `pub mod quic;` 声明处。
 pub mod bi_stream;
 pub mod control;
 pub mod datagram;
 pub mod loss_detection;
 pub mod priority;
 pub mod punch_bridge; // M8-T026-P1: 打洞路径 → 媒体传输桥（PATH-004 升舱）
+/// # S-17 接线门禁（F-22 · 接线前必读）
+///
+/// 本模块（`quic.rs`）的 rustls 客户端校验 `SkipServerVerification` 全放行
+/// 是**有意设计**（仅协议合规，`quic.rs` 模块文档有完整说明）——安全完全由
+/// 上层 Ed25519 握手承担（审计报告 2026-08-02 §4 F-22，当前
+/// `accept_media_transport` 无生产调用方，为 dead code）。
+///
+/// 任何未来把 QUIC 传输接入主流程（session / 主传输选择路径）的改动，
+/// **必须先满足以下门禁，否则禁止接线**：
+///
+/// 1. **服务端策略层校验**：接入服务端接受路径前必须先补策略层校验——
+///    白名单 / 审批 / pin，与 `accept_quic_transport` 的
+///    `server_handshake_verified_with_nickname_generic` 对齐（该握手已含
+///    服务端对客户端公钥的策略校验与挑战码校验），不得绕过或替换为空实现；
+/// 2. **客户端侧服务端身份校验**：客户端拨号必须携带强制校验的服务端身份——
+///    `connect_quic_transport` 的 `server_pin: PinExpectation`（R-02 已取消旧的
+///    `_server_pubkey_base64` 下划线占位参数，改为类型化强制校验，core 握手层
+///    无"无期望跳过"路径）——**禁止**以任何形式恢复"空串 / 忽略 pin"的快捷方式；
+/// 3. 保持 F-22 职责分离现状不变：TLS 层全放行 + 上层 Ed25519 强制 pin 校验。
+///
+/// 违反门禁的接线 = 回归 F-22 全放行风险。
 pub mod quic;
 pub mod reassembly;
 pub mod stream;
@@ -47,8 +84,10 @@ pub use punch_bridge::{
     punch_upgrade_connect_task, PunchMediaCreds, PunchUpgrade, PunchUpgradeEvent,
 };
 
+use crate::encoder::types::EncodedPacket;
 use crate::proto::EncodedWindow;
 use async_trait::async_trait;
+use std::sync::mpsc;
 
 /// 传输层错误。
 #[derive(Debug, thiserror::Error)]
@@ -103,6 +142,35 @@ pub trait MediaTransport: Send {
 
     /// 接收一个帧（已解密、已重组）。
     async fn recv_frame(&mut self) -> Result<FramePacket, TransportError>;
+
+    /// R-04：发送一批音频包（`PacketKind::Audio`，Opus 帧）。
+    ///
+    /// 实现者：
+    /// - QUIC：音频走独立 DATAGRAM（中优先级，可丢，单包 ≤
+    ///   [`MAX_PACKET_PAYLOAD`]），DATAGRAM 头带 kind 字节区分视频。
+    /// - TCP：`ChannelTag::Audio` 前缀（与 SecureChannel 阶段既有字节流兼容）。
+    ///
+    /// 默认实现返回"不支持"（外部/桩实现零改动）。
+    async fn send_audio(&mut self, pkts: &[EncodedPacket]) -> Result<(), TransportError> {
+        let _ = pkts;
+        Err(TransportError::InvalidFrame(
+            "audio send not supported by this transport".into(),
+        ))
+    }
+
+    /// R-04：拆出音频包接收端（媒体接收循环内部按 type 分流——`recv_frame`
+    /// 遇到音频包转入本通道，返回视频帧）。
+    ///
+    /// - 返回 `Some(rx)`：音频**接收已启用**——接收循环把音频包缓冲进通道
+    ///   （会话把它交给 `AudioDecodePipeline`）。
+    /// - 返回 `None`：未启用（音频开关关闭）——接收循环**丢弃**音频包，
+    ///   不缓冲（避免无消费者时通道无界增长）。
+    ///
+    /// 同一传输只可调用一次（再次调用返回 `None`）；传输被 drop 时通道关闭，
+    /// 消费端 `recv` 返回错误 → 音频线程干净退出。
+    fn take_audio_receiver(&mut self) -> Option<mpsc::Receiver<crate::decoder::AudioPacket>> {
+        None
+    }
 
     /// 发送控制消息。
     async fn send_control(&mut self, msg: &ControlMessage) -> Result<(), TransportError>;

@@ -205,7 +205,7 @@ async fn quic_loopback_end_to_end() {
             "loopback.example",
             "desktop",
             &server_id,
-            &server_pub,
+            kirin_desk_core::crypto::handshake::PinExpectation::exact_from_base64(&server_pub).expect("server pubkey"),
             "challenge",
         )
         .await

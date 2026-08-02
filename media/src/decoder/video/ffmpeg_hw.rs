@@ -67,6 +67,46 @@ fn hw_device_type_for(decoder_name: &str) -> Option<i32> {
     }
 }
 
+/// 创建 hw device：按候选设备串逐个尝试绑定（M8-T030 §3.5，与编码侧
+/// `ffmpeg_hw.rs::create_hw_device_with_candidates` 同语义）。
+///
+/// 候选顺序（[`crate::gpu::device_strings`]）：LUID 高32-低32 → 低32-高32 →
+/// 描述名。**失败语义（R-06 实测修正）**：`candidates` 为空（无选定适配器 /
+/// 非 Windows）→ 直接 `None`（现状默认设备，GPU-NF-002）；非空但全失败 →
+/// 返回错误让回退链继续（如 `KIRIN_GPU_PREFER=nvidia` 时 qsv 解码失败 →
+/// 落 cuvid/d3d11va 用 NVIDIA 串）。绑定成功输出 info 日志（GPU-NF-005）。
+fn create_hw_device_with_candidates(
+    device_type: i32,
+    candidates: &[String],
+) -> Result<*mut ffmpeg::AVBufferRef, DecodeError> {
+    if candidates.is_empty() {
+        // 无选定适配器：保持现状默认设备行为（GPU-NF-002）。
+        return ffmpeg::av_hwdevice_ctx_create(device_type, None).map_err(|e| {
+            DecodeError::InitFailed(format!("av_hwdevice_ctx_create(default device): {e}"))
+        });
+    }
+    for d in candidates {
+        // 描述名含 NUL 时跳过（理论不可能，防御）。
+        let Ok(c) = std::ffi::CString::new(d.as_str()) else {
+            continue;
+        };
+        match ffmpeg::av_hwdevice_ctx_create(device_type, Some(&c)) {
+            Ok(ctx) => {
+                tracing::info!("FfmpegHwDecoder: hwdevice created on '{d}'");
+                return Ok(ctx);
+            }
+            Err(e) => {
+                tracing::debug!("FfmpegHwDecoder: hwdevice '{d}' failed: {e}");
+            }
+        }
+    }
+    Err(DecodeError::InitFailed(
+        "av_hwdevice_ctx_create: all candidate device strings failed \
+         (GPU binding mismatch, fallback chain continues)"
+            .into(),
+    ))
+}
+
 impl VideoBackend for FfmpegHwDecoder {
     /// 打开硬件解码后端。
     ///
@@ -86,13 +126,23 @@ impl VideoBackend for FfmpegHwDecoder {
         let mut ctx = ffmpeg::avcodec_alloc_context3(codec)?;
 
         // Step 1: hw device（失败 = 本机不可用，factory 回退下一项）。
+        // M8-T030（R-06）：按选定适配器设备串候选绑定（十进制适配器索引，
+        // 实测定案见设计文档 §3.5）；无选定适配器时直接 None（现状）。
         let hw_type = hw_device_type_for(decoder_name).ok_or_else(|| {
             DecodeError::InitFailed(format!("unknown hw type for {decoder_name}"))
         })?;
-        let hw_device_ctx = ffmpeg::av_hwdevice_ctx_create(hw_type, None).map_err(|e| {
-            ffmpeg::avcodec_free_context(&mut ctx);
-            DecodeError::InitFailed(format!("av_hwdevice_ctx_create({decoder_name}): {e}"))
-        })?;
+        let hw_device_ctx = match create_hw_device_with_candidates(
+            hw_type,
+            &crate::gpu::hwdevice_candidates(),
+        ) {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                ffmpeg::avcodec_free_context(&mut ctx);
+                return Err(DecodeError::InitFailed(format!(
+                    "av_hwdevice_ctx_create({decoder_name}): {e}"
+                )));
+            }
+        };
 
         // Step 2: 绑定 hw device 到 codec context（+1 ref；free_context 时 FFmpeg
         // 内部 unref，本结构在 Drop 里 unref 顶层 ref——两条路径各自平衡）。

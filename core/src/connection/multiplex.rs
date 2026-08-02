@@ -210,7 +210,11 @@ impl<S: AsyncWrite + Unpin> Multiplexer<S> {
     /// 发送一条带类型前缀的消息。
     ///
     /// 负载超过帧长上限返回 [`FrameTooLarge`](MultiplexError::FrameTooLarge)（不写流）。
-    pub async fn send(&mut self, kind: MultiplexType, payload: &[u8]) -> Result<(), MultiplexError> {
+    pub async fn send(
+        &mut self,
+        kind: MultiplexType,
+        payload: &[u8],
+    ) -> Result<(), MultiplexError> {
         if payload.len() as u32 > self.max_frame_len {
             return Err(MultiplexError::FrameTooLarge(
                 payload.len() as u32,
@@ -343,7 +347,8 @@ mod tests {
             MultiplexType::Input,
         ] {
             let frame = encode_frame(kind, &[1, 2, 3]);
-            let (k, len) = decode_header(&frame[..FRAME_HEADER_LEN], DEFAULT_MAX_FRAME_LEN).unwrap();
+            let (k, len) =
+                decode_header(&frame[..FRAME_HEADER_LEN], DEFAULT_MAX_FRAME_LEN).unwrap();
             assert_eq!(k, kind);
             assert_eq!(len, 3);
         }
@@ -378,14 +383,29 @@ mod tests {
         let mut receiver = Multiplexer::new(b);
 
         sender.send(MultiplexType::Control, b"hello").await.unwrap();
-        sender.send(MultiplexType::Video, &[0u8; 100]).await.unwrap();
+        sender
+            .send(MultiplexType::Video, &[0u8; 100])
+            .await
+            .unwrap();
         sender.send(MultiplexType::Audio, b"audio").await.unwrap();
         sender.send(MultiplexType::Input, b"keys").await.unwrap();
 
-        assert_eq!(receiver.recv().await.unwrap(), (MultiplexType::Control, b"hello".to_vec()));
-        assert_eq!(receiver.recv().await.unwrap(), (MultiplexType::Video, vec![0u8; 100]));
-        assert_eq!(receiver.recv().await.unwrap(), (MultiplexType::Audio, b"audio".to_vec()));
-        assert_eq!(receiver.recv().await.unwrap(), (MultiplexType::Input, b"keys".to_vec()));
+        assert_eq!(
+            receiver.recv().await.unwrap(),
+            (MultiplexType::Control, b"hello".to_vec())
+        );
+        assert_eq!(
+            receiver.recv().await.unwrap(),
+            (MultiplexType::Video, vec![0u8; 100])
+        );
+        assert_eq!(
+            receiver.recv().await.unwrap(),
+            (MultiplexType::Audio, b"audio".to_vec())
+        );
+        assert_eq!(
+            receiver.recv().await.unwrap(),
+            (MultiplexType::Input, b"keys".to_vec())
+        );
     }
 
     /// 帧头跨多个写入块（逐字节写）→ 接收端 read_exact 仍能正确组帧。
@@ -401,7 +421,10 @@ mod tests {
         }
         a.flush().await.unwrap();
 
-        assert_eq!(receiver.recv().await.unwrap(), (MultiplexType::Video, vec![1, 2, 3, 4, 5]));
+        assert_eq!(
+            receiver.recv().await.unwrap(),
+            (MultiplexType::Video, vec![1, 2, 3, 4, 5])
+        );
     }
 
     /// 大帧：负载 16MB 以内可传；超过上限在 send 侧即拒绝。
@@ -409,7 +432,10 @@ mod tests {
     async fn test_multiplexer_frame_too_large_rejected() {
         let (a, _b) = duplex(64 * 1024);
         let mut sender = Multiplexer::with_max_frame(a, 8);
-        let err = sender.send(MultiplexType::Video, &[0u8; 9]).await.unwrap_err();
+        let err = sender
+            .send(MultiplexType::Video, &[0u8; 9])
+            .await
+            .unwrap_err();
         assert!(matches!(err, MultiplexError::FrameTooLarge(9, 8)));
     }
 

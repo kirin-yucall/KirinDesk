@@ -1,11 +1,14 @@
 mod cli;
-mod policy;
-mod privacy;
-mod theme;
-mod widgets;
-pub mod terminal;
 pub mod clipboard;
 pub mod file_panel;
+mod policy;
+mod privacy;
+pub mod terminal;
+mod theme;
+mod widgets;
+// R-12 (M15-T007): 国际化基础设施（先行；文案抽取 S2~S4 随波次 3，
+// 见 task_docs/修复任务/E_安全打磨R-12至R-13.md）。消费方 `use crate::t;`。
+mod i18n;
 
 use file_panel::{FileCommand, FileDirection, FilePanelState, FileTask, FileTaskStatus};
 
@@ -15,6 +18,13 @@ use kirin_desk_core::connection::file_transfer::{
     FileTransferFrame, SlideWindowSender, StoredTransfer, TransferScheduler, TransferStore,
     BLOCK_SIZE, DEFAULT_MAX_FILE_SIZE,
 };
+// R-03 (R03-S1): 可复用建连链路（CLI/GUI/断线重连共用）。
+use kirin_desk_core::connection::client::{
+    connect_peer, resolve_peer, ConnectError, ConnectionOptions, DnsConfig, TrustPolicy,
+};
+// R-03 (R03-S2/S4): 重连状态机与上下文。
+use kirin_desk_core::connection::manager::{ManagedConnection, ReconnectContext};
+use kirin_desk_core::connection::reconnection::attempt_reconnect;
 use kirin_desk_core::connection::ShellMessage;
 // M8-T019: 隐私模式（黑屏 / 锁屏）状态机。
 use kirin_desk_core::connection::privacy::{PrivacyController, PrivacyLevel, PrivacyOutcome};
@@ -22,8 +32,8 @@ use kirin_desk_core::connection::temp_mode::TempModeManager;
 use kirin_desk_core::crypto::ed25519::IdentityManager;
 // M15 (SRV-SEC-KH-001): 服务端两阶段握手（预读 init → pin → 应答）。
 use kirin_desk_core::crypto::handshake::{
-    domain_matches_whitelist, server_handshake_respond_generic, server_read_init,
-    verify_server_init_with_temp, SecureChannel,
+    domain_matches_whitelist, id_matches_whitelist, server_handshake_respond_generic,
+    server_read_init, verify_server_init_with_temp, SecureChannel,
 };
 use kirin_desk_media::capture::CaptureError;
 // M15 (SRV-SEC-RL-001/002): 服务端连接速率限制。
@@ -39,9 +49,9 @@ use terminal::Terminal;
 // M15-T008: 设计令牌 + 通用组件（本文件全部取色/字号经 theme 令牌，零裸 Color32）。
 use theme::{Theme, ThemeMode};
 use widgets::{
-    action_button, badge, card, copy_button, labeled_input, log_view, selectable_pill,
-    segmented_control, stat_card, StatRow, status_dot, status_dot_char, stepper, toolbar_button,
-    BadgeKind, ButtonKind, ButtonState, LogViewOptions, Validity,
+    action_button, badge, card, copy_button, labeled_input, log_view, segmented_control,
+    selectable_pill, stat_card, status_dot, status_dot_char, stepper, toolbar_button, BadgeKind,
+    ButtonKind, ButtonState, LogViewOptions, StatRow, Validity,
 };
 
 // M10: 设备列表持久化 + DNS 发现连接。
@@ -49,7 +59,9 @@ use kirin_desk_dns::discovery::DiscoveryService;
 use kirin_desk_dns::godaddy::GoDaddyClient;
 use kirin_desk_utils::devices::{DeviceStore, SavedDevice};
 // M15 (CLI-KH): 已知主机指纹验证。
-use kirin_desk_utils::known_hosts::{fingerprint as kh_fingerprint, FingerprintStatus, KnownHostsStore};
+use kirin_desk_utils::known_hosts::{
+    fingerprint as kh_fingerprint, FingerprintStatus, KnownHostsStore,
+};
 
 // M9: 远程输入注入（客户端捕获 → 加密通道 → 服务端注入）。
 // M8-T020: SpecialCombo 特殊键（Win/Alt+Tab/任务管理器/锁屏）。
@@ -63,7 +75,7 @@ use kirin_desk_media::transport::{
     ChannelTag, ControlMessage, SecureChannelReceiver, SecureChannelSender,
 };
 // M14-T005: 自动更新（Settings Update 面板 + 每周后台检查）。
-use kirin_desk_updater::{ReleaseInfo, UpdateChannel, UpdateStatus, Updater};
+use kirin_desk_updater::{InstallOutcome, ReleaseInfo, UpdateChannel, UpdateStatus, Updater};
 use std::path::{Path, PathBuf};
 
 /// Global log buffer shared between tracing and GUI display.
@@ -76,6 +88,11 @@ fn gui_log_buffer() -> Arc<LogBuffer> {
 pub(crate) fn clear_gui_log() {
     gui_log_buffer().clear();
 }
+
+/// S-02 (F-5): 服务端并发连接处理上限（含 60s 审批等待）——accept 循环每连接
+/// `tokio::spawn`，同时处理的连接数不超过本值，超出者在任务内排队（信号量）；
+/// GUI 与 CLI（`super::`）共用。
+pub(crate) const SERVER_MAX_CONCURRENT_CONNECTIONS: usize = 64;
 
 /// Global persistent device identity (loaded once at startup).
 fn global_identity() -> &'static OnceLock<IdentityManager> {
@@ -93,6 +110,47 @@ fn server_stop_signal() -> &'static AtomicBool {
 fn connection_status() -> &'static Mutex<String> {
     static S: OnceLock<Mutex<String>> = OnceLock::new();
     S.get_or_init(|| Mutex::new(String::new()))
+}
+
+/// R-04：会话级音频开关（Settings 页 / CLI `--no-audio` 共用，进程级生效）。
+///
+/// 会话启动时读取：GUI 客户端会话据此创建音频解码/播放线程，GUI 服务端
+/// 会话据此创建捕获/编码线程；`false` → 会话无声但视频/键鼠不受影响。
+fn audio_enabled_global() -> &'static AtomicBool {
+    static AUDIO: AtomicBool = AtomicBool::new(true); // 默认开（P1D 默认参数）
+    &AUDIO
+}
+
+/// R-04：音频开关读取（CLI 解析测试 / 会话启动共用；`pub(crate)`）。
+pub(crate) fn audio_enabled() -> bool {
+    audio_enabled_global().load(Ordering::Relaxed)
+}
+
+/// R-04：音频开关写入（Settings 勾选 / CLI `--no-audio` 解析）。
+pub(crate) fn set_audio_enabled(enabled: bool) {
+    audio_enabled_global().store(enabled, Ordering::Relaxed);
+    tracing::info!(
+        "[audio] session audio {}",
+        if enabled { "enabled" } else { "disabled" }
+    );
+}
+
+/// R-04：会话窗口状态栏音频状态（静音 / 播放中 / 已禁用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AudioUiState {
+    /// 会话级开关关闭（`--no-audio` / Settings 取消勾选）。
+    Disabled,
+    /// 音频线程存活但无声（无设备降级 / 尚未收到包）。
+    Muted,
+    /// 播放中（解码管线已启动并投递 PCM）。
+    Playing,
+}
+
+/// R-04：共享音频 UI 状态（M8-T021 P1 键控惯例：按 session_id 键控，
+/// 音频线程写，各连接窗口状态栏每帧读自身会话）。
+fn audio_window_state() -> &'static Mutex<HashMap<u64, AudioUiState>> {
+    static S: OnceLock<Mutex<HashMap<u64, AudioUiState>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Global server-side channel halves: (输入接收读半, 视频发送写半)。
@@ -178,6 +236,10 @@ fn cleanup_session_state(session_id: u64) {
     if let Ok(mut m) = client_privacy_state().lock() {
         m.remove(&session_id);
     }
+    // R-04：音频 UI 状态（会话退出清理，窗口关闭后无残留）。
+    if let Ok(mut m) = audio_window_state().lock() {
+        m.remove(&session_id);
+    }
 }
 
 /// 服务端隐私控制器（GUI 模式黑屏覆盖 / 锁屏执行；每会话一个，接收任务
@@ -205,8 +267,7 @@ fn server_file_panel_state() -> &'static Mutex<FilePanelState> {
 }
 
 /// 服务端文件命令通道（主窗口 → 服务端会话；连接建立时注册）。
-fn server_file_tx(
-) -> &'static Mutex<Option<tokio::sync::mpsc::UnboundedSender<FileCommand>>> {
+fn server_file_tx() -> &'static Mutex<Option<tokio::sync::mpsc::UnboundedSender<FileCommand>>> {
     static T: OnceLock<Mutex<Option<tokio::sync::mpsc::UnboundedSender<FileCommand>>>> =
         OnceLock::new();
     T.get_or_init(|| Mutex::new(None))
@@ -251,7 +312,12 @@ fn updater() -> Updater {
             let data_dir = kirin_desk_utils::config::Config::config_dir()
                 .unwrap_or_else(|_| PathBuf::from("."))
                 .join("updates");
-            Updater::new(data_dir, UpdateChannel::Stable)
+            // R-07-S4: 更新通道取 `[update].channel`（默认 release；配置缺失/非法回退 Stable）。
+            let channel = kirin_desk_utils::config::Config::load()
+                .ok()
+                .and_then(|c| c.update.channel.parse().ok())
+                .unwrap_or(UpdateChannel::Stable);
+            Updater::new(data_dir, channel)
         })
         .clone()
 }
@@ -271,6 +337,8 @@ struct UpdateUiState {
     downloaded: Option<PathBuf>,
     /// 最近错误信息。
     error: Option<String>,
+    /// R-07-S3: 最近提示信息（如 macOS/Linux 手动安装指引）。
+    info: Option<String>,
 }
 
 fn update_state() -> &'static Mutex<UpdateUiState> {
@@ -331,39 +399,11 @@ fn spawn_update_download(ctx: egui::Context, release: ReleaseInfo) {
     });
 }
 
-/// 安装已下载更新（Windows：替换脚本 → 旧进程退出 → 覆盖 exe → 重启）。
-#[cfg(target_os = "windows")]
-fn install_update(downloaded: &Path) -> Result<(), String> {
-    use std::os::windows::process::CommandExt;
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let script_dir = std::env::temp_dir().join("kirin_desk_update");
-    std::fs::create_dir_all(&script_dir).map_err(|e| e.to_string())?;
-    let script = script_dir.join("apply_update.bat");
-    let content = format!(
-        "@echo off\r\n\
-         timeout /t 2 /nobreak >nul\r\n\
-         copy /Y \"{}\" \"{}\" >nul\r\n\
-         if exist \"{}\" start \"\" \"{}\"\r\n\
-         del \"%~f0\"\r\n",
-        downloaded.display(),
-        exe.display(),
-        exe.display(),
-        exe.display()
-    );
-    std::fs::write(&script, content).map_err(|e| e.to_string())?;
-    // CREATE_NO_WINDOW：替换脚本后台静默运行。
-    std::process::Command::new("cmd")
-        .args(["/c", script.to_str().unwrap_or("")])
-        .creation_flags(0x08000000)
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-/// 非 Windows 平台：自动安装暂未支持，提示手动替换。
-#[cfg(not(target_os = "windows"))]
-fn install_update(_downloaded: &Path) -> Result<(), String> {
-    Err("自动安装暂仅支持 Windows，请手动替换应用。".to_string())
+/// 安装已下载更新（R-07-S3：安装职责收归 updater crate——
+/// Windows 替换脚本由 `Updater::install` 生成并后台启动；macOS/Linux 返回
+/// 手动安装提示）。
+fn install_update(downloaded: &Path) -> Result<InstallOutcome, String> {
+    updater().install(downloaded).map_err(|e| e.to_string())
 }
 
 // M15 (SRV-SEC-WL / 连接审批): 服务端线程 ↔ GUI 审批弹窗的跨线程桥。
@@ -380,8 +420,8 @@ fn pending_conn_tx() -> &'static OnceLock<tokio::sync::mpsc::UnboundedSender<Pen
 }
 
 /// GUI 侧待审批连接接收端（egui update 每帧 try_recv）。
-fn pending_conn_rx() -> &'static Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<PendingConnection>>>
-{
+fn pending_conn_rx(
+) -> &'static Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<PendingConnection>>> {
     static RX: OnceLock<Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<PendingConnection>>>> =
         OnceLock::new();
     RX.get_or_init(|| Mutex::new(None))
@@ -471,11 +511,7 @@ async fn handle_server_privacy_message(
                     true,
                     Some(active),
                     kirin_desk_utils::audit::AuditEvent::PrivacyDegraded,
-                    format!(
-                        "level={}->{} {audit_peer}",
-                        level.as_str(),
-                        active.as_str()
-                    ),
+                    format!("level={}->{} {audit_peer}", level.as_str(), active.as_str()),
                 )
             } else {
                 (
@@ -544,9 +580,36 @@ fn init_logging_from_config() {
     }
 }
 
+/// M8-T030（R-06）：从 config `[media.gpu]` 注入单 GPU 偏好。
+///
+/// 读取失败 / 未配置 → 默认偏好（auto + 过滤虚拟），不阻断启动；
+/// `KIRIN_GPU_PREFER` env 覆盖在 `gpu::apply_preferences` 内部完成
+/// （env > config > auto，GPU-NF-005）。
+fn apply_gpu_preferences_from_config() {
+    use kirin_desk_media::gpu::{apply_preferences, GpuPreference, GpuPreferences};
+
+    let cfg = kirin_desk_utils::config::Config::load().unwrap_or_default();
+    let prefs = GpuPreferences {
+        prefer: GpuPreference::parse_str(&cfg.media.gpu.prefer),
+        filter_virtual: cfg.media.gpu.filter_virtual,
+        virtual_keywords: cfg.media.gpu.virtual_keywords.clone(),
+    };
+    // 触发枚举 + 选择（首用缓存；选定结果仅日志，供编码/解码绑定读取）。
+    let _ = apply_preferences(prefs);
+}
+
 pub fn run() {
     // Initialize logging from config
     init_logging_from_config();
+
+    // R-10 (M15-T006): 全局 panic hook——panic 写入日志文件/控制台，
+    // GUI 模式下由 show_panic_dialog 弹错误框（附日志路径）。
+    kirin_desk_utils::logging::install_panic_hook();
+
+    // M8-T030（R-06，GPU-FR-009）：启动时注入单 GPU 偏好（config `[media.gpu]`，
+    // KIRIN_GPU_PREFER env 覆盖）。后续编码/解码/GPU 内核经 gpu 模块首用缓存
+    // 绑定选定适配器；无真实 GPU → None 回退 FFmpeg 默认设备（GPU-NF-002）。
+    apply_gpu_preferences_from_config();
 
     // Probe FFmpeg availability at startup
     if kirin_desk_media::ffmpeg::ensure_loaded().is_ok() {
@@ -716,6 +779,12 @@ struct ConnectionWindow {
     privacy_ack_seq: u64,
     /// M8-T019: 待显示 toast（(文案, 起始时刻)，5s 自动消失）。
     privacy_toast: Option<(String, std::time::Instant)>,
+    /// R-03 (R03-S4)：断线重连上下文（会话建立时登记；断开后自动/手动重连）。
+    reconnect_ctx: Option<Arc<ReconnectCtx>>,
+    /// R-03：重连任务停止标志（窗口关闭时置位，中止退避循环）。
+    reconnect_stop: Option<Arc<AtomicBool>>,
+    /// R-04：本会话音频状态（音频线程经键控 map 写入；状态栏徽标读取）。
+    audio_state: AudioUiState,
 }
 
 impl ConnectionWindow {
@@ -756,6 +825,15 @@ impl ConnectionWindow {
     fn send_display_control(&self, msg: ControlMessage) {
         if let Some(tx) = &self.control_tx {
             let _ = tx.send(msg);
+        }
+    }
+
+    /// R-04：同步本会话音频状态（音频线程 → 键控 map → 状态栏徽标）。
+    fn sync_audio_state(&mut self) {
+        if let Ok(m) = audio_window_state().lock() {
+            if let Some(st) = m.get(&self.session_id) {
+                self.audio_state = *st;
+            }
         }
     }
 
@@ -942,6 +1020,8 @@ struct DesktopWindowSignal {
     control_tx: tokio::sync::mpsc::UnboundedSender<ControlMessage>,
     /// 窗口持有；关闭 / 去重丢弃信号 → sender drop → 会话退出（P2 消费）。
     close_tx: tokio::sync::mpsc::UnboundedSender<()>,
+    /// R-03 (R03-S4)：断线重连上下文（窗口持有；None = 该连接不支持自动重连）。
+    reconnect_ctx: Option<Arc<ReconnectCtx>>,
 }
 
 /// Signal to add a new connection window (addr + 输入发送通道 + 文件命令通道
@@ -949,6 +1029,24 @@ struct DesktopWindowSignal {
 fn add_window_signal() -> &'static Mutex<Vec<DesktopWindowSignal>> {
     static W: OnceLock<Mutex<Vec<DesktopWindowSignal>>> = OnceLock::new();
     W.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// R-03 (R03-S3/S4)：重连续接信号——断线重连成功后按 `session_id` 更新
+/// **既有窗口**的通道（不新建窗口；UI 帧 drain 消费）。
+struct ResumeSignal {
+    session_id: u64,
+    addr: String,
+    bridge: kirin_desk_media::decoder::RenderBridge,
+    input_tx: tokio::sync::mpsc::UnboundedSender<Vec<WireInputEvent>>,
+    file_tx: tokio::sync::mpsc::UnboundedSender<FileCommand>,
+    control_tx: tokio::sync::mpsc::UnboundedSender<ControlMessage>,
+    close_tx: tokio::sync::mpsc::UnboundedSender<()>,
+}
+
+/// R-03：重连续接信号队列（会话线程 push；UI 帧按 session_id 换通道）。
+fn add_resume_signal() -> &'static Mutex<Vec<ResumeSignal>> {
+    static R: OnceLock<Mutex<Vec<ResumeSignal>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 /// M10-T003: 连接线程成功保存设备后置位，UI 每帧检查并刷新 Devices 列表。
@@ -1000,6 +1098,216 @@ enum ClientTrust {
     /// 未命中弹首次指纹确认框，CLI-KH-001）。用户确认的公钥在握手成功后
     /// 写入 known_hosts（CLI-KH-002）。
     Confirm,
+}
+
+// ════════════════════════════════════════════════════════════════
+// R-03 (R03-S2/S4/S5)：断线重连 UI 状态
+// ════════════════════════════════════════════════════════════════
+
+/// R-03 (R03-S4)：桌面会话重连上下文（首次建连时登记；断线后自动/手动重连）。
+#[derive(Clone)]
+struct ReconnectCtx {
+    /// 建连规格（含信任策略与凭据；core `ReconnectContext` 以此为凭）。
+    options: ConnectionOptions,
+    server_id: String,
+    /// 展示用地址（窗口标题/日志）。
+    addr_label: String,
+    domain: String,
+    device_type: String,
+}
+
+impl ReconnectCtx {
+    /// 转为 core 层重连上下文（`attempt_reconnect` 消费）。
+    fn to_core(&self) -> ReconnectContext {
+        ReconnectContext {
+            options: self.options.clone(),
+            server_id: self.server_id.clone(),
+        }
+    }
+}
+
+/// R-03 (R03-S4)：重连状态（重连线程写入 → UI 帧读取覆盖层）。
+#[derive(Debug, Clone, PartialEq)]
+enum ReconnectUiState {
+    /// 自动重连进行中（第 N 次 / 共 M 次；N=0 表示刚触发未到首次）。
+    Retrying { attempt: u32, max: u32 },
+    /// 不可重连（R03-S5：明确原因文案，不静默失败）。
+    Failed { reason: String },
+}
+
+/// R-03：按 `session_id` 键控的重连状态（多窗口各自独立）。
+fn reconnect_state_map() -> &'static Mutex<HashMap<u64, ReconnectUiState>> {
+    static M: OnceLock<Mutex<HashMap<u64, ReconnectUiState>>> = OnceLock::new();
+    M.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// R-03：自动重连最大尝试次数（退避 1s/2s/4s/8s/16s，与 `ManagedConnection` 默认一致）。
+const MAX_RECONNECT_ATTEMPTS: u32 = 5;
+
+/// R-03 (R03-S1)：GUI `ClientTrust` → 抽取链路 `TrustPolicy`（确认策略回调注入；
+/// 确认放行的公钥写入共享槽，供握手成功后记录 known_hosts，CLI-KH-002）。
+fn core_trust_policy(
+    trust: &ClientTrust,
+    server_id: &str,
+    confirmed_key: Arc<Mutex<Option<String>>>,
+) -> TrustPolicy {
+    match trust {
+        ClientTrust::Verified(k) => TrustPolicy::Verified(k.clone()),
+        ClientTrust::Confirm => {
+            let id = server_id.to_string();
+            let confirmed_key_cb = confirmed_key;
+            TrustPolicy::Confirm(Some(Arc::new(move |key: &str| {
+                let ok = known_hosts_or_confirm(&id, key);
+                if ok {
+                    if let Ok(mut ck) = confirmed_key_cb.lock() {
+                        *ck = Some(key.to_string());
+                    }
+                }
+                ok
+            })))
+        }
+    }
+}
+
+/// R-03 (R03-S2)：把 "[v6]:port" / "v4:port" 拆为 (ip, port)（建连规格组装用）。
+fn split_connect_addr(addr: &str) -> (String, u16) {
+    if let Some(rest) = addr.strip_prefix('[') {
+        if let Some((ip, tail)) = rest.split_once(']') {
+            let port = tail.trim_start_matches(':').parse().unwrap_or(3389);
+            return (ip.to_string(), port);
+        }
+    }
+    if let Some((ip, port)) = addr.rsplit_once(':') {
+        return (ip.to_string(), port.parse().unwrap_or(3389));
+    }
+    (addr.to_string(), 3389)
+}
+
+/// R-03 (R03-S2/S4)：构造桌面会话的重连上下文（断线后自动重连用）。
+/// 返回 `None` = 无设备身份（理论不可达，启动时已加载）。
+fn build_reconnect_ctx(
+    target: String,
+    port: u16,
+    server_id: String,
+    challenge: String,
+    device_type: &str,
+    trust: ClientTrust,
+    dns: Option<DnsConfig>,
+    domain: String,
+) -> Option<Arc<ReconnectCtx>> {
+    let identity = global_identity().get()?;
+    let addr_label = if dns.is_some() {
+        // 域名模式：重连时重新发现（IP 可能变化），展示用原域名。
+        server_id.clone()
+    } else {
+        // IP 模式：目标即地址。
+        if target.contains(':') {
+            format!("[{}]:{}", target, port)
+        } else {
+            format!("{}:{}", target, port)
+        }
+    };
+    let confirmed_key: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    Some(Arc::new(ReconnectCtx {
+        options: ConnectionOptions {
+            target,
+            port,
+            server_id: server_id.clone(),
+            challenge,
+            device_type: device_type.to_string(),
+            client_identity: Arc::new(identity.clone()),
+            // 保持 GUI 既有行为（client_id = server_id；client_domain 固定）。
+            client_id: server_id.clone(),
+            client_domain: "gui-client.local".to_string(),
+            dns,
+            trust: core_trust_policy(&trust, &server_id, confirmed_key),
+        },
+        server_id,
+        addr_label,
+        domain,
+        device_type: device_type.to_string(),
+    }))
+}
+
+/// R-03 (R03-S4)：启动断线重连任务（自动/手动按钮共用）——`attempt_reconnect`
+/// 按 1s/2s/4s…退避驱动（上限 30s），成功后以**同一 session_id** 续接会话
+/// （R03-S3：`run_client_session_with_channel` push 续接信号，UI 帧换通道）。
+/// 失败 → 覆盖层显示明确原因（R03-S5）。窗口关闭时置位停止标志中止退避。
+fn spawn_reconnect(win: &mut ConnectionWindow) {
+    let Some(ctx) = win.reconnect_ctx.clone() else {
+        return;
+    };
+    let session_id = win.session_id;
+    let stop = Arc::new(AtomicBool::new(false));
+    win.reconnect_stop = Some(stop.clone());
+    {
+        let mut m = reconnect_state_map().lock().unwrap();
+        m.insert(
+            session_id,
+            ReconnectUiState::Retrying {
+                attempt: 0,
+                max: MAX_RECONNECT_ATTEMPTS,
+            },
+        );
+    }
+    let state_map = reconnect_state_map();
+    let addr_label = ctx.addr_label.clone();
+    let core_ctx = ctx.to_core();
+    tracing::info!(
+        "[reconnect] session {}: spawning backoff reconnect",
+        session_id
+    );
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().expect("reconnect rt");
+        rt.block_on(async move {
+            let mut conn = ManagedConnection::new(&core_ctx.server_id);
+            conn.max_reconnect_attempts = MAX_RECONNECT_ATTEMPTS;
+            conn.set_reconnect_context(core_ctx);
+            // 每次尝试前更新覆盖层"第 N 次"。
+            let on_attempt: Option<Arc<dyn Fn(u32) + Send + Sync>> =
+                Some(Arc::new(move |attempt: u32| {
+                    if let Ok(mut m) = state_map.lock() {
+                        if let Some(ReconnectUiState::Retrying { attempt: cur, .. }) =
+                            m.get_mut(&session_id)
+                        {
+                            *cur = attempt;
+                        }
+                    }
+                }));
+            match attempt_reconnect(&mut conn, on_attempt, Some(stop)).await {
+                Ok(channel) => {
+                    tracing::info!(
+                        "[reconnect] session {} reconnected — resuming session",
+                        session_id
+                    );
+                    // R03-S3：会话层续接（同一 session_id；UI 帧按续接信号换通道，
+                    // 不再新建窗口）。
+                    run_client_session_with_channel(
+                        channel,
+                        addr_label,
+                        Some(ctx),
+                        Some(session_id),
+                    )
+                    .await;
+                }
+                Err(f) => {
+                    tracing::warn!("[reconnect] session {} failed: {}", session_id, f.reason);
+                    // R03-S5：明确不可重连原因（不静默失败）。
+                    if let Ok(mut m) = state_map.lock() {
+                        m.insert(
+                            session_id,
+                            ReconnectUiState::Failed {
+                                reason: f.message(),
+                            },
+                        );
+                    }
+                    if let Ok(mut s) = connection_status().lock() {
+                        *s = f.message();
+                    }
+                }
+            }
+        });
+    });
 }
 
 /// M15 (CLI-KH-001): 首次连接指纹确认请求——连接线程设置后阻塞等待，
@@ -1060,9 +1368,7 @@ fn confirm_fingerprint_blocking(device_id: &str, pubkey_base64: &str) -> bool {
 /// - 未命中 → 首次指纹确认框，用户确认后才继续。
 /// 拒绝时向 `connection_status` 写入原因。
 fn known_hosts_or_confirm(device_id: &str, pubkey_base64: &str) -> bool {
-    match KnownHostsStore::load()
-        .map(|store| store.check(device_id, pubkey_base64))
-    {
+    match KnownHostsStore::load().map(|store| store.check(device_id, pubkey_base64)) {
         Ok(FingerprintStatus::Match) => {
             tracing::info!("[known_hosts] fingerprint MATCH for '{}'", device_id);
             true
@@ -1089,11 +1395,7 @@ fn known_hosts_or_confirm(device_id: &str, pubkey_base64: &str) -> bool {
 /// 握手成功后记录 known_hosts（CLI-KH-002）；失败仅告警，不影响主流程。
 fn record_known_host(device_id: &str, pubkey_base64: &str) {
     match KnownHostsStore::load().and_then(|mut s| s.confirm(device_id, pubkey_base64)) {
-        Ok(fp) => tracing::info!(
-            "[known_hosts] recorded '{}' fingerprint {}",
-            device_id,
-            fp
-        ),
+        Ok(fp) => tracing::info!("[known_hosts] recorded '{}' fingerprint {}", device_id, fp),
         Err(e) => tracing::warn!("[known_hosts] failed to record '{}': {}", device_id, e),
     }
 }
@@ -1113,7 +1415,9 @@ async fn run_client_shell_session(
     device_type: &str,
     ctx: egui::Context,
 ) {
-    use kirin_desk_core::crypto::handshake::client_handshake_with_confirm;
+    use kirin_desk_core::crypto::handshake::{
+        client_handshake_with_confirm, CoreReason, PinExpectation,
+    };
     // M8-T021 P1: 会话标识（窗口键控状态 key；窗口 id 与之解耦）。
     let session_id = next_session_id();
     tracing::info!("[shell] TCP connecting to {} ...", addr);
@@ -1141,6 +1445,14 @@ async fn run_client_shell_session(
     let confirmed_key: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let ch = match trust.clone() {
         ClientTrust::Verified(expected) => {
+            // R-02：pin 强类型——known_hosts/DNS TXT 已确认公钥 → `Exact` 强制比对。
+            let pin = match PinExpectation::exact_from_base64(&expected) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!("[shell] invalid trusted key: {}", e);
+                    return;
+                }
+            };
             client_handshake_with_confirm(
                 stream,
                 client_id,
@@ -1148,7 +1460,7 @@ async fn run_client_shell_session(
                 "gui-client.local",
                 "shell",
                 server_name,
-                Some(expected),
+                pin,
                 None,
                 &challenge,
             )
@@ -1174,7 +1486,8 @@ async fn run_client_shell_session(
                 "gui-client.local",
                 "shell",
                 server_name,
-                None,
+                // R-02：无带外公钥 → 确认回调必填（`UserConfirmRequired`，无跳过路径）。
+                PinExpectation::None(CoreReason::UserConfirmRequired),
                 key_confirm,
                 &challenge,
             )
@@ -1198,7 +1511,10 @@ async fn run_client_shell_session(
     };
     tracing::info!("[shell] Handshake SUCCESS! Channel to '{}'", server_id);
     if let Ok(mut s) = connection_status().lock() {
-        *s = format!("[shell] Connected to {}@{} (transport: TCP)", server_id, addr);
+        *s = format!(
+            "[shell] Connected to {}@{} (transport: TCP)",
+            server_id, addr
+        );
     }
 
     // M15 (CLI-KH-002): 连接成功 → 记录 known_hosts + 自动保存设备。
@@ -1294,7 +1610,9 @@ async fn run_client_shell_session(
 // ════════════════════════════════════════════════════════════════
 
 /// 把 core 侧 [`TransferStatus`] 映射为 UI 任务状态。
-fn map_file_status(st: kirin_desk_core::connection::file_transfer::TransferStatus) -> FileTaskStatus {
+fn map_file_status(
+    st: kirin_desk_core::connection::file_transfer::TransferStatus,
+) -> FileTaskStatus {
     use kirin_desk_core::connection::file_transfer::TransferStatus as S;
     match st {
         S::Queued => FileTaskStatus::Queued,
@@ -1431,7 +1749,9 @@ impl FileSession {
 
     /// 同步发送侧任务到面板。
     fn panel_sync_send(&self, tid: u64) {
-        let Some(s) = self.senders.get(&tid) else { return };
+        let Some(s) = self.senders.get(&tid) else {
+            return;
+        };
         let (done, total) = s.progress();
         let mut task = FileTask::queued(tid, s.name.clone(), total, FileDirection::Upload);
         task.done = done;
@@ -1444,7 +1764,9 @@ impl FileSession {
 
     /// 同步接收侧任务到面板。
     fn panel_sync_recv(&self, tid: u64) {
-        let Some(r) = self.receivers.get(&tid) else { return };
+        let Some(r) = self.receivers.get(&tid) else {
+            return;
+        };
         let (done, total) = r.progress();
         let mut task = FileTask::queued(tid, r.name.clone(), total, FileDirection::Download);
         task.done = done;
@@ -1605,8 +1927,13 @@ impl FileSession {
 
     /// 发 Offer（声明白名、大小、总块数、整文件哈希）。
     async fn send_offer(&mut self, tid: u64) -> bool {
-        let Some(s) = self.senders.get(&tid) else { return false };
-        let meta = FileOfferMeta { name: s.name.clone(), size: s.size };
+        let Some(s) = self.senders.get(&tid) else {
+            return false;
+        };
+        let meta = FileOfferMeta {
+            name: s.name.clone(),
+            size: s.size,
+        };
         let frame = FileTransferFrame::offer(tid, &meta, s.total_blocks(), s.sha256);
         if !self.send_frame(frame).await {
             return false;
@@ -1633,9 +1960,15 @@ impl FileSession {
                 break;
             };
             let size = self.senders.get(&tid).map(|s| s.size).unwrap_or(0);
-            let total_blocks = self.senders.get(&tid).map(|s| s.total_blocks()).unwrap_or(0);
+            let total_blocks = self
+                .senders
+                .get(&tid)
+                .map(|s| s.total_blocks())
+                .unwrap_or(0);
             let read = {
-                let Some(file) = self.src_files.get_mut(&tid) else { break };
+                let Some(file) = self.src_files.get_mut(&tid) else {
+                    break;
+                };
                 use std::io::{Read, Seek, SeekFrom};
                 let len = block_len(seq, size);
                 if let Err(e) = file.seek(SeekFrom::Start(block_offset(seq))) {
@@ -1671,7 +2004,9 @@ impl FileSession {
     async fn on_accept(&mut self, frame: FileTransferFrame) {
         let tid = frame.transfer_id;
         let (all_acked, sha, total_blocks) = {
-            let Some(sender) = self.senders.get_mut(&tid) else { return };
+            let Some(sender) = self.senders.get_mut(&tid) else {
+                return;
+            };
             let remote_next = bincode::deserialize::<u32>(&frame.data).unwrap_or(0);
             sender.on_accept(remote_next);
             (sender.all_acked(), sender.sha256, sender.total_blocks())
@@ -1697,10 +2032,16 @@ impl FileSession {
     async fn on_ack(&mut self, frame: FileTransferFrame) {
         let tid = frame.transfer_id;
         let (finish_ready, sha, total_blocks) = {
-            let Some(sender) = self.senders.get_mut(&tid) else { return };
+            let Some(sender) = self.senders.get_mut(&tid) else {
+                return;
+            };
             let was_complete = sender.is_complete();
             sender.on_ack(frame.seq);
-            (sender.all_acked() && !was_complete, sender.sha256, sender.total_blocks())
+            (
+                sender.all_acked() && !was_complete,
+                sender.sha256,
+                sender.total_blocks(),
+            )
         };
         self.panel_sync_send(tid);
         if finish_ready {
@@ -1782,7 +2123,9 @@ impl FileSession {
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!("file offer deserialize failed: {e}");
-                let _ = self.send_frame(FileTransferFrame::simple(tid, FileOp::Reject, 0)).await;
+                let _ = self
+                    .send_frame(FileTransferFrame::simple(tid, FileOp::Reject, 0))
+                    .await;
                 return;
             }
         };
@@ -1861,7 +2204,11 @@ impl FileSession {
             // Accept 携带本端续传进度（u32）。
             let mut acc = FileTransferFrame::simple(tid, FileOp::Accept, 0);
             acc.data = bincode::serialize(&resume_from).unwrap_or_default();
-            acc.total_blocks = self.receivers.get(&tid).map(|r| r.total_blocks).unwrap_or(0);
+            acc.total_blocks = self
+                .receivers
+                .get(&tid)
+                .map(|r| r.total_blocks)
+                .unwrap_or(0);
             if !self.send_frame(acc).await {
                 tracing::error!("file accept send failed");
                 self.recv_sched.finish_one();
@@ -1894,7 +2241,9 @@ impl FileSession {
             Err(e) => {
                 // 顺序破坏/块长异常 → 终止该传输（防御）。
                 tracing::warn!("file receive error: {e}");
-                let _ = self.send_frame(FileTransferFrame::simple(tid, FileOp::Cancel, 0)).await;
+                let _ = self
+                    .send_frame(FileTransferFrame::simple(tid, FileOp::Cancel, 0))
+                    .await;
                 if let Some(r) = self.receivers.get_mut(&tid) {
                     r.cancel();
                 }
@@ -1910,7 +2259,9 @@ impl FileSession {
         let tid = frame.transfer_id;
         let outcome = {
             let Some(recv) = self.receivers.get_mut(&tid) else {
-                let _ = self.send_frame(FileTransferFrame::simple(tid, FileOp::FinishAck, 0)).await;
+                let _ = self
+                    .send_frame(FileTransferFrame::simple(tid, FileOp::FinishAck, 0))
+                    .await;
                 return;
             };
             let result = recv.verify().map(|()| recv.commit());
@@ -1950,7 +2301,9 @@ impl FileSession {
             (_, _, total, name) => {
                 // 校验失败（FT-SEC-003）：Cancel + 删除 .part。
                 tracing::warn!("file checksum FAILED for {tid}");
-                let _ = self.send_frame(FileTransferFrame::simple(tid, FileOp::Cancel, 0)).await;
+                let _ = self
+                    .send_frame(FileTransferFrame::simple(tid, FileOp::Cancel, 0))
+                    .await;
                 if let Some(r) = self.receivers.get_mut(&tid) {
                     r.cancel();
                 }
@@ -2003,7 +2356,11 @@ impl FileSession {
             if let Ok(mut p) = self.panel.lock() {
                 p.upsert(FileTask {
                     transfer_id: tid,
-                    name: self.pending_offers.get(&tid).map(|(m, _)| m.name.clone()).unwrap_or_default(),
+                    name: self
+                        .pending_offers
+                        .get(&tid)
+                        .map(|(m, _)| m.name.clone())
+                        .unwrap_or_default(),
                     size: 0,
                     direction: FileDirection::Download,
                     done: 0,
@@ -2056,7 +2413,9 @@ impl FileSession {
         }
         for tid in dead {
             tracing::warn!("file transfer {tid} idle timeout — cancelling");
-            let _ = self.send_frame(FileTransferFrame::simple(tid, FileOp::Cancel, 0)).await;
+            let _ = self
+                .send_frame(FileTransferFrame::simple(tid, FileOp::Cancel, 0))
+                .await;
             if let Some(s) = self.senders.get(&tid) {
                 if let Ok(mut p) = self.panel.lock() {
                     p.upsert(FileTask {
@@ -2106,7 +2465,9 @@ impl FileSession {
     /// 本地取消命令：发 Cancel 帧 + 回滚。
     async fn cmd_cancel(&mut self, tid: u64) {
         if self.senders.contains_key(&tid) {
-            let _ = self.send_frame(FileTransferFrame::simple(tid, FileOp::Cancel, 0)).await;
+            let _ = self
+                .send_frame(FileTransferFrame::simple(tid, FileOp::Cancel, 0))
+                .await;
             if let Ok(mut p) = self.panel.lock() {
                 if let Some(s) = self.senders.get(&tid) {
                     p.upsert(FileTask {
@@ -2126,14 +2487,20 @@ impl FileSession {
             self.cleanup_task(tid);
             self.schedule_next_send().await;
         } else if self.receivers.contains_key(&tid) || self.pending_offers.contains_key(&tid) {
-            let _ = self.send_frame(FileTransferFrame::simple(tid, FileOp::Cancel, 0)).await;
+            let _ = self
+                .send_frame(FileTransferFrame::simple(tid, FileOp::Cancel, 0))
+                .await;
             if let Some(r) = self.receivers.get_mut(&tid) {
                 r.cancel();
             }
             if let Ok(mut p) = self.panel.lock() {
                 p.upsert(FileTask {
                     transfer_id: tid,
-                    name: self.pending_offers.get(&tid).map(|(m, _)| m.name.clone()).unwrap_or_default(),
+                    name: self
+                        .pending_offers
+                        .get(&tid)
+                        .map(|(m, _)| m.name.clone())
+                        .unwrap_or_default(),
                     size: 0,
                     direction: FileDirection::Download,
                     done: 0,
@@ -2164,21 +2531,88 @@ async fn run_client_session(
     challenge: String,
     domain: String,
     device_type: &str,
+    reconnect: Option<Arc<ReconnectCtx>>,
 ) {
+    // R-03 (R03-S1)：初始建连共用抽取链路（resolve_peer + connect_peer），
+    // 会话机制复用 run_client_session_with_channel（重连续接同入口）。
     tracing::info!("TCP connecting to {} ...", addr);
     if let Ok(mut s) = connection_status().lock() {
         *s = format!("Connecting: {} ...", addr);
     }
-    let Ok(stream) = tokio::net::TcpStream::connect(&addr).await else {
-        tracing::error!("TCP connect to {} FAILED", addr);
-        if let Ok(mut s) = connection_status().lock() {
-            *s = format!("TCP connect FAILED: {}", addr);
-        }
+    let Some(client_id) = global_identity().get() else {
+        tracing::error!("No device identity loaded, can't handshake");
         return;
     };
-    tracing::info!("TCP connected to {}", addr);
-    run_client_session_with_stream(stream, addr, server_id, trust, challenge, domain, device_type)
-        .await;
+    let (ip, port) = split_connect_addr(&addr);
+    // 确认回调共享槽（Confirm 路径：确认放行的公钥供成功后记录 known_hosts，CLI-KH-002）。
+    let confirmed_key: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let opts = ConnectionOptions {
+        target: ip,
+        port,
+        server_id: server_id.clone(),
+        challenge: challenge.clone(),
+        device_type: device_type.to_string(),
+        client_identity: Arc::new(client_id.clone()),
+        client_id: server_id.clone(), // 保持 GUI 既有行为
+        client_domain: "gui-client.local".to_string(), // 保持 GUI 既有行为
+        dns: None,                    // GUI 发现在调用方完成，此处直连
+        trust: core_trust_policy(&trust, &server_id, confirmed_key.clone()),
+    };
+    let peer = match resolve_peer(&opts).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!("resolve peer failed: {}", e);
+            if let Ok(mut s) = connection_status().lock() {
+                *s = format!("{}", e);
+            }
+            return;
+        }
+    };
+    // 握手阶段状态（与旧流程同文案）。
+    if let Ok(mut s) = connection_status().lock() {
+        *s = format!("Handshaking: {}@{} ...", server_id, addr);
+    }
+    let outcome = match connect_peer(&opts, &peer).await {
+        Ok(o) => o,
+        Err(ConnectError::Tcp(e)) => {
+            tracing::error!("TCP connect to {} FAILED: {}", addr, e);
+            if let Ok(mut s) = connection_status().lock() {
+                *s = format!("TCP connect FAILED: {}", addr);
+            }
+            return;
+        }
+        Err(e) => {
+            tracing::error!("Handshake FAILED: {}", e);
+            if let Ok(mut s) = connection_status().lock() {
+                *s = format!("Handshake FAILED: {}", e);
+                // M8-T017-P2 (CLI-TMP-003): 携带挑战码时追加引导提示（防枚举，纯客户端文案）。
+                if let ConnectError::Handshake(_) = &e {
+                    if let Some(h) = crate::policy::connect_failure_challenge_hint(&challenge) {
+                        s.push('\n');
+                        s.push_str(&h);
+                    }
+                }
+            }
+            return;
+        }
+    };
+    tracing::info!(
+        "Handshake SUCCESS! Secured channel established to '{}'",
+        server_id
+    );
+    if let Ok(mut s) = connection_status().lock() {
+        *s = format!("Connected to {}@{} (transport: TCP)", server_id, addr);
+    }
+    // M15 (CLI-KH-002): 连接成功 → 记录 known_hosts；M10-T003: 自动保存设备。
+    let trusted_key = match &trust {
+        ClientTrust::Verified(k) => Some(k.clone()),
+        ClientTrust::Confirm => confirmed_key.lock().ok().and_then(|k| k.clone()),
+    };
+    if let Some(key) = &trusted_key {
+        record_known_host(&server_id, key);
+        save_device_to_store(&addr, &server_id, key, device_type, &domain);
+    }
+    run_client_session_with_channel(outcome.channel, addr, reconnect, None).await;
 }
 
 /// M8-T026-P2 (ID-021)：会话入口的**已连接流**变体 —— 供设备 ID 模式
@@ -2192,11 +2626,14 @@ async fn run_client_session_with_stream(
     challenge: String,
     domain: String,
     device_type: &str,
+    // R-03 (R03-S3/S4)：重连续接上下文 / 续接会话标识（重连成功后复用同一
+    // session_id 更新既有窗口，不新建）。
+    reconnect: Option<Arc<ReconnectCtx>>,
+    resume_session_id: Option<u64>,
 ) {
-    use kirin_desk_core::crypto::handshake::client_handshake_with_confirm;
-    // M8-T021 P1: 会话标识（窗口键控状态 key；窗口 id 与之解耦）。
-    let session_id = next_session_id();
-
+    use kirin_desk_core::crypto::handshake::{
+        client_handshake_with_confirm, CoreReason, PinExpectation,
+    };
     let Some(client_id) = global_identity().get() else {
         tracing::error!("No device identity loaded, can't handshake");
         return;
@@ -2223,6 +2660,14 @@ async fn run_client_session_with_stream(
                 "strict",
                 if challenge.is_empty() { "none" } else { "set" }
             );
+            // R-02：pin 强类型——DNS TXT 已确认公钥 → `Exact` 强制比对。
+            let pin = match PinExpectation::exact_from_base64(&expected) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!("invalid trusted key: {}", e);
+                    return;
+                }
+            };
             client_handshake_with_confirm(
                 stream,
                 client_id,
@@ -2230,7 +2675,7 @@ async fn run_client_session_with_stream(
                 "gui-client.local",
                 "desktop",
                 server_name,
-                Some(expected),
+                pin,
                 None,
                 &challenge,
             )
@@ -2263,7 +2708,8 @@ async fn run_client_session_with_stream(
                 "gui-client.local",
                 "desktop",
                 server_name,
-                None,
+                // R-02：无带外公钥 → 确认回调必填（`UserConfirmRequired`，无跳过路径）。
+                PinExpectation::None(CoreReason::UserConfirmRequired),
                 key_confirm,
                 &challenge,
             )
@@ -2306,12 +2752,34 @@ async fn run_client_session_with_stream(
         save_device_to_store(&addr_label, &server_id, key, device_type, &domain);
     }
 
+    // R-03 (R03-S3)：握手完成 → 会话机制（通道拆分/任务/窗口信号）统一入口。
+    run_client_session_with_channel(ch, addr_label, reconnect, resume_session_id).await;
+}
+/// R-03 (R03-S3/S4)：会话机制统一入口——通道拆分 → 输入/控制/文件任务 →
+/// 视频接收解码 → 窗口信号。首连（`resume_session_id = None`）push 新建窗口
+/// 信号；断线重连续接（`Some(session_id)`）push 续接信号（UI 帧按 session_id
+/// 更新既有窗口通道，不新建窗口）。与 R-04（音频接线）按函数级分块。
+#[allow(clippy::too_many_arguments)]
+async fn run_client_session_with_channel(
+    channel: SecureChannel,
+    addr_label: String,
+    reconnect: Option<Arc<ReconnectCtx>>,
+    resume_session_id: Option<u64>,
+) {
+    // M8-T021 P1: 会话标识（窗口键控状态 key；窗口 id 与之解耦）。
+    // R-03：重连续接复用同一 session_id（窗口已存在，键控状态继续有效）。
+    let session_id = resume_session_id.unwrap_or_else(next_session_id);
+    // 本机身份（文件会话盐需要公钥；启动时已加载）。
+    let Some(client_id) = global_identity().get() else {
+        tracing::error!("No device identity loaded, can't start session");
+        return;
+    };
     // M9: 拆分通道为读写半通道——视频接收（读半）与输入发送（写半）
     // 各自单任务独占、无锁并发（TCP 双工 + 每消息随机 nonce）。
     // M13-T006: 写半进一步由多个任务共享（input/clipboard/文件），
     // 用 Arc<tokio::sync::Mutex<SecureChannelSender>> 保证帧边界。
-    let peer_id = ch.peer_id.clone();
-    let (reader, writer) = ch.into_split();
+    let peer_id = channel.peer_id.clone();
+    let (reader, writer) = channel.into_split();
     let sender_shared: Arc<tokio::sync::Mutex<SecureChannelSender>> =
         Arc::new(tokio::sync::Mutex::new(SecureChannelSender::new(writer)));
     let mut video_receiver = SecureChannelReceiver::new(reader);
@@ -2322,11 +2790,9 @@ async fn run_client_session_with_stream(
     // M13-T003: 剪贴板推送通道（轮询任务产出的 EncodedPacket 批）。
     let (clip_tx, mut clip_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<EncodedPacket>>();
     // M8-T018: 显示器控制消息通道（下拉切换 / 列表刷新 → `ChannelTag::Control`）。
-    let (control_tx, mut control_rx) =
-        tokio::sync::mpsc::unbounded_channel::<ControlMessage>();
+    let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel::<ControlMessage>();
     // M13-T006: 文件命令（UI → 文件会话）与帧转发（接收循环 → 文件会话）。
-    let (file_cmd_tx, mut file_cmd_rx) =
-        tokio::sync::mpsc::unbounded_channel::<FileCommand>();
+    let (file_cmd_tx, mut file_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<FileCommand>();
     let (file_frame_tx, mut file_frame_rx) =
         tokio::sync::mpsc::unbounded_channel::<FileTransferFrame>();
     let sender_input = sender_shared.clone();
@@ -2400,12 +2866,26 @@ async fn run_client_session_with_stream(
     // M8-T021 P1: 渲染桥在 push 信号**之前**创建（原 2398 位于 push 之后需调整
     // 顺序）——桥克隆进信号随窗口走，会话保留一份给解码线程 push_decoded。
     let bridge = kirin_desk_media::decoder::RenderBridge::new(2, 16); // jitter 2 帧 @60fps
-    // M8-T021 P1: close_tx——窗口持有；去重丢弃信号 / 窗口关闭 → sender drop →
-    // 会话退出（P2 消费 close_rx）。
+                                                                      // M8-T021 P1: close_tx——窗口持有；去重丢弃信号 / 窗口关闭 → sender drop →
+                                                                      // 会话退出（P2 消费 close_rx）。
     let (close_tx, mut close_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     // Signal main thread to open connection window (addr + 输入通道 + 文件命令通道
     // + M8-T018 显示器控制通道 + M8-T021 P1 会话标识/渲染桥/关闭通道)
-    if let Ok(mut w) = add_window_signal().lock() {
+    // R-03 (R03-S3/S4)：首连 → 新建窗口信号；重连续接 → 续接信号（UI 帧按
+    // session_id 更新既有窗口的通道，不新建窗口）。
+    if resume_session_id.is_some() {
+        if let Ok(mut w) = add_resume_signal().lock() {
+            w.push(ResumeSignal {
+                session_id,
+                addr: addr_label.clone(),
+                bridge: bridge.clone(),
+                input_tx,
+                file_tx: file_cmd_tx.clone(),
+                control_tx: control_tx.clone(),
+                close_tx,
+            });
+        }
+    } else if let Ok(mut w) = add_window_signal().lock() {
         w.push(DesktopWindowSignal {
             session_id,
             addr: addr_label.clone(),
@@ -2414,6 +2894,7 @@ async fn run_client_session_with_stream(
             file_tx: file_cmd_tx.clone(),
             control_tx: control_tx.clone(),
             close_tx,
+            reconnect_ctx: reconnect,
         });
     }
     // M8-T018（CLI-MON-001）：连接建立后自动请求显示器列表（与既有控制
@@ -2515,8 +2996,7 @@ async fn run_client_session_with_stream(
     // → 解码线程（专用 std::thread）→ RenderBridge（抖动缓冲）
     // → 各连接窗口 pop 自己的桥 → 窗口纹理上传（M8-T021 P1）。
     // 桥已在 push 信号前创建（见上）：信号里放克隆给窗口，会话保留本份给解码线程。
-    let (pkt_tx, pkt_rx) =
-        std::sync::mpsc::channel::<kirin_desk_media::decoder::DecoderPacket>();
+    let (pkt_tx, pkt_rx) = std::sync::mpsc::channel::<kirin_desk_media::decoder::DecoderPacket>();
 
     // 1. 解码线程：FFmpeg 解码为阻塞同步调用，用专用 std::thread
     //    （避免污染 tokio runtime；解码器 Send 非 Sync，线程独占）。
@@ -2538,7 +3018,9 @@ async fn run_client_session_with_stream(
                 }
             };
             while let Ok(pkt) = pkt_rx.recv() {
-                let Some(dec) = decoder.as_mut() else { continue; };
+                let Some(dec) = decoder.as_mut() else {
+                    continue;
+                };
                 match dec.decode(&pkt) {
                     Ok(frames) => {
                         for f in frames {
@@ -2557,6 +3039,60 @@ async fn run_client_session_with_stream(
             tracing::info!("Video decode thread exited");
         })
         .expect("spawn video decode thread");
+
+    // R-04：音频解码 + 播放线程（会话级开关；libopus/播放设备缺失 → 静音
+    // 降级，视频/键鼠不受影响）。接收循环按 `ChannelTag::Audio` 分流投递。
+    // 线程退出条件：会话结束（sender drop → `run()` 返回）或开关关闭（不建线程）。
+    let audio_pkt_tx = if audio_enabled_global().load(Ordering::Relaxed) {
+        let (audio_tx, audio_rx) =
+            std::sync::mpsc::channel::<kirin_desk_media::decoder::AudioPacket>();
+        let audio_sid = session_id;
+        let audio_handle = std::thread::Builder::new()
+            .name("kirin-audio-decode".into())
+            .spawn(move || {
+                let mut pipe =
+                    match kirin_desk_media::decoder::audio::AudioDecodePipeline::new(audio_rx) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::info!("Audio decode disabled (init failed): {e}");
+                            if let Ok(mut m) = audio_window_state().lock() {
+                                m.insert(audio_sid, AudioUiState::Muted);
+                            }
+                            return;
+                        }
+                    };
+                match pipe.start_playback() {
+                    Ok(()) => {
+                        tracing::info!("Audio playback started (WASAPI shared render)");
+                        if let Ok(mut m) = audio_window_state().lock() {
+                            m.insert(audio_sid, AudioUiState::Playing);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::info!("Audio playback unavailable ({e}) — decode-only (silent)");
+                        if let Ok(mut m) = audio_window_state().lock() {
+                            m.insert(audio_sid, AudioUiState::Muted);
+                        }
+                    }
+                }
+                // run()：音频通道关闭（会话结束）→ Ok 返回，线程干净退出。
+                let _ = pipe.run();
+                if let Ok(mut m) = audio_window_state().lock() {
+                    m.insert(audio_sid, AudioUiState::Muted);
+                }
+                tracing::info!("Audio pipeline exited");
+            })
+            .expect("spawn audio decode thread");
+        // 线程句柄持有即保活（std::thread 句柄 drop 不 join）；退出由通道关闭驱动。
+        let _ = audio_handle;
+        Some(audio_tx)
+    } else {
+        // 开关关闭：状态栏显示「音频已禁用」，不建线程、不缓冲。
+        if let Ok(mut m) = audio_window_state().lock() {
+            m.insert(session_id, AudioUiState::Disabled);
+        }
+        None
+    };
 
     // 2. 接收循环（tokio，瘦身：仅重组 + 投递 DecoderPacket，不再解码）。
     // NOTE: runs in the SAME tokio runtime as the handshake to avoid
@@ -2595,10 +3131,7 @@ async fn run_client_session_with_stream(
             if tag == ChannelTag::Control {
                 match bincode::deserialize::<ControlMessage>(&payload) {
                     Ok(ControlMessage::DisplayListResp { displays }) => {
-                        tracing::info!(
-                            "DisplayListResp: {} display(s) available",
-                            displays.len()
-                        );
+                        tracing::info!("DisplayListResp: {} display(s) available", displays.len());
                         // M8-T021 P1: 键控写入本会话的显示列表（多窗口互不覆盖）。
                         if let Ok(mut m) = display_view_state().lock() {
                             let st = m.entry(session_id).or_default();
@@ -2613,24 +3146,15 @@ async fn run_client_session_with_stream(
                         }
                     }
                     Ok(ControlMessage::PrivacyModeAck { ok, active_level }) => {
-                        tracing::info!(
-                            "PrivacyModeAck: ok={} active={:?}",
-                            ok,
-                            active_level
-                        );
+                        tracing::info!("PrivacyModeAck: ok={} active={:?}", ok, active_level);
                         // M8-T021 P1: 键控写入本会话的隐私状态。
                         let mut st = client_privacy_state().lock().unwrap();
                         let st = st.entry(session_id).or_default();
                         // 降级判断：请求 Black 但生效 Lock（SRV-PRIV-013）→ toast。
-                        let toast =
-                            privacy::ack_toast(ok, active_level, st.requested);
+                        let toast = privacy::ack_toast(ok, active_level, st.requested);
                         st.ack = Some(privacy::PrivacyAckState {
                             level: active_level,
-                            seq: st
-                                .ack
-                                .as_ref()
-                                .map_or(0, |a| a.seq)
-                                .saturating_add(1),
+                            seq: st.ack.as_ref().map_or(0, |a| a.seq).saturating_add(1),
                             toast,
                         });
                     }
@@ -2648,6 +3172,20 @@ async fn run_client_session_with_stream(
                         }
                     }
                     Err(e) => tracing::warn!("file frame decode failed: {e}"),
+                }
+                continue;
+            }
+            // R-04：音频包（Opus 帧）→ 音频解码/播放线程（PTS 来自帧头，
+            // jitter 排序 + WASAPI 播放；会话开关关闭时服务端不发音频包）。
+            if tag == ChannelTag::Audio {
+                if let Some(tx) = &audio_pkt_tx {
+                    let pkt = kirin_desk_media::decoder::AudioPacket {
+                        pts: _header.pts,
+                        data: payload,
+                    };
+                    if tx.send(pkt).is_err() {
+                        break; // 音频线程已退出（会话结束）
+                    }
                 }
                 continue;
             }
@@ -2692,8 +3230,9 @@ async fn run_client_session_with_stream(
                     // P2D：窗口 → 逐帧 DecoderPacket → 解码线程。
                     // PTS 方案 A：frame_id 线性近似（每窗口 2~4 帧，
                     // wid×10+idx 保证跨窗口单调；详见 frame_id_to_pts）。
-                    for (idx, frame_nalus) in
-                        KirinDeskApp::window_frame_nalus(&window).into_iter().enumerate()
+                    for (idx, frame_nalus) in KirinDeskApp::window_frame_nalus(&window)
+                        .into_iter()
+                        .enumerate()
                     {
                         if frame_nalus.is_empty() {
                             continue;
@@ -2786,7 +3325,8 @@ async fn run_client_session_by_id(device_id: String, ctx: egui::Context) {
         Ok(i) => i,
         Err(IdConnectError::SignatureVerification) => {
             if let Ok(mut s) = connection_status().lock() {
-                *s = "解析响应签名校验失败（ID-SEC-001）— 可能 server_pubkey 错误或中间人".to_string();
+                *s = "解析响应签名校验失败（ID-SEC-001）— 可能 server_pubkey 错误或中间人"
+                    .to_string();
             }
             return;
         }
@@ -2823,12 +3363,14 @@ async fn run_client_session_by_id(device_id: String, ctx: egui::Context) {
         Err(_) => ClientTrust::Confirm,
     };
     // ID-011：三级路径编排（直连 → 打洞 hook → 中继兜底）。
-    let from_peer = tunnel
-        .device_id
-        .clone()
-        .unwrap_or_else(|| kirin_desk_utils::known_hosts::fingerprint(&client_id.public_key_base64()));
+    let from_peer = tunnel.device_id.clone().unwrap_or_else(|| {
+        kirin_desk_utils::known_hosts::fingerprint(&client_id.public_key_base64())
+    });
     if let Ok(mut s) = connection_status().lock() {
-        *s = format!("Connecting: {} (relay {}) ...", device_id, tunnel.server_addr);
+        *s = format!(
+            "Connecting: {} (relay {}) ...",
+            device_id, tunnel.server_addr
+        );
     }
     let (path, stream) = match connector.connect_stream(&info, &from_peer).await {
         Ok(x) => x,
@@ -2850,6 +3392,7 @@ async fn run_client_session_by_id(device_id: String, ctx: egui::Context) {
     let ctx2 = ctx.clone();
     let device_id2 = device_id.clone();
     // 复用会话入口（握手 + 媒体会话）；首次连接指纹确认由内部 key_confirm 弹窗。
+    // R-03：ID 模式暂不支持自动重连（重连需 re-resolve 中继路径，None 上下文）。
     run_client_session_with_stream(
         stream,
         format!("{} (via relay, {})", device_id, path),
@@ -2858,6 +3401,8 @@ async fn run_client_session_by_id(device_id: String, ctx: egui::Context) {
         challenge,
         String::new(),
         "desktop",
+        None,
+        None,
     )
     .await;
     let _ = ctx2;
@@ -2889,6 +3434,12 @@ struct KirinDeskApp {
     nickname: String,
     challenge_code: String,
     allowed_domains: String,
+    /// M8-T027 (UI-IDWL-001): Settings ID 白名单文本框（逗号/换行分隔 device-id，
+    /// 保存写 `[network].allowed_ids`，永久条目，即时生效）。
+    allowed_ids: String,
+    /// M8-T027 (UI-IDWL-002): ID 白名单条目列表缓存（含过期条目与永久条目，
+    /// 供 Settings 展示过期/永久标记与逐条删除；随保存/删除刷新）。
+    id_whitelist_entries: Vec<kirin_desk_utils::config::IdWhitelistEntry>,
     listen_port: String,
     ip_mode_allowed: bool,
     temp_mode: bool,
@@ -2992,7 +3543,13 @@ fn now_epoch_ms() -> u64 {
 /// M10-T003: 连接成功后自动保存设备到 `devices.json`（桌面会话与 Shell 会话共用）。
 /// 按 id 去重 + last_seen 刷新由 `DeviceStore` 维护；保存成功置位 `devices_dirty`
 /// 让 Devices 页即时刷新。
-fn save_device_to_store(addr: &str, server_id: &str, pubkey: &str, device_type: &str, domain: &str) {
+fn save_device_to_store(
+    addr: &str,
+    server_id: &str,
+    pubkey: &str,
+    device_type: &str,
+    domain: &str,
+) {
     let port = addr
         .rsplit(':')
         .next()
@@ -3017,6 +3574,66 @@ fn save_device_to_store(addr: &str, server_id: &str, pubkey: &str, device_type: 
             }
         }
         Err(e) => tracing::warn!("Device store load failed: {}", e),
+    }
+}
+
+/// R-10 (M15-T006): 待显示 panic 摘要（`show_panic_dialog` 每帧轮询
+/// `take_panic_message` 填充；点「关闭」清除）。
+fn panic_dialog_msg() -> &'static Mutex<Option<String>> {
+    static M: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    M.get_or_init(|| Mutex::new(None))
+}
+
+/// R-10 (M15-T006): panic 错误框——有 panic 摘要时弹居中模态窗
+/// （消息摘要 + 日志文件路径可复制），点「关闭」后不再显示。
+fn show_panic_dialog(ctx: &egui::Context, theme: &Theme) {
+    if let Some(msg) = kirin_desk_utils::logging::take_panic_message() {
+        *panic_dialog_msg().lock().unwrap() = Some(msg);
+    }
+    let msg = panic_dialog_msg().lock().unwrap().clone();
+    if let Some(msg) = msg {
+        let log_path = kirin_desk_utils::logging::current_log_path(
+            &kirin_desk_utils::logging::default_log_dir(),
+        );
+        egui::Window::new("程序异常（panic）")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(
+                            "程序发生未处理异常（panic），可能不稳定。建议尽快重启应用。",
+                        )
+                        .color(theme.fg_weak),
+                    )
+                    .selectable(false),
+                );
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add(
+                    egui::Label::new(egui::RichText::new(&msg).monospace().size(theme.mono_size))
+                        .selectable(true),
+                );
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new("日志文件：").color(theme.fg_weak))
+                            .selectable(false),
+                    );
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(log_path.display().to_string()))
+                            .selectable(true),
+                    );
+                    copy_button(ui, theme, &log_path.display().to_string());
+                });
+                ui.add_space(4.0);
+                if action_button(ui, theme, ButtonKind::Primary, "关闭", ButtonState::Enabled)
+                    .clicked()
+                {
+                    *panic_dialog_msg().lock().unwrap() = None;
+                }
+            });
     }
 }
 
@@ -3215,6 +3832,9 @@ impl eframe::App for KirinDeskApp {
                 });
         }
 
+        // R-10 (M15-T006): panic 错误框（每帧轮询；关闭后不再显示）。
+        show_panic_dialog(ctx, &theme);
+
         // --- M15 (CLI-KH-001): 首次连接指纹确认模态框 ---
         // 连接线程设置 `pending_fingerprint` 后阻塞等待；本模态框应答后放行。
         // 窗口被关闭（X）→ Sender drop → 连接线程 recv Err → 视为拒绝。
@@ -3314,7 +3934,10 @@ impl eframe::App for KirinDeskApp {
             }
             // 未应答（窗口仍开着）→ 下一帧继续显示。
             if !accepted && !rejected {
-                pending_fingerprint().lock().ok().map(|mut g| *g = Some(pfp));
+                pending_fingerprint()
+                    .lock()
+                    .ok()
+                    .map(|mut g| *g = Some(pfp));
                 ctx.request_repaint();
             }
         }
@@ -3332,7 +3955,12 @@ impl eframe::App for KirinDeskApp {
                     )
                     .selectable(false),
                 );
-                badge(ui, &theme, kirin_desk_updater::APP_VERSION, BadgeKind::Neutral);
+                badge(
+                    ui,
+                    &theme,
+                    kirin_desk_updater::APP_VERSION,
+                    BadgeKind::Neutral,
+                );
                 ui.separator();
                 // 图标化标签页（选中态品牌色胶囊）
                 for (tab, icon, name) in [
@@ -3355,7 +3983,12 @@ impl eframe::App for KirinDeskApp {
                 // M15-T008: pending 计数改红色 Badge
                 let wc = waiting.len();
                 if wc > 0 {
-                    badge(ui, &theme, &format!("⚡ {} pending!", wc), BadgeKind::Danger);
+                    badge(
+                        ui,
+                        &theme,
+                        &format!("⚡ {} pending!", wc),
+                        BadgeKind::Danger,
+                    );
                 }
             });
             ui.add_space(4.0);
@@ -3430,10 +4063,8 @@ impl eframe::App for KirinDeskApp {
                 .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 16.0))
                 .show(ctx, |ui| {
                     ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(notice).size(theme.small_size),
-                        )
-                        .selectable(true),
+                        egui::Label::new(egui::RichText::new(notice).size(theme.small_size))
+                            .selectable(true),
                     );
                     ui.add_space(8.0);
                     if action_button(
@@ -3463,9 +4094,11 @@ impl eframe::App for KirinDeskApp {
         {
             if let Ok(mut signals) = add_window_signal().lock() {
                 for sig in signals.drain(..) {
-                    if let Some(existing) = self.windows.iter().find(|w| {
-                        w.addr == sig.addr && w.kind == WindowKind::Desktop
-                    }) {
+                    if let Some(existing) = self
+                        .windows
+                        .iter()
+                        .find(|w| w.addr == sig.addr && w.kind == WindowKind::Desktop)
+                    {
                         Self::focus_window(ctx, existing.id);
                         tracing::info!(
                             "[dedup] desktop window {} exists for {}, signal dropped",
@@ -3502,6 +4135,9 @@ impl eframe::App for KirinDeskApp {
                         privacy_level: None,
                         privacy_ack_seq: 0,
                         privacy_toast: None,
+                        reconnect_ctx: sig.reconnect_ctx,
+                        reconnect_stop: None,
+                        audio_state: AudioUiState::Muted,
                     });
                     tracing::info!("Connection window opened: id={}", wid);
                 }
@@ -3510,9 +4146,11 @@ impl eframe::App for KirinDeskApp {
             // M8-T021 P1: 同 addr 去重 + 聚焦；terminal 用会话侧实例（断链修复）。
             if let Ok(mut signals) = add_shell_window_signal().lock() {
                 for sig in signals.drain(..) {
-                    if let Some(existing) = self.windows.iter().find(|w| {
-                        w.addr == sig.addr && w.kind == WindowKind::Shell
-                    }) {
+                    if let Some(existing) = self
+                        .windows
+                        .iter()
+                        .find(|w| w.addr == sig.addr && w.kind == WindowKind::Shell)
+                    {
                         Self::focus_window(ctx, existing.id);
                         tracing::info!(
                             "[dedup] shell window {} exists for {}, signal dropped",
@@ -3550,8 +4188,43 @@ impl eframe::App for KirinDeskApp {
                         privacy_level: None,
                         privacy_ack_seq: 0,
                         privacy_toast: None,
+                        // R-03：Shell 会话无桌面断线重连（窗口持有 None）。
+                        reconnect_ctx: None,
+                        reconnect_stop: None,
+                        audio_state: AudioUiState::Muted,
                     });
                     tracing::info!("Shell window opened: id={}", wid);
+                }
+            }
+            // R-03 (R03-S3/S4)：重连续接信号——按 session_id 更新**既有**窗口的
+            // 通道（不新建窗口）；窗口已关闭 → 信号 drop → close_tx drop → 会话退出。
+            if let Ok(mut signals) = add_resume_signal().lock() {
+                for sig in signals.drain(..) {
+                    if let Some(win) = self
+                        .windows
+                        .iter_mut()
+                        .find(|w| w.session_id == sig.session_id)
+                    {
+                        win.addr = sig.addr;
+                        win.input_tx = Some(sig.input_tx);
+                        win.bridge = Some(sig.bridge);
+                        win.file_tx = Some(sig.file_tx);
+                        win.control_tx = Some(sig.control_tx);
+                        win.close_tx = Some(sig.close_tx);
+                        // 会话已恢复 → 清除重连状态（覆盖层随 input_tx 复活消失）。
+                        if let Ok(mut m) = reconnect_state_map().lock() {
+                            m.remove(&sig.session_id);
+                        }
+                        tracing::info!(
+                            "[reconnect] session {} resumed (channels swapped)",
+                            sig.session_id
+                        );
+                    } else {
+                        tracing::warn!(
+                            "[reconnect] resume signal for missing window session {} — dropped",
+                            sig.session_id
+                        );
+                    }
                 }
             }
         }
@@ -3591,6 +4264,8 @@ impl eframe::App for KirinDeskApp {
                     }
                     // M8-T019 (UI-PRIV-002): 同步隐私 ack（徽标 / 输入禁用 / toast）。
                     win.sync_privacy_state();
+                    // R-04：同步音频状态（音频线程 → 键控 map → 状态栏徽标）。
+                    win.sync_audio_state();
                     egui::TopBottomPanel::top(format!("conn_status_{}", wid)).show(ctx, |ui| {
                         ui.horizontal(|ui| {
                             if win.kind == WindowKind::Shell {
@@ -3651,6 +4326,18 @@ impl eframe::App for KirinDeskApp {
                                         badge(ui, &theme, "🔒 锁屏", BadgeKind::Danger);
                                     }
                                     None => {}
+                                }
+                                // R-04：音频状态徽标（静音 / 播放中 / 已禁用）。
+                                match win.audio_state {
+                                    AudioUiState::Playing => {
+                                        badge(ui, &theme, "🔊 播放中", BadgeKind::Info);
+                                    }
+                                    AudioUiState::Muted => {
+                                        badge(ui, &theme, "🔇 静音", BadgeKind::Neutral);
+                                    }
+                                    AudioUiState::Disabled => {
+                                        badge(ui, &theme, "🔇 音频已禁用", BadgeKind::Neutral);
+                                    }
                                 }
                             }
                             // M15-T008: 工具栏（显示器 🖥 / 文件 📁 / 特殊键 🔑 / 全屏 ▣ / 断开 ✖）
@@ -4059,7 +4746,10 @@ impl eframe::App for KirinDeskApp {
                             }
                         }
                         // M15-T008: 断开检测（输入发送通道已关闭 = 远端会话结束）→
-                        // 错误覆盖层 + 重连按钮（重连逻辑预留，后续 M9 联调期接入）。
+                        // 错误覆盖层 + 重连按钮。
+                        // R-03 (R03-S4)：断线后自动重连（一次性触发；重连中/已失败
+                        // 不重复），覆盖层显示"自动重连中（第 N 次/共 M 次）"，按钮
+                        // 禁用态随状态机；不可重连路径给出明确原因（R03-S5）。
                         let disconnected = win
                             .input_tx
                             .as_ref()
@@ -4068,25 +4758,86 @@ impl eframe::App for KirinDeskApp {
                         if disconnected {
                             // M8-T019: 断连后隐私徽标清空（服务端已本地恢复，SRV-PRIV-014）。
                             win.privacy_level = None;
+                            // 自动重连：仅首次触发（Retrying/Failed 状态下不重复）。
+                            let auto_start = reconnect_state_map()
+                                .lock()
+                                .unwrap()
+                                .get(&win.session_id)
+                                .is_none()
+                                && win.reconnect_ctx.is_some();
+                            if auto_start {
+                                spawn_reconnect(win);
+                            }
+                            let reconnect_state = reconnect_state_map()
+                                .lock()
+                                .unwrap()
+                                .get(&win.session_id)
+                                .cloned();
                             ui.centered_and_justified(|ui| {
                                 ui.vertical(|ui| {
                                     status_dot(ui, theme.danger, "Connection lost");
                                     ui.add_space(8.0);
-                                    if action_button(
-                                        ui,
-                                        &theme,
-                                        ButtonKind::Primary,
-                                        "Reconnect",
-                                        ButtonState::Enabled,
-                                    )
-                                    .clicked()
-                                    {
-                                        tracing::info!(
-                                            "Reconnect requested — reserved for M9 integration"
-                                        );
+                                    match &reconnect_state {
+                                        Some(ReconnectUiState::Retrying { attempt, max }) => {
+                                            ui.label(format!(
+                                                "自动重连中（第 {} 次/共 {} 次）",
+                                                (*attempt).max(1),
+                                                max
+                                            ));
+                                            ui.add_space(8.0);
+                                            // 重连中：按钮禁用（随状态机）。
+                                            action_button(
+                                                ui,
+                                                &theme,
+                                                ButtonKind::Primary,
+                                                "Reconnect",
+                                                ButtonState::Busy,
+                                            );
+                                        }
+                                        Some(ReconnectUiState::Failed { reason }) => {
+                                            // R03-S5：明确不可重连原因，不静默。
+                                            ui.label(reason.clone());
+                                            ui.add_space(8.0);
+                                            if action_button(
+                                                ui,
+                                                &theme,
+                                                ButtonKind::Primary,
+                                                "Reconnect",
+                                                ButtonState::Enabled,
+                                            )
+                                            .clicked()
+                                            {
+                                                spawn_reconnect(win);
+                                            }
+                                        }
+                                        None => {
+                                            if win.reconnect_ctx.is_none() {
+                                                // R03-S5：无重连上下文的连接（ID 模式等）
+                                                // → 显式原因，不静默失败。
+                                                ui.label(
+                                                    "无法自动重连（该连接方式不支持自动重连，请手动重连）",
+                                                );
+                                            } else {
+                                                ui.label("Connection lost");
+                                                ui.add_space(8.0);
+                                                if action_button(
+                                                    ui,
+                                                    &theme,
+                                                    ButtonKind::Primary,
+                                                    "Reconnect",
+                                                    ButtonState::Enabled,
+                                                )
+                                                .clicked()
+                                                {
+                                                    spawn_reconnect(win);
+                                                }
+                                            }
+                                        }
                                     }
                                 });
                             });
+                            // 重连进度/结果刷新（~5fps；恢复后信号消费即消失）。
+                            ctx.request_repaint_after(std::time::Duration::from_millis(200));
                             return;
                         }
                         let Some(texture) = win.texture.as_ref() else {
@@ -4287,6 +5038,13 @@ impl eframe::App for KirinDeskApp {
                         on: false,
                     });
                 }
+                // R-03 (R03-S4)：窗口关闭 → 中止重连退避 + 清重连状态。
+                if let Some(stop) = &win.reconnect_stop {
+                    stop.store(true, Ordering::Relaxed);
+                }
+                if let Ok(mut m) = reconnect_state_map().lock() {
+                    m.remove(&win.session_id);
+                }
             }
             self.windows.retain(|w| w.id != wid);
             tracing::info!("Connection window closed: id={}", wid);
@@ -4338,7 +5096,11 @@ impl KirinDeskApp {
     /// drain 兜底「点击与握手期间窗口才建立」的竞态。
     fn try_dedup_connect(&self, ctx: &egui::Context, addr: &str, kind: WindowKind) -> bool {
         // 1. 已有窗口：聚焦（T021-01-B）。
-        if let Some(win) = self.windows.iter().find(|w| w.addr == addr && w.kind == kind) {
+        if let Some(win) = self
+            .windows
+            .iter()
+            .find(|w| w.addr == addr && w.kind == kind)
+        {
             Self::focus_window(ctx, win.id);
             return true;
         }
@@ -4359,6 +5121,9 @@ impl KirinDeskApp {
             self.nickname = cfg.device.nickname;
             self.challenge_code = cfg.device.challenge_code;
             self.allowed_domains = cfg.network.allowed_domains.join(", ");
+            // M8-T027 (UI-IDWL-001/002): ID 白名单文本框 + 条目列表缓存加载。
+            self.allowed_ids = cfg.network.allowed_ids.join(", ");
+            self.id_whitelist_entries = cfg.network.id_whitelist.clone();
             self.ip_mode_allowed = cfg.network.ip_mode_allowed;
             self.temp_mode = cfg.network.temp_mode;
             self.listen_port = cfg.network.port.to_string();
@@ -4732,8 +5497,7 @@ impl KirinDeskApp {
                     self.temp_code = None;
                     // 手动关闭 → 审计 Disabled；清标记避免归零误报 Expired。
                     self.temp_window_was_active = false;
-                    let mut logger =
-                        kirin_desk_utils::audit::AuditLogger::open_default().ok();
+                    let mut logger = kirin_desk_utils::audit::AuditLogger::open_default().ok();
                     if closed {
                         audit_record(
                             &mut logger,
@@ -4886,8 +5650,41 @@ impl KirinDeskApp {
         }
     }
 
+    /// M8-T027 (UI-IDWL-002): 逐条删除 ID 白名单条目（同时清理 `allowed_ids`
+    /// 与 `id_whitelist` 两维），刷新列表缓存并写审计 `WhitelistIdRemoved`。
+    fn remove_id_whitelist_entry(&mut self, device_id: &str) {
+        match kirin_desk_utils::config::Config::load() {
+            Ok(mut cfg) => match cfg.id_whitelist_remove(device_id) {
+                Ok(true) => {
+                    self.id_whitelist_entries
+                        .retain(|e| e.device_id != device_id);
+                    // 永久条目同时从文本框移除（逗号/换行分隔）。
+                    self.allowed_ids = self
+                        .allowed_ids
+                        .split(|c| c == ',' || c == '\n' || c == '\r')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty() && s != device_id)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    if let Ok(mut a) = kirin_desk_utils::audit::AuditLogger::open_default() {
+                        let _ = a.record(
+                            kirin_desk_utils::audit::AuditEvent::WhitelistIdRemoved,
+                            &format!("device={}", device_id),
+                        );
+                    }
+                    self.settings_status = format!("Removed ID whitelist entry: {}", device_id);
+                }
+                Ok(false) => {
+                    self.settings_status = format!("ID not found in whitelist: {}", device_id)
+                }
+                Err(e) => self.settings_status = format!("Remove failed: {}", e),
+            },
+            Err(_) => self.settings_status = "Config load failed".to_string(),
+        }
+    }
+
     fn start_server(&mut self) {
-        use tracing::{error, info, warn};
+        use tracing::{error, info};
         let port: u16 = self.listen_port.parse().unwrap_or(3389);
         let allowed: Vec<String> = self
             .allowed_domains
@@ -4921,13 +5718,18 @@ impl KirinDeskApp {
 
         // M15 (SRV-SEC-KH/RL/AUDIT): 服务端策略组件 — known_hosts / 审计 /
         // 速率限制 / DNS 配置（供 TXT 公钥兜底）。
-        let mut known = match kirin_desk_utils::known_hosts::KnownClientsStore::load() {
-            Ok(k) => k,
-            Err(e) => {
-                tracing::warn!("known_clients load error (in-memory fallback): {}", e);
-                kirin_desk_utils::known_hosts::KnownClientsStore::empty()
-            }
-        };
+        // S-02 (F-5): 每连接并发处理——known_hosts 与限速器经 `Arc<Mutex>`
+        // 跨连接共享（限速语义不因并发而丢失）；审计日志改由每连接独立打开
+        // （append 模式多句柄并发安全，同隐私审计路径）。
+        let known = Arc::new(Mutex::new(
+            match kirin_desk_utils::known_hosts::KnownClientsStore::load() {
+                Ok(k) => k,
+                Err(e) => {
+                    tracing::warn!("known_clients load error (in-memory fallback): {}", e);
+                    kirin_desk_utils::known_hosts::KnownClientsStore::empty()
+                }
+            },
+        ));
         let cfg = kirin_desk_utils::config::Config::load().unwrap_or_default();
         // M13-T005 (UA-ACCEPT-004): 无人值守下强制关闭 temp-mode/ip-mode 旁路——
         // 不提供任何临时放行未知设备的路径。
@@ -4939,14 +5741,14 @@ impl KirinDeskApp {
             "Server: temp_mode={}, ip_mode={}, skip_whitelist={}, unattended={}",
             temp_mode, ip_mode, skip_whitelist, unattended
         );
-        let mut audit = match kirin_desk_utils::audit::AuditLogger::open_default() {
-            Ok(a) => Some(a),
-            Err(e) => {
-                tracing::warn!("audit log open error (audit disabled): {}", e);
-                None
-            }
-        };
-        let mut rate_limiter = kirin_desk_core::network::rate_limit::RateLimiter::new();
+        let rate_limiter = Arc::new(Mutex::new(
+            kirin_desk_core::network::rate_limit::RateLimiter::new(),
+        ));
+        // S-02 (F-5): 并发连接处理上限（含审批等待）——accept 循环 spawn 每连接，
+        // 超出上限的连接在任务内排队（信号量），服务端持续接受新连接。
+        let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(
+            SERVER_MAX_CONCURRENT_CONNECTIONS,
+        ));
         // 审批桥：服务端线程 → GUI 弹窗（连接审批，SRV-SEC-WL）。
         let (pend_tx, pend_rx) = tokio::sync::mpsc::unbounded_channel::<PendingConnection>();
         let _ = pending_conn_tx().set(pend_tx);
@@ -4970,670 +5772,36 @@ impl KirinDeskApp {
                             }
                             match server.accept().await {
                                 Ok((stream, addr)) => {
-                                    info!("Incoming connection from {}", addr);
-                                    // M15 (SRV-SEC-RL/AUDIT/KH/WL): 速率限制 → 审计 →
-                                    // 两阶段握手（known_hosts/DNS pin + 白名单 + 审批）。
-                                    let ip = addr.ip().to_canonical();
-                                    audit_record(
-                                        &mut audit,
-                                        kirin_desk_utils::audit::AuditEvent::ConnectionRequest,
-                                        &format!("ip={} port={}", ip, addr.port()),
-                                    );
-                                    if !matches!(
-                                        rate_limiter.check_connect(&ip),
-                                        RateLimitDecision::Allowed
-                                    ) {
-                                        audit_record(
-                                            &mut audit,
-                                            kirin_desk_utils::audit::AuditEvent::RateLimited,
-                                            &format!("ip={}", ip),
-                                        );
-                                        warn!("Rate limited: {} — rejected", ip);
-                                        continue;
-                                    }
-                                    // Use global identity as server identity
-                                    if let Some(server_id) = global_identity().get() {
-                                        let server_name = if server_nickname.is_empty() { "gui-server".to_string() } else { server_nickname.clone() };
-                                        let expected_challenge = if server_challenge.is_empty() { None } else { Some(&*server_challenge) };
-                                        // 1) 预读握手初始化消息（不应答）。
-                                        let mut stream = stream;
-                                        let init = match server_read_init(&mut stream).await {
-                                            Ok(i) => i,
-                                            Err(e) => {
-                                                audit_record(
-                                                    &mut audit,
-                                                    kirin_desk_utils::audit::AuditEvent::HandshakeFailure,
-                                                    &format!("ip={} error={}", ip, e),
-                                                );
-                                                rate_limiter.record_handshake_failure(&ip);
-                                                continue;
-                                            }
+                                    // S-02 (F-5): 每连接 spawn 并发处理——单连接
+                                    // "只连不发" / 60s 审批等待不再冻结 accept 循环；
+                                    // 64 并发上限，超出者在任务内排队（信号量）。
+                                    let sem = conn_semaphore.clone();
+                                    let allowed = allowed.clone();
+                                    let cfg = cfg.clone();
+                                    let server_nickname = server_nickname.clone();
+                                    let server_challenge = server_challenge.clone();
+                                    let expected_nick = expected_nick.clone();
+                                    let known = known.clone();
+                                    let rate_limiter = rate_limiter.clone();
+                                    tokio::spawn(async move {
+                                        let Ok(_permit) = sem.acquire_owned().await else {
+                                            return;
                                         };
-                                        // 2) 客户端公钥解析（known_hosts → DNS TXT，SRV-SEC-KH-001）。
-                                        let (expected_key, _resolution) = crate::policy::resolve_expected_client_key(&known, &cfg, &init.client_id).await;
-                                        // 3) 白名单检查；未知公钥且非白名单 → 审批弹窗（temp/ip 模式跳过）。
-                                        // M8-T017 (SRV-TMP-006): 临时连接窗口**逐连接**判定
-                                        // （窗口中途开启/过期即时生效），与配置旁路取或；
-                                        // 无人值守下窗口维度一并关闭（UA-ACCEPT-004）。
-                                        let temp_window: Option<TempModeManager> = if unattended {
-                                            None
-                                        } else {
-                                            crate::policy::temp_mode_window_manager()
-                                        };
-                                        let skip = skip_whitelist || temp_window.is_some();
-                                        let is_whitelisted = allowed.iter().any(|a| domain_matches_whitelist(&init.client_domain, a));
-                                        if !skip && !is_whitelisted && expected_key.is_none() {
-                                            // M13-T005 (UA-ACCEPT-002): 无人值守下
-                                            // 未知设备自动拒绝——无人工审批弹窗，
-                                            // 立即审计 + 记握手失败后断开。
-                                            if unattended {
-                                                audit_record(
-                                                    &mut audit,
-                                                    kirin_desk_utils::audit::AuditEvent::AuthFailure,
-                                                    &format!("ip={} client={} reason=unattended_unknown", ip, init.client_id),
-                                                );
-                                                rate_limiter.record_handshake_failure(&ip);
-                                                warn!(
-                                                    "Unattended: unknown client {} ({}) rejected — no approval in unattended mode",
-                                                    init.client_id, ip
-                                                );
-                                                continue;
-                                            }
-                                            let id = pending_next_id();
-                                            let (dec_tx, dec_rx) = tokio::sync::oneshot::channel::<bool>();
-                                            pending_decisions().lock().unwrap().insert(id, dec_tx);
-                                            let pc = PendingConnection {
-                                                id,
-                                                client_id: init.client_id.clone(),
-                                                client_domain: init.client_domain.clone(),
-                                                device_type: init.client_device_type.clone(),
-                                                status: PendingStatus::Waiting,
-                                            };
-                                            if let Some(tx) = pending_conn_tx().get() {
-                                                let _ = tx.send(pc);
-                                            }
-                                            // 等待用户决策（60s 超时）。
-                                            match tokio::time::timeout(
-                                                std::time::Duration::from_secs(60),
-                                                dec_rx,
-                                            )
-                                            .await
-                                            {
-                                                Ok(Ok(true)) => {} // 用户接受 → 继续握手
-                                                _ => {
-                                                    audit_record(
-                                                        &mut audit,
-                                                        kirin_desk_utils::audit::AuditEvent::AuthFailure,
-                                                        &format!("ip={} client={} approval declined/timeout", ip, init.client_id),
-                                                    );
-                                                    rate_limiter.record_handshake_failure(&ip);
-                                                    continue;
-                                                }
-                                            }
-                                        }
-                                        // 4) pin/nickname/challenge/签名校验 + 应答。
-                                        // M8-T017 (SRV-TMP-HK-001/003): 挑战码二态——固定
-                                        // 挑战码 **或** 窗口内临时挑战码任一正确即通过。
-                                        if let Err(e) = verify_server_init_with_temp(
-                                            &init,
-                                            expected_key.as_deref().unwrap_or(""),
-                                            expected_nick.as_deref(),
-                                            expected_challenge,
-                                            temp_window.as_ref(),
-                                        ) {
-                                            audit_record(
-                                                &mut audit,
-                                                kirin_desk_utils::audit::AuditEvent::HandshakeFailure,
-                                                &format!("ip={} error={}", ip, e),
-                                            );
-                                            rate_limiter.record_handshake_failure(&ip);
-                                            continue;
-                                        }
-                                        let g = match server_handshake_respond_generic(
-                                            stream, server_id, &server_name, &init, "",
+                                        Self::handle_incoming_connection(
+                                            stream,
+                                            addr,
+                                            allowed,
+                                            cfg,
+                                            skip_whitelist,
+                                            unattended,
+                                            server_nickname,
+                                            server_challenge,
+                                            expected_nick,
+                                            known,
+                                            rate_limiter,
                                         )
-                                        .await
-                                        {
-                                            Ok(g) => g,
-                                            Err(e) => {
-                                                audit_record(
-                                                    &mut audit,
-                                                    kirin_desk_utils::audit::AuditEvent::HandshakeFailure,
-                                                    &format!("ip={} error={}", ip, e),
-                                                );
-                                                rate_limiter.record_handshake_failure(&ip);
-                                                continue;
-                                            }
-                                        };
-                                        let ch = SecureChannel {
-                                            stream: g.stream,
-                                            cipher: g.cipher,
-                                            peer_id: g.peer_id,
-                                            peer_domain: g.peer_domain,
-                                            peer_device_type: g.peer_device_type,
-                                            selected_codec: g.selected_codec,
-                                        };
-                                        audit_record(
-                                            &mut audit,
-                                            kirin_desk_utils::audit::AuditEvent::HandshakeSuccess,
-                                            &format!("ip={} client={} <{}>", ip, ch.peer_id, ch.peer_domain),
-                                        );
-                                        rate_limiter.reset(&ip);
-                                        crate::policy::record_successful_handshake(&mut known, &ch.peer_id);
-                                        info!("Handshake SUCCESS with {}", addr);
-                                        // M13-T005 (UA-ACCEPT-003): 会话类型分发——
-                                        // 客户端声明 "shell" → PTY 桥接（无头/远程终端）；
-                                        // 其余（desktop）→ 远程桌面（捕获+编码+输入注入）。
-                                        // 单端口统一监听，远控与 shell 会话互不冲突
-                                        // （shell 仅服务端处于无头服务器模式时使用）。
-                                        if ch.peer_device_type == "shell" {
-                                            use kirin_desk_core::connection::{
-                                                run_shell_bridge, DEFAULT_PTY_COLS, DEFAULT_PTY_ROWS,
-                                            };
-                                            let peer_id = ch.peer_id.clone();
-                                            info!("Session type: shell — bridging PTY for {}", peer_id);
-                                            let result = run_shell_bridge(
-                                                ch,
-                                                DEFAULT_PTY_COLS,
-                                                DEFAULT_PTY_ROWS,
-                                                None,
-                                            )
-                                            .await;
-                                            audit_record(
-                                                &mut audit,
-                                                kirin_desk_utils::audit::AuditEvent::Disconnect,
-                                                &format!("ip={} client={} shell", ip, peer_id),
-                                            );
-                                            match result {
-                                                Ok(()) => info!("Shell session closed: {}", addr),
-                                                Err(e) => warn!("Shell session ended with error: {}", e),
-                                            }
-                                            continue;
-                                        }
-                                        // M9: 拆分读写半通道——视频发送（写）+ 输入接收（读），
-                                        // 各方向单任务独占、无锁并发。
-                                        // M13-T006: 写半由多任务共享（视频捕获 + 文件传输），
-                                        // 用 Arc<Mutex<SecureChannelSender>> 保证帧边界。
-                                        let peer_id_ft = ch.peer_id.clone();
-                                        let (reader, writer) = ch.into_split();
-                                        // Store channel halves for capture streaming + input injection
-                                        if let Ok(mut c) = server_channel().lock() {
-                                            *c = Some((
-                                                SecureChannelReceiver::new(reader),
-                                                SecureChannelSender::new(writer),
-                                            ));
-                                        }
-
-                                                // M8: 窗口式媒体传输捕获循环 (DXGI + WindowPipeline + EncodedWindow)
-                                                let stop_capture = server_stop_signal();
-                                                tokio::spawn(async move {
-                                                    use kirin_desk_media::capture::create_capture_source;
-                                                    use kirin_desk_media::encoder::types::Codec;
-                                                    use kirin_desk_media::VideoEncoderPipeline;
-                                                    use kirin_desk_media::window_pipeline::WindowPipeline;
-                                                    use kirin_desk_media::proto::{EncodeConfig, RawFrame, WindowConfig};
-                                                    use std::time::Duration;
-
-                                                    // Wait briefly for the channel to settle
-                                                    tokio::time::sleep(Duration::from_millis(200)).await;
-
-                                                    // 1. Create DXGI capture source on monitor 0
-                                                    let mut capture = match create_capture_source(0) {
-                                                        Ok(c) => c,
-                                                        Err(e) => {
-                                                            error!("Failed to create capture source: {}", e);
-                                                            return;
-                                                        }
-                                                    };
-                                                    let (width, height) = capture.resolution();
-                                                    info!("Capture: DXGI source created, {}x{}", width, height);
-
-                                                    // 2. Create video encoder pipeline (P1C: VideoEncoderPipeline,
-                                                    //    HW 优先 + libx264 软编回退)
-                                                    let encoder = match VideoEncoderPipeline::new(Codec::H264, None) {
-                                                        Ok(e) => e,
-                                                        Err(e) => {
-                                                            error!("Failed to create video encoder pipeline: {}", e);
-                                                            return;
-                                                        }
-                                                    };
-                                                    info!("Capture: video encoder '{}' created (hw={})", encoder.name(), encoder.is_hardware());
-
-                                                    // 3. Create window pipeline
-                                                    let mut pipeline = WindowPipeline::new(
-                                                        WindowConfig::default(),
-                                                        encoder,
-                                                    );
-                                                    pipeline.update_encode_config(EncodeConfig {
-                                                        qp: 26,
-                                                        force_idr: false,
-                                                        frame_ratio: 1.0,
-                                                        preset: "ultrafast".into(),
-                                                    });
-
-                                                    // Take channel halves once（输入接收读半 → 分发任务；视频发送写半 → 本任务）
-                                                    let (mut receiver, sender) = match server_channel().lock().unwrap().take() {
-                                                        Some(parts) => parts,
-                                                        None => {
-                                                            error!("Server channel lost before capture start");
-                                                            return;
-                                                        }
-                                                    };
-                                                    let sender_shared: Arc<tokio::sync::Mutex<SecureChannelSender>> =
-                                                        Arc::new(tokio::sync::Mutex::new(sender));
-
-                                                    // M13-T006: 服务端文件命令/帧事件通道。
-                                                    let (server_file_cmd_tx, mut server_file_cmd_rx) =
-                                                        tokio::sync::mpsc::unbounded_channel::<FileCommand>();
-                                                    let (server_file_frame_tx, mut server_file_frame_rx) =
-                                                        tokio::sync::mpsc::unbounded_channel::<FileTransferFrame>();
-                                                    *server_file_tx().lock().unwrap() = Some(server_file_cmd_tx);
-
-                                                    // M13-T006: 服务端文件会话任务（接收落盘 + 推送下载）。
-                                                    {
-                                                        let sender_ft = sender_shared.clone();
-                                                        let my_id = global_identity().get().map(|i| i.public_key_base64()).unwrap_or_default();
-                                                        let salt = file_transfer_salt(&my_id, &peer_id_ft);
-                                                        let cfg_ft = kirin_desk_utils::config::Config::load().unwrap_or_default();
-                                                        let store_path = transfers_store_path("server");
-                                                        let download_dir = cfg_ft.file_transfer.resolved_download_dir();
-                                                        let max_file_size = if cfg_ft.file_transfer.max_file_size > 0 {
-                                                            cfg_ft.file_transfer.max_file_size
-                                                        } else {
-                                                            DEFAULT_MAX_FILE_SIZE
-                                                        };
-                                                        tokio::spawn(async move {
-                                                            let mut ft = FileSession::new(
-                                                                sender_ft,
-                                                                server_file_panel_state(),
-                                                                salt,
-                                                                store_path,
-                                                                download_dir,
-                                                                max_file_size,
-                                                                Some(server_file_notices()),
-                                                            );
-                                                            let mut tick = tokio::time::interval(Duration::from_secs(1));
-                                                            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                                                            loop {
-                                                                tokio::select! {
-                                                                    cmd = server_file_cmd_rx.recv() => {
-                                                                        let Some(cmd) = cmd else {
-                                                                            tracing::info!("Server file session exited");
-                                                                            break;
-                                                                        };
-                                                                        ft.handle_command(cmd).await;
-                                                                    }
-                                                                    frame = server_file_frame_rx.recv() => {
-                                                                        let Some(frame) = frame else {
-                                                                            tracing::info!("Server file session exited (recv loop closed)");
-                                                                            break;
-                                                                        };
-                                                                        ft.handle_frame(frame).await;
-                                                                    }
-                                                                    _ = tick.tick() => {
-                                                                        ft.on_tick().await;
-                                                                    }
-                                                                }
-                                                            }
-                                                            *server_file_tx().lock().unwrap() = None;
-                                                        });
-                                                    }
-
-                                                    // M9/M13-T006: 服务端接收分发任务——Input → 注入；
-                                                    // FileTransfer → 文件会话；其他 tag 忽略。
-                                                    let stop_input = stop_capture;
-                                                    let file_frame_tx_dispatch = server_file_frame_tx.clone();
-                                                    // M8-T020 SKEY-SEC-002: 锁屏请求审计 detail（对端身份）。
-                                                    let audit_peer = format!("ip={} client={}", ip, peer_id_ft);
-                                                    // M8-T019 (SRV-PRIV-010/014): 服务端隐私控制器——
-                                                    // GUI 模式（headless=false）可绘制黑屏覆盖窗口；
-                                                    // 接收任务与 UI 线程共享（UI 每帧轮询 active_level）。
-                                                    let privacy_controller =
-                                                        Arc::new(Mutex::new(PrivacyController::new(false)));
-                                                    *server_privacy_controller().lock().unwrap() =
-                                                        Some(privacy_controller.clone());
-                                                    // M8-T019 (PRIV-SEC-001): 隐私审计独立句柄
-                                                    // （append 模式多句柄并发安全；与主审计流互不干扰）。
-                                                    let mut privacy_audit =
-                                                        kirin_desk_utils::audit::AuditLogger::open_default().ok();
-                                                    let sender_privacy = sender_shared.clone();
-                                                    // M8-T018: 显示器切换命令通道（分发任务 → 捕获循环；
-                                                    // 热切换重建捕获源，无需重连）。
-                                                    let (switch_monitor_tx, mut switch_monitor_rx) =
-                                                        tokio::sync::mpsc::unbounded_channel::<u32>();
-                                                    // M8-T018（SRV-MON-010）：注入器在分发任务与捕获循环
-                                                    // 间共享——显示器切换后同步更新换算基准（src/dst = 新屏
-                                                    // 分辨率）。键鼠事件 ~60fps，切换低频，锁竞争可忽略。
-                                                    let injector = Arc::new(tokio::sync::Mutex::new(
-                                                        InputInjector::new(width, height, width, height),
-                                                    ));
-                                                    // 捕获循环持有的另一句柄（切换成功后更新基准）。
-                                                    let injector_capture = injector.clone();
-                                                    tokio::spawn(async move {
-                                                        // src = 客户端坐标空间：客户端按服务端捕获分辨率
-                                                        // (base_w/base_h) 发像素坐标 → src == dst。
-                                                        let injector_dispatch = injector;
-                                                        let switch_monitor_tx_dispatch = switch_monitor_tx.clone();
-                                                        let mut dropped_input: u64 = 0;
-                                                        // M8-T019 (SRV-PRIV-015): 锁屏解锁轮询节流（1s）。
-                                                        let mut last_unlock_poll =
-                                                            std::time::Instant::now() - Duration::from_secs(1);
-                                                        loop {
-                                                            if stop_input.load(Ordering::Relaxed) {
-                                                                info!("Input receive loop stopping by user request");
-                                                                break;
-                                                            }
-                                                            // M8-T019 (SRV-PRIV-015): 锁屏被本地解锁 →
-                                                            // 自动恢复注入 + 通知客户端（无需重连）。
-                                                            if last_unlock_poll.elapsed()
-                                                                >= Duration::from_secs(1)
-                                                            {
-                                                                last_unlock_poll = std::time::Instant::now();
-                                                                let resumed = privacy_controller
-                                                                    .lock()
-                                                                    .unwrap()
-                                                                    .poll_unlock();
-                                                                if resumed {
-                                                                    audit_record(
-                                                                        &mut privacy_audit,
-                                                                        kirin_desk_utils::audit::AuditEvent::PrivacyRecovered,
-                                                                        "event=unlock level=lock initiator=local",
-                                                                    );
-                                                                    info!("[Privacy] workstation unlocked — injection resumed");
-                                                                    send_privacy_ack(
-                                                                        &sender_privacy,
-                                                                        true,
-                                                                        None,
-                                                                    )
-                                                                    .await;
-                                                                }
-                                                            }
-                                                            let (tag, _header, payload) = match receiver.recv_tagged().await {
-                                                                Ok(v) => v,
-                                                                Err(e) => {
-                                                                    error!("Receive channel error: {} — stopping", e);
-                                                                    break;
-                                                                }
-                                                            };
-                                                            match tag {
-                                                                ChannelTag::Input => {
-                                                                    // M8-T019 (SRV-PRIV-015): 锁屏期间注入暂停
-                                                                    // （SendInput 对安全桌面无效），解锁自动恢复。
-                                                                    if privacy_controller
-                                                                        .lock()
-                                                                        .unwrap()
-                                                                        .injection_paused()
-                                                                    {
-                                                                        dropped_input += 1;
-                                                                        if dropped_input % 200 == 1 {
-                                                                            warn!(
-                                                                                "[Privacy] input dropped during lock ({} events)",
-                                                                                dropped_input
-                                                                            );
-                                                                        }
-                                                                        continue;
-                                                                    }
-                                                                    match bincode::deserialize::<WireInputEvent>(&payload) {
-                                                                        Ok(ev) => {
-                                                                            // M8-T020 SKEY-SEC-002: 锁屏请求写审计日志
-                                                                            // （锁屏调用本身由注入管线执行，单一实现 =
-                                                                            // M8-T019 privacy::platform_lock_screen）。
-                                                                            if ev.kind == InputKind::SpecialKey
-                                                                                && ev.combo == Some(SpecialCombo::LockScreen)
-                                                                            {
-                                                                                if let Ok(mut audit) =
-                                                                                    kirin_desk_utils::audit::AuditLogger::open_default()
-                                                                                {
-                                                                                    let _ = audit.record(
-                                                                                        kirin_desk_utils::audit::AuditEvent::LockScreen,
-                                                                                        &format!("{audit_peer} combo=LockScreen"),
-                                                                                    );
-                                                                                }
-                                                                            }
-                                                                            // 注入失败不重试（可靠流不重发用户操作），仅记日志。
-                                                                            let mut inj = injector_dispatch
-                                                                                .lock()
-                                                                                .await;
-                                                                            if let Err(e) = inj.handle(ev) {
-                                                                                warn!("Input inject failed (dropping, no retry): {}", e);
-                                                                            }
-                                                                        }
-                                                                        Err(e) => warn!("Input event deserialize failed: {}", e),
-                                                                    }
-                                                                }
-                                                                // M8-T019 (SRV-PRIV-001/002/013 + PRIV-SEC-001):
-                                                                // 隐私模式控制（复用 M8-T018 控制通道）。
-                                                                // M8-T018: 显示器枚举/切换控制（同通道分发）。
-                                                                ChannelTag::Control => {
-                                                                    match bincode::deserialize::<ControlMessage>(
-                                                                        &payload,
-                                                                    ) {
-                                                                        Ok(ControlMessage::DisplayListReq) => {
-                                                                            // M8-T018（SRV-CAP-MON-001）：枚举显示器
-                                                                            // → DisplayListResp（空时兜底默认屏）。
-                                                                            let displays = kirin_desk_media::capture::factory::enumerate_monitors();
-                                                                            if let Ok(data) = bincode::serialize(
-                                                                                &ControlMessage::DisplayListResp { displays },
-                                                                            ) {
-                                                                                let pkt = EncodedPacket {
-                                                                                    ts: Timestamp::now(),
-                                                                                    kind: PacketKind::Control,
-                                                                                    data,
-                                                                                    is_key: false,
-                                                                                };
-                                                                                if let Err(e) = sender_privacy
-                                                                                    .lock()
-                                                                                    .await
-                                                                                    .send_packets(&[pkt])
-                                                                                    .await
-                                                                                {
-                                                                                    warn!("DisplayListResp send failed: {}", e);
-                                                                                }
-                                                                            }
-                                                                        }
-                                                                        Ok(ControlMessage::DisplaySelect { index }) => {
-                                                                            // M8-T018（SRV-MON-003）：捕获循环热切换；
-                                                                            // 越界/重建失败 → Nack（捕获循环回复）。
-                                                                            if switch_monitor_tx_dispatch.send(index).is_err() {
-                                                                                warn!("DisplaySelect: switch channel closed");
-                                                                            }
-                                                                        }
-                                                                        // 其余控制消息（PrivacyMode 等）→ 既有隐私处理
-                                                                        // （其内部忽略非 PrivacyMode 消息）。
-                                                                        Ok(_) => {
-                                                                            handle_server_privacy_message(
-                                                                                &payload,
-                                                                                &privacy_controller,
-                                                                                &sender_privacy,
-                                                                                &mut privacy_audit,
-                                                                                &audit_peer,
-                                                                            )
-                                                                            .await;
-                                                                        }
-                                                                        Err(e) => {
-                                                                            warn!("Control message deserialize failed: {}", e);
-                                                                        }
-                                                                    }
-                                                                }
-                                                                ChannelTag::FileTransfer => {
-                                                                    match FileTransferFrame::decode(&payload) {
-                                                                        Ok(frame) => {
-                                                                            if file_frame_tx_dispatch.send(frame).is_err() {
-                                                                                break;
-                                                                            }
-                                                                        }
-                                                                        Err(e) => warn!("File frame decode failed: {}", e),
-                                                                    }
-                                                                }
-                                                                // 其余 tag（Video/Audio/Clipboard 等）无服务端消费方，静默忽略。
-                                                                _ => {}
-                                                            }
-                                                        }
-                                                        // M8-T019 (SRV-PRIV-014 安全红线): 断连/停止 →
-                                                        // 本地状态复位（黑屏覆盖随之关闭，无网络依赖）。
-                                                        if let Some(was) = privacy_controller
-                                                            .lock()
-                                                            .unwrap()
-                                                            .on_connection_lost()
-                                                        {
-                                                            audit_record(
-                                                                &mut privacy_audit,
-                                                                kirin_desk_utils::audit::AuditEvent::PrivacyRecovered,
-                                                                &format!(
-                                                                    "event=disconnect level={} initiator=system",
-                                                                    was.as_str()
-                                                                ),
-                                                            );
-                                                            info!(
-                                                                "[Privacy] connection lost — privacy state restored ({})",
-                                                                was.as_str()
-                                                            );
-                                                        }
-                                                        *server_privacy_controller().lock().unwrap() = None;
-                                                    });
-                                                    info!("Capture loop started (DXGI event-driven + 70ms windows)");
-
-                                                    let mut window_count: u64 = 0;
-                                                    // M8-T018（SRV-CAP-MON-003）：显示器切换成功后，
-                                                    // 下一窗口强制 IDR（客户端切换后立即可解码）。
-                                                    let mut force_idr_next = false;
-
-                                                        loop {
-                                                            if stop_capture.load(Ordering::Relaxed) {
-                                                                info!("Capture loop stopping by user request");
-                                                                break;
-                                                            }
-
-                                                            // M8-T018（SRV-CAP-MON-002）：显示器切换命令——
-                                                            // 会话内热切换（重建捕获源，无需重连）。失败回退
-                                                            // 当前屏 + Nack（MON-NF-001）。
-                                                            if let Ok(idx) = switch_monitor_rx.try_recv() {
-                                                                match capture.switch_monitor(idx as usize) {
-                                                                    Ok(()) => {
-                                                                        let (sw, sh) = capture.resolution();
-                                                                        info!(
-                                                                            "Capture: switched to monitor {} ({}x{})",
-                                                                            idx, sw, sh
-                                                                        );
-                                                                        force_idr_next = true;
-                                                                        // M8-T018（SRV-MON-010）：注入换算基准
-                                                                        // 跟随新屏分辨率（客户端基数同步切换）。
-                                                                        let mut inj = injector_capture.lock().await;
-                                                                        inj.set_resolution(sw, sh);
-                                                                    }
-                                                                    Err(e) => {
-                                                                        error!(
-                                                                            "Capture: switch monitor {} failed: {} — keeping current",
-                                                                            idx, e
-                                                                        );
-                                                                        let reason = format!(
-                                                                            "switch monitor {idx} failed: {e}"
-                                                                        );
-                                                                        if let Ok(data) = bincode::serialize(
-                                                                            &ControlMessage::DisplaySelectNack { reason },
-                                                                        ) {
-                                                                            let pkt = EncodedPacket {
-                                                                                ts: Timestamp::now(),
-                                                                                kind: PacketKind::Control,
-                                                                                data,
-                                                                                is_key: false,
-                                                                            };
-                                                                            if let Err(e2) = sender_shared
-                                                                                .lock()
-                                                                                .await
-                                                                                .send_packets(&[pkt])
-                                                                                .await
-                                                                            {
-                                                                                warn!("DisplaySelectNack send failed: {}", e2);
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-
-                                                            // Wait for a fresh screen frame (blocks until change)
-                                                            // M8-T018（MON-NF-002）：带超时等待——静默屏幕
-                                                            // （长时间无画面变化）也定期醒来处理切换命令，
-                                                            // 切换延迟与屏幕活动度解耦（目标 <500ms）。
-                                                            match capture.wait_for_frame_timeout(Duration::from_millis(200)) {
-                                                                Ok(frame) => {
-                                                                    let raw = RawFrame {
-                                                                        data: Arc::new(frame.data().to_vec()),
-                                                                        width: frame.width(),
-                                                                        height: frame.height(),
-                                                                        timestamp: std::time::SystemTime::now(),
-                                                                        dirty_rects: frame.dirty_rects().to_vec(),
-                                                                        force_key: window_count == 0 || force_idr_next,
-                                                                    };
-                                                                    force_idr_next = false;
-                                                                    // push_frame already returns the EncodedWindow if window closes
-                                                                    match pipeline.push_frame(raw) {
-                                                                        Ok(Some(encoded_window)) => {
-                                                                            window_count = encoded_window.window_id;
-                                                                            let n_frames = encoded_window.frame_count;
-                                                                            info!("Capture: window {} encoded ({} frames, {}x{})",
-                                                                                encoded_window.window_id, n_frames,
-                                                                                encoded_window.base_w, encoded_window.base_h);
-
-                                                                            // Serialize and send over SecureChannel (tag 分帧 Video)
-                                                                            match bincode::serialize(&encoded_window) {
-                                                                                Ok(bytes) => {
-                                                                                    let pkt = EncodedPacket {
-                                                                                        ts: Timestamp::now(),
-                                                                                        kind: PacketKind::Video,
-                                                                                        data: bytes,
-                                                                                        is_key: window_count == 0,
-                                                                                    };
-                                                                                    if let Err(e) = sender_shared.lock().await.send_packets(&[pkt]).await {
-                                                                                        error!("Capture send error window {}: {} — closing", encoded_window.window_id, e);
-                                                                                        break;
-                                                                                    }
-                                                                                }
-                                                                                Err(e) => {
-                                                                                    error!("Serialize window {} failed: {}", encoded_window.window_id, e);
-                                                                                }
-                                                                            }
-                                                                        }
-                                                                        Ok(None) => {
-                                                                            // still collecting frames for this window
-                                                                        }
-                                                                        Err(e) => {
-                                                                            error!("Window pipeline error: {} — retrying", e);
-                                                                            tokio::time::sleep(Duration::from_millis(50)).await;
-                                                                        }
-                                                                    }
-                                                                }
-                                                                Err(e) => {
-                                                                    // Fatal errors: break the capture loop (connection lost, no monitor)
-                                                                    // Transient errors: retry with backoff
-                                                                    match &e {
-                                                                        // M8-T018（MON-NF-002）：静默屏幕超时——
-                                                                        // 定期醒来轮询显示器切换命令，无需日志。
-                                                                        CaptureError::Timeout => continue,
-                                                                        CaptureError::AccessLost => {
-                                                                            error!("Capture access lost — closing connection, will recreate");
-                                                                            break;
-                                                                        }
-                                                                        CaptureError::NoMonitor | CaptureError::InvalidMonitor => {
-                                                                            error!("Capture: {} — stopping capture", e);
-                                                                            break;
-                                                                        }
-                                                                        _ => {
-                                                                            error!("Capture error: {} — sleeping and retrying", e);
-                                                                            tokio::time::sleep(Duration::from_millis(100)).await;
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                        info!("Capture loop exited after {} windows", window_count);
-
-                                                        // 连接退出：清空（输入任务因 recv 失败自行退出）
-                                                        *server_channel().lock().unwrap() = None;
-                                                });
-                                    } else {
-                                        error!("No server identity available, rejecting {}", addr);
-                                    }
+                                        .await;
+                                    });
                                 }
                                 Err(e) => {
                                     error!("Accept error: {}", e);
@@ -5647,6 +5815,829 @@ impl KirinDeskApp {
                 }
             });
         });
+    }
+
+    /// S-02 (F-5): 处理一条入站连接（accept 循环每连接 `tokio::spawn` 并发调用）。
+    ///
+    /// 流程与原内联实现完全一致（行为不变）：审计 → 速率限制 → 两阶段握手
+    /// （known_hosts/DNS pin + 白名单 + 审批 + 二态挑战码）→ 会话分发
+    /// （shell PTY / 远程桌面）。`rate_limiter`/`known` 为跨连接共享状态
+    /// （`Arc<Mutex>`），仅在需要处短暂持锁、不跨 await；审计日志按连接独立
+    /// 打开（append 模式多句柄并发安全，同隐私审计路径）。
+    ///
+    /// 本函数即 S-01c 追加每连接校验的落点（合并顺序 S-02 → S-01c）。
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_incoming_connection(
+        stream: tokio::net::TcpStream,
+        addr: std::net::SocketAddrV6,
+        allowed: Vec<String>,
+        cfg: kirin_desk_utils::config::Config,
+        skip_whitelist: bool,
+        unattended: bool,
+        server_nickname: String,
+        server_challenge: String,
+        expected_nick: Option<String>,
+        known: Arc<Mutex<kirin_desk_utils::known_hosts::KnownClientsStore>>,
+        rate_limiter: Arc<Mutex<RateLimiter>>,
+    ) {
+        use tracing::{error, info, warn};
+        info!("Incoming connection from {}", addr);
+        // M15 (SRV-SEC-RL/AUDIT/KH/WL): 速率限制 → 审计 →
+        // 两阶段握手（known_hosts/DNS pin + 白名单 + 审批）。
+        let ip = addr.ip().to_canonical();
+        // S-02: 审计日志按连接独立打开（append 模式多句柄并发安全）。
+        let mut audit = match kirin_desk_utils::audit::AuditLogger::open_default() {
+            Ok(a) => Some(a),
+            Err(e) => {
+                tracing::warn!("audit log open error (audit disabled): {}", e);
+                None
+            }
+        };
+        audit_record(
+            &mut audit,
+            kirin_desk_utils::audit::AuditEvent::ConnectionRequest,
+            &format!("ip={} port={}", ip, addr.port()),
+        );
+        if !matches!(
+            rate_limiter.lock().unwrap().check_connect(&ip),
+            RateLimitDecision::Allowed
+        ) {
+            audit_record(
+                &mut audit,
+                kirin_desk_utils::audit::AuditEvent::RateLimited,
+                &format!("ip={}", ip),
+            );
+            warn!("Rate limited: {} — rejected", ip);
+            return;
+        }
+        // Use global identity as server identity
+        if let Some(server_id) = global_identity().get() {
+            let server_name = if server_nickname.is_empty() {
+                "gui-server".to_string()
+            } else {
+                server_nickname.clone()
+            };
+            let expected_challenge = if server_challenge.is_empty() {
+                None
+            } else {
+                Some(&*server_challenge)
+            };
+            // 1) 预读握手初始化消息（不应答）。
+            let mut stream = stream;
+            let init = match server_read_init(&mut stream).await {
+                Ok(i) => i,
+                Err(e) => {
+                    audit_record(
+                        &mut audit,
+                        kirin_desk_utils::audit::AuditEvent::HandshakeFailure,
+                        &format!("ip={} error={}", ip, e),
+                    );
+                    rate_limiter.lock().unwrap().record_handshake_failure(&ip);
+                    return;
+                }
+            };
+            // 2) 客户端公钥解析（known_hosts → DNS TXT，SRV-SEC-KH-001）。
+            // S-02: known 快照（resolve 为异步，避免跨 await 持锁）。
+            let known_snapshot = known.lock().unwrap().clone();
+            let (expected_key, _resolution) =
+                crate::policy::resolve_expected_client_key(&known_snapshot, &cfg, &init.client_id)
+                    .await;
+            // 3) 白名单检查；未知公钥且非白名单 → 审批弹窗（temp/ip 模式跳过）。
+            // M8-T017 (SRV-TMP-006): 临时连接窗口**逐连接**判定
+            // （窗口中途开启/过期即时生效），与配置旁路取或；
+            // 无人值守下窗口维度一并关闭（UA-ACCEPT-004）。
+            let temp_window: Option<TempModeManager> = if unattended {
+                None
+            } else {
+                crate::policy::temp_mode_window_manager()
+            };
+            // S-01c (F-2): 静态旁路（temp_mode/ip_mode
+            // 配置开启 → skip_whitelist）开启但零凭据
+            // （无固定挑战码 + 无激活临时窗口）→ 该连接
+            // fail-closed 拒绝 + 审计。杜绝「配置即失守」
+            // 后门：旁路只允许跳过白名单/审批，不允许
+            // 跳过凭据本身。
+            if skip_whitelist && expected_challenge.is_none() && temp_window.is_none() {
+                audit_record(
+                    &mut audit,
+                    kirin_desk_utils::audit::AuditEvent::AuthFailure,
+                    &format!(
+                        "ip={} reason=bypass_without_credentials \
+                                                     (temp_mode/ip_mode bypass enabled but no \
+                                                     challenge code and no temp window)",
+                        ip
+                    ),
+                );
+                warn!(
+                    "Rejected {}: whitelist bypass enabled without \
+                                                 any credential (no challenge code, no temp \
+                                                 window) — set a challenge code in Settings \
+                                                 or enable a temp window (S-01c/F-2)",
+                    addr
+                );
+                return;
+            }
+            let skip = skip_whitelist || temp_window.is_some();
+            // M8-T027 (SRV-IDWL-021): 双白名单 OR——
+            // 域名命中 **或** ID 命中即视为白名单命中（域名
+            // 行为不变）；ID 列表**逐连接**从配置快照读取，
+            // Settings 保存后即时生效（UI-IDWL-001）。
+            let allowed_ids = kirin_desk_utils::config::Config::load()
+                .map(|c| c.id_whitelist_active_ids(chrono::Utc::now()))
+                .unwrap_or_default();
+            let is_whitelisted = allowed
+                .iter()
+                .any(|a| domain_matches_whitelist(&init.client_domain, a))
+                || allowed_ids
+                    .iter()
+                    .any(|id| id_matches_whitelist(&init.client_id, id));
+            if !skip && !is_whitelisted && expected_key.is_none() {
+                // M13-T005 (UA-ACCEPT-002): 无人值守下
+                // 未知设备自动拒绝——无人工审批弹窗，
+                // 立即审计 + 记握手失败后断开。
+                if unattended {
+                    audit_record(
+                        &mut audit,
+                        kirin_desk_utils::audit::AuditEvent::AuthFailure,
+                        &format!(
+                            "ip={} client={} reason=unattended_unknown",
+                            ip, init.client_id
+                        ),
+                    );
+                    rate_limiter.lock().unwrap().record_handshake_failure(&ip);
+                    warn!(
+                                                    "Unattended: unknown client {} ({}) rejected — no approval in unattended mode",
+                                                    init.client_id, ip
+                                                );
+                    return;
+                }
+                let id = pending_next_id();
+                let (dec_tx, dec_rx) = tokio::sync::oneshot::channel::<bool>();
+                pending_decisions().lock().unwrap().insert(id, dec_tx);
+                let pc = PendingConnection {
+                    id,
+                    client_id: init.client_id.clone(),
+                    client_domain: init.client_domain.clone(),
+                    device_type: init.client_device_type.clone(),
+                    status: PendingStatus::Waiting,
+                };
+                if let Some(tx) = pending_conn_tx().get() {
+                    let _ = tx.send(pc);
+                }
+                // 等待用户决策（60s 超时）。
+                match tokio::time::timeout(std::time::Duration::from_secs(60), dec_rx).await {
+                    Ok(Ok(true)) => {} // 用户接受 → 继续握手
+                    _ => {
+                        audit_record(
+                            &mut audit,
+                            kirin_desk_utils::audit::AuditEvent::AuthFailure,
+                            &format!(
+                                "ip={} client={} approval declined/timeout",
+                                ip, init.client_id
+                            ),
+                        );
+                        rate_limiter.lock().unwrap().record_handshake_failure(&ip);
+                        return;
+                    }
+                }
+            }
+            // 4) pin/nickname/challenge/签名校验 + 应答。
+            // M8-T017 (SRV-TMP-HK-001/003): 挑战码二态——固定
+            // 挑战码 **或** 窗口内临时挑战码任一正确即通过。
+            // S-01a (F-1)：生产路径零凭据 → 拒绝
+            // （`allow_no_credentials = false`，R-02）。
+            if let Err(e) = verify_server_init_with_temp(
+                &init,
+                expected_key.as_deref().unwrap_or(""),
+                expected_nick.as_deref(),
+                expected_challenge,
+                temp_window.as_ref(),
+                false,
+            ) {
+                audit_record(
+                    &mut audit,
+                    kirin_desk_utils::audit::AuditEvent::HandshakeFailure,
+                    &format!("ip={} error={}", ip, e),
+                );
+                rate_limiter.lock().unwrap().record_handshake_failure(&ip);
+                return;
+            }
+            let g =
+                match server_handshake_respond_generic(stream, server_id, &server_name, &init, "")
+                    .await
+                {
+                    Ok(g) => g,
+                    Err(e) => {
+                        audit_record(
+                            &mut audit,
+                            kirin_desk_utils::audit::AuditEvent::HandshakeFailure,
+                            &format!("ip={} error={}", ip, e),
+                        );
+                        rate_limiter.lock().unwrap().record_handshake_failure(&ip);
+                        return;
+                    }
+                };
+            let ch = SecureChannel {
+                stream: g.stream,
+                cipher: g.cipher,
+                peer_id: g.peer_id,
+                peer_domain: g.peer_domain,
+                peer_device_type: g.peer_device_type,
+                selected_codec: g.selected_codec,
+            };
+            audit_record(
+                &mut audit,
+                kirin_desk_utils::audit::AuditEvent::HandshakeSuccess,
+                &format!("ip={} client={} <{}>", ip, ch.peer_id, ch.peer_domain),
+            );
+            rate_limiter.lock().unwrap().reset(&ip);
+            crate::policy::record_successful_handshake(&mut known.lock().unwrap(), &ch.peer_id);
+            info!("Handshake SUCCESS with {}", addr);
+            // M13-T005 (UA-ACCEPT-003): 会话类型分发——
+            // 客户端声明 "shell" → PTY 桥接（无头/远程终端）；
+            // 其余（desktop）→ 远程桌面（捕获+编码+输入注入）。
+            // 单端口统一监听，远控与 shell 会话互不冲突
+            // （shell 仅服务端处于无头服务器模式时使用）。
+            if ch.peer_device_type == "shell" {
+                use kirin_desk_core::connection::{
+                    run_shell_bridge, DEFAULT_PTY_COLS, DEFAULT_PTY_ROWS,
+                };
+                let peer_id = ch.peer_id.clone();
+                info!("Session type: shell — bridging PTY for {}", peer_id);
+                let result = run_shell_bridge(ch, DEFAULT_PTY_COLS, DEFAULT_PTY_ROWS, None).await;
+                audit_record(
+                    &mut audit,
+                    kirin_desk_utils::audit::AuditEvent::Disconnect,
+                    &format!("ip={} client={} shell", ip, peer_id),
+                );
+                match result {
+                    Ok(()) => info!("Shell session closed: {}", addr),
+                    Err(e) => warn!("Shell session ended with error: {}", e),
+                }
+                return;
+            }
+            // M9: 拆分读写半通道——视频发送（写）+ 输入接收（读），
+            // 各方向单任务独占、无锁并发。
+            // M13-T006: 写半由多任务共享（视频捕获 + 文件传输），
+            // 用 Arc<Mutex<SecureChannelSender>> 保证帧边界。
+            let peer_id_ft = ch.peer_id.clone();
+            let (reader, writer) = ch.into_split();
+            // Store channel halves for capture streaming + input injection
+            if let Ok(mut c) = server_channel().lock() {
+                *c = Some((
+                    SecureChannelReceiver::new(reader),
+                    SecureChannelSender::new(writer),
+                ));
+            }
+
+            // M8: 窗口式媒体传输捕获循环 (DXGI + WindowPipeline + EncodedWindow)
+            let stop_capture = server_stop_signal();
+            tokio::spawn(async move {
+                use kirin_desk_media::capture::create_capture_source;
+                use kirin_desk_media::encoder::types::Codec;
+                use kirin_desk_media::proto::{EncodeConfig, RawFrame, WindowConfig};
+                use kirin_desk_media::window_pipeline::WindowPipeline;
+                use kirin_desk_media::VideoEncoderPipeline;
+                use std::time::Duration;
+
+                // Wait briefly for the channel to settle
+                tokio::time::sleep(Duration::from_millis(200)).await;
+
+                // 1. Create DXGI capture source on monitor 0
+                let mut capture = match create_capture_source(0) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        error!("Failed to create capture source: {}", e);
+                        return;
+                    }
+                };
+                let (width, height) = capture.resolution();
+                info!("Capture: DXGI source created, {}x{}", width, height);
+
+                // 2. Create video encoder pipeline (P1C: VideoEncoderPipeline,
+                //    HW 优先 + libx264 软编回退)
+                // M8-T030（R-06，GPU-FR-006）：GPU 内核复用选定适配器上的
+                // D3D11 设备（与 FFmpeg HW 编解码同 GPU）；无真实 GPU /
+                // 未链接 libkirin_gpu → init 失败 → kernel=None（CPU 路径，
+                // tile-hash 由 classify_cpu 真实兜底）。
+                // （R-03 编译解锁修复：未链接时与 media 同 cfg 门控回退 None。）
+                let kernel: Option<
+                    Box<dyn kirin_desk_media::encoder::video::tile_diff::GpuKernel>,
+                > = {
+                    #[cfg(kirin_gpu_linked)]
+                    {
+                        use kirin_desk_media::encoder::gpu_ffi::kernel::KgpuKernel;
+                        KgpuKernel::init(kirin_desk_media::gpu::d3d11_device_handle())
+                            .ok()
+                            .map(|k| {
+                                Box::new(k)
+                                    as Box<
+                                        dyn kirin_desk_media::encoder::video::tile_diff::GpuKernel,
+                                    >
+                            })
+                    }
+                    #[cfg(not(kirin_gpu_linked))]
+                    {
+                        None
+                    }
+                };
+                let encoder = match VideoEncoderPipeline::new(Codec::H264, kernel) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        error!("Failed to create video encoder pipeline: {}", e);
+                        return;
+                    }
+                };
+                info!(
+                    "Capture: video encoder '{}' created (hw={})",
+                    encoder.name(),
+                    encoder.is_hardware()
+                );
+
+                // 3. Create window pipeline
+                let mut pipeline = WindowPipeline::new(WindowConfig::default(), encoder);
+                pipeline.update_encode_config(EncodeConfig {
+                    qp: 26,
+                    force_idr: false,
+                    frame_ratio: 1.0,
+                    preset: "ultrafast".into(),
+                });
+
+                // Take channel halves once（输入接收读半 → 分发任务；视频发送写半 → 本任务）
+                let (mut receiver, sender) = match server_channel().lock().unwrap().take() {
+                    Some(parts) => parts,
+                    None => {
+                        error!("Server channel lost before capture start");
+                        return;
+                    }
+                };
+                let sender_shared: Arc<tokio::sync::Mutex<SecureChannelSender>> =
+                    Arc::new(tokio::sync::Mutex::new(sender));
+
+                // R-04：音频捕获 + 编码线程（会话级开关；无环回设备/libopus
+                // → info 降级，视频/键鼠不断）。捕获+编码为阻塞调用 → blocking
+                // 线程池；批次经 tokio 通道交发送循环（与视频写半互斥，tag=Audio）。
+                if audio_enabled_global().load(Ordering::Relaxed) {
+                    let sender_audio = sender_shared.clone();
+                    let stop_audio = stop_capture.clone();
+                    tokio::spawn(async move {
+                        let (audio_pkt_tx, mut audio_pkt_rx) =
+                            tokio::sync::mpsc::channel::<Vec<EncodedPacket>>(32);
+                        let audio_tx_task = audio_pkt_tx.clone();
+                        let stop_pipe = stop_audio.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let mut pipeline = match kirin_desk_media::AudioPipeline::new() {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    tracing::info!("Audio disabled (pipeline init failed): {e}");
+                                    return;
+                                }
+                            };
+                            if let Err(e) = pipeline.start() {
+                                tracing::info!("Audio disabled (capture start failed): {e}");
+                                return;
+                            }
+                            tracing::info!(
+                                "Audio capture started ({}Hz/{}ch)",
+                                pipeline.sample_rate(),
+                                pipeline.channels()
+                            );
+                            loop {
+                                if stop_pipe.load(Ordering::Relaxed) {
+                                    break;
+                                }
+                                match pipeline.next_packets() {
+                                    Ok(pkts) if !pkts.is_empty() => {
+                                        // 主循环忙（通道满）→ 丢批次（音频可丢，播放端静音补位）。
+                                        if audio_tx_task.try_send(pkts).is_err() {
+                                            tracing::debug!("Audio batch dropped (send loop busy)");
+                                        }
+                                    }
+                                    Ok(_) => {
+                                        std::thread::sleep(std::time::Duration::from_millis(5))
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "Audio pipeline error: {e} — stopping audio"
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+                            tracing::info!("Audio capture stopped");
+                        });
+                        // 发送循环：会话结束（stop / 断链）→ 通道关闭 → 退出。
+                        while let Some(pkts) = audio_pkt_rx.recv().await {
+                            if let Err(e) = sender_audio.lock().await.send_packets(&pkts).await {
+                                tracing::warn!("Audio send failed: {e} — audio degraded");
+                                break;
+                            }
+                        }
+                    });
+                }
+
+                // M13-T006: 服务端文件命令/帧事件通道。
+                let (server_file_cmd_tx, mut server_file_cmd_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<FileCommand>();
+                let (server_file_frame_tx, mut server_file_frame_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<FileTransferFrame>();
+                *server_file_tx().lock().unwrap() = Some(server_file_cmd_tx);
+
+                // M13-T006: 服务端文件会话任务（接收落盘 + 推送下载）。
+                {
+                    let sender_ft = sender_shared.clone();
+                    let my_id = global_identity()
+                        .get()
+                        .map(|i| i.public_key_base64())
+                        .unwrap_or_default();
+                    let salt = file_transfer_salt(&my_id, &peer_id_ft);
+                    let cfg_ft = kirin_desk_utils::config::Config::load().unwrap_or_default();
+                    let store_path = transfers_store_path("server");
+                    let download_dir = cfg_ft.file_transfer.resolved_download_dir();
+                    let max_file_size = if cfg_ft.file_transfer.max_file_size > 0 {
+                        cfg_ft.file_transfer.max_file_size
+                    } else {
+                        DEFAULT_MAX_FILE_SIZE
+                    };
+                    tokio::spawn(async move {
+                        let mut ft = FileSession::new(
+                            sender_ft,
+                            server_file_panel_state(),
+                            salt,
+                            store_path,
+                            download_dir,
+                            max_file_size,
+                            Some(server_file_notices()),
+                        );
+                        let mut tick = tokio::time::interval(Duration::from_secs(1));
+                        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                        loop {
+                            tokio::select! {
+                                cmd = server_file_cmd_rx.recv() => {
+                                    let Some(cmd) = cmd else {
+                                        tracing::info!("Server file session exited");
+                                        break;
+                                    };
+                                    ft.handle_command(cmd).await;
+                                }
+                                frame = server_file_frame_rx.recv() => {
+                                    let Some(frame) = frame else {
+                                        tracing::info!("Server file session exited (recv loop closed)");
+                                        break;
+                                    };
+                                    ft.handle_frame(frame).await;
+                                }
+                                _ = tick.tick() => {
+                                    ft.on_tick().await;
+                                }
+                            }
+                        }
+                        *server_file_tx().lock().unwrap() = None;
+                    });
+                }
+
+                // M9/M13-T006: 服务端接收分发任务——Input → 注入；
+                // FileTransfer → 文件会话；其他 tag 忽略。
+                let stop_input = stop_capture;
+                let file_frame_tx_dispatch = server_file_frame_tx.clone();
+                // M8-T020 SKEY-SEC-002: 锁屏请求审计 detail（对端身份）。
+                let audit_peer = format!("ip={} client={}", ip, peer_id_ft);
+                // M8-T019 (SRV-PRIV-010/014): 服务端隐私控制器——
+                // GUI 模式（headless=false）可绘制黑屏覆盖窗口；
+                // 接收任务与 UI 线程共享（UI 每帧轮询 active_level）。
+                let privacy_controller = Arc::new(Mutex::new(PrivacyController::new(false)));
+                *server_privacy_controller().lock().unwrap() = Some(privacy_controller.clone());
+                // M8-T019 (PRIV-SEC-001): 隐私审计独立句柄
+                // （append 模式多句柄并发安全；与主审计流互不干扰）。
+                let mut privacy_audit = kirin_desk_utils::audit::AuditLogger::open_default().ok();
+                let sender_privacy = sender_shared.clone();
+                // M8-T018: 显示器切换命令通道（分发任务 → 捕获循环；
+                // 热切换重建捕获源，无需重连）。
+                let (switch_monitor_tx, mut switch_monitor_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<u32>();
+                // M8-T018（SRV-MON-010）：注入器在分发任务与捕获循环
+                // 间共享——显示器切换后同步更新换算基准（src/dst = 新屏
+                // 分辨率）。键鼠事件 ~60fps，切换低频，锁竞争可忽略。
+                let injector = Arc::new(tokio::sync::Mutex::new(InputInjector::new(
+                    width, height, width, height,
+                )));
+                // 捕获循环持有的另一句柄（切换成功后更新基准）。
+                let injector_capture = injector.clone();
+                tokio::spawn(async move {
+                    // src = 客户端坐标空间：客户端按服务端捕获分辨率
+                    // (base_w/base_h) 发像素坐标 → src == dst。
+                    let injector_dispatch = injector;
+                    let switch_monitor_tx_dispatch = switch_monitor_tx.clone();
+                    let mut dropped_input: u64 = 0;
+                    // M8-T019 (SRV-PRIV-015): 锁屏解锁轮询节流（1s）。
+                    let mut last_unlock_poll = std::time::Instant::now() - Duration::from_secs(1);
+                    loop {
+                        if stop_input.load(Ordering::Relaxed) {
+                            info!("Input receive loop stopping by user request");
+                            break;
+                        }
+                        // M8-T019 (SRV-PRIV-015): 锁屏被本地解锁 →
+                        // 自动恢复注入 + 通知客户端（无需重连）。
+                        if last_unlock_poll.elapsed() >= Duration::from_secs(1) {
+                            last_unlock_poll = std::time::Instant::now();
+                            let resumed = privacy_controller.lock().unwrap().poll_unlock();
+                            if resumed {
+                                audit_record(
+                                    &mut privacy_audit,
+                                    kirin_desk_utils::audit::AuditEvent::PrivacyRecovered,
+                                    "event=unlock level=lock initiator=local",
+                                );
+                                info!("[Privacy] workstation unlocked — injection resumed");
+                                send_privacy_ack(&sender_privacy, true, None).await;
+                            }
+                        }
+                        let (tag, _header, payload) = match receiver.recv_tagged().await {
+                            Ok(v) => v,
+                            Err(e) => {
+                                error!("Receive channel error: {} — stopping", e);
+                                break;
+                            }
+                        };
+                        match tag {
+                            ChannelTag::Input => {
+                                // M8-T019 (SRV-PRIV-015): 锁屏期间注入暂停
+                                // （SendInput 对安全桌面无效），解锁自动恢复。
+                                if privacy_controller.lock().unwrap().injection_paused() {
+                                    dropped_input += 1;
+                                    if dropped_input % 200 == 1 {
+                                        warn!(
+                                            "[Privacy] input dropped during lock ({} events)",
+                                            dropped_input
+                                        );
+                                    }
+                                    continue;
+                                }
+                                match bincode::deserialize::<WireInputEvent>(&payload) {
+                                    Ok(ev) => {
+                                        // M8-T020 SKEY-SEC-002: 锁屏请求写审计日志
+                                        // （锁屏调用本身由注入管线执行，单一实现 =
+                                        // M8-T019 privacy::platform_lock_screen）。
+                                        if ev.kind == InputKind::SpecialKey
+                                            && ev.combo == Some(SpecialCombo::LockScreen)
+                                        {
+                                            if let Ok(mut audit) =
+                                                kirin_desk_utils::audit::AuditLogger::open_default()
+                                            {
+                                                let _ = audit.record(
+                                                    kirin_desk_utils::audit::AuditEvent::LockScreen,
+                                                    &format!("{audit_peer} combo=LockScreen"),
+                                                );
+                                            }
+                                        }
+                                        // 注入失败不重试（可靠流不重发用户操作），仅记日志。
+                                        let mut inj = injector_dispatch.lock().await;
+                                        if let Err(e) = inj.handle(ev) {
+                                            warn!(
+                                                "Input inject failed (dropping, no retry): {}",
+                                                e
+                                            );
+                                        }
+                                    }
+                                    Err(e) => warn!("Input event deserialize failed: {}", e),
+                                }
+                            }
+                            // M8-T019 (SRV-PRIV-001/002/013 + PRIV-SEC-001):
+                            // 隐私模式控制（复用 M8-T018 控制通道）。
+                            // M8-T018: 显示器枚举/切换控制（同通道分发）。
+                            ChannelTag::Control => {
+                                match bincode::deserialize::<ControlMessage>(&payload) {
+                                    Ok(ControlMessage::DisplayListReq) => {
+                                        // M8-T018（SRV-CAP-MON-001）：枚举显示器
+                                        // → DisplayListResp（空时兜底默认屏）。
+                                        let displays =
+                                            kirin_desk_media::capture::factory::enumerate_monitors(
+                                            );
+                                        if let Ok(data) =
+                                            bincode::serialize(&ControlMessage::DisplayListResp {
+                                                displays,
+                                            })
+                                        {
+                                            let pkt = EncodedPacket {
+                                                ts: Timestamp::now(),
+                                                kind: PacketKind::Control,
+                                                data,
+                                                is_key: false,
+                                            };
+                                            if let Err(e) = sender_privacy
+                                                .lock()
+                                                .await
+                                                .send_packets(&[pkt])
+                                                .await
+                                            {
+                                                warn!("DisplayListResp send failed: {}", e);
+                                            }
+                                        }
+                                    }
+                                    Ok(ControlMessage::DisplaySelect { index }) => {
+                                        // M8-T018（SRV-MON-003）：捕获循环热切换；
+                                        // 越界/重建失败 → Nack（捕获循环回复）。
+                                        if switch_monitor_tx_dispatch.send(index).is_err() {
+                                            warn!("DisplaySelect: switch channel closed");
+                                        }
+                                    }
+                                    // 其余控制消息（PrivacyMode 等）→ 既有隐私处理
+                                    // （其内部忽略非 PrivacyMode 消息）。
+                                    Ok(_) => {
+                                        handle_server_privacy_message(
+                                            &payload,
+                                            &privacy_controller,
+                                            &sender_privacy,
+                                            &mut privacy_audit,
+                                            &audit_peer,
+                                        )
+                                        .await;
+                                    }
+                                    Err(e) => {
+                                        warn!("Control message deserialize failed: {}", e);
+                                    }
+                                }
+                            }
+                            ChannelTag::FileTransfer => match FileTransferFrame::decode(&payload) {
+                                Ok(frame) => {
+                                    if file_frame_tx_dispatch.send(frame).is_err() {
+                                        break;
+                                    }
+                                }
+                                Err(e) => warn!("File frame decode failed: {}", e),
+                            },
+                            // 其余 tag（Video/Audio/Clipboard 等）无服务端消费方，静默忽略。
+                            _ => {}
+                        }
+                    }
+                    // M8-T019 (SRV-PRIV-014 安全红线): 断连/停止 →
+                    // 本地状态复位（黑屏覆盖随之关闭，无网络依赖）。
+                    if let Some(was) = privacy_controller.lock().unwrap().on_connection_lost() {
+                        audit_record(
+                            &mut privacy_audit,
+                            kirin_desk_utils::audit::AuditEvent::PrivacyRecovered,
+                            &format!("event=disconnect level={} initiator=system", was.as_str()),
+                        );
+                        info!(
+                            "[Privacy] connection lost — privacy state restored ({})",
+                            was.as_str()
+                        );
+                    }
+                    *server_privacy_controller().lock().unwrap() = None;
+                });
+                info!("Capture loop started (DXGI event-driven + 70ms windows)");
+
+                let mut window_count: u64 = 0;
+                // M8-T018（SRV-CAP-MON-003）：显示器切换成功后，
+                // 下一窗口强制 IDR（客户端切换后立即可解码）。
+                let mut force_idr_next = false;
+
+                loop {
+                    if stop_capture.load(Ordering::Relaxed) {
+                        info!("Capture loop stopping by user request");
+                        break;
+                    }
+
+                    // M8-T018（SRV-CAP-MON-002）：显示器切换命令——
+                    // 会话内热切换（重建捕获源，无需重连）。失败回退
+                    // 当前屏 + Nack（MON-NF-001）。
+                    if let Ok(idx) = switch_monitor_rx.try_recv() {
+                        match capture.switch_monitor(idx as usize) {
+                            Ok(()) => {
+                                let (sw, sh) = capture.resolution();
+                                info!("Capture: switched to monitor {} ({}x{})", idx, sw, sh);
+                                force_idr_next = true;
+                                // M8-T018（SRV-MON-010）：注入换算基准
+                                // 跟随新屏分辨率（客户端基数同步切换）。
+                                let mut inj = injector_capture.lock().await;
+                                inj.set_resolution(sw, sh);
+                            }
+                            Err(e) => {
+                                error!(
+                                    "Capture: switch monitor {} failed: {} — keeping current",
+                                    idx, e
+                                );
+                                let reason = format!("switch monitor {idx} failed: {e}");
+                                if let Ok(data) =
+                                    bincode::serialize(&ControlMessage::DisplaySelectNack {
+                                        reason,
+                                    })
+                                {
+                                    let pkt = EncodedPacket {
+                                        ts: Timestamp::now(),
+                                        kind: PacketKind::Control,
+                                        data,
+                                        is_key: false,
+                                    };
+                                    if let Err(e2) =
+                                        sender_shared.lock().await.send_packets(&[pkt]).await
+                                    {
+                                        warn!("DisplaySelectNack send failed: {}", e2);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Wait for a fresh screen frame (blocks until change)
+                    // M8-T018（MON-NF-002）：带超时等待——静默屏幕
+                    // （长时间无画面变化）也定期醒来处理切换命令，
+                    // 切换延迟与屏幕活动度解耦（目标 <500ms）。
+                    match capture.wait_for_frame_timeout(Duration::from_millis(200)) {
+                        Ok(frame) => {
+                            let raw = RawFrame {
+                                data: Arc::new(frame.data().to_vec()),
+                                width: frame.width(),
+                                height: frame.height(),
+                                timestamp: std::time::SystemTime::now(),
+                                dirty_rects: frame.dirty_rects().to_vec(),
+                                force_key: window_count == 0 || force_idr_next,
+                            };
+                            force_idr_next = false;
+                            // push_frame already returns the EncodedWindow if window closes
+                            match pipeline.push_frame(raw) {
+                                Ok(Some(encoded_window)) => {
+                                    window_count = encoded_window.window_id;
+                                    let n_frames = encoded_window.frame_count;
+                                    info!(
+                                        "Capture: window {} encoded ({} frames, {}x{})",
+                                        encoded_window.window_id,
+                                        n_frames,
+                                        encoded_window.base_w,
+                                        encoded_window.base_h
+                                    );
+
+                                    // Serialize and send over SecureChannel (tag 分帧 Video)
+                                    match bincode::serialize(&encoded_window) {
+                                        Ok(bytes) => {
+                                            let pkt = EncodedPacket {
+                                                ts: Timestamp::now(),
+                                                kind: PacketKind::Video,
+                                                data: bytes,
+                                                is_key: window_count == 0,
+                                            };
+                                            if let Err(e) = sender_shared
+                                                .lock()
+                                                .await
+                                                .send_packets(&[pkt])
+                                                .await
+                                            {
+                                                error!(
+                                                    "Capture send error window {}: {} — closing",
+                                                    encoded_window.window_id, e
+                                                );
+                                                break;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            error!(
+                                                "Serialize window {} failed: {}",
+                                                encoded_window.window_id, e
+                                            );
+                                        }
+                                    }
+                                }
+                                Ok(None) => {
+                                    // still collecting frames for this window
+                                }
+                                Err(e) => {
+                                    error!("Window pipeline error: {} — retrying", e);
+                                    tokio::time::sleep(Duration::from_millis(50)).await;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            // Fatal errors: break the capture loop (connection lost, no monitor)
+                            // Transient errors: retry with backoff
+                            match &e {
+                                // M8-T018（MON-NF-002）：静默屏幕超时——
+                                // 定期醒来轮询显示器切换命令，无需日志。
+                                CaptureError::Timeout => continue,
+                                CaptureError::AccessLost => {
+                                    error!(
+                                        "Capture access lost — closing connection, will recreate"
+                                    );
+                                    break;
+                                }
+                                CaptureError::NoMonitor | CaptureError::InvalidMonitor => {
+                                    error!("Capture: {} — stopping capture", e);
+                                    break;
+                                }
+                                _ => {
+                                    error!("Capture error: {} — sleeping and retrying", e);
+                                    tokio::time::sleep(Duration::from_millis(100)).await;
+                                }
+                            }
+                        }
+                    }
+                }
+                info!("Capture loop exited after {} windows", window_count);
+
+                // 连接退出：清空（输入任务因 recv 失败自行退出）
+                *server_channel().lock().unwrap() = None;
+            });
+        } else {
+            error!("No server identity available, rejecting {}", addr);
+        }
     }
 
     fn show_devices(&mut self, ui: &mut egui::Ui, theme: &Theme) {
@@ -5710,7 +6701,7 @@ impl KirinDeskApp {
                                 );
                                 title_rect = Some(tr.rect);
                                 ui.add_space(32.0); // 📋 预留
-                                // 类型徽标（server=info / desktop=neutral）
+                                                    // 类型徽标（server=info / desktop=neutral）
                                 let (kind, label) = if d.device_type == "server" {
                                     (BadgeKind::Info, "server")
                                 } else {
@@ -5747,11 +6738,8 @@ impl KirinDeskApp {
                         });
                     // M15-T008: Frame 只给 hover 感知 → 叠加点击交互层（单击填入 / 右键菜单）。
                     let rect = card.response.rect;
-                    let click = ui.interact(
-                        rect,
-                        ui.id().with(("dev_card", i)),
-                        egui::Sense::click(),
-                    );
+                    let click =
+                        ui.interact(rect, ui.id().with(("dev_card", i)), egui::Sense::click());
                     // M8-T028: 📋 按钮注册于卡片点击层之后（同层后注册者优先命中）——
                     // 按钮可点，卡片单击填入/右键菜单行为不变。
                     let mut copied: Option<String> = None;
@@ -5888,11 +6876,14 @@ impl KirinDeskApp {
     /// 有域名且 API 已配置 → Domain 模式（DNS 发现）；否则 IP 模式直连。
     fn fill_connect_from_device(&mut self, d: &SavedDevice) {
         self.connect_nickname = d.nickname.clone();
-        if !d.domain.is_empty() && !self.api_key.trim().is_empty() && !self.api_secret.trim().is_empty()
+        if !d.domain.is_empty()
+            && !self.api_key.trim().is_empty()
+            && !self.api_secret.trim().is_empty()
         {
             self.connect_domain = d.domain.clone();
             self.ip_mode_allowed = false; // 切换 Domain 模式界面（仅内存，不写回配置）
-            self.connect_status = format!("Ready: {}@{}（Domain 模式自动发现）", d.nickname, d.domain);
+            self.connect_status =
+                format!("Ready: {}@{}（Domain 模式自动发现）", d.nickname, d.domain);
         } else {
             self.connect_ipv6 = d.ipv6.clone();
             self.connect_port = d.port.to_string();
@@ -6005,7 +6996,11 @@ impl KirinDeskApp {
         if self.ip_mode_allowed {
             // M15-T008: 表单校验——IPv6 合法 / 端口 1-65535 / 昵称与挑战码必填（UI-CON-010/022）
             let ip_empty = self.connect_ipv6.trim().is_empty();
-            let ip_ok = self.connect_ipv6.trim().parse::<std::net::Ipv6Addr>().is_ok();
+            let ip_ok = self
+                .connect_ipv6
+                .trim()
+                .parse::<std::net::Ipv6Addr>()
+                .is_ok();
             let port_empty = self.connect_port.trim().is_empty();
             let port_ok = self
                 .connect_port
@@ -6117,8 +7112,7 @@ impl KirinDeskApp {
                 if action_button(ui, theme, ButtonKind::Primary, "Connect", state).clicked() {
                     do_connect = true;
                 }
-                if action_button(ui, theme, ButtonKind::Secondary, "Connect Shell", state)
-                    .clicked()
+                if action_button(ui, theme, ButtonKind::Secondary, "Connect Shell", state).clicked()
                 {
                     do_shell = true;
                 }
@@ -6160,6 +7154,21 @@ impl KirinDeskApp {
                         // M15: 共享会话启动器——TCP 连接 → 完整握手（IP 模式无带外
                         // 公钥 → known_hosts 命中自动放行 / 首次指纹确认，CLI-HSK-SEC-003）
                         // → 会话任务 → 自动保存设备 + 记录 known_hosts。
+                        // R-03 (R03-S2/S4)：登记重连上下文（断线后自动重连）。
+                        let reconnect_ctx = if do_shell {
+                            None // Shell 会话无桌面断线重连
+                        } else {
+                            build_reconnect_ctx(
+                                ip.clone(),
+                                port,
+                                nick.clone(),
+                                chal.clone(),
+                                "desktop",
+                                ClientTrust::Confirm,
+                                None,
+                                String::new(),
+                            )
+                        };
                         let ctx = ui.ctx().clone();
                         std::thread::spawn(move || {
                             let rt = tokio::runtime::Runtime::new().expect("connect rt");
@@ -6184,6 +7193,7 @@ impl KirinDeskApp {
                                         chal,
                                         String::new(),
                                         "desktop",
+                                        reconnect_ctx,
                                     )
                                     .await;
                                 }
@@ -6251,12 +7261,9 @@ impl KirinDeskApp {
             } else {
                 ui.add(
                     egui::Label::new(
-                        egui::RichText::new(format!(
-                            "via relay {}",
-                            tunnel_cfg.server_addr
-                        ))
-                        .size(theme.small_size)
-                        .color(theme.fg_weak),
+                        egui::RichText::new(format!("via relay {}", tunnel_cfg.server_addr))
+                            .size(theme.small_size)
+                            .color(theme.fg_weak),
                     )
                     .selectable(false),
                 );
@@ -6543,7 +7550,32 @@ impl KirinDeskApp {
                                     {
                                         return;
                                     }
-                                    let trust = ClientTrust::Verified(info.public_key_base64);
+                                    let trust = ClientTrust::Verified(info.public_key_base64.clone());
+                                    // R-03 (R03-S2/S4)：登记重连上下文——断线后按原
+                                    // 规格自动重连（重新发现域名，IP 可能已变化）；
+                                    // server 型（Shell）会话无桌面断线重连。
+                                    let reconnect_ctx = if info.device_type == "server" {
+                                        None
+                                    } else {
+                                        build_reconnect_ctx(
+                                            device_id.clone(),
+                                            0, // 域名模式端口来自发现
+                                            device_id.clone(),
+                                            chal.clone(),
+                                            "desktop",
+                                            ClientTrust::Verified(
+                                                info.public_key_base64.clone(),
+                                            ),
+                                            Some(DnsConfig {
+                                                api_key: cfg.godaddy.api_key.clone(),
+                                                api_secret: cfg.godaddy.api_secret.clone(),
+                                                api_url: cfg.godaddy.api_url.clone(),
+                                                domain: domain.clone(),
+                                                ip_family: family,
+                                            }),
+                                            domain.clone(),
+                                        )
+                                    };
                                     // 3. 连接中 → 握手（TXT 公钥强制验证）→ 已连接 → 自动保存。
                                     //    server 型设备自动切换远程终端窗口（§8.4）。
                                     if info.device_type == "server" {
@@ -6565,6 +7597,7 @@ impl KirinDeskApp {
                                             chal,
                                             domain,
                                             "desktop",
+                                            reconnect_ctx,
                                         )
                                         .await;
                                     }
@@ -6738,6 +7771,49 @@ impl KirinDeskApp {
                     egui::Label::new(
                         egui::RichText::new(
                             "Temp mode skips whitelist check. Use for Linux headless servers.",
+                        )
+                        .size(theme.small_size)
+                        .color(theme.fg_weak),
+                    )
+                    .selectable(false),
+                );
+                // S-01c (F-1/F-2): 高危配置警告——旁路（IP/Temp mode）开启但
+                // 挑战码为空 → 旁路零凭据连接全部被拒（fail-closed），提示用户
+                // 在 Identity 页配置挑战码（凭据是旁路放行的前提）。
+                if (self.ip_mode_allowed || self.temp_mode)
+                    && self.challenge_code.trim().is_empty()
+                {
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(
+                                "⚠ HIGH RISK: whitelist bypass (IP/Temp mode) is ON but \
+                                 Challenge Code is empty — bypass connections carry zero \
+                                 credentials and will be REJECTED (fail-closed, F-1/F-2). \
+                                 Set a challenge code in the Identity section to allow them.",
+                            )
+                            .size(theme.small_size)
+                            .color(theme.danger),
+                        )
+                        .selectable(false),
+                    );
+                }
+                // R-04：音频开关（会话级，默认开；取消勾选 = 本次进程内所有
+                // 会话不再传音频，视频/键鼠不受影响）。
+                ui.add_space(4.0);
+                let mut audio_on = audio_enabled_global().load(Ordering::Relaxed);
+                if ui.checkbox(&mut audio_on, "音频传输 (会话级)").changed() {
+                    set_audio_enabled(audio_on);
+                    self.settings_status = if audio_on {
+                        "Audio enabled (takes effect on new sessions)".to_string()
+                    } else {
+                        "Audio disabled (takes effect on new sessions)".to_string()
+                    };
+                }
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(
+                            "System sound of the controlled device is streamed (Opus 48kHz stereo).",
                         )
                         .size(theme.small_size)
                         .color(theme.fg_weak),
@@ -7029,6 +8105,77 @@ impl KirinDeskApp {
                     )
                     .selectable(false),
                 );
+
+                // M8-T027 (UI-IDWL-001): 设备 ID 白名单文本框（逗号/换行分隔，
+                // 保存写 `[network].allowed_ids` 永久条目，重启持久化）。
+                ui.add_space(8.0);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new("Allowed Device IDs:")
+                            .size(theme.small_size)
+                            .color(theme.fg_weak),
+                    )
+                    .selectable(false),
+                );
+                egui::TextEdit::multiline(&mut self.allowed_ids)
+                    .desired_rows(2)
+                    .desired_width(ui.available_width())
+                    .show(ui);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(
+                            "(comma or newline separated device IDs; exact match, case-sensitive, \
+                             `office-*` = prefix wildcard; takes effect immediately after Save)",
+                        )
+                        .size(theme.small_size)
+                        .color(theme.fg_weak),
+                    )
+                    .selectable(false),
+                );
+                // M8-T027 (UI-IDWL-002): ID 白名单条目列表（永久/过期标记 +
+                // 逐条删除；过期条目自动失效但仍展示直至被删/清理）。
+                ui.add_space(6.0);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new("ID whitelist entries:")
+                            .size(theme.small_size)
+                            .color(theme.fg_weak),
+                    )
+                    .selectable(false),
+                );
+                let mut pending_remove: Option<String> = None;
+                let idwl_now = chrono::Utc::now();
+                for entry in &self.id_whitelist_entries {
+                    let expired = !entry.is_active(idwl_now);
+                    let expiry_label = match &entry.expiry {
+                        Some(t) if expired => format!(
+                            "(expired {})",
+                            t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                        ),
+                        Some(t) => format!(
+                            "(expires {})",
+                            t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                        ),
+                        None => "(permanent)".to_string(),
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label(format!("  {}", entry.device_id));
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(expiry_label)
+                                    .size(theme.small_size)
+                                    .color(if expired { theme.danger } else { theme.fg_weak }),
+                            )
+                            .selectable(false),
+                        );
+                        if ui.small_button("✕ Remove").clicked() {
+                            pending_remove = Some(entry.device_id.clone());
+                        }
+                    });
+                }
+                if let Some(device_id) = pending_remove {
+                    self.remove_id_whitelist_entry(&device_id);
+                }
             });
 
             egui::CollapsingHeader::new("Logging").show(ui, |ui| {
@@ -7186,7 +8333,17 @@ impl KirinDeskApp {
                                     drop(guard);
                                     match install_update(&path) {
                                         // 替换脚本已在后台启动：立即退出让出 exe 文件锁。
-                                        Ok(()) => std::process::exit(0),
+                                        Ok(InstallOutcome::Restarting) => std::process::exit(0),
+                                        // macOS/Linux：安装包已落地，提示手动打开方式。
+                                        Ok(InstallOutcome::ManualInstall { artifact, hint }) => {
+                                            let mut s2 = s.lock().unwrap();
+                                            s2.downloaded = None;
+                                            s2.info = Some(format!(
+                                                "已下载到 {}。{}",
+                                                artifact.display(),
+                                                hint
+                                            ));
+                                        }
                                         Err(e) => {
                                             let mut s2 = s.lock().unwrap();
                                             s2.error = Some(e);
@@ -7206,6 +8363,10 @@ impl KirinDeskApp {
                     if let Some(e) = &guard.error {
                         ui.add_space(4.0);
                         badge(ui, theme, &format!("Update error: {}", e), BadgeKind::Danger);
+                    }
+                    if let Some(m) = &guard.info {
+                        ui.add_space(4.0);
+                        badge(ui, theme, m, BadgeKind::Success);
                     }
                 });
 
@@ -7232,7 +8393,17 @@ impl KirinDeskApp {
                 if action_button(ui, theme, ButtonKind::Primary, "Save", ButtonState::Enabled)
                     .clicked()
                 {
-                    let mut cfg = kirin_desk_utils::config::Config::default();
+                    // M8-T027 (UI-IDWL-001): 改为基于**现有配置**修改而非重建——
+                    // 否则 GUI 保存会清空 CLI 添加的域名/ID 过期条目（`whitelist`/
+                    // `id_whitelist`）与 tunnel 服务端参数（M8-T026）。
+                    let mut cfg = kirin_desk_utils::config::Config::load().unwrap_or_default();
+                    // UI-IDWL-004: 保存时对**新增**的永久 ID 条目写审计
+                    // `WhitelistIdAdded`（旧缓存含保存前条目）。
+                    let prev_ids: std::collections::HashSet<String> = self
+                        .id_whitelist_entries
+                        .iter()
+                        .map(|e| e.device_id.clone())
+                        .collect();
                     cfg.device.id = self.device_id.clone();
                     cfg.device.nickname = self.nickname.clone();
                     cfg.device.challenge_code = self.challenge_code.clone();
@@ -7248,6 +8419,16 @@ impl KirinDeskApp {
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty())
                         .collect();
+                    // M8-T027 (UI-IDWL-001): ID 白名单文本框（逗号/换行分隔）→
+                    // `[network].allowed_ids` 永久条目（即时生效：accept 循环
+                    // 逐连接读取配置快照）。
+                    let new_ids: Vec<String> = self
+                        .allowed_ids
+                        .split(|c| c == ',' || c == '\n' || c == '\r')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    cfg.network.allowed_ids = new_ids.clone();
                     cfg.network.ip_mode_allowed = self.ip_mode_allowed;
                     cfg.network.temp_mode = self.temp_mode;
                     // M15-T008: 主题模式持久化（`[ui] theme`，默认 light）
@@ -7268,6 +8449,30 @@ impl KirinDeskApp {
                         );
                     match cfg.save() {
                         Ok(()) => {
+                            // UI-IDWL-004: 审计新增永久 ID 条目（附 device_id）。
+                            if let Ok(mut a) = kirin_desk_utils::audit::AuditLogger::open_default()
+                            {
+                                for id in new_ids.iter().filter(|id| !prev_ids.contains(*id)) {
+                                    let _ = a.record(
+                                        kirin_desk_utils::audit::AuditEvent::WhitelistIdAdded,
+                                        &format!("device={} expiry=permanent", id),
+                                    );
+                                }
+                            }
+                            // 刷新条目列表缓存（永久 + 带过期条目）。
+                            let mut entries: Vec<kirin_desk_utils::config::IdWhitelistEntry> =
+                                new_ids
+                                    .iter()
+                                    .map(|id| {
+                                        kirin_desk_utils::config::IdWhitelistEntry::new(id, None)
+                                    })
+                                    .collect();
+                            for e in &cfg.network.id_whitelist {
+                                if !entries.iter().any(|x| x.device_id == e.device_id) {
+                                    entries.push(e.clone());
+                                }
+                            }
+                            self.id_whitelist_entries = entries;
                             self.settings_status = "Saved".to_string();
                             if let Ok(p) = self.listen_port.parse::<u16>() {
                                 self.connect_port = p.to_string();

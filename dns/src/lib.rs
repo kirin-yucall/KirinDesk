@@ -23,6 +23,7 @@ pub mod godaddy;
 pub mod heartbeat;
 pub mod srv;
 pub mod txt;
+pub mod validate;
 
 #[cfg(test)]
 pub mod test_support;

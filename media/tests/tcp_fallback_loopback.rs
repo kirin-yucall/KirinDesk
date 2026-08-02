@@ -96,7 +96,7 @@ async fn run_client(
         "loopback.example",
         "tester",
         server_id,
-        server_pub,
+        kirin_desk_core::crypto::handshake::PinExpectation::exact_from_base64(server_pub).expect("server pubkey"),
         "challenge",
     )
     .await

@@ -74,6 +74,11 @@ impl KgpuKernel {
     /// `device`：`None` → 自建 device；`Some(ptr)` → 复用调用方 device。
     /// 平台语义：Windows=ID3D11Device* / Linux=VkDevice(待) / macOS=MTLDevice(待)。
     /// （Windows: windows-capture → 与编码器同 device，零拷贝直通。）
+    ///
+    /// M8-T030（R-06，GPU-FR-006）：调用方应传
+    /// [`crate::gpu::d3d11_device_handle()`]（选定适配器上创建的 D3D11 设备，
+    /// 与 FFmpeg HW 编解码绑定同一 GPU）；无选定适配器 / 非 Windows → `None`
+    /// 自建设备，保持现状。
     pub fn init(device: Option<*mut core::ffi::c_void>) -> Result<Self, EncodeError> {
         let dev = device.unwrap_or(core::ptr::null_mut());
         let code = unsafe { super::kgpu_init(dev) };

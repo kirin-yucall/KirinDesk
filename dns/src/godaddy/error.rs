@@ -41,6 +41,19 @@ pub enum GoDaddyError {
     #[error("Network error: {0}")]
     Network(#[from] reqwest::Error),
 
+    /// Invalid client configuration (S-14a / F-17: non-https api_url).
+    #[error("Invalid configuration: {0}")]
+    Configuration(String),
+
+    /// Response body exceeded the size limit (S-14c / F-19: 1 MiB cap).
+    #[error("Response too large: {actual} bytes (limit {limit})")]
+    ResponseTooLarge {
+        /// Size limit in bytes.
+        limit: usize,
+        /// Actual size in bytes (Content-Length or actual bytes read).
+        actual: usize,
+    },
+
     /// JSON serialization/deserialization error.
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),

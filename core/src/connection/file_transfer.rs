@@ -7,7 +7,9 @@
 //!   超时重传、暂停/恢复/取消、断点续传）；
 //! - [`ChunkReceiver`]：接收侧重组状态机（按序落 `.part`、整体 SHA-256
 //!   校验、原子 rename、取消回滚）；
-//! - [`TransferScheduler`]：会话内并发任务队列（≤3，FIFO）；
+//! - [`TransferScheduler`]：会话内并发任务队列（≤3 活跃，FIFO；排队上限
+//!   [`MAX_QUEUE_LEN`]，S-10c）；
+//! - [`SessionQuota`]：会话级总字节/文件数配额（S-10b）；
 //! - [`TransferStore`]：断点状态持久化（`transfers.json`，仅元数据）。
 //!
 //! I/O 接线（TCP 发送/接收、帧转发）由上层（ui）完成；本模块所有函数
@@ -40,6 +42,18 @@ pub const MAX_CONCURRENT: usize = 3;
 
 /// 单文件大小上限默认值（4 GiB，Offer 阶段拒绝，FT-SEC-002）。
 pub const DEFAULT_MAX_FILE_SIZE: u64 = 4 * 1024 * 1024 * 1024;
+
+/// S-10b (F-11)：单会话累计字节配额默认值（4 GiB，与单文件上限一致——
+/// 单文件整传恰好占满预算，不误伤正常大文件传输；对齐
+/// `utils::config::FileTransferConfig::default_session_max_bytes`）。
+pub const DEFAULT_SESSION_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// S-10b (F-11)：单会话文件数配额默认值（64；对齐
+/// `utils::config::FileTransferConfig::default_session_max_files`）。
+pub const DEFAULT_SESSION_MAX_FILES: u64 = 64;
+
+/// S-10c (F-11)：调度队列长度上限（排队任务数超过即拒绝入队）。
+pub const MAX_QUEUE_LEN: usize = 128;
 
 /// 单文件最大块数兜底（1M 块 = 64 GiB，防止恶意 total_blocks 撑爆内存）。
 const MAX_BLOCKS: u64 = 1 << 20;
@@ -114,7 +128,12 @@ impl FileTransferFrame {
     }
 
     /// 构造 Offer 帧。
-    pub fn offer(transfer_id: u64, meta: &FileOfferMeta, total_blocks: u32, sha256: [u8; 32]) -> Self {
+    pub fn offer(
+        transfer_id: u64,
+        meta: &FileOfferMeta,
+        total_blocks: u32,
+        sha256: [u8; 32],
+    ) -> Self {
         Self {
             transfer_id,
             op: FileOp::Offer,
@@ -156,6 +175,22 @@ pub enum FileTransferError {
     OutOfOrder(u32, u32),
     #[error("transfer rejected by peer: {0}")]
     Rejected(String),
+    /// S-10a (F-11)：`resume_from` 越界（> 总块数）→ 拒绝续传，
+    /// 防止恶意断点直接 `set_len(seq*64KiB)` 制造数百 TB 稀疏文件。
+    #[error("invalid resume offset {0} (total blocks {1})")]
+    InvalidResumeOffset(u32, u32),
+    /// S-10b (F-11)：会话级字节配额超限（已预留 {0}，上限 {1}）。
+    #[error("session byte quota exceeded: {0} bytes reserved (max {1})")]
+    SessionBytesExceeded(u64, u64),
+    /// S-10b (F-11)：会话级文件数配额超限（已预留 {0} 个，上限 {1}）。
+    #[error("session file quota exceeded: {0} files reserved (max {1})")]
+    SessionFilesExceeded(u64, u64),
+    /// S-10c (F-11)：调度队列已满，拒绝入队。
+    #[error("transfer scheduler queue full (max {0})")]
+    QueueFull(usize),
+    /// S-10d (F-11)：磁盘剩余空间不足（需 {0} 字节，可用 {1}）。
+    #[error("insufficient disk space: need {0} bytes, free {1}")]
+    InsufficientDiskSpace(u64, u64),
     #[error("io: {0}")]
     Io(String),
     #[error("cancelled")]
@@ -186,7 +221,9 @@ pub fn derive_transfer_id(name: &str, size: u64, salt: &str) -> u64 {
 pub fn sanitize_filename(name: &str) -> Result<String, FileTransferError> {
     // 尾随点/空格（Windows 解析歧义）在 trim 前判定，避免被吞掉。
     if name.ends_with('.') || name.ends_with(' ') {
-        return Err(FileTransferError::UnsafeFilename("trailing dot or space".into()));
+        return Err(FileTransferError::UnsafeFilename(
+            "trailing dot or space".into(),
+        ));
     }
     let name = name.trim();
     if name.is_empty() {
@@ -202,7 +239,9 @@ pub fn sanitize_filename(name: &str) -> Result<String, FileTransferError> {
         || name.contains('\\')
         || name.contains('\0')
     {
-        return Err(FileTransferError::UnsafeFilename("path separators or absolute path".into()));
+        return Err(FileTransferError::UnsafeFilename(
+            "path separators or absolute path".into(),
+        ));
     }
     // 盘符（C:）。
     let bytes = name.as_bytes();
@@ -216,18 +255,22 @@ pub fn sanitize_filename(name: &str) -> Result<String, FileTransferError> {
     // Windows 非法字符 + 控制字符。
     for c in name.chars() {
         if matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*') || (c as u32) < 0x20 {
-            return Err(FileTransferError::UnsafeFilename(format!("illegal char {c:?}")));
+            return Err(FileTransferError::UnsafeFilename(format!(
+                "illegal char {c:?}"
+            )));
         }
     }
     // Windows 保留名（含扩展名前缀，如 CON.txt）。
     let stem = name.split('.').next().unwrap_or("");
     let upper = stem.to_ascii_uppercase();
     let reserved = [
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
-        "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
     ];
     if reserved.contains(&upper.as_str()) {
-        return Err(FileTransferError::UnsafeFilename(format!("reserved name {name}")));
+        return Err(FileTransferError::UnsafeFilename(format!(
+            "reserved name {name}"
+        )));
     }
     Ok(name.to_string())
 }
@@ -310,6 +353,48 @@ pub fn sha256_file(path: &Path) -> Result<[u8; 32], FileTransferError> {
     Ok(hasher.finalize().into())
 }
 
+/// S-10d (F-11)：查询 `path` 所在卷的可用磁盘空间（字节）。
+///
+/// 最小实现（不新增依赖）：Windows 经 `libloading` 动态调用
+/// `GetDiskFreeSpaceExW`；其他平台无 std API 可用 → 返回 `None`
+/// （调用方视为「未知」，跳过检查）。
+#[cfg(windows)]
+pub fn free_disk_space(path: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let lib = libloading::Library::new("kernel32.dll").ok()?;
+        let get_free: libloading::Symbol<
+            unsafe extern "system" fn(*const u16, *mut u64, *mut u64, *mut u64) -> i32,
+        > = lib.get(b"GetDiskFreeSpaceExW").ok()?;
+        let mut free_bytes_avail: u64 = 0;
+        let mut total_bytes: u64 = 0;
+        let mut total_free: u64 = 0;
+        let ok = get_free(
+            wide.as_ptr(),
+            &mut free_bytes_avail,
+            &mut total_bytes,
+            &mut total_free,
+        );
+        if ok == 0 {
+            None // 路径不存在/调用失败 → 未知
+        } else {
+            Some(free_bytes_avail)
+        }
+    }
+}
+
+/// S-10d (F-11)：非 Windows 平台无内建磁盘空间 API（不新增 libc/fs2
+/// 依赖）→ 返回 `None`，落盘前检查跳过（尽力而为）。
+#[cfg(not(windows))]
+pub fn free_disk_space(_path: &Path) -> Option<u64> {
+    None
+}
+
 // ════════════════════════════════════════════════════════════════
 // SlideWindowSender — 发送侧滑窗状态机
 // ════════════════════════════════════════════════════════════════
@@ -371,7 +456,12 @@ pub struct SlideWindowSender {
 
 impl SlideWindowSender {
     /// 创建发送器。`sha256` 为整文件哈希（Offer 声明）。
-    pub fn new(transfer_id: u64, name: String, size: u64, sha256: [u8; 32]) -> Result<Self, FileTransferError> {
+    pub fn new(
+        transfer_id: u64,
+        name: String,
+        size: u64,
+        sha256: [u8; 32],
+    ) -> Result<Self, FileTransferError> {
         let total_blocks = total_blocks_for(size);
         if total_blocks > MAX_BLOCKS {
             return Err(FileTransferError::InvalidBlockCount(total_blocks));
@@ -429,7 +519,9 @@ impl SlideWindowSender {
 
     /// 平均速度（字节/秒；未开始返回 0）。
     pub fn speed(&self) -> f64 {
-        let Some(start) = self.started else { return 0.0 };
+        let Some(start) = self.started else {
+            return 0.0;
+        };
         let elapsed = start.elapsed().as_secs_f64();
         if elapsed <= 0.0 {
             return 0.0;
@@ -451,7 +543,10 @@ impl SlideWindowSender {
     /// 取双方进度最大值作为发送起点。首传时对端回 0。
     pub fn on_accept(&mut self, remote_next_seq: u32) {
         self.started.get_or_insert_with(Instant::now);
-        self.start_seq = self.local_resume_seq.max(remote_next_seq).min(self.total_blocks);
+        self.start_seq = self
+            .local_resume_seq
+            .max(remote_next_seq)
+            .min(self.total_blocks);
         self.next_seq = self.start_seq;
         self.sent_at.clear();
         self.in_flight = 0;
@@ -656,13 +751,21 @@ impl ChunkReceiver {
         if blocks > MAX_BLOCKS {
             return Err(FileTransferError::InvalidBlockCount(blocks));
         }
-        Ok(FileOfferMeta { name, size: meta.size })
+        Ok(FileOfferMeta {
+            name,
+            size: meta.size,
+        })
     }
 
     /// 开始接收：落 `.part` 到 `dir`（自动改名目标名）。
     ///
     /// `resume_from`：续传起点（已有 `.part` 的已收进度，通常来自
     /// [`TransferStore`]）；对应 `.part` 文件须由调用方先还原/确认存在。
+    ///
+    /// S-10a (F-11)：`resume_from` 必须 ≤ 总块数（由 `meta.size` 派生），
+    /// 越界直接拒绝——旧实现无条件 `set_len(seq*64KiB)`，u32 极值可制造
+    /// 数百 TB 稀疏文件。截断长度同时以 `meta.size` 为上限（非整块文件
+    /// 不会把 `.part` 撑大）。
     pub fn begin(
         &mut self,
         meta: &FileOfferMeta,
@@ -671,8 +774,21 @@ impl ChunkReceiver {
         resume_from: u32,
     ) -> Result<(), FileTransferError> {
         let name = sanitize_filename(&meta.name)?;
+        let blocks = total_blocks_for(meta.size) as u32;
+        if resume_from > blocks {
+            return Err(FileTransferError::InvalidResumeOffset(resume_from, blocks));
+        }
+        // 断点对应的已收字节（不超声明大小）。
+        let written = block_offset(resume_from).min(meta.size);
         std::fs::create_dir_all(dir)
             .map_err(|e| FileTransferError::Io(format!("create dir {}: {e}", dir.display())))?;
+        // S-10d (F-11)：落盘前检查磁盘剩余空间（尽力而为；平台不支持时跳过）。
+        let needed = meta.size.saturating_sub(written);
+        if let Some(free) = free_disk_space(dir) {
+            if free < needed {
+                return Err(FileTransferError::InsufficientDiskSpace(needed, free));
+            }
+        }
         let final_path = unique_target_path(dir, &name);
         // .part 用最终名 + ".part" 后缀。
         let mut part = final_path.clone();
@@ -684,15 +800,27 @@ impl ChunkReceiver {
                 .unwrap_or_else(|| name.clone())
         );
         part.set_file_name(part_name);
-        let blocks = total_blocks_for(meta.size) as u32;
         let mut opts = std::fs::OpenOptions::new();
-        opts.create(true).write(true).truncate(resume_from == 0).read(true);
+        opts.create(true)
+            .write(true)
+            .truncate(resume_from == 0)
+            .read(true);
         let file = opts
             .open(&part)
             .map_err(|e| FileTransferError::Io(format!("open part {}: {e}", part.display())))?;
-        // 续传时截断到已收长度（防止残留脏数据）。
+        // 续传时截断到已收长度（以 meta.size 为上限，防残留脏数据 +
+        // 防稀疏撑大）；已有 `.part` 比断点还短 → 数据缺失，续传必败，拒绝。
         if resume_from > 0 {
-            let written = block_offset(resume_from);
+            let actual_len = file
+                .metadata()
+                .map_err(|e| FileTransferError::Io(format!("part metadata: {e}")))?
+                .len();
+            if actual_len < written {
+                return Err(FileTransferError::Io(format!(
+                    "part file {} shorter ({actual_len}) than resume offset {written}",
+                    part.display()
+                )));
+            }
             if written > 0 {
                 file.set_len(written)
                     .map_err(|e| FileTransferError::Io(format!("truncate part: {e}")))?;
@@ -703,7 +831,7 @@ impl ChunkReceiver {
         self.total_blocks = blocks;
         self.sha256 = sha256;
         self.next_seq = resume_from;
-        self.received_bytes = block_offset(resume_from);
+        self.received_bytes = written;
         self.part_path = part;
         self.final_path = final_path;
         self.file = Some(file);
@@ -732,7 +860,10 @@ impl ChunkReceiver {
                 data.len()
             )));
         }
-        let file = self.file.as_mut().ok_or_else(|| FileTransferError::Io("no part file".into()))?;
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| FileTransferError::Io("no part file".into()))?;
         use std::io::{Seek, SeekFrom, Write};
         file.seek(SeekFrom::Start(block_offset(seq)))
             .map_err(|e| FileTransferError::Io(format!("seek part: {e}")))?;
@@ -842,10 +973,100 @@ impl Drop for ChunkReceiver {
 }
 
 // ════════════════════════════════════════════════════════════════
+// SessionQuota — 会话级传输配额（S-10b）
+// ════════════════════════════════════════════════════════════════
+
+/// S-10b (F-11)：会话级传输配额——单会话累计字节 + 文件数双上限。
+///
+/// 语义：每个新 Offer 在接受前 `try_reserve(meta.size)`，超限 → 拒绝；
+/// 传输取消/失败（未完成）时 `release(size)` 归还预算。
+/// `max_bytes == 0` 表示字节不设限；`max_files == 0` 表示文件数不设限。
+///
+/// 默认值 [`DEFAULT_SESSION_MAX_BYTES`]（4 GiB，与单文件上限一致，
+/// 单文件整传恰好占满预算，不误伤正常大文件）+
+/// [`DEFAULT_SESSION_MAX_FILES`]（64 个）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionQuota {
+    max_bytes: u64,
+    max_files: u64,
+    reserved_bytes: u64,
+    reserved_files: u64,
+}
+
+impl SessionQuota {
+    /// 创建配额（`0` = 该维度不设限）。
+    pub fn new(max_bytes: u64, max_files: u64) -> Self {
+        Self {
+            max_bytes,
+            max_files,
+            reserved_bytes: 0,
+            reserved_files: 0,
+        }
+    }
+
+    /// 预留一个文件（`size` 字节）。字节或文件数任一超限 → 拒绝（不扣减）。
+    pub fn try_reserve(&mut self, size: u64) -> Result<(), FileTransferError> {
+        if self.max_files > 0 && self.reserved_files >= self.max_files {
+            return Err(FileTransferError::SessionFilesExceeded(
+                self.reserved_files,
+                self.max_files,
+            ));
+        }
+        if self.max_bytes > 0 {
+            let remaining = self.max_bytes.saturating_sub(self.reserved_bytes);
+            if size > remaining {
+                return Err(FileTransferError::SessionBytesExceeded(
+                    self.reserved_bytes,
+                    self.max_bytes,
+                ));
+            }
+        }
+        self.reserved_bytes += size;
+        self.reserved_files += 1;
+        Ok(())
+    }
+
+    /// 归还预算（取消/失败时调用；饱和减，防溢出）。
+    pub fn release(&mut self, size: u64) {
+        self.reserved_bytes = self.reserved_bytes.saturating_sub(size);
+        self.reserved_files = self.reserved_files.saturating_sub(1);
+    }
+
+    /// 已预留字节。
+    pub fn reserved_bytes(&self) -> u64 {
+        self.reserved_bytes
+    }
+
+    /// 已预留文件数。
+    pub fn reserved_files(&self) -> u64 {
+        self.reserved_files
+    }
+
+    /// 剩余可用字节（`max_bytes == 0` → u64::MAX 表示不设限）。
+    pub fn remaining_bytes(&self) -> u64 {
+        if self.max_bytes == 0 {
+            u64::MAX
+        } else {
+            self.max_bytes.saturating_sub(self.reserved_bytes)
+        }
+    }
+
+    /// 剩余可用文件数（`max_files == 0` → u64::MAX 表示不设限）。
+    pub fn remaining_files(&self) -> u64 {
+        if self.max_files == 0 {
+            u64::MAX
+        } else {
+            self.max_files.saturating_sub(self.reserved_files)
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════
 // TransferScheduler — 会话内并发任务队列（≤3，FIFO）
 // ════════════════════════════════════════════════════════════════
 
-/// 并发任务调度：活跃任务 ≤ [`MAX_CONCURRENT`]，超量入队 FIFO。
+/// 并发任务调度：活跃任务 ≤ [`MAX_CONCURRENT`]，超量入队 FIFO；
+/// 队列长度上限 [`MAX_QUEUE_LEN`]（S-10c/F-11：满则拒绝入队）。
 ///
 /// 发送与接收各持一个实例（收发并发互不干扰）。
 #[derive(Debug, Default)]
@@ -862,9 +1083,25 @@ impl<T> TransferScheduler<T> {
         }
     }
 
-    /// 入队（若活跃未满则立即出队返回）。
-    pub fn push(&mut self, item: T) {
+    /// 入队（若活跃未满则立即出队返回）。队列已满（≥ [`MAX_QUEUE_LEN`]）
+    /// 时**拒绝入队**（丢弃该任务，返回 `false`）——防恶意 Offer 撑爆内存。
+    ///
+    /// 需要显式拒绝语义（如回 Reject 帧）时用 [`Self::try_push`]。
+    pub fn push(&mut self, item: T) -> bool {
+        if self.queue.len() >= MAX_QUEUE_LEN {
+            return false;
+        }
         self.queue.push_back(item);
+        true
+    }
+
+    /// 入队并返回显式结果：队列满 → [`FileTransferError::QueueFull`]。
+    pub fn try_push(&mut self, item: T) -> Result<(), FileTransferError> {
+        if self.queue.len() >= MAX_QUEUE_LEN {
+            return Err(FileTransferError::QueueFull(MAX_QUEUE_LEN));
+        }
+        self.queue.push_back(item);
+        Ok(())
     }
 
     /// 取出下一个可运行任务（活跃 < 上限时出队）。
@@ -932,8 +1169,9 @@ impl TransferStore {
     /// 从 JSON 加载；文件不存在 → 空存储。
     pub fn load_from(path: &Path) -> Result<Self, String> {
         match std::fs::read_to_string(path) {
-            Ok(content) => serde_json::from_str(&content)
-                .map_err(|e| format!("transfers.json parse: {e}")),
+            Ok(content) => {
+                serde_json::from_str(&content).map_err(|e| format!("transfers.json parse: {e}"))
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::new()),
             Err(e) => Err(format!("transfers.json read: {e}")),
         }
@@ -953,7 +1191,9 @@ impl TransferStore {
     }
 
     pub fn find_mut(&mut self, transfer_id: u64) -> Option<&mut StoredTransfer> {
-        self.transfers.iter_mut().find(|t| t.transfer_id == transfer_id)
+        self.transfers
+            .iter_mut()
+            .find(|t| t.transfer_id == transfer_id)
     }
 
     /// 新增或更新（按 transfer_id 去重）。
@@ -1030,10 +1270,7 @@ mod tests {
             "dir/file.txt",
             "a\\b",
         ] {
-            assert!(
-                sanitize_filename(name).is_err(),
-                "should reject {name:?}"
-            );
+            assert!(sanitize_filename(name).is_err(), "should reject {name:?}");
         }
     }
 
@@ -1058,10 +1295,7 @@ mod tests {
             "",
             "    ",
         ] {
-            assert!(
-                sanitize_filename(name).is_err(),
-                "should reject {name:?}"
-            );
+            assert!(sanitize_filename(name).is_err(), "should reject {name:?}");
         }
     }
 
@@ -1085,10 +1319,7 @@ mod tests {
 
     #[test]
     fn test_unique_target_path() {
-        let dir = std::env::temp_dir().join(format!(
-            "kirin_ft_test_{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("kirin_ft_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         // 同名不存在 → 原名。
         let p1 = unique_target_path(&dir, "x.txt");
@@ -1246,7 +1477,9 @@ mod tests {
         let mut rng = 0x1234_5678u64;
         let mut content = Vec::new();
         while (content.len() as u64) < size {
-            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             content.push((rng >> 33) as u8);
         }
         std::fs::write(&path, &content).unwrap();
@@ -1284,7 +1517,10 @@ mod tests {
         std::fs::create_dir_all(&src_dir).unwrap();
         let (src, content, sha) = make_source_file(&src_dir, "big.bin", BLOCK_SIZE * 3 + 1234);
         let size = content.len() as u64;
-        let meta = FileOfferMeta { name: "big.bin".into(), size };
+        let meta = FileOfferMeta {
+            name: "big.bin".into(),
+            size,
+        };
         // 校验通过。
         let checked = ChunkReceiver::validate_offer(&meta, DEFAULT_MAX_FILE_SIZE).unwrap();
         assert_eq!(checked.name, "big.bin");
@@ -1311,7 +1547,10 @@ mod tests {
         let dir = tmp_dir("duplicate");
         let (_, content, sha) = make_source_file(&dir, "dup.bin", BLOCK_SIZE * 2);
         let size = content.len() as u64;
-        let meta = FileOfferMeta { name: "dup.bin".into(), size };
+        let meta = FileOfferMeta {
+            name: "dup.bin".into(),
+            size,
+        };
         let mut recv = ChunkReceiver::new(1);
         recv.begin(&meta, &dir, sha, 0).unwrap();
         recv.on_data(0, &content[..BLOCK_SIZE as usize]).unwrap();
@@ -1320,7 +1559,9 @@ mod tests {
         assert!(dup);
         assert_eq!(recv.next_seq(), 1);
         // 乱序（跳号）→ 错误。
-        assert!(recv.on_data(2, &content[2 * BLOCK_SIZE as usize..]).is_err());
+        assert!(recv
+            .on_data(2, &content[2 * BLOCK_SIZE as usize..])
+            .is_err());
         // 顺序完成。
         recv.on_data(1, &content[BLOCK_SIZE as usize..]).unwrap();
         recv.verify().unwrap();
@@ -1332,7 +1573,10 @@ mod tests {
         let dir = tmp_dir("tamper");
         let (_, mut content, sha) = make_source_file(&dir, "t.bin", BLOCK_SIZE * 2);
         let size = content.len() as u64;
-        let meta = FileOfferMeta { name: "t.bin".into(), size };
+        let meta = FileOfferMeta {
+            name: "t.bin".into(),
+            size,
+        };
         let mut recv = ChunkReceiver::new(1);
         recv.begin(&meta, &dir, sha, 0).unwrap();
         // 篡改块 1 的一个字节（模拟中间人/损坏）。
@@ -1340,7 +1584,10 @@ mod tests {
         content[idx] ^= 0xFF;
         send_file_via_receiver(&mut recv, &content).unwrap();
         assert!(recv.is_complete());
-        assert!(matches!(recv.verify(), Err(FileTransferError::ChecksumMismatch)));
+        assert!(matches!(
+            recv.verify(),
+            Err(FileTransferError::ChecksumMismatch)
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1349,12 +1596,16 @@ mod tests {
         let dir = tmp_dir("resume");
         let (_, content, sha) = make_source_file(&dir, "r.bin", BLOCK_SIZE * 4);
         let size = content.len() as u64;
-        let meta = FileOfferMeta { name: "r.bin".into(), size };
+        let meta = FileOfferMeta {
+            name: "r.bin".into(),
+            size,
+        };
         // 第一段：收到前 2 块后中断（模拟进程被杀），.part 保留。
         let mut recv = ChunkReceiver::new(7);
         recv.begin(&meta, &dir, sha, 0).unwrap();
         recv.on_data(0, &content[..BLOCK_SIZE as usize]).unwrap();
-        recv.on_data(1, &content[BLOCK_SIZE as usize..2 * BLOCK_SIZE as usize]).unwrap();
+        recv.on_data(1, &content[BLOCK_SIZE as usize..2 * BLOCK_SIZE as usize])
+            .unwrap();
         let resume_from = recv.next_seq();
         assert_eq!(resume_from, 2);
         assert!(recv.part_path().exists());
@@ -1378,7 +1629,10 @@ mod tests {
         let dir2 = tmp_dir("cancel");
         let (_, content2, sha2) = make_source_file(&dir2, "c.bin", BLOCK_SIZE * 2);
         let size2 = content2.len() as u64;
-        let meta2 = FileOfferMeta { name: "c.bin".into(), size: size2 };
+        let meta2 = FileOfferMeta {
+            name: "c.bin".into(),
+            size: size2,
+        };
         let mut recv3 = ChunkReceiver::new(8);
         recv3.begin(&meta2, &dir2, sha2, 0).unwrap();
         recv3.on_data(0, &content2[..BLOCK_SIZE as usize]).unwrap();
@@ -1393,13 +1647,206 @@ mod tests {
     #[test]
     fn test_receiver_size_limits() {
         // 超限文件在 Offer 阶段即拒绝（FT-SEC-002）。
-        let meta = FileOfferMeta { name: "huge.bin".into(), size: 5 * 1024 * 1024 * 1024 };
+        let meta = FileOfferMeta {
+            name: "huge.bin".into(),
+            size: 5 * 1024 * 1024 * 1024,
+        };
         let err = ChunkReceiver::validate_offer(&meta, DEFAULT_MAX_FILE_SIZE).unwrap_err();
         assert!(matches!(err, FileTransferError::FileTooLarge(_, _)));
         // 可配置限制。
-        let meta2 = FileOfferMeta { name: "ok.bin".into(), size: 1024 };
+        let meta2 = FileOfferMeta {
+            name: "ok.bin".into(),
+            size: 1024,
+        };
         let err2 = ChunkReceiver::validate_offer(&meta2, 512).unwrap_err();
         assert!(matches!(err2, FileTransferError::FileTooLarge(_, _)));
+    }
+
+    // ---- S-10a: resume_from 越界校验（F-11）----
+
+    #[test]
+    fn test_begin_rejects_resume_out_of_range() {
+        // S-10a：resume_from > total_blocks → 拒绝（旧实现直接
+        // set_len(seq*64KiB)，u32 极值可造数百 TB 稀疏文件）。
+        let dir = tmp_dir("resume_guard");
+        let size = BLOCK_SIZE * 2;
+        let meta = FileOfferMeta {
+            name: "g.bin".into(),
+            size,
+        };
+        let mut recv = ChunkReceiver::new(1);
+        let err = recv.begin(&meta, &dir, [0u8; 32], 3).unwrap_err();
+        assert!(matches!(err, FileTransferError::InvalidResumeOffset(3, 2)));
+        // u32 极值 → 拒绝。
+        let mut recv2 = ChunkReceiver::new(2);
+        let err2 = recv2
+            .begin(&meta, &dir, [0u8; 32], u32::MAX)
+            .unwrap_err();
+        assert!(matches!(err2, FileTransferError::InvalidResumeOffset(_, 2)));
+        // 拒绝时不创建任何 .part 文件。
+        assert!(!dir.join("g.bin.part").exists(), "no part file created");
+        // 0 字节文件（0 块）：resume_from=0 合法；>0 拒绝。
+        let meta0 = FileOfferMeta {
+            name: "z.bin".into(),
+            size: 0,
+        };
+        let mut recv4 = ChunkReceiver::new(4);
+        let err4 = recv4.begin(&meta0, &dir, [0u8; 32], 1).unwrap_err();
+        assert!(matches!(err4, FileTransferError::InvalidResumeOffset(1, 0)));
+        recv4.begin(&meta0, &dir, [0u8; 32], 0).unwrap();
+        // 边界：resume_from == total_blocks 合法（.part 数据齐备 → 等 Finish 校验）。
+        let (_, content, sha) = make_source_file(&dir, "src_ok.bin", size);
+        let meta_ok = FileOfferMeta {
+            name: "ok.bin".into(),
+            size,
+        };
+        {
+            let mut phase1 = ChunkReceiver::new(3);
+            phase1.begin(&meta_ok, &dir, sha, 0).unwrap();
+            send_file_via_receiver(&mut phase1, &content).unwrap();
+        } // drop：.part 保留。
+        let mut recv3 = ChunkReceiver::new(3);
+        recv3.begin(&meta_ok, &dir, sha, 2).unwrap();
+        assert!(recv3.is_complete());
+        assert_eq!(recv3.next_seq(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_begin_resume_never_exceeds_declared_size() {
+        // S-10a 核心：set_len/已收字节以 meta.size 为上限——旧实现对非整块
+        // 对齐文件（BLOCK+100）resume_from==total_blocks 时 set_len(2*64KiB)
+        // 把 .part 撑到 131072 且 received_bytes 虚高（整体校验必败）。
+        let dir = tmp_dir("resume_clamp");
+        let size = BLOCK_SIZE + 100; // 2 块，非整块对齐。
+        let (_, content, sha) = make_source_file(&dir, "src_c.bin", size);
+        let meta = FileOfferMeta {
+            name: "c.bin".into(),
+            size,
+        };
+        // 阶段 1：收完全部 2 块（.part 长度 = size）。
+        {
+            let mut phase1 = ChunkReceiver::new(5);
+            phase1.begin(&meta, &dir, sha, 0).unwrap();
+            send_file_via_receiver(&mut phase1, &content).unwrap();
+            assert!(phase1.is_complete());
+        } // drop：.part 保留。
+        // 阶段 2：从断点 2（== total_blocks）续传 → 截断长度被钳制到 size。
+        let mut recv = ChunkReceiver::new(5);
+        recv.begin(&meta, &dir, sha, 2).unwrap();
+        assert!(recv.is_complete());
+        assert_eq!(recv.received_bytes(), size, "received_bytes clamped to size");
+        assert_eq!(
+            std::fs::metadata(recv.part_path()).unwrap().len(),
+            size,
+            "part exactly {size} bytes, not 131072"
+        );
+        // 合法续传不回归：整体 SHA-256 校验通过并原子落盘。
+        recv.verify().unwrap();
+        let final_path = recv.commit().unwrap();
+        assert_eq!(std::fs::read(&final_path).unwrap(), content);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_begin_rejects_resume_with_shorter_part() {
+        // 已有 .part 实际长度 < 断点声明的已收字节 → 数据缺失，续传必败，
+        // begin 提前拒绝（不静默 set_len 补零）。
+        let dir = tmp_dir("resume_short");
+        let size = BLOCK_SIZE * 4;
+        let meta = FileOfferMeta {
+            name: "s.bin".into(),
+            size,
+        };
+        let (_, content, sha) = make_source_file(&dir, "s_src.bin", size);
+        // 阶段 1：只收到 1 块。
+        let mut recv = ChunkReceiver::new(7);
+        recv.begin(&meta, &dir, sha, 0).unwrap();
+        recv.on_data(0, &content[..BLOCK_SIZE as usize]).unwrap();
+        drop(recv);
+        // 阶段 2：store 声称断点 3（实际只有 1 块数据）→ 拒绝。
+        let mut recv2 = ChunkReceiver::new(7);
+        let err = recv2.begin(&meta, &dir, sha, 3).unwrap_err();
+        assert!(matches!(err, FileTransferError::Io(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- SessionQuota (S-10b) ----
+
+    #[test]
+    fn test_session_quota_bytes_and_files() {
+        let mut q = SessionQuota::new(100, 3);
+        assert_eq!(q.remaining_bytes(), 100);
+        assert_eq!(q.remaining_files(), 3);
+        q.try_reserve(40).unwrap();
+        q.try_reserve(40).unwrap();
+        // 字节超限 → 拒绝（不扣减）。
+        assert!(matches!(
+            q.try_reserve(30),
+            Err(FileTransferError::SessionBytesExceeded(80, 100))
+        ));
+        assert_eq!((q.reserved_bytes(), q.reserved_files()), (80, 2));
+        // 释放后恢复。
+        q.release(40);
+        assert_eq!((q.reserved_bytes(), q.reserved_files()), (40, 1));
+        q.try_reserve(30).unwrap(); // bytes 70, files 2
+        q.try_reserve(1).unwrap(); // bytes 71, files 3
+        // 文件数超限 → 拒绝（第 4 个）。
+        assert!(matches!(
+            q.try_reserve(1),
+            Err(FileTransferError::SessionFilesExceeded(3, 3))
+        ));
+        assert_eq!((q.reserved_bytes(), q.reserved_files()), (71, 3));
+        // release 饱和减，不泄底。
+        q.release(999);
+        q.release(999);
+        q.release(999);
+        assert_eq!((q.reserved_bytes(), q.reserved_files()), (0, 0));
+    }
+
+    #[test]
+    fn test_session_quota_defaults_do_not_hurt_large_files() {
+        // 默认值（4 GiB + 64 文件）：单文件整传恰好占满字节预算 → 允许；
+        // 再多 1 字节 → 拒绝（验收 §5：不误伤正常大文件传输）。
+        let mut q = SessionQuota::new(DEFAULT_SESSION_MAX_BYTES, DEFAULT_SESSION_MAX_FILES);
+        assert!(q.try_reserve(DEFAULT_SESSION_MAX_BYTES).is_ok());
+        assert!(matches!(
+            q.try_reserve(1),
+            Err(FileTransferError::SessionBytesExceeded(_, _))
+        ));
+        // 文件数维度：64 个 1 字节文件 OK，第 65 个拒绝。
+        let mut q2 = SessionQuota::new(DEFAULT_SESSION_MAX_BYTES, DEFAULT_SESSION_MAX_FILES);
+        for _ in 0..DEFAULT_SESSION_MAX_FILES {
+            q2.try_reserve(1).unwrap();
+        }
+        assert!(matches!(
+            q2.try_reserve(1),
+            Err(FileTransferError::SessionFilesExceeded(64, 64))
+        ));
+    }
+
+    #[test]
+    fn test_session_quota_zero_means_unlimited() {
+        // 0 = 该维度不设限（配置语义）。
+        let mut q = SessionQuota::new(0, 0);
+        q.try_reserve(1 << 40).unwrap(); // 1 TiB
+        q.try_reserve(1 << 40).unwrap();
+        assert_eq!(q.remaining_bytes(), u64::MAX);
+        assert_eq!(q.remaining_files(), u64::MAX);
+        // 只限字节不限文件数。
+        let mut q2 = SessionQuota::new(10, 0);
+        q2.try_reserve(10).unwrap();
+        assert!(matches!(
+            q2.try_reserve(1),
+            Err(FileTransferError::SessionBytesExceeded(_, _))
+        ));
+        // 只限文件数不限字节。
+        let mut q3 = SessionQuota::new(0, 1);
+        q3.try_reserve(10).unwrap();
+        assert!(matches!(
+            q3.try_reserve(0),
+            Err(FileTransferError::SessionFilesExceeded(_, _))
+        ));
     }
 
     // ---- TransferScheduler ----
@@ -1430,6 +1877,34 @@ mod tests {
         sched.finish_one();
         sched.finish_one();
         assert_eq!(sched.active(), 0);
+    }
+
+    #[test]
+    fn test_scheduler_queue_cap() {
+        // S-10c (F-11)：队列长度上限 MAX_QUEUE_LEN，满则拒绝入队。
+        let mut sched = TransferScheduler::new();
+        // 先占满并发槽位（3 个活跃）。
+        for i in 0..MAX_CONCURRENT {
+            sched.try_push(i).unwrap();
+            sched.pop_ready().unwrap();
+        }
+        // 队列可容纳 MAX_QUEUE_LEN 个。
+        for i in 0..MAX_QUEUE_LEN {
+            assert!(sched.try_push(i).is_ok(), "queue has room for {i}");
+        }
+        assert_eq!(sched.queued(), MAX_QUEUE_LEN);
+        // 满 → try_push Err(QueueFull)，push 返回 false 且不增长。
+        assert!(matches!(
+            sched.try_push(999),
+            Err(FileTransferError::QueueFull(MAX_QUEUE_LEN))
+        ));
+        assert!(!sched.push(999));
+        assert_eq!(sched.queued(), MAX_QUEUE_LEN);
+        // 出队一个 → 恢复可入队（FIFO 顺序保持）。
+        sched.finish_one();
+        assert_eq!(sched.pop_ready(), Some(0));
+        assert!(sched.try_push(42).is_ok());
+        assert_eq!(sched.queued(), MAX_QUEUE_LEN);
     }
 
     // ---- TransferStore ----
@@ -1482,7 +1957,10 @@ mod tests {
     fn test_frame_roundtrip() {
         let frame = FileTransferFrame::offer(
             7,
-            &FileOfferMeta { name: "x.bin".into(), size: 1000 },
+            &FileOfferMeta {
+                name: "x.bin".into(),
+                size: 1000,
+            },
             1,
             [9u8; 32],
         );

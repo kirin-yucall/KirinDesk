@@ -50,7 +50,7 @@ fn punch_creds(
         domain: "punch.example".into(),
         device_type: "desktop".into(),
         peer_device_id: peer_device_id.into(),
-        peer_public_key_base64: peer_pub.into(),
+        peer_pin: kirin_desk_core::crypto::handshake::PinExpectation::exact_from_base64(&peer_pub).expect("peer pubkey"),
         challenge: "challenge".into(),
     }
 }

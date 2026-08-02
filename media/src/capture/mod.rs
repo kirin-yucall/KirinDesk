@@ -6,7 +6,7 @@
 //! |------|------|------|
 //! | Windows | `windows-capture` crate（唯一后端，无 WGC/DXGI/GDI 回退链） | ✅ 已实现 |
 //! | macOS | `zed-scap` crate（ScreenCaptureKit，M12-MAC MAC-T001） | ✅ 已实现 |
-//! | Linux | `zed-scap` | ⏳ M12（见 远控服务端_需求文档 §3.2.2） |
+//! | Linux | `linux_pipewire`（PipeWire screen-cast portal，X11/Wayland 统一，M12-T001 / R-14-S1） | ✅ 已实现 |
 //!
 //! 旧后端（wgc/dxgi/gdi/pipewire）已按 M8-T008 设计删除。
 
@@ -17,6 +17,9 @@ pub mod windows_capture;
 
 #[cfg(target_os = "macos")]
 pub mod zed_scap;
+
+#[cfg(target_os = "linux")]
+pub mod linux_pipewire;
 
 pub use factory::{create_capture_source, enumerate_monitors, list_monitors};
 
@@ -34,6 +37,8 @@ pub enum CaptureFrame {
     WindowsCapture(WindowsCaptureFrame),
     /// zed-scap crate 帧（macOS，ScreenCaptureKit）。
     ZedScap(ZedScapFrame),
+    /// linux_pipewire 帧（Linux，PipeWire screen-cast portal）。
+    PipeWire(PipeWireFrame),
 }
 
 impl CaptureFrame {
@@ -41,6 +46,7 @@ impl CaptureFrame {
         match self {
             CaptureFrame::WindowsCapture(f) => &f.data,
             CaptureFrame::ZedScap(f) => &f.data,
+            CaptureFrame::PipeWire(f) => &f.data,
         }
     }
 
@@ -48,6 +54,7 @@ impl CaptureFrame {
         match self {
             CaptureFrame::WindowsCapture(f) => f.width,
             CaptureFrame::ZedScap(f) => f.width,
+            CaptureFrame::PipeWire(f) => f.width,
         }
     }
 
@@ -55,6 +62,7 @@ impl CaptureFrame {
         match self {
             CaptureFrame::WindowsCapture(f) => f.height,
             CaptureFrame::ZedScap(f) => f.height,
+            CaptureFrame::PipeWire(f) => f.height,
         }
     }
 
@@ -62,19 +70,21 @@ impl CaptureFrame {
         match self {
             CaptureFrame::WindowsCapture(f) => f.timestamp,
             CaptureFrame::ZedScap(f) => f.timestamp,
+            CaptureFrame::PipeWire(f) => f.timestamp,
         }
     }
 
     /// 返回此帧的 dirty rects 列表。
     ///
     /// windows-capture 的 `Frame::dirty_regions()` 提供 dirty rects；
-    /// zed-scap（ScreenCaptureKit）不暴露脏区信息 → 恒空列表
-    /// （捕获层无完整 dirty rects 信息 → Tile-Hash Diff 仍是前置优化层，
-    /// 见 M8-T008 §Step 1）。
+    /// zed-scap（ScreenCaptureKit）与 linux_pipewire（portal/PW 无脏区信息）
+    /// 恒空列表（捕获层无完整 dirty rects 信息 → Tile-Hash Diff 仍是前置
+    /// 优化层，见 M8-T008 §Step 1）。
     pub fn dirty_rects(&self) -> &[DirtyRect] {
         match self {
             CaptureFrame::WindowsCapture(f) => &f.dirty_rects,
             CaptureFrame::ZedScap(f) => &f.dirty_rects,
+            CaptureFrame::PipeWire(f) => &f.dirty_rects,
         }
     }
 }
@@ -107,6 +117,23 @@ pub struct ZedScapFrame {
     /// 高度（像素）
     pub height: u32,
     /// dirty rects（zed-scap 无脏区信息 → 恒空，上游 diff 层兜底）
+    pub dirty_rects: Vec<DirtyRect>,
+    /// 捕获时间戳（帧到达时刻）
+    pub timestamp: Instant,
+}
+
+/// linux_pipewire 捕获帧（Linux，PipeWire screen-cast portal）。
+///
+/// 同模式定义在此处（平台无关），Linux 后端实现在 `linux_pipewire.rs`
+/// （`cfg(target_os = "linux")` 门控）。
+pub struct PipeWireFrame {
+    /// RGBA pixel data（portal 输出 RGBx/BGRx/BGRA 已统一转 RGBA）
+    pub data: Vec<u8>,
+    /// 宽度（像素）
+    pub width: u32,
+    /// 高度（像素）
+    pub height: u32,
+    /// dirty rects（portal/PW 无脏区信息 → 恒空，上游 diff 层兜底）
     pub dirty_rects: Vec<DirtyRect>,
     /// 捕获时间戳（帧到达时刻）
     pub timestamp: Instant,
@@ -152,11 +179,16 @@ impl std::error::Error for CaptureError {}
 /// 显示器信息。
 #[derive(Debug, Clone)]
 pub struct MonitorInfo {
+    /// 过滤后的位置索引（0-based；Windows 过滤虚拟屏后重新编号，保证
+    /// `switch_monitor` 索引一致；macOS/兜底为枚举序）。
     pub id: usize,
     pub name: String,
     pub width: u32,
     pub height: u32,
     pub is_primary: bool,
+    /// M8-T030（R-06）：虚拟显示器标记（名称关键词命中，GPU-FR-007）。
+    /// Windows 默认过滤（`filter_virtual` 可关）；macOS/兜底恒 false。
+    pub is_virtual: bool,
 }
 
 // ════════════════════════════════════════════════════════════════

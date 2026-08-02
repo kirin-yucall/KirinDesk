@@ -25,8 +25,8 @@
 
 use crate::crypto::ed25519::IdentityManager;
 use crate::crypto::handshake::{
-    client_handshake_generic, server_handshake_verified_with_nickname_generic,
-    SecureChannelGeneric,
+    client_handshake_generic, server_handshake_verified_with_nickname_generic, CoreReason,
+    PinExpectation, SecureChannelGeneric,
 };
 use kirin_desk_relay::protocol::{
     decode_extension, decode_probe, encode_probe, encode_probe_ack, read_frame, write_frame,
@@ -64,7 +64,10 @@ pub struct PunchModes {
 
 impl Default for PunchModes {
     fn default() -> Self {
-        Self { udp: true, tcp: true }
+        Self {
+            udp: true,
+            tcp: true,
+        }
     }
 }
 
@@ -77,8 +80,9 @@ pub struct PunchHandshake {
     pub device_type: String,
     /// 对端设备 ID（服务端握手昵称 / 客户端握手 server_id）。
     pub peer_device_id: String,
-    /// 对端 Ed25519 公钥（base64，pin 绑定；known_hosts/DNS TXT 来源）。
-    pub peer_public_key_base64: String,
+    /// 对端公钥 pin（R-02 强类型：known_hosts / DNS TXT 来源用 `Exact`；
+    /// 回环自签用 `None(CoreReason::InternalLoopback)`——不再有"空串跳过"形态）。
+    pub peer_pin: PinExpectation,
     /// 挑战码（PUNCH-SEC-001：挑战码校验保持生效）。
     pub challenge: String,
 }
@@ -125,7 +129,9 @@ impl PunchConfig {
                 domain: "punch.local".into(),
                 device_type: "punch-test".into(),
                 peer_device_id: "peer".into(),
-                peer_public_key_base64: String::new(),
+                // R-02-S3 自签兜底：loopback 由 core 以本端自身公钥作真实 pin
+                // 比对（不依赖"无期望"跳过；真实场景用 `Exact` 覆盖对端公钥）。
+                peer_pin: PinExpectation::None(CoreReason::InternalLoopback),
                 challenge: String::new(),
             },
         }
@@ -140,7 +146,9 @@ pub enum PunchResult {
         peer_addr: SocketAddr,
     },
     /// TCP 同时打开成功：已完成 Ed25519 双向握手（PUNCH-SEC-001）。
-    TcpEstablished { channel: SecureChannelGeneric<TcpStream> },
+    TcpEstablished {
+        channel: SecureChannelGeneric<TcpStream>,
+    },
     /// 全部路径失败（PUNCH-003；中继承载不受影响）。
     Failed { reason: String },
 }
@@ -152,7 +160,10 @@ impl std::fmt::Debug for PunchResult {
                 .debug_struct("UdpEstablished")
                 .field(
                     "socket",
-                    &socket.local_addr().map(|a| a.to_string()).unwrap_or_default(),
+                    &socket
+                        .local_addr()
+                        .map(|a| a.to_string())
+                        .unwrap_or_default(),
                 )
                 .field("peer_addr", peer_addr)
                 .finish(),
@@ -267,7 +278,10 @@ impl PunchSession {
         self.repunch_attempts = self.repunch_attempts.saturating_add(1);
         self.audit(
             AuditEvent::TunnelRepunch,
-            &format!("device={} attempt={}", self.cfg.device_id, self.repunch_attempts),
+            &format!(
+                "device={} attempt={}",
+                self.cfg.device_id, self.repunch_attempts
+            ),
         );
         if self.repunch_attempts > self.cfg.max_repunch_attempts {
             self.state = PunchState::Failed;
@@ -307,7 +321,12 @@ impl PunchSession {
         // 控制连接（PUNCH-005：首次建立，repunch 复用；失败即整体失败）。
         // 打洞流程内读写为**顺序**（注册 → 等候选 → 上报），无需 split。
         if self.control.is_none() {
-            match timeout(CONNECT_TIMEOUT, TcpStream::connect(self.cfg.rendezvous_addr)).await {
+            match timeout(
+                CONNECT_TIMEOUT,
+                TcpStream::connect(self.cfg.rendezvous_addr),
+            )
+            .await
+            {
                 Ok(Ok(stream)) => {
                     info!("punch: control connected to {}", self.cfg.rendezvous_addr);
                     self.control = Some(stream);
@@ -415,11 +434,16 @@ impl PunchSession {
                 let device_id = self.cfg.device_id.clone();
                 spawned += 1;
                 tcp_handle = Some(tokio::spawn(async move {
-                    if let Some(r) =
-                        Self::tcp_simultaneous_open(
-                            local_ip, open_port, tcp_targets, open_timeout, hs, identity, device_id,
-                        )
-                        .await
+                    if let Some(r) = Self::tcp_simultaneous_open(
+                        local_ip,
+                        open_port,
+                        tcp_targets,
+                        open_timeout,
+                        hs,
+                        identity,
+                        device_id,
+                    )
+                    .await
                     {
                         let _ = tx.send(r).await;
                     }
@@ -439,10 +463,8 @@ impl PunchSession {
         let result = results
             .into_iter()
             .find(|r| !matches!(r, PunchResult::Failed { .. }))
-            .unwrap_or_else(|| {
-                PunchResult::Failed {
-                    reason: "all punch paths failed (probe timeout / tcp open timeout)".into(),
-                }
+            .unwrap_or_else(|| PunchResult::Failed {
+                reason: "all punch paths failed (probe timeout / tcp open timeout)".into(),
             });
         if let Some(h) = udp_handle {
             if !matches!(result, PunchResult::UdpEstablished { .. }) {
@@ -514,19 +536,22 @@ impl PunchSession {
             match read_frame(ctrl_r).await {
                 Ok((ty, payload)) => {
                     match ty {
-                    TYPE_PEER_CANDIDATES => {
-                        let pc: PeerCandidates =
-                            decode_extension(TYPE_PEER_CANDIDATES, &payload, TYPE_PEER_CANDIDATES)
-                                .map_err(|e| format!("peer candidates decode: {e}"))?;
-                        if pc.session_id == session_id {
-                            return Ok(pc.candidates);
+                        TYPE_PEER_CANDIDATES => {
+                            let pc: PeerCandidates = decode_extension(
+                                TYPE_PEER_CANDIDATES,
+                                &payload,
+                                TYPE_PEER_CANDIDATES,
+                            )
+                            .map_err(|e| format!("peer candidates decode: {e}"))?;
+                            if pc.session_id == session_id {
+                                return Ok(pc.candidates);
+                            }
+                            // 其它会话的互转 → 忽略（防串话）
                         }
-                        // 其它会话的互转 → 忽略（防串话）
-                    }
-                    _ => {
-                        // 对端 PunchResult 转发等 → 忽略，继续等
-                        debug!("punch: ignore frame 0x{ty:02x} during candidate exchange");
-                    }
+                        _ => {
+                            // 对端 PunchResult 转发等 → 忽略，继续等
+                            debug!("punch: ignore frame 0x{ty:02x} during candidate exchange");
+                        }
                     }
                 }
                 Err(e) => return Err(format!("control recv: {e}")),
@@ -537,6 +562,15 @@ impl PunchSession {
     /// UDP 探测（PUNCH-001/004）：每轮向全部 UDP 候选发探测，等待 Ack。
     /// 收到对端探测 → 回 `PunchProbeAck`（回显 nonce）；收到本端 nonce 的
     /// Ack → 路径确认。`max_probes` 轮无 Ack → 失败（PUNCH-003）。
+    ///
+    /// **S-12b（F-12 打洞控制面加固）**：探测**应答**与**路径确认**都只接受
+    /// `targets`（对端候选地址集）内的来源——
+    /// - 非候选来源的探测**不回 Ack**（嗅探者无法借本端做 UDP 反射/放大，
+    ///   也无法探测本端活跃性；PUNCH-PROTO-004 探测不经服务器不变）；
+    /// - 非候选来源回显本端 nonce 的"回声"**不确认路径**（防路径劫持——
+    ///   恶意方无法让打洞结果指向任意地址）。
+    /// 副作用（fail-closed 优先）：对称/端口受限 NAT 下对端应答源地址若与
+    /// 候选不一致，该路径判失败 → 走 TCP 同时打开/中继兜底（S-12c 登记）。
     async fn udp_probe(
         socket: UdpSocket,
         session_id: [u8; 16],
@@ -568,11 +602,17 @@ impl PunchSession {
                             if p.session_id != session_id {
                                 continue; // 陌生会话报文 → 丢弃（PUNCH-SEC-003）
                             }
+                            // S-12b（F-12）：来源不在对端候选地址集 → 丢弃
+                            // （不回 Ack、不确认路径；防 UDP 反射/路径劫持）。
+                            if !targets.contains(&from) {
+                                debug!("punch: drop probe from non-candidate {from}");
+                                continue;
+                            }
                             if p.nonce == nonce {
                                 debug!("punch: probe ack from {from} (round {})", round + 1);
                                 return Ok((from, socket)); // 路径确认
                             }
-                            // 对端探测 → 回 Ack（回显其 nonce）
+                            // 对端探测 → 回 Ack（回显其 nonce；仅对端候选地址）
                             let ack = PunchProbeAck { session_id, nonce: p.nonce };
                             let _ = socket.send_to(&encode_probe_ack(&ack), from).await;
                         }
@@ -592,6 +632,8 @@ impl PunchSession {
     /// TCP 同时打开（PUNCH-002）：bind 与 UDP 同端口 + 循环 connect 对方
     /// TCP 候选（双方"同时"发起）；连接建立后走 Ed25519 双向握手
     /// （PUNCH-SEC-001；握手角色由 device_id 字典序判定，双方一致）。
+    /// 套接字按**对端地址族**选择 v4/v6（IPv6 候选不再硬编码 `new_v4`，
+    /// R-17；本地地址族与候选不一致的条目跳过，避免 bind 报错）。
     #[allow(clippy::too_many_arguments)]
     async fn tcp_simultaneous_open(
         local_ip: IpAddr,
@@ -605,9 +647,18 @@ impl PunchSession {
         let deadline = tokio::time::Instant::now() + open_timeout;
         let mut attempt = 0u32;
         loop {
-            // 每目标新建 socket（connect 消费所有权；同端口 TCP/UDP 可共存）
+            // 每目标新建 socket（connect 消费所有权；同端口 TCP/UDP 可共存）。
+            // R-17：按目标地址族建 v4/v6 套接字；本地地址族不匹配的候选跳过
+            // （本地地址族与候选族不一致时 bind 必然失败，整轮重试无意义）。
             for target in &targets {
-                let socket = match TcpSocket::new_v4() {
+                if target.is_ipv6() != local_ip.is_ipv6() {
+                    continue;
+                }
+                let socket = match if target.is_ipv6() {
+                    TcpSocket::new_v6()
+                } else {
+                    TcpSocket::new_v4()
+                } {
                     Ok(s) => s,
                     Err(_) => return None,
                 };
@@ -635,16 +686,26 @@ impl PunchSession {
                                 &hs.domain,
                                 &hs.device_type,
                                 &hs.peer_device_id,
-                                &hs.peer_public_key_base64,
+                                hs.peer_pin.clone(),
                                 &hs.challenge,
                             )
                             .await
                         } else {
+                            // 服务端角色：pin 解析为对端公钥 base64（R-02：
+                            // `Exact` 编码回 base64；`InternalLoopback` 取本端
+                            // 自身公钥——自签；`UserConfirmRequired` 服务端无此路径）。
+                            let client_key_b64 = match hs.peer_pin.resolve_base64(&id) {
+                                Ok(k) => k,
+                                Err(e) => {
+                                    warn!("punch: tcp handshake pin resolve failed: {e}");
+                                    return None;
+                                }
+                            };
                             server_handshake_verified_with_nickname_generic(
                                 stream,
                                 &id,
                                 &did,
-                                &hs.peer_public_key_base64,
+                                &client_key_b64,
                                 Some(&hs.peer_device_id),
                                 Some(&hs.challenge),
                             )
@@ -763,12 +824,21 @@ mod tests {
     async fn test_tcp_simultaneous_open_handshake() {
         // PUNCH-002 + PUNCH-SEC-001：TCP 同时打开 + Ed25519 双向握手
         let (_server, _addr, mut a, mut b) = punch_pair("dev-aa", "dev-bb").await;
-        // 双方公钥 pin（真实流程来自 known_hosts/DNS TXT；PUNCH-SEC-001）
-        a.cfg.handshake.peer_public_key_base64 = b.identity.public_key_base64();
-        b.cfg.handshake.peer_public_key_base64 = a.identity.public_key_base64();
+        // 双方公钥 pin（真实流程来自 known_hosts/DNS TXT；PUNCH-SEC-001，
+        // R-02：`Exact` 强类型，不再有空串跳过形态）
+        a.cfg.handshake.peer_pin =
+            PinExpectation::exact_from_base64(&b.identity.public_key_base64()).expect("b pubkey");
+        b.cfg.handshake.peer_pin =
+            PinExpectation::exact_from_base64(&a.identity.public_key_base64()).expect("a pubkey");
         // 只开 TCP 路径，验证同时打开 + 握手
-        a.cfg.modes = PunchModes { udp: false, tcp: true };
-        b.cfg.modes = PunchModes { udp: false, tcp: true };
+        a.cfg.modes = PunchModes {
+            udp: false,
+            tcp: true,
+        };
+        b.cfg.modes = PunchModes {
+            udp: false,
+            tcp: true,
+        };
         let (ra, rb) = tokio::join!(a.establish(), b.establish());
 
         let (mut ch_a, mut ch_b) = match (ra, rb) {
@@ -789,6 +859,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_tcp_simultaneous_open_ipv6_loopback() {
+        // PUNCH-002/IPv6（R-17）：TCP 同时打开按对端地址族建 v6 套接字，
+        // `[::1]` 回环同时打开 + Ed25519 握手（与 IPv4 用例对称）。
+        let server = Arc::new(RendezvousServer::bind(0).await.unwrap());
+        let mut addr = server.local_addr();
+        if addr.ip().is_unspecified() {
+            addr = SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, addr.port()));
+        }
+        let srv = Arc::clone(&server);
+        tokio::spawn(async move {
+            let _ = srv.serve(watch::channel(false).1).await;
+        });
+
+        let mut cfg_a = PunchConfig::loopback("dev-6a");
+        cfg_a.rendezvous_addr = addr;
+        cfg_a.local_ip = "::1".parse().unwrap();
+        cfg_a.handshake.peer_device_id = "dev-6b".into();
+        let mut cfg_b = PunchConfig::loopback("dev-6b");
+        cfg_b.rendezvous_addr = addr;
+        cfg_b.local_ip = "::1".parse().unwrap();
+        cfg_b.handshake.peer_device_id = "dev-6a".into();
+
+        let mut a = PunchSession::new(cfg_a, tmp_identity());
+        a.pin_session();
+        let mut b = PunchSession::with_session_id(cfg_b, tmp_identity(), a.session_id());
+
+        // 双方公钥 pin（PUNCH-SEC-001，同 IPv4 用例；R-02 `Exact` 强类型）；
+        // 只开 TCP 路径
+        a.cfg.handshake.peer_pin =
+            PinExpectation::exact_from_base64(&b.identity.public_key_base64()).expect("b pubkey");
+        b.cfg.handshake.peer_pin =
+            PinExpectation::exact_from_base64(&a.identity.public_key_base64()).expect("a pubkey");
+        a.cfg.modes = PunchModes {
+            udp: false,
+            tcp: true,
+        };
+        b.cfg.modes = PunchModes {
+            udp: false,
+            tcp: true,
+        };
+
+        let (ra, rb) = tokio::join!(a.establish(), b.establish());
+        match (ra, rb) {
+            (PunchResult::TcpEstablished { .. }, PunchResult::TcpEstablished { .. }) => {}
+            (ra, rb) => panic!("expected tcp established on [::1], got {ra:?} / {rb:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn test_udp_probe_failure_judgment() {
         // PUNCH-003：5 次探测无 Ack → 失败判定（打洞 socket 上直发）
         let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -796,16 +915,111 @@ mod tests {
         let dead_addr = dead.local_addr().unwrap();
         drop(dead); // 端口释放后无人监听（探测打不中）
         let started = std::time::Instant::now();
-        let r = PunchSession::udp_probe(
-            sock,
-            [7; 16],
-            vec![dead_addr],
-            Duration::from_millis(20),
-            5,
-        )
-        .await;
+        let r =
+            PunchSession::udp_probe(sock, [7; 16], vec![dead_addr], Duration::from_millis(20), 5)
+                .await;
         assert!(r.is_err(), "expected probe failure");
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn test_udp_probe_ack_only_to_peer_candidates() {
+        // S-12b（F-12）：探测应答只发对端候选地址集（不放大/不反射到任意
+        // 地址）——非候选（陌生人）来源的**合法探测**（正确 session_id）
+        // 不得收到任何应答；陌生人回显本端 nonce 的"回声"不得确认路径
+        // （防路径劫持）；候选来源正常 Ack 且仅候选来源可确认路径。
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let stranger = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sock_addr = sock.local_addr().unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let sid = [9u8; 16];
+
+        // 探测任务：targets 仅含候选（peer）地址；20 轮 × 50ms = 1s 预算
+        let task = tokio::spawn(async move {
+            PunchSession::udp_probe(
+                sock,
+                sid,
+                vec![peer_addr],
+                Duration::from_millis(50),
+                20,
+            )
+            .await
+        });
+        let mut buf = [0u8; 64];
+
+        // 1) 陌生人（非候选）发合法探测 → 不得收到任何应答
+        let stranger_nonce = [1u8; 16];
+        stranger
+            .send_to(
+                &encode_probe(&PunchProbe {
+                    session_id: sid,
+                    nonce: stranger_nonce,
+                }),
+                sock_addr,
+            )
+            .await
+            .unwrap();
+        let got =
+            tokio::time::timeout(Duration::from_millis(120), stranger.recv_from(&mut buf)).await;
+        assert!(got.is_err(), "non-candidate must not receive any response");
+
+        // 2) 候选（peer）发探测 → 收到回显其 nonce 的 Ack（先到达的可能是
+        //    本端探测报文，probe/ack 同构，以 nonce 区分后继续等）
+        let peer_nonce = [2u8; 16];
+        peer.send_to(
+            &encode_probe(&PunchProbe {
+                session_id: sid,
+                nonce: peer_nonce,
+            }),
+            sock_addr,
+        )
+        .await
+        .unwrap();
+        let ack = loop {
+            let (n, from) =
+                tokio::time::timeout(Duration::from_millis(250), peer.recv_from(&mut buf))
+                    .await
+                    .expect("peer ack timeout")
+                    .unwrap();
+            assert_eq!(from, sock_addr, "ack must come from probe socket");
+            if let Ok(a) = bincode::deserialize::<PunchProbeAck>(&buf[..n]) {
+                if a.nonce == peer_nonce {
+                    break a;
+                }
+            }
+        };
+        assert_eq!(ack.session_id, sid);
+        assert_eq!(ack.nonce, peer_nonce, "ack must echo peer's probe nonce");
+
+        // 3) 捕获本端探测原文（含本端随机 nonce，作"回声"素材）
+        let probe_n = loop {
+            let (n, _from) =
+                tokio::time::timeout(Duration::from_millis(250), peer.recv_from(&mut buf))
+                    .await
+                    .expect("capture probe timeout")
+                    .unwrap();
+            if let Ok(p) = decode_probe(&buf[..n]) {
+                if p.session_id == sid && p.nonce != peer_nonce {
+                    break n;
+                }
+            }
+        };
+
+        // 3a) 陌生人回显本端 nonce → 不得确认路径（若确认，任务将提前以
+        //     陌生人地址成功，下方 peer_addr 断言失败——防路径劫持）
+        stranger.send_to(&buf[..probe_n], sock_addr).await.unwrap();
+        // 3b) 候选回显本端 nonce → 确认路径
+        peer.send_to(&buf[..probe_n], sock_addr).await.unwrap();
+
+        let (established, _sock) = task
+            .await
+            .expect("udp_probe task panicked")
+            .expect("probe failed");
+        assert_eq!(
+            established, peer_addr,
+            "path must be confirmed with candidate address only"
+        );
     }
 
     #[tokio::test]
@@ -865,10 +1079,8 @@ mod tests {
     #[tokio::test]
     async fn test_audit_events_written() {
         // PUNCH-SEC-004：成功/重打洞审计齐全
-        let path = std::env::temp_dir().join(format!(
-            "kirin_desk_punch_audit_{}.log",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("kirin_desk_punch_audit_{}.log", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let logger = Arc::new(StdMutex::new(AuditLogger::open(&path).expect("audit open")));
 

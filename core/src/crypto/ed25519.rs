@@ -1,12 +1,14 @@
+use chacha20poly1305::AeadInPlace;
 use chacha20poly1305::KeyInit;
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
-use chacha20poly1305::AeadInPlace;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use zeroize::Zeroize;
+
+use crate::crypto::keystore::{default_backend, KeyStore, KeyStoreError};
 
 /// Error types for Ed25519 operations.
 #[derive(Debug, thiserror::Error)]
@@ -25,9 +27,18 @@ pub enum Ed25519Error {
     Serialization(String),
     #[error("Encryption error: {0}")]
     Encryption(String),
+    /// S-05 (F-4) fail-closed：身份存储存在但损坏/不可解密，或曾配发的
+    /// 身份存储丢失——**拒绝启动，不静默生成新身份**。
+    #[error("Identity storage corrupt or missing: {0} — refusing to start with a new identity (no silent regeneration)")]
+    CorruptIdentity(String),
+    /// S-05 (F-4)：密钥存储后端失败（钥匙串/DPAPI/兜底后端）。
+    #[error("Key store error: {0}")]
+    KeyStore(#[from] KeyStoreError),
 }
 
-/// Format for serialized encrypted private key data.
+/// 自定义加密存储格式（R-20 命名对齐：**非 PKCS#8**）。
+/// JSON `{nonce, ciphertext}`：ChaCha20Poly1305 加密后的 Ed25519 私钥字节；
+/// 密钥由 `derive_identity_key`（SHA-256(device_id)）派生。
 #[derive(Debug, Serialize, Deserialize)]
 struct EncryptedPrivateKey {
     /// Nonce used for ChaCha20Poly1305 encryption.
@@ -39,14 +50,17 @@ struct EncryptedPrivateKey {
 /// Identity key manager for Ed25519 long-term identity keys.
 ///
 /// Each device generates one Ed25519 key pair at first boot.
-/// The private key is stored encrypted on disk; the public key
-/// is uploaded to DNS TXT records for peer verification.
+/// The private key is stored via the [`KeyStore`] backend（S-05：系统钥匙串 /
+/// DPAPI / secret-tool，兜底为随机主密钥文件）；`key_path` 保留为旧格式
+/// 文件路径（迁移检测与配发标记定位用）。公钥上传至 DNS TXT 记录供对端验证。
+// R-03 (R03-S1): Clone 供重连上下文（Arc<IdentityManager>）与原连接路径复用。
+#[derive(Clone)]
 pub struct IdentityManager {
     /// Ed25519 signing key (private key).
     signing_key: SigningKey,
     /// Ed25519 verifying key (public key).
     verifying_key: VerifyingKey,
-    /// Path to the encrypted key file.
+    /// Legacy 加密文件路径（S-05 迁移/标记定位；密钥本体在 KeyStore 后端）。
     key_path: PathBuf,
 }
 
@@ -100,10 +114,8 @@ impl IdentityManager {
         let json = serde_json::to_string(&encrypted)
             .map_err(|e| Ed25519Error::Serialization(e.to_string()))?;
 
-        if let Some(parent) = self.key_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&self.key_path, &json)?;
+        // S-07 (F-8): 经 write_private 落盘（0600/0700/O_NOFOLLOW + 原子替换）。
+        crate::crypto::keystore::write_private_file(&self.key_path, json.as_bytes())?;
 
         Ok(())
     }
@@ -111,8 +123,8 @@ impl IdentityManager {
     /// Load the private key from encrypted disk storage.
     pub fn load(key_path: PathBuf, encryption_key: &[u8; 32]) -> Result<Self, Ed25519Error> {
         let json = std::fs::read_to_string(&key_path)?;
-        let encrypted: EncryptedPrivateKey = serde_json::from_str(&json)
-            .map_err(|e| Ed25519Error::Serialization(e.to_string()))?;
+        let encrypted: EncryptedPrivateKey =
+            serde_json::from_str(&json).map_err(|e| Ed25519Error::Serialization(e.to_string()))?;
 
         let key = Key::from_slice(encryption_key);
         let cipher = ChaCha20Poly1305::new(key);
@@ -185,32 +197,161 @@ impl IdentityManager {
         &self.signing_key
     }
 
-    /// Load from disk, or generate + save if not found.
-    /// Uses SHA-256(device_id) as encryption key.
+    /// Load the device identity, or generate + persist if this is a fresh install.
+    ///
+    /// S-05 (F-4) fail-closed 语义：
+    /// - 旧格式文件 `ed25519.json` 存在 → 自动迁移到系统钥匙串后端
+    ///   （DPAPI / Keychain / secret-tool），**先写新后端并读回验证、再备份原文件**
+    ///   （失败回退不覆盖，计划 §5 风险 3）；
+    /// - 文件存在但损坏 / 不可解密 → [`Ed25519Error::CorruptIdentity`] 报错 +
+    ///   审计告警，**不静默再生**；
+    /// - 存储全部丢失但曾配发过身份（`identity.provisioned` 标记）→ 拒绝启动；
+    /// - 全新安装（无文件、无后端条目、无标记）→ 生成并持久化。
     pub fn load_or_generate(key_path: PathBuf, device_id: &str) -> Result<Self, Ed25519Error> {
+        let base_dir = key_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let keystore = default_backend(&base_dir);
+        Self::load_or_generate_with(keystore.as_ref(), key_path, device_id)
+    }
+
+    /// fail-closed 加载（内部；测试用内存 mock 后端驱动，全平台确定性）。
+    fn load_or_generate_with(
+        keystore: &dyn KeyStore,
+        key_path: PathBuf,
+        device_id: &str,
+    ) -> Result<Self, Ed25519Error> {
+        let label = identity_label(device_id);
+        let marker = provision_marker_path(&key_path);
+
+        // 1) 旧格式文件存在 → 必须可迁移，否则 fail-closed。
         if key_path.exists() {
-            let enc_key = derive_identity_key(device_id);
-            Self::load(key_path, &enc_key)
-        } else {
-            let id = Self::generate(key_path)?;
-            let enc_key = derive_identity_key(device_id);
-            id.save(&enc_key)?;
-            Ok(id)
+            if !key_path.is_file() {
+                return Err(fail_corrupt(format!(
+                    "identity path {key_path:?} exists but is not a regular file"
+                )));
+            }
+            let secret = Self::try_migrate_legacy(&key_path, device_id, keystore, &label)?;
+            ensure_marker_has_label(&marker, &label)?;
+            return Self::from_secret(secret, key_path);
         }
+
+        // 2) 后端已有身份 → 直接使用（并补齐配发标记，幂等）。
+        match keystore.get(&label) {
+            Ok(Some(secret)) => {
+                if let Err(e) = ensure_marker_has_label(&marker, &label) {
+                    tracing::warn!(
+                        target: "identity",
+                        "identity recovered from keystore but provision marker could not be updated: {}",
+                        e
+                    );
+                }
+                return Self::from_secret(secret, key_path);
+            }
+            Ok(None) => {}
+            // fail-closed：后端故障不得作为换身份的理由。
+            Err(e) => return Err(e.into()),
+        }
+
+        // 3) 曾配发过身份但存储全部丢失 → 拒绝启动，不静默换身份。
+        if marker_has_label(&marker, &label)? {
+            return Err(fail_corrupt(format!(
+                "identity storage for {label:?} is missing or deleted (provision marker present); \
+                 refusing to generate a new identity"
+            )));
+        }
+
+        // 4) 全新安装：生成 + 落库（成功才返回）+ 配发标记。
+        let id = Self::generate(key_path)?;
+        keystore.set(&label, &id.signing_key().to_bytes())?;
+        ensure_marker_has_label(&marker, &label)?;
+        Ok(id)
+    }
+
+    /// 迁移向导：检测旧格式（JSON `{nonce,ciphertext}`，ChaCha20Poly1305 +
+    /// device_id 派生密钥，R-20 命名：自定义加密存储）并迁移到新后端，
+    /// 返回解出的私钥字节。
+    ///
+    /// 顺序（计划 §5 风险 3：失败回退不覆盖原文件）：
+    /// 1. 读 + 解密旧文件（不落盘）；
+    /// 2. `keystore.set` 写入新后端并读回验证；
+    /// 3. 原文件先置 0600 再改名为 `ed25519.json.bak.<ts>`（备份保留，可删）。
+    /// 任何一步失败 → 原文件原样保留，下次启动重试。
+    fn try_migrate_legacy(
+        key_path: &Path,
+        device_id: &str,
+        keystore: &dyn KeyStore,
+        label: &str,
+    ) -> Result<Vec<u8>, Ed25519Error> {
+        let enc_key = derive_identity_key(device_id);
+        let legacy = Self::load(key_path.to_path_buf(), &enc_key).map_err(|e| {
+            fail_corrupt(format!(
+                "legacy identity file {key_path:?} exists but cannot be decrypted \
+                 (device_id changed or file damaged): {e}"
+            ))
+        })?;
+        let key_array = legacy.signing_key().to_bytes();
+
+        // 先写新后端，读回验证通过后才动原文件。
+        keystore.set(label, &key_array)?;
+        match keystore.get(label) {
+            Ok(Some(verify)) if verify == key_array => {}
+            Ok(_) => {
+                return Err(fail_corrupt(format!(
+                    "migration read-back verification failed for {label:?}; \
+                     original file {key_path:?} left untouched"
+                )))
+            }
+            Err(e) => return Err(Ed25519Error::KeyStore(e)),
+        }
+
+        // 备份（改名保留，0600），随后原路径不再保存可逆私钥。
+        crate::crypto::keystore::set_private_permissions(key_path)?;
+        let backup = legacy_backup_path(key_path);
+        std::fs::rename(key_path, &backup)?;
+        tracing::info!(
+            target: "identity",
+            "identity migrated to keystore backend {label}; legacy file backed up to {backup:?} \
+             (can be deleted once the new backend is verified)"
+        );
+        Ok(key_array.to_vec())
+    }
+
+    /// 从后端返回的私钥字节构造身份（长度非法 → fail-closed）。
+    fn from_secret(secret: Vec<u8>, key_path: PathBuf) -> Result<Self, Ed25519Error> {
+        let key_array: [u8; 32] = secret
+            .try_into()
+            .map_err(|_| fail_corrupt("keystore returned key material of invalid length".into()))?;
+        let signing_key = SigningKey::from_bytes(&key_array);
+        let verifying_key = signing_key.verifying_key();
+        Ok(Self {
+            signing_key,
+            verifying_key,
+            key_path,
+        })
     }
 
     /// Default identity file path: ~/.kirin_desk/identity/ed25519.json
     pub fn default_path() -> Result<PathBuf, Ed25519Error> {
-        let home = dirs_next::home_dir()
-            .ok_or_else(|| Ed25519Error::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound, "no home dir")))?;
-        Ok(home.join(".kirin_desk").join("identity").join("ed25519.json"))
+        let home = dirs_next::home_dir().ok_or_else(|| {
+            Ed25519Error::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no home dir",
+            ))
+        })?;
+        Ok(home
+            .join(".kirin_desk")
+            .join("identity")
+            .join("ed25519.json"))
     }
 }
 
 /// Derive a 32-byte encryption key from a device ID.
+/// 仅用于旧格式（legacy）文件读取/迁移（S-05：新存储走 KeyStore 后端，
+/// 不再用 device_id 派生密钥——F-4 伪加密根因）。
 fn derive_identity_key(device_id: &str) -> [u8; 32] {
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(b"kirindesk-identity-key:");
     hasher.update(device_id.as_bytes());
@@ -220,6 +361,86 @@ fn derive_identity_key(device_id: &str) -> [u8; 32] {
     key
 }
 
+// ════════════════════════════════════════════════════════════════
+// S-05 (F-4)：KeyStore 接线辅助
+// ════════════════════════════════════════════════════════════════
+
+/// S-05：身份在后端中的 label（macOS Keychain 的 service+account 亦用此键）。
+fn identity_label(device_id: &str) -> String {
+    format!("kirindesk.identity.{device_id}")
+}
+
+/// 配发标记：`<identity_dir>/identity.provisioned`，JSON
+/// `{"labels":["<label>", ...]}`。用于区分"全新安装"与"身份存储被删除"
+/// （fail-closed：拒绝启动，不静默换身份）。
+fn provision_marker_path(key_path: &Path) -> PathBuf {
+    key_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("identity.provisioned")
+}
+
+/// 迁移备份路径：`<name>.bak.<unix_ts>`（时间戳避免覆盖历史备份）。
+fn legacy_backup_path(key_path: &Path) -> PathBuf {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let name = key_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "ed25519.json".to_string());
+    key_path.with_file_name(format!("{name}.bak.{ts}"))
+}
+
+/// fail-closed 告警 + 错误构造（审计告警走 tracing::error，身份不可静默更换）。
+fn fail_corrupt(msg: String) -> Ed25519Error {
+    tracing::error!(
+        target: "identity",
+        "S-05 fail-closed: {} — refusing to generate a new identity",
+        msg
+    );
+    Ed25519Error::CorruptIdentity(msg)
+}
+
+/// 配发标记是否包含该 label（文件不存在 → false；解析失败 → fail-closed）。
+fn marker_has_label(marker: &Path, label: &str) -> Result<bool, Ed25519Error> {
+    let content = match std::fs::read_to_string(marker) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(Ed25519Error::Io(e)),
+        Ok(c) => c,
+    };
+    let data: ProvisionMarker = serde_json::from_str(&content)
+        .map_err(|e| fail_corrupt(format!("provision marker {marker:?} malformed: {e}")))?;
+    Ok(data.labels.iter().any(|l| l == label))
+}
+
+/// 确保配发标记包含该 label（缺失则追加；幂等）。
+fn ensure_marker_has_label(marker: &Path, label: &str) -> Result<(), Ed25519Error> {
+    let mut data = match std::fs::read_to_string(marker) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            ProvisionMarker { labels: Vec::new() }
+        }
+        Err(e) => return Err(Ed25519Error::Io(e)),
+        Ok(content) => serde_json::from_str(&content)
+            .map_err(|e| fail_corrupt(format!("provision marker {marker:?} malformed: {e}")))?,
+    };
+    if data.labels.iter().any(|l| l == label) {
+        return Ok(());
+    }
+    data.labels.push(label.to_string());
+    let json =
+        serde_json::to_string(&data).map_err(|e| Ed25519Error::Serialization(e.to_string()))?;
+    crate::crypto::keystore::write_private_file(marker, json.as_bytes())?;
+    Ok(())
+}
+
+/// 配发标记内容（S-05）。
+#[derive(Debug, Serialize, Deserialize)]
+struct ProvisionMarker {
+    labels: Vec<String>,
+}
+
 /// 公钥指纹（M15 / SRV-SEC-KH-003）：base64 公钥 → SHA-256 → 小写十六进制、
 /// 每 4 字符冒号分组（如 `a1b2:c3d4:...`，64 位十六进制 = 16 组）。
 ///
@@ -227,7 +448,7 @@ fn derive_identity_key(device_id: &str) -> [u8; 32] {
 /// base64 公钥为输入），用于服务端返回指纹（`HandshakeResponse.server_fingerprint`）
 /// 与客户端 known_hosts 指纹比对。
 pub fn fingerprint(public_key_base64: &str) -> String {
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(public_key_base64.as_bytes());
     let digest = hasher.finalize();
@@ -315,5 +536,242 @@ mod tests {
     fn test_invalid_public_key() {
         let result = IdentityManager::parse_public_key("invalid-base64!!!");
         assert!(result.is_err());
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // S-05 (F-4) fail-closed & 迁移（S-05c 单测收口）
+    // 全部用内存 mock 后端驱动 `load_or_generate_with`，平台无关确定性。
+    // ════════════════════════════════════════════════════════════════
+
+    use crate::crypto::keystore::MemoryKeyStore;
+
+    fn s05_temp_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("kirin_desk_s05_{}_{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn load_with(
+        keystore: &MemoryKeyStore,
+        dir: &Path,
+        device_id: &str,
+    ) -> Result<IdentityManager, Ed25519Error> {
+        IdentityManager::load_or_generate_with(keystore, dir.join("ed25519.json"), device_id)
+    }
+
+    /// 恒失败后端：验证"后端故障 → fail-closed，不换身份"。
+    struct FailingKeyStore;
+    impl KeyStore for FailingKeyStore {
+        fn set(&self, _label: &str, _secret: &[u8]) -> Result<(), KeyStoreError> {
+            Err(KeyStoreError::Backend("test failure".into()))
+        }
+        fn get(&self, _label: &str) -> Result<Option<Vec<u8>>, KeyStoreError> {
+            Err(KeyStoreError::Backend("test failure".into()))
+        }
+        fn delete(&self, _label: &str) -> Result<(), KeyStoreError> {
+            Err(KeyStoreError::Backend("test failure".into()))
+        }
+    }
+
+    #[test]
+    fn s05_fresh_boot_generates_and_reuses() {
+        let dir = s05_temp_dir("fresh");
+        let ks = MemoryKeyStore::new();
+
+        let id = load_with(&ks, &dir, "dev-1").unwrap();
+        // 已持久化到后端 + 配发标记
+        assert_eq!(ks.get(&identity_label("dev-1")).unwrap().unwrap().len(), 32);
+        assert!(dir.join("identity.provisioned").exists());
+
+        // 二次加载（无文件、后端有）→ 同一身份
+        let id2 = load_with(&ks, &dir, "dev-1").unwrap();
+        assert_eq!(id.public_key_base64(), id2.public_key_base64());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn s05_corrupt_file_fails_closed_not_overwritten() {
+        let dir = s05_temp_dir("corrupt");
+        let path = dir.join("ed25519.json");
+        let garbage = b"not a json file at all";
+        std::fs::write(&path, garbage).unwrap();
+
+        let ks = MemoryKeyStore::new();
+        let err = load_with(&ks, &dir, "dev-1").unwrap_err();
+        assert!(
+            matches!(err, Ed25519Error::CorruptIdentity(_)),
+            "expected CorruptIdentity, got {err:?}"
+        );
+        // 原文件未被覆盖，且未产生新身份
+        assert_eq!(std::fs::read(&path).unwrap(), garbage);
+        assert!(ks.get(&identity_label("dev-1")).unwrap().is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn s05_undecryptable_legacy_fails_closed() {
+        let dir = s05_temp_dir("undecryptable");
+        let path = dir.join("ed25519.json");
+        // 用另一 device_id 的密钥写旧格式 → 当前 device_id 解不开
+        let id = IdentityManager::generate(path.clone()).unwrap();
+        id.save(&derive_identity_key("other-device")).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let ks = MemoryKeyStore::new();
+        let err = load_with(&ks, &dir, "dev-1").unwrap_err();
+        assert!(
+            matches!(err, Ed25519Error::CorruptIdentity(_)),
+            "expected CorruptIdentity, got {err:?}"
+        );
+        // 原文件原样保留
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(ks.get(&identity_label("dev-1")).unwrap().is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn s05_legacy_migration_to_keystore() {
+        let dir = s05_temp_dir("migrate");
+        let path = dir.join("ed25519.json");
+
+        // 构造旧格式文件（R-20 格式：JSON nonce+ciphertext）
+        let original = IdentityManager::generate(path.clone()).unwrap();
+        let orig_pub = original.public_key_base64();
+        original.save(&derive_identity_key("dev-1")).unwrap();
+
+        let ks = MemoryKeyStore::new();
+        let migrated = load_with(&ks, &dir, "dev-1").unwrap();
+        assert_eq!(migrated.public_key_base64(), orig_pub);
+
+        // 密钥已进新后端
+        assert_eq!(
+            ks.get(&identity_label("dev-1")).unwrap().unwrap(),
+            original.signing_key().to_bytes().to_vec()
+        );
+
+        // 原文件已改名备份（先备份再改写：不覆盖、不删除）
+        assert!(!path.exists());
+        let backups: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("ed25519.json.bak."))
+            .collect();
+        assert_eq!(backups.len(), 1, "expected exactly one migration backup");
+
+        // 再次加载 → 走 keystore 路径，身份一致
+        let again = load_with(&ks, &dir, "dev-1").unwrap();
+        assert_eq!(again.public_key_base64(), orig_pub);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn s05_deleted_storage_fails_closed() {
+        let dir = s05_temp_dir("deleted");
+        let ks = MemoryKeyStore::new();
+
+        // 配发身份（生成标记）
+        let _ = load_with(&ks, &dir, "dev-1").unwrap();
+        assert!(dir.join("identity.provisioned").exists());
+
+        // 模拟身份存储被删除（keystore 条目 + 文件都不在，标记仍在）
+        ks.delete(&identity_label("dev-1")).unwrap();
+
+        let err = load_with(&ks, &dir, "dev-1").unwrap_err();
+        assert!(
+            matches!(err, Ed25519Error::CorruptIdentity(_)),
+            "expected CorruptIdentity, got {err:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn s05_device_id_change_generates_new_identity() {
+        // 文档化行为：更换 device_id = 新设备身份（标记按 label 记录，
+        // 旧 label 的身份仍保留在后端；不构成"静默换身份"）。
+        let dir = s05_temp_dir("device_change");
+        let ks = MemoryKeyStore::new();
+
+        let id1 = load_with(&ks, &dir, "dev-1").unwrap();
+        let id2 = load_with(&ks, &dir, "dev-2").unwrap();
+        assert_ne!(id1.public_key_base64(), id2.public_key_base64());
+        assert!(ks.get(&identity_label("dev-1")).unwrap().is_some());
+        assert!(ks.get(&identity_label("dev-2")).unwrap().is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn s05_keystore_failure_fails_closed() {
+        let dir = s05_temp_dir("ks_fail");
+        // 后端故障（全新路径）→ 不得静默生成
+        let err = IdentityManager::load_or_generate_with(
+            &FailingKeyStore,
+            dir.join("ed25519.json"),
+            "dev-1",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Ed25519Error::KeyStore(_)),
+            "expected KeyStore error, got {err:?}"
+        );
+        assert!(!dir.join("identity.provisioned").exists());
+
+        // 后端故障（旧格式文件存在）→ 迁移失败，原文件保留
+        let path = dir.join("ed25519.json");
+        let id = IdentityManager::generate(path.clone()).unwrap();
+        id.save(&derive_identity_key("dev-1")).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let err = IdentityManager::load_or_generate_with(
+            &FailingKeyStore,
+            dir.join("ed25519.json"),
+            "dev-1",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Ed25519Error::KeyStore(_)),
+            "expected KeyStore error, got {err:?}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn s05_marker_corrupt_fails_closed() {
+        let dir = s05_temp_dir("marker_corrupt");
+        std::fs::write(dir.join("identity.provisioned"), b"not json").unwrap();
+
+        let ks = MemoryKeyStore::new();
+        let err = load_with(&ks, &dir, "dev-1").unwrap_err();
+        assert!(
+            matches!(err, Ed25519Error::CorruptIdentity(_)),
+            "expected CorruptIdentity, got {err:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn s05_public_load_or_generate_roundtrip() {
+        // 端到端走真实默认后端（本机 Windows=DPAPI / Linux CI=文件兜底 /
+        // macOS=Keychain）：生成 → 二次加载同一身份。
+        let dir = s05_temp_dir("public");
+        let path = dir.join("ed25519.json");
+
+        let id = IdentityManager::load_or_generate(path.clone(), "dev-1").unwrap();
+        let pub1 = id.public_key_base64();
+
+        let id2 = IdentityManager::load_or_generate(path.clone(), "dev-1").unwrap();
+        assert_eq!(pub1, id2.public_key_base64());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

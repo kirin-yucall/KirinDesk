@@ -93,7 +93,12 @@ impl Terminal {
     /// 处理单个 egui 事件；消费了返回 true。
     pub fn handle_event(&mut self, event: &egui::Event) -> bool {
         match event {
-            egui::Event::Key { key, pressed, modifiers, .. } => {
+            egui::Event::Key {
+                key,
+                pressed,
+                modifiers,
+                ..
+            } => {
                 if !*pressed {
                     return true; // 吞掉 keyup，避免影响其他控件
                 }
@@ -183,7 +188,8 @@ impl Terminal {
                 self.ime_preedit = None;
                 true
             }
-            egui::Event::Ime(egui::ImeEvent::Enabled) | egui::Event::Ime(egui::ImeEvent::Disabled) => {
+            egui::Event::Ime(egui::ImeEvent::Enabled)
+            | egui::Event::Ime(egui::ImeEvent::Disabled) => {
                 self.ime_preedit = None; // 组合开始/结束的边界复位（Windows 每次组合都会发）
                 true
             }
@@ -274,15 +280,20 @@ impl Terminal {
                     let (crow, ccol) = screen.cursor_position();
                     if (crow as usize) < scr_rows as usize && (ccol as usize) < scr_cols as usize {
                         let mut job = egui::text::LayoutJob::default();
-                        job.append(preedit, 0.0, egui::TextFormat {
-                            font_id: font.clone(),
-                            color: Color32::BLACK,
-                            background: Color32::from_gray(180), // 反显风格
-                            underline: egui::Stroke::new(1.0, Color32::BLACK),
-                            ..Default::default()
-                        });
+                        job.append(
+                            preedit,
+                            0.0,
+                            egui::TextFormat {
+                                font_id: font.clone(),
+                                color: Color32::BLACK,
+                                background: Color32::from_gray(180), // 反显风格
+                                underline: egui::Stroke::new(1.0, Color32::BLACK),
+                                ..Default::default()
+                            },
+                        );
                         let pos = cell_rect(ui, row_h, crow, ccol, char_w).min;
-                        ui.painter().galley(pos, ui.painter().layout_job(job), Color32::WHITE);
+                        ui.painter()
+                            .galley(pos, ui.painter().layout_job(job), Color32::WHITE);
                     }
                 }
             }
@@ -312,17 +323,12 @@ fn cell_rect(ui: &Ui, row_h: f32, row: u16, col: u16, char_w: f32) -> Rect {
 }
 
 /// 绘制一行：按单元格颜色分段构建 LayoutJob（背景色用空格占位，保持连续）。
-fn draw_row(
-    ui: &mut Ui,
-    screen: &vt100::Screen,
-    font: &FontId,
-    row_h: f32,
-    row: u16,
-    cols: u16,
-) {
+fn draw_row(ui: &mut Ui, screen: &vt100::Screen, font: &FontId, row_h: f32, row: u16, cols: u16) {
     let mut job = egui::text::LayoutJob::default();
     for col in 0..cols {
-        let Some(cell) = screen.cell(row, col) else { continue };
+        let Some(cell) = screen.cell(row, col) else {
+            continue;
+        };
         if cell.is_wide_continuation() {
             continue; // 宽字符续位：字符已在首格绘制
         }
@@ -358,7 +364,10 @@ fn draw_row(
     }
     let galley = ui.painter().layout_job(job);
     ui.painter().galley(
-        egui::pos2(ui.min_rect().left(), ui.min_rect().top() + row as f32 * row_h),
+        egui::pos2(
+            ui.min_rect().left(),
+            ui.min_rect().top() + row as f32 * row_h,
+        ),
         galley,
         Color32::WHITE,
     );
@@ -552,7 +561,9 @@ mod tests {
     fn row_text(screen: &vt100::Screen, row: u16, cols: u16) -> String {
         let mut text = String::new();
         for col in 0..cols {
-            let Some(cell) = screen.cell(row, col) else { continue };
+            let Some(cell) = screen.cell(row, col) else {
+                continue;
+            };
             if cell.is_wide_continuation() {
                 continue;
             }

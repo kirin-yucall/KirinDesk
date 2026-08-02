@@ -101,6 +101,10 @@ pub enum TunnelClientError {
     Timeout(String),
     #[error("login rejected: {0}")]
     LoginRejected(String),
+    /// M8-T026-P3：服务器认证失败（双向认证回执校验失败 / fail-closed
+    /// 拒绝，TNL-SEC-007/008）。
+    #[error("server authentication failed: {0}")]
+    ServerAuthFailed(String),
     #[error("protocol error: {0}")]
     Protocol(#[from] crate::protocol::ProtocolError),
     #[error("io error: {0}")]
@@ -262,33 +266,38 @@ impl TunnelClient {
                     "control channel closed",
                 )))
         };
-        // 3. Login（TNL-CLIENT-001 / TNL-PROTO-002）。
-        send(&tx, &ControlMsg::Login {
-            token: cfg.token.clone(),
+        // 3. Login（TNL-CLIENT-001 / TNL-PROTO-002）— M8-T026-P3 挑战-响应
+        // 认证（TNL-SEC-006~008）：口令永不明文上线；双向认证回执校验
+        // （T4 伪造服务器）；带口令客户端遇未认证服务器 fail-closed 拒绝。
+        let auth_fields = crate::auth::LoginFields {
             version: PROTOCOL_VERSION.to_string(),
             hostname: cfg.hostname.clone(),
-            // M8-T026-P2 扩展字段（ID-001）：纯穿透客户端不参与设备 ID 注册。
             device_id: None,
             ed25519_pub: None,
-        })?;
-        let login_resp = tokio::time::timeout(cfg.connect_timeout, read_frame(&mut reader))
-            .await
-            .map_err(|_| TunnelClientError::Timeout("login response".to_string()))?;
-        let (ty, payload) = login_resp?;
-        let resp = decode_control(ty, &payload)?;
-        match resp {
-            ControlMsg::LoginResp { ok: true, .. } => {}
-            ControlMsg::LoginResp { ok: false, err, .. } => {
-                return Err(TunnelClientError::LoginRejected(
-                    err.unwrap_or_else(|| "login failed".to_string()),
-                ));
+        };
+        // clone 进 async 块（future 不得借用 send 参数）；引用为 Copy，
+        // 外层闭包借引用保持 Fn 语义。
+        let auth_send = |msg: &ControlMsg| {
+            let msg = msg.clone();
+            let tx_ref = &tx;
+            let send_ref = &send;
+            async move { send_ref(tx_ref, &msg) }
+        };
+        let outcome = crate::auth::authenticate(
+            &mut reader,
+            auth_send,
+            &cfg.token,
+            cfg.connect_timeout,
+            &auth_fields,
+        )
+        .await
+        .map_err(map_auth_error)?;
+        match outcome {
+            crate::auth::AuthOutcome::Challenged => {
+                debug!("tunnel login authenticated (challenge-response, TNL-SEC-006)");
             }
-            _ => {
-                return Err(TunnelClientError::Protocol(
-                    crate::protocol::ProtocolError::Bincode(
-                        "expected LoginResp".to_string(),
-                    ),
-                ));
+            crate::auth::AuthOutcome::Legacy => {
+                debug!("tunnel login accepted (legacy unauthenticated server, no token)");
             }
         }
         // 4. 逐条注册代理（TNL-CLIENT-002，重试 ≤3 次，仍失败继续其余）。
@@ -533,6 +542,33 @@ async fn write_frame_simple(
     stream.write_all(&frame).await?;
     stream.flush().await?;
     Ok(())
+}
+
+/// 认证错误 → 客户端错误映射（M8-T026-P3 语义保持：登录被拒 → LoginRejected；
+/// 双向认证/ fail-closed → ServerAuthFailed；其余 → 协议错误）。
+fn map_auth_error(e: crate::auth::ClientAuthError) -> TunnelClientError {
+    use crate::auth::ClientAuthError;
+    match e {
+        ClientAuthError::LoginRejected(reason) => TunnelClientError::LoginRejected(reason),
+        ClientAuthError::Timeout(t) => TunnelClientError::Timeout(t),
+        ClientAuthError::NoTokenForChallenge => TunnelClientError::ServerAuthFailed(
+            "server requires challenge-response auth, but no token is configured locally (TNL-SEC-008)"
+                .to_string(),
+        ),
+        ClientAuthError::LegacyServerRejected => TunnelClientError::ServerAuthFailed(
+            "server did not issue an auth challenge (unauthenticated server); refusing to continue with token configured (TNL-SEC-008)"
+                .to_string(),
+        ),
+        ClientAuthError::ServerReceiptMismatch => TunnelClientError::ServerAuthFailed(
+            "server auth receipt verification failed (T4)".to_string(),
+        ),
+        ClientAuthError::ServerReceiptMissing => TunnelClientError::ServerAuthFailed(
+            "server login response lacks auth receipt (T4)".to_string(),
+        ),
+        other => TunnelClientError::Protocol(crate::protocol::ProtocolError::Bincode(
+            other.to_string(),
+        )),
+    }
 }
 
 /// 指数退避 + 抖动（TNL-STAB-003）：`base × 2^(attempt-1)` 封顶 `max`，

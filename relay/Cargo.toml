@@ -11,6 +11,9 @@ edition.workspace = true
 # M8-T025（Windows 打包验收）新增：socket2——bind 前显式 IPV6_V6ONLY=false
 # 实现双栈（Windows 裸 AF_INET6 socket 默认 v6-only；tokio TcpSocket 未暴露
 # 该 setter；对齐 media/quic.rs 同款做法）。
+# M8-T026-P3（TNL-NF-004 延续）新增：hmac / sha2——挑战-响应认证
+# （HMAC-SHA256，TNL-PROTO-013；sha2 已在 workspace deps，hmac 已在
+# lockfile 解析 0.12.1，仅注册）。
 [dependencies]
 tokio.workspace = true
 serde.workspace = true
@@ -18,9 +21,15 @@ bincode.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+hmac.workspace = true
+sha2.workspace = true
 ed25519-dalek = { workspace = true, features = ["pkcs8", "pem", "rand_core"] }
 rand.workspace = true
 base64 = "0.22"
 get_if_addrs = "0.5"
 # M8-T025（Windows 打包验收）：bind 前设置 IPV6_V6ONLY=false（见上注释）。
 socket2 = "0.6"
+# S-07 (F-8): 服务器 Ed25519 私钥落盘走 kirin-desk-utils::fsutil::write_private
+# （0600/0700/O_NOFOLLOW）。utils 为叶子 crate（零 core 依赖），不违反
+# TNL-NF-004「不依赖 core crate」约束。
+kirin-desk-utils = { path = "../utils" }

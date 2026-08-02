@@ -255,6 +255,97 @@ fn strip_ansi_escapes(s: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// R-10 (M15-T006): 全局 panic hook
+// ---------------------------------------------------------------------------
+
+/// 最近一次 panic 摘要（GUI 弹窗用；`take_panic_message` 消费一次后为 None）。
+static LAST_PANIC: Mutex<Option<String>> = Mutex::new(None);
+
+/// 今日日志文件路径：`{log_dir}/kirindesk-{YYYY-MM-DD}.log`（与轮转文件命名一致）。
+pub fn current_log_path(log_dir: &Path) -> PathBuf {
+    log_dir.join(format!("kirindesk-{}.log", RotatingFileWriter::today()))
+}
+
+/// R-10: 安装全局 panic hook——panic 时把消息 + 位置 + backtrace 写入
+/// stderr、tracing 日志与今日日志文件，并把摘要存入静态槽供 GUI 弹窗
+/// （`take_panic_message`）。正常路径零影响；重复调用覆盖安装。
+pub fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let payload = panic_payload_text(info);
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "unknown location".to_string());
+        let backtrace = std::backtrace::Backtrace::capture();
+
+        let msg = format!(
+            "PANIC at {location}\n  message: {payload}\n  backtrace:\n{backtrace}"
+        );
+
+        // 1) 控制台恒写（无 subscriber 也能看到）
+        eprintln!("{}", msg);
+        // 2) 有 subscriber 时进日志系统（含 GUI 环形缓冲）
+        tracing::error!("{}", msg);
+        // 3) 直接追加今日日志文件（不依赖 subscriber 是否初始化）
+        append_to_log_file(&msg);
+        // 4) 摘要进静态槽 → GUI 弹窗（附日志路径，见 ui 侧 show_panic_dialog）
+        let log_path = current_log_path(&default_log_dir());
+        if let Ok(mut slot) = LAST_PANIC.lock() {
+            *slot = Some(format!(
+                "{payload}\n\n位置：{location}\n\n完整信息见日志：{path}",
+                payload = payload,
+                location = location,
+                path = log_path.display()
+            ));
+        }
+    }));
+}
+
+/// 消费最近一次 panic 摘要（无 panic 或已消费 → None）。
+pub fn take_panic_message() -> Option<String> {
+    LAST_PANIC.lock().ok().and_then(|mut s| s.take())
+}
+
+fn panic_payload_text(info: &std::panic::PanicHookInfo) -> String {
+    if let Some(s) = info.payload().downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = info.payload().downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+/// 追加写入今日日志文件（hook 专用：即使 tracing 未初始化也有落盘记录）。
+fn append_to_log_file(msg: &str) {
+    append_to_log_file_in(&default_log_dir(), msg);
+}
+
+/// 追加打开日志文件（S-07b：Unix 新建日志 0600——日志可能含敏感信息；
+/// 追加打开不改变既有文件权限）。
+fn open_log_append(path: &Path) -> io::Result<File> {
+    let mut opts = OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+}
+
+fn append_to_log_file_in(dir: &Path, msg: &str) {
+    if fs::create_dir_all(dir).is_err() {
+        return; // stderr 已输出，不重复告警
+    }
+    let path = current_log_path(dir);
+    if let Ok(mut f) = open_log_append(&path) {
+        let _ = writeln!(f, "{}", msg.trim_end());
+        let _ = f.flush();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Rotating file writer (unchanged except minor cleanup)
 // ---------------------------------------------------------------------------
 struct RotatingFileWriter {
@@ -284,7 +375,8 @@ impl RotatingFileWriter {
 
     fn open_file(&self, date: &str) -> io::Result<File> {
         let path = self.dir.join(format!("kirindesk-{}.log", date));
-        OpenOptions::new().create(true).append(true).open(&path)
+        // S-07b: 新建日志 0600（日志可能含敏感信息）。
+        open_log_append(&path)
     }
 }
 
@@ -439,5 +531,53 @@ mod tests {
     fn test_strip_ansi() {
         let input = "\x1b[32mINFO\x1b[0m test";
         assert_eq!(strip_ansi_escapes(input), "INFO test");
+    }
+
+    // ── R-10: panic hook ────────────────────────────────────────
+
+    #[test]
+    fn test_panic_hook_records_message() {
+        install_panic_hook(); // 幂等：覆盖安装
+        // 子线程触发受控 panic（join 返回 Err 不影响本测试）
+        let h = std::thread::spawn(|| {
+            panic!("R-10 controlled panic {}", 42);
+        });
+        assert!(h.join().is_err());
+
+        let msg = take_panic_message().expect("panic 摘要应被记录");
+        assert!(msg.contains("R-10 controlled panic 42"), "摘要含 payload: {msg}");
+        assert!(msg.contains("完整信息见日志"), "摘要附日志路径: {msg}");
+        // 消费一次后为 None
+        assert!(take_panic_message().is_none());
+    }
+
+    #[test]
+    fn test_append_to_log_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "kirin_desk_test_panic_log_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        append_to_log_file_in(&dir, "boom\nbacktrace line");
+        let text = fs::read_to_string(current_log_path(&dir)).unwrap();
+        assert!(text.contains("boom"));
+        assert!(text.contains("backtrace line"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_current_log_path() {
+        let p = current_log_path(Path::new("/tmp/logs"));
+        let name = p.file_name().unwrap().to_string_lossy().to_string();
+        assert!(name.starts_with("kirindesk-"), "命名与轮转文件一致: {name}");
+        assert!(name.ends_with(".log"));
+        // 日期段为 YYYY-MM-DD（与 RotatingFileWriter::today 一致）
+        let date = &name["kirindesk-".len()..name.len() - ".log".len()];
+        assert_eq!(date.len(), 10);
+        assert_eq!(&date[4..5], "-");
+        assert_eq!(&date[7..8], "-");
     }
 }

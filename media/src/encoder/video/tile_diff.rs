@@ -51,13 +51,17 @@ impl Default for TileDiffConfig {
 /// 上一帧的网格信息（用于首帧 / 分辨率变化判定）。
 pub struct TileDiff {
     cfg: TileDiffConfig,
-    /// 上一帧 tile hash（CPU 回退模式）。
+    /// 上一帧 tile hash（GPU 内核模式哨兵：`None` = 首帧，全量 dirty）。
     ///
     /// P1A 阶段：真实 hash 由 GPU 内核（P1B）产出；本字段用作"是否首帧"
-    /// 的哨兵（`None` = 首帧，全量 dirty）。P1B 接入后改为存储实际 hash 值。
+    /// 的哨兵。P1B 接入后存储实际 hash 值。
     prev_hash: Option<Vec<u64>>,
     /// 上次见到的网格尺寸（用于检测分辨率变化 → 重置）。
     last_grid: Option<(u32, u32)>,
+    /// M8-T030（R-06）：CPU 兜底路径的上一帧 tile hash（真实 CRC32 值，
+    /// 由 [`cpu_tile_hash_rgba`](Self::cpu_tile_hash_rgba) 维护，与 `prev_hash`
+    /// 哨兵解耦——`decide` 的首帧/分辨率变化逻辑不覆盖本字段）。
+    cpu_prev: Option<Vec<u64>>,
 }
 
 impl TileDiff {
@@ -67,6 +71,7 @@ impl TileDiff {
             cfg,
             prev_hash: None,
             last_grid: None,
+            cpu_prev: None,
         }
     }
 
@@ -148,18 +153,102 @@ impl TileDiff {
     /// CPU 回退：把纹理读回内存逐 tile 计算（与 GPU hash 算法一致：
     /// 每 tile 采样点均值 + CRC32）。
     ///
-    /// **P1A 现状**：`GpuTexture.handle` 为 opaque 指针，本阶段没有 C++ 内核
-    /// （P1B）把它读回内存；故此处返回 [`GpuKernel`](EncodeError::GpuKernel)
-    /// 错误而非伪造数据。P1B 接入 kgpu_tile_hash 后，此函数改为调用内核
-    /// 的 CPU 回退路径或直接由 kernel 实现承担。
+    /// **现状**：`GpuTexture.handle` 为 opaque 指针，本函数无法读到像素——
+    /// 纹理路径缺内核时仍返回 [`GpuKernel`](EncodeError::GpuKernel) 错误。
+    /// M8-T030（R-06，GPU-FR-008）真实 CPU 兜底走
+    /// [`cpu_tile_hash_rgba`](Self::cpu_tile_hash_rgba)（捕获层 CPU 帧 RGBA
+    /// 直接喂入，见 [`classify_cpu`](Self::classify_cpu)）。
     fn cpu_tile_hash(&mut self, tex: &GpuTexture) -> Result<DirtyTileMap, EncodeError> {
         if tex.is_null() {
             return Err(EncodeError::InvalidConfig("null texture".into()));
         }
         // 无 P1B 纹理读回能力：交给上层提供 GPU 内核（kernel=Some）。
         Err(EncodeError::GpuKernel(
-            "CPU tile-hash fallback requires P1B GPU texture readback".into(),
+            "CPU tile-hash requires CPU frame data (call classify_cpu with RGBA)".into(),
         ))
+    }
+
+    /// **真实 CPU 兜底**（M8-T030 GPU-FR-008）：对 CPU 帧 RGBA 做逐 tile
+    /// CRC32 哈希 + 与上一帧 diff，产出 [`DirtyTileMap`]。
+    ///
+    /// - 输入：捕获层 CPU 帧（BGRA8 `&[u8]` + 宽高，`CapturedFrame.data`）；
+    ///   `GpuTexture` 为哨兵指针时不依赖纹理读回（设计文档 §3.7）。
+    /// - 算法：按 `cfg.tile_w × tile_h`（默认 64×64）分块，每 tile 对全部
+    ///   像素 RGBA 字节算 CRC32（全采样，与 GPU hash 语义一致——P1B
+    ///   tile_hash_hlsl.h 全像素均值折叠进 CRC32），与 `cpu_prev` 帧间比对
+    ///   → dirty map。
+    /// - 首帧 / 分辨率变化（网格数变化）→ 全量 dirty（`decide` 亦按首帧处理）。
+    /// - 触发条件：无 GPU 内核（`kernel = None` / 未链接）时的 CPU 路径
+    ///   （pipeline 在 `tex.is_null()` 时经 [`classify_cpu`](Self::classify_cpu)
+    ///   调用本函数）。
+    fn cpu_tile_hash_rgba(
+        &mut self,
+        rgba: &[u8],
+        w: u32,
+        h: u32,
+    ) -> Result<DirtyTileMap, EncodeError> {
+        let (w, h) = (w as usize, h as usize);
+        if rgba.len() < w.saturating_mul(h).saturating_mul(4) {
+            return Err(EncodeError::InvalidConfig(
+                "cpu tile-hash: frame buffer smaller than w*h*4".into(),
+            ));
+        }
+        let tw = self.cfg.tile_w.max(1) as usize;
+        let th = self.cfg.tile_h.max(1) as usize;
+        let grid_w = w.div_ceil(tw).max(1);
+        let grid_h = h.div_ceil(th).max(1);
+        if w == 0 || h == 0 {
+            return Err(EncodeError::InvalidConfig(
+                "cpu tile-hash: zero-size frame".into(),
+            ));
+        }
+        let count = grid_w * grid_h;
+        let mut hashes = Vec::with_capacity(count);
+        for ty in 0..grid_h {
+            for tx in 0..grid_w {
+                hashes.push(tile_crc32(rgba, w, h, tw, th, tx, ty) as u64);
+            }
+        }
+        // 帧间 diff：首帧 / 网格变化 → 全量 dirty。
+        let mut dirty = vec![true; count];
+        let mut dirty_count = count;
+        if let Some(prev) = &self.cpu_prev {
+            if prev.len() == count {
+                dirty_count = 0;
+                for (i, &h) in hashes.iter().enumerate() {
+                    if prev[i] == h {
+                        dirty[i] = false;
+                    } else {
+                        dirty_count += 1;
+                    }
+                }
+            }
+        }
+        self.cpu_prev = Some(hashes);
+        let mut map = DirtyTileMap {
+            tile_w: self.cfg.tile_w,
+            tile_h: self.cfg.tile_h,
+            grid_w: grid_w as u32,
+            grid_h: grid_h as u32,
+            dirty,
+            dirty_ratio: dirty_count as f32 / count as f32,
+        };
+        map.compute_ratio();
+        Ok(map)
+    }
+
+    /// **CPU 兜底决策入口**（M8-T030 GPU-FR-008 / R06-S7 验收）：无 GPU 内核
+    /// 时对 CPU 帧 RGBA 走真实 tile-hash diff → 三态决策（全静/微变/大动）。
+    ///
+    /// pipeline 在 CPU 路径（`tex.is_null()`）调用；任何机器可用（环境无关）。
+    pub fn classify_cpu(
+        &mut self,
+        rgba: &[u8],
+        w: u32,
+        h: u32,
+    ) -> Result<EncodeDecision, EncodeError> {
+        let map = self.cpu_tile_hash_rgba(rgba, w, h)?;
+        Ok(self.decide(map))
     }
 }
 
@@ -232,6 +321,55 @@ pub trait GpuKernel: Send {
     fn is_linked(&self) -> bool {
         false
     }
+}
+
+// ════════════════════════════════════════════════════════════════
+// CPU tile CRC32（M8-T030 GPU-FR-008；无外部依赖）
+// ════════════════════════════════════════════════════════════════
+
+/// CRC32（IEEE 802.3，poly 0xEDB88320）查表初始化。
+fn crc32_table() -> [u32; 256] {
+    let mut table = [0u32; 256];
+    for (i, entry) in table.iter_mut().enumerate() {
+        let mut c = i as u32;
+        for _ in 0..8 {
+            c = if c & 1 != 0 {
+                0xEDB88320 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
+        }
+        *entry = c;
+    }
+    table
+}
+
+/// 逐 tile CRC32（**全采样**，与 GPU hash 语义一致——P1B `tile_hash_hlsl.h`
+/// 每 8×8 子块全像素均值折叠进 CRC32；CPU 兜底对 tile 内全部像素的
+/// RGBA 字节做 CRC32，无采样漏检）。
+///
+/// `x0/y0` 为 tile 起点；边缘 tile 超出帧边界部分 clamp（不越界）。
+fn tile_crc32(
+    rgba: &[u8],
+    w: usize,
+    h: usize,
+    tw: usize,
+    th: usize,
+    tx: usize,
+    ty: usize,
+) -> u32 {
+    static TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(crc32_table);
+    let x_end = ((tx + 1) * tw).min(w);
+    let y_end = ((ty + 1) * th).min(h);
+    let mut c = 0xFFFF_FFFFu32;
+    for y in (ty * th)..y_end {
+        let row = &rgba[y * w * 4..y * w * 4 + x_end * 4];
+        for &b in row[(tx * tw * 4)..].iter() {
+            c = table[((c ^ b as u32) & 0xFF) as usize] ^ (c >> 8);
+        }
+    }
+    c ^ 0xFFFF_FFFF
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -482,12 +620,13 @@ mod tests {
 
     #[test]
     fn test_classify_without_kernel_returns_gpukernel_error() {
-        // kernel=None + 非空纹理 → GpuKernel 错误（P1A 无纹理读回能力）。
+        // kernel=None + 非空纹理 → GpuKernel 错误（纹理路径无像素可读；
+        // 真实 CPU 兜底走 classify_cpu，见 test_cpu_hash_* 系列）。
         let mut d = TileDiff::default();
         let tex = GpuTexture::new(0x1usize as *mut _, 64, 64);
         let err = d.classify(&tex, None).unwrap_err();
         match err {
-            EncodeError::GpuKernel(msg) => assert!(msg.contains("P1B")),
+            EncodeError::GpuKernel(msg) => assert!(msg.contains("classify_cpu")),
             other => panic!("期望 GpuKernel 错误，实际: {:?}", other),
         }
     }
@@ -507,6 +646,141 @@ mod tests {
         let decision = d.decide(m);
         // NaN 防御 → 当作全静。
         assert!(matches!(decision, EncodeDecision::Static));
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // M8-T030（R-06）：CPU tile-hash 兜底测试（环境无关，GPU-FR-008）
+    // ════════════════════════════════════════════════════════════
+
+    /// 640×480 纯色帧（80 tiles：10×8；改 1 tile = 1.25% < 5% → Incremental）。
+    fn solid_frame(w: u32, h: u32, fill: u8) -> Vec<u8> {
+        vec![fill; (w * h * 4) as usize]
+    }
+
+    /// 在帧内画一个小方块（改写局部像素）。
+    fn patch(frame: &mut [u8], w: u32, h: u32, x: u32, y: u32, bw: u32, bh: u32, val: u8) {
+        for py in y..(y + bh).min(h) {
+            for px in x..(x + bw).min(w) {
+                let i = ((py * w + px) * 4) as usize;
+                frame[i] = val;
+                frame[i + 1] = val;
+                frame[i + 2] = val;
+            }
+        }
+    }
+
+    /// 首帧 → FullFrame（全 dirty）。
+    #[test]
+    fn test_cpu_hash_first_frame_fullframe() {
+        let mut d = TileDiff::default();
+        let (w, h) = (640u32, 480u32);
+        let frame = solid_frame(w, h, 128);
+        let decision = d.classify_cpu(&frame, w, h).unwrap();
+        match decision {
+            EncodeDecision::FullFrame(map) => {
+                assert_eq!(map.dirty_ratio, 1.0, "首帧应全 dirty");
+                assert!(map.dirty.iter().all(|b| *b));
+            }
+            other => panic!("首帧应 FullFrame，实际: {:?}", other),
+        }
+    }
+
+    /// 帧间无变化 → Static（纯色第二帧）。
+    #[test]
+    fn test_cpu_hash_static_unchanged() {
+        let mut d = TileDiff::default();
+        let (w, h) = (640u32, 480u32);
+        let frame = solid_frame(w, h, 128);
+        let _ = d.classify_cpu(&frame, w, h).unwrap(); // 首帧建立基线。
+        let decision = d.classify_cpu(&frame, w, h).unwrap();
+        assert!(
+            matches!(decision, EncodeDecision::Static),
+            "无变化应 Static，实际: {decision:?}"
+        );
+    }
+
+    /// 局部微变（1 tile / 80 = 1.25% < 5%）→ Incremental（1 个 region）。
+    #[test]
+    fn test_cpu_hash_incremental_small_change() {
+        let mut d = TileDiff::default();
+        let (w, h) = (640u32, 480u32);
+        let mut frame = solid_frame(w, h, 128);
+        let _ = d.classify_cpu(&frame, w, h).unwrap(); // 首帧基线。
+        // 改写第 1 个 tile（0..64, 0..64）内的一个小方块。
+        patch(&mut frame, w, h, 10, 10, 20, 20, 200);
+        let decision = d.classify_cpu(&frame, w, h).unwrap();
+        match decision {
+            EncodeDecision::Incremental(regions) => {
+                assert!(!regions.is_empty(), "微变应产出 region");
+                // 所有 region 应落在改动 tile 所在行（tile 网格坐标）。
+                assert!(
+                    regions.iter().all(|r| r.y == 0),
+                    "改动在第 0 行 tile，region 应只含 y=0: {regions:?}"
+                );
+            }
+            other => panic!("1/80 变化应 Incremental，实际: {other:?}"),
+        }
+    }
+
+    /// 大动（≥5% tiles）→ FullFrame。
+    #[test]
+    fn test_cpu_hash_fullframe_many_changes() {
+        let mut d = TileDiff::default();
+        let (w, h) = (640u32, 480u32);
+        let mut frame = solid_frame(w, h, 128);
+        let _ = d.classify_cpu(&frame, w, h).unwrap(); // 首帧基线。
+        // 改写 6 个 tile（前 3 行 × 前 2 列区域）→ 6/80 = 7.5% > 5% → FullFrame。
+        patch(&mut frame, w, h, 0, 0, 128, 192, 200);
+        let decision = d.classify_cpu(&frame, w, h).unwrap();
+        match decision {
+            EncodeDecision::FullFrame(map) => {
+                assert!((map.dirty_ratio - 0.075).abs() < 1e-4, "ratio={}", map.dirty_ratio);
+            }
+            other => panic!("≥5% 变化应 FullFrame，实际: {other:?}"),
+        }
+    }
+
+    /// 分辨率变化 → 重置基线 + FullFrame。
+    #[test]
+    fn test_cpu_hash_resolution_change_resets() {
+        let mut d = TileDiff::default();
+        let frame1 = solid_frame(640, 480, 128);
+        let _ = d.classify_cpu(&frame1, 640, 480).unwrap();
+        // 尺寸变化：即使内容全同也应按首帧处理（网格数变化）。
+        let frame2 = solid_frame(320, 240, 128);
+        let decision = d.classify_cpu(&frame2, 320, 240).unwrap();
+        assert!(
+            matches!(decision, EncodeDecision::FullFrame(_)),
+            "分辨率变化应 FullFrame，实际: {decision:?}"
+        );
+    }
+
+    /// 缓冲长度不匹配 → InvalidConfig（防御）。
+    #[test]
+    fn test_cpu_hash_buffer_too_small() {
+        let mut d = TileDiff::default();
+        let err = d.classify_cpu(&[0u8; 16], 640, 480).unwrap_err();
+        assert!(matches!(err, EncodeError::InvalidConfig(_)));
+    }
+
+    /// 零尺寸帧 → InvalidConfig。
+    #[test]
+    fn test_cpu_hash_zero_frame() {
+        let mut d = TileDiff::default();
+        let err = d.classify_cpu(&[], 0, 0).unwrap_err();
+        assert!(matches!(err, EncodeError::InvalidConfig(_)));
+    }
+
+    /// tile CRC32 对内容敏感：同位置改 1 字节 → hash 必变（防误判全静）。
+    #[test]
+    fn test_tile_crc32_sensitive_to_single_byte() {
+        let (w, h) = (64usize, 64usize);
+        let a = vec![0u8; w * h * 4];
+        let mut b = a.clone();
+        b[10] = 1; // 单个字节差异。
+        let ha = tile_crc32(&a, w, h, 64, 64, 0, 0);
+        let hb = tile_crc32(&b, w, h, 64, 64, 0, 0);
+        assert_ne!(ha, hb, "1 字节差异必须改变 tile hash");
     }
 
     /// 一个最小的 GpuKernel stub，验证 classify(kernel=Some) 路径把决策

@@ -37,8 +37,9 @@ fn test_e2e_encryption() {
     let alice = kirin_desk_core::crypto::x25519::EphemeralSession::new();
     let bob = kirin_desk_core::crypto::x25519::EphemeralSession::new();
 
-    let alice_shared = alice.diffie_hellman(bob.public_key());
-    let bob_shared = bob.diffie_hellman(alice.public_key());
+    // S-04: diffie_hellman 现返回 Result（全零输出 → ExchangeFailed）。
+    let alice_shared = alice.diffie_hellman(bob.public_key()).expect("valid peer key");
+    let bob_shared = bob.diffie_hellman(alice.public_key()).expect("valid peer key");
     assert_eq!(alice_shared, bob_shared);
 
     let alice_key = kirin_desk_core::crypto::x25519::EphemeralSession::derive_session_key(&alice_shared);

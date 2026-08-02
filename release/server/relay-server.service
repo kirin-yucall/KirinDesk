@@ -1,0 +1,29 @@
+# KirinDesk Relay Server systemd 服务示例（内网穿透服务端）
+#
+# 用法：按需修改 ExecStart / Environment 后
+#   sudo cp relay-server.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now relay-server
+#
+# token 建议经 Environment 提供（避免出现在进程列表/日志中），
+# 若改用 --token 参数请删掉 Environment 行。
+
+[Unit]
+Description=KirinDesk Relay Server (内网穿透服务端)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 替换为你的高熵 token（≥32 字节，与客户端 [tunnel] token 一致）
+Environment=KIRIN_RELAY_TOKEN=REPLACE_WITH_HIGH_ENTROPY_TOKEN
+# 控制端口 7000 + 自动分配端口范围 60000-60099
+ExecStart=/usr/local/bin/relay-server --bind-port 7000 --port-range 60000-60099
+Restart=on-failure
+RestartSec=3
+# 服务器 Ed25519 密钥持久化路径：/root/.kirin_desk/relay_server_key.pem
+# （首次启动自动生成；换机部署请备份，否则客户端 server_pubkey 需同步更新）
+# 如需自定义密钥路径：
+# ExecStart=/usr/local/bin/relay-server --bind-port 7000 --port-range 60000-60099 --server-key /etc/relay-server/relay_server_key.pem
+
+[Install]
+WantedBy=multi-user.target

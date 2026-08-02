@@ -348,7 +348,10 @@ mod tests {
         for msg in [
             ShellMessage::ShellStdin(b"ls -la\r".to_vec()),
             ShellMessage::ShellStdout("\x1b[32mOK\x1b[0m".as_bytes().to_vec()),
-            ShellMessage::ShellResize { cols: 132, rows: 43 },
+            ShellMessage::ShellResize {
+                cols: 132,
+                rows: 43,
+            },
         ] {
             let wire = msg.encode().unwrap();
             let back = ShellMessage::decode(&wire).unwrap();

@@ -71,39 +71,39 @@ impl ThemeMode {
 pub struct Theme {
     pub dark: bool,
     // -- 色彩 --
-    pub bg: Color32,             // 窗口/面板背景
-    pub bg_panel: Color32,       // 卡片、分组容器
-    pub bg_strong: Color32,      // hover、输入框内底
-    pub fg: Color32,             // 正文
-    pub fg_weak: Color32,        // 次要说明、占位符
-    pub primary: Color32,        // 品牌蓝：主按钮、选中态、链接
-    pub primary_hover: Color32,  // 主按钮 hover
-    pub accent: Color32,         // 麒麟青：辅助点缀（在线点、徽标）
-    pub success: Color32,        // 成功/在线/已连接
-    pub warning: Color32,        // 警告
-    pub danger: Color32,         // 危险/错误/拒绝
-    pub info: Color32,           // 信息
-    pub border: Color32,         // 卡片/分隔线
-    pub selection: Color32,      // 文本选中
-    pub on_primary: Color32,     // 主色底上的文字（明亮=白 / 深色=近黑，对比度 ≥ 4.5）
-    pub video_bg: Color32,       // 视频画布 letterbox 黑底（两主题共用）
+    pub bg: Color32,            // 窗口/面板背景
+    pub bg_panel: Color32,      // 卡片、分组容器
+    pub bg_strong: Color32,     // hover、输入框内底
+    pub fg: Color32,            // 正文
+    pub fg_weak: Color32,       // 次要说明、占位符
+    pub primary: Color32,       // 品牌蓝：主按钮、选中态、链接
+    pub primary_hover: Color32, // 主按钮 hover
+    pub accent: Color32,        // 麒麟青：辅助点缀（在线点、徽标）
+    pub success: Color32,       // 成功/在线/已连接
+    pub warning: Color32,       // 警告
+    pub danger: Color32,        // 危险/错误/拒绝
+    pub info: Color32,          // 信息
+    pub border: Color32,        // 卡片/分隔线
+    pub selection: Color32,     // 文本选中
+    pub on_primary: Color32,    // 主色底上的文字（明亮=白 / 深色=近黑，对比度 ≥ 4.5）
+    pub video_bg: Color32,      // 视频画布 letterbox 黑底（两主题共用）
     // -- 字号（遵守 UI-F003：Body/Button/Heading 不改）--
-    pub body_size: f32,          // 20px
-    pub button_size: f32,        // 18px
-    pub heading_size: f32,       // 26px
-    pub small_size: f32,         // 16px
-    pub mono_size: f32,          // 16px
+    pub body_size: f32,    // 20px
+    pub button_size: f32,  // 18px
+    pub heading_size: f32, // 26px
+    pub small_size: f32,   // 16px
+    pub mono_size: f32,    // 16px
     // -- 间距 / 圆角 / 边框 / 阴影 --
-    pub spacing: f32,            // 8px 栅格
+    pub spacing: f32,             // 8px 栅格
     pub item_spacing: egui::Vec2, // (8, 6)
-    pub window_padding: f32,     // 12px 面板内边距
-    pub card_padding: f32,       // 12px 卡片内边距
-    pub rounding_control: f32,   // 6px 按钮/输入框
-    pub rounding_card: f32,      // 8px 卡片
-    pub rounding_badge: f32,     // 4px 徽标
-    pub border_width: f32,       // 1px
-    pub shadow_blur: f32,        // 8px
-    pub shadow_alpha: u8,        // 明亮 20% / 深色 40%
+    pub window_padding: f32,      // 12px 面板内边距
+    pub card_padding: f32,        // 12px 卡片内边距
+    pub rounding_control: f32,    // 6px 按钮/输入框
+    pub rounding_card: f32,       // 8px 卡片
+    pub rounding_badge: f32,      // 4px 徽标
+    pub border_width: f32,        // 1px
+    pub shadow_blur: f32,         // 8px
+    pub shadow_alpha: u8,         // 明亮 20% / 深色 40%
 }
 
 /// `#RRGGBB` → Color32（令牌构建专用，组件层零裸值）。

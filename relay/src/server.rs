@@ -11,6 +11,7 @@
 //!   泵流任务全部对称关闭，无残留协程。
 
 use crate::audit::{AuditSink, TunnelAuditEvent};
+use crate::auth::{constant_time_eq, random_nonce};
 use crate::protocol::{
     decode_control, decode_extension, decode_work_header, encode_control, encode_extension,
     read_frame, CandidateRegister, ControlMsg, ResolveDevice, TunnelConn, TunnelHeader,
@@ -18,7 +19,10 @@ use crate::protocol::{
     TYPE_RESOLVE_DEVICE, TYPE_TUNNEL_CONN, TYPE_TUNNEL_HEADER, TYPE_TUNNEL_RESP,
     TYPE_WORK_HEADER,
 };
-use crate::rate_limit::{RateLimitDecision, RateLimiter, RateLimiterConfig};
+use crate::rate_limit::{
+    RateLimitDecision, RateLimiter, RateLimiterConfig, DEFAULT_MAX_PENDING_PER_TARGET,
+    DEFAULT_MAX_PENDING_TUNNELS,
+};
 use crate::registry::{RegisterOutcome, Registry, RegistryError};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -64,6 +68,14 @@ pub struct TunnelServerConfig {
     pub max_concurrent_work: usize,
     /// 速率限制参数（TNL-SEC-002）。
     pub rate_limit: RateLimiterConfig,
+    /// S-03（审计 F-6）：未认证 TunnelConn 限速参数 —— 独立于 Login 限速
+    /// （解耦配置，默认 10 次 / 30s / IP）。
+    pub tunnel_conn_rate_limit: RateLimiterConfig,
+    /// S-03（审计 F-6）：`tunnels` pending 表硬上限（默认 256；超限直接拒绝，
+    /// 防未认证放大攻击撑爆 pending 表与目标设备控制通道）。
+    pub max_pending_tunnels: usize,
+    /// S-03（审计 F-6）：每目标设备同时未配对隧道数上限（默认 16）。
+    pub max_pending_per_target: usize,
     /// 审计回调（None = 不记录）。
     pub audit: Option<Arc<dyn AuditSink>>,
     /// M8-T026-P2 (ID-SEC-001)：服务器 Ed25519 密钥路径（None = 默认
@@ -82,6 +94,9 @@ impl Default for TunnelServerConfig {
             max_proxies: DEFAULT_MAX_PROXIES,
             max_concurrent_work: DEFAULT_MAX_CONCURRENT_WORK,
             rate_limit: RateLimiterConfig::default(),
+            tunnel_conn_rate_limit: RateLimiterConfig::tunnel_conn_default(),
+            max_pending_tunnels: DEFAULT_MAX_PENDING_TUNNELS,
+            max_pending_per_target: DEFAULT_MAX_PENDING_PER_TARGET,
             audit: None,
             server_key_path: None,
         }
@@ -151,6 +166,14 @@ struct ServerShared {
     /// conn_id → (session_id, proxy_name)，work 回连按此路由（TNL-SERVER-005）。
     pending_index: Mutex<HashMap<u64, (String, String)>>,
     rate_limiter: Mutex<RateLimiter>,
+    /// S-03（审计 F-6）：TunnelConn 未认证限速器（独立于 Login 限速）。
+    tunnel_conn_limiter: Mutex<RateLimiter>,
+    /// S-03（审计 F-6）：pending 表镜像计数 —— 与 registry `tunnels` 表
+    /// 插入/移除 1:1 镜像（register_tunnel 成功后 +1，wait_for_pair 返回后 -1；
+    /// 该表条目仅由这两点增删，见 `handle_tunnel_conn`）。
+    pending_tunnels: AtomicUsize,
+    /// S-03（审计 F-6）：每目标设备未配对隧道计数（镜像，同上生命周期）。
+    pending_by_target: Mutex<HashMap<String, usize>>,
     /// M8-T026-P2 (ID-002)：设备在线表（注册/解析/中继配对）。
     registry: Arc<Registry>,
     /// 优雅关闭：置位后 accept 循环停止（`TunnelServer::shutdown`）。
@@ -233,6 +256,7 @@ impl TunnelServer {
             })?,
         };
         let rate_limit_cfg = cfg.rate_limit.clone();
+        let tunnel_conn_rate_limit_cfg = cfg.tunnel_conn_rate_limit.clone();
         // M8-T026-P2 (ID-SEC-001)：服务器签名密钥（加载或首次生成持久化）。
         let key_path = cfg
             .server_key_path
@@ -251,6 +275,11 @@ impl TunnelServer {
             sessions: Mutex::new(HashMap::new()),
             pending_index: Mutex::new(HashMap::new()),
             rate_limiter: Mutex::new(RateLimiter::with_config(rate_limit_cfg)),
+            tunnel_conn_limiter: Mutex::new(RateLimiter::with_config(
+                tunnel_conn_rate_limit_cfg,
+            )),
+            pending_tunnels: AtomicUsize::new(0),
+            pending_by_target: Mutex::new(HashMap::new()),
             registry,
             shutting_down: AtomicBool::new(false),
             shutdown_tx: broadcast::channel(64).0,
@@ -272,6 +301,39 @@ impl TunnelServer {
     pub async fn run(self) -> Result<(), TunnelServerError> {
         let shared = self.shared.clone();
         info!("Tunnel server listening on port {}", self.port());
+        // R-24：ID-003 空闲清理 —— `Registry::sweep_idle` 此前无调用方（死代码），
+        // 现注册心跳 tick 旁挂的全局 sweep：周期 = 心跳超时/2（下限 500ms），
+        // 与 per-session 心跳刷新（`last_seen`）配合——超过心跳超时未刷新的
+        // 离线条目移除并审计 `DeviceOffline`（用服务器观察地址定位）。
+        // 优雅关闭：随 shutdown 广播退出，不残留任务。
+        let sweep_shared = shared.clone();
+        tokio::spawn(async move {
+            let interval = (sweep_shared.cfg.heartbeat_timeout / 2)
+                .max(Duration::from_millis(500));
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut shutdown = sweep_shared.shutdown_tx.subscribe();
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        for (device_id, client) in sweep_shared
+                            .registry
+                            .sweep_idle(sweep_shared.cfg.heartbeat_timeout)
+                            .await
+                        {
+                            info!(
+                                "registry sweep: device '{device_id}' offline (heartbeat timeout)"
+                            );
+                            sweep_shared.audit(TunnelAuditEvent::DeviceOffline {
+                                client,
+                                device_id,
+                            });
+                        }
+                    }
+                    _ = shutdown.recv() => break,
+                }
+            }
+        });
         loop {
             if shared.shutting_down.load(Ordering::SeqCst) {
                 info!("Tunnel server shutting down (accept loop stopped)");
@@ -293,14 +355,24 @@ impl TunnelServer {
     }
 }
 
+/// 登录请求信息（含 M8-T026-P3 挑战-响应字段，TNL-PROTO-011）。
+struct LoginInfo {
+    token: String,
+    version: String,
+    hostname: String,
+    device_id: Option<String>,
+    ed25519_pub: Option<String>,
+    auth_nonce: Option<[u8; 16]>,
+    auth_digest: Option<Vec<u8>>,
+}
+
 /// 处理一条新连接：读首帧 → Login（新会话）/ WorkConnHeader（数据面）/
 /// M8-T026-P2 扩展首帧（TunnelConn 控制器数据面 / TunnelHeader 设备回连）。
 async fn handle_incoming(
     shared: Arc<ServerShared>,
-    stream: TcpStream,
+    mut stream: TcpStream,
     addr: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut stream = stream;
     let (ty, payload) = match tokio::time::timeout(FIRST_FRAME_TIMEOUT, read_frame(&mut stream))
         .await
     {
@@ -311,7 +383,38 @@ async fn handle_incoming(
         TYPE_CONTROL => {
             let msg = match decode_control(ty, &payload) {
                 Ok(m) => m,
-                Err(_) => return Ok(()),
+                Err(_) => {
+                    // 解码失败：bincode 对旧载荷（5 字段 Login）无法 serde
+                    // default 补缺（TNL-PROTO-011），回退旧结构解码 ——
+                    // 旧客户端（v1.0）走 legacy/升级拒绝路径（T6）；
+                    // 非旧载荷 → 回显升级提示（不静默关闭）。
+                    match crate::protocol::decode_legacy_login(&payload) {
+                        Ok(legacy) => ControlMsg::Login {
+                            token: legacy.token,
+                            version: legacy.version,
+                            hostname: legacy.hostname,
+                            device_id: legacy.device_id,
+                            ed25519_pub: legacy.ed25519_pub,
+                            auth_nonce: None,
+                            auth_digest: None,
+                        },
+                        Err(_) => {
+                            let resp = encode_control(&ControlMsg::LoginResp {
+                                ok: false,
+                                err: Some(
+                                    "server requires challenge-response auth; upgrade client (bad login frame)"
+                                        .to_string(),
+                                ),
+                                server_version: crate::protocol::PROTOCOL_VERSION.to_string(),
+                                auth_digest: None,
+                            });
+                            if let Ok(frame) = resp {
+                                let _ = stream.write_all(&frame).await;
+                            }
+                            return Ok(());
+                        }
+                    }
+                }
             };
             match msg {
                 // M8-T026-P2 (ID-001)：device_id / ed25519_pub 为设备注册字段。
@@ -321,9 +424,24 @@ async fn handle_incoming(
                     hostname,
                     device_id,
                     ed25519_pub,
+                    auth_nonce,
+                    auth_digest,
                 } => {
-                    handle_login(shared, stream, addr, token, version, hostname, device_id, ed25519_pub)
-                        .await
+                    handle_login(
+                        shared,
+                        stream,
+                        addr,
+                        LoginInfo {
+                            token,
+                            version,
+                            hostname,
+                            device_id,
+                            ed25519_pub,
+                            auth_nonce,
+                            auth_digest,
+                        },
+                    )
+                    .await
                 }
                 _ => Ok(()), // 首帧必须是 Login
             }
@@ -341,7 +459,7 @@ async fn handle_incoming(
                 Ok(r) => r,
                 Err(_) => return Ok(()),
             };
-            handle_tunnel_conn(shared, stream, req).await
+            handle_tunnel_conn(shared, stream, addr, req).await
         }
         // M8-T026-P2 (§8.1)：设备回连（中继配对）。
         TYPE_TUNNEL_HEADER => {
@@ -355,20 +473,17 @@ async fn handle_incoming(
     }
 }
 
-/// Login 校验（TNL-SERVER-002 / TNL-SEC-001/002）：速率限制 → token 常数时间
-/// 比较 → 主版本协商 → 成功则启动会话控制任务。
+/// Login 认证（TNL-SERVER-002 / TNL-SEC-001/002、006~010）：
+/// 速率限制 → 主版本协商 → 认证（口令模式两阶段挑战-响应 / legacy 空 token
+/// 常数时间比较）→ 成功则启动会话控制任务。
 ///
-/// M8-T026-P2 (ID-001/ID-004)：`device_id` 存在时登记在线表（同 ID 不同公钥 →
-/// 后到者拒绝 + LoginResp{ok:false}）。
+/// 失败统一走 [`reject_login`]：审计 `LoginFailed` + 记握手失败（限流联动
+/// T5）+ 写回 `LoginResp{ok:false}`（不静默关闭）。
 async fn handle_login(
     shared: Arc<ServerShared>,
-    mut stream: TcpStream,
+    stream: TcpStream,
     addr: SocketAddr,
-    token: String,
-    version: String,
-    hostname: String,
-    device_id: Option<String>,
-    ed25519_pub: Option<String>,
+    login: LoginInfo,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 1. 速率限制（仅统计会话尝试，不统计 work 连接）。
     let decision = shared.rate_limiter.lock().unwrap().check_connect(&addr.ip());
@@ -380,33 +495,205 @@ async fn handle_login(
         warn!("tunnel rate limited: {} ({:?})", addr, decision);
         return Ok(());
     }
-    // 2. token 校验（常数时间比较，防时序侧信道，TNL-SEC-001）。
-    let token_ok = constant_time_eq(token.as_bytes(), shared.cfg.token.as_bytes());
-    // 3. 主版本协商（TNL-PROTO-008）。
-    let version_ok = crate::protocol::major_version(&version)
-        == crate::protocol::major_version(crate::protocol::PROTOCOL_VERSION);
-    if !token_ok || !version_ok {
-        let reason = if !token_ok {
-            "invalid token".to_string()
-        } else {
-            format!("incompatible protocol version: {version}")
-        };
-        shared.audit(TunnelAuditEvent::LoginFailed {
-            client: addr,
-            reason: reason.clone(),
-        });
-        shared.rate_limiter.lock().unwrap().record_handshake_failure(&addr.ip());
-        warn!("tunnel login failed from {}: {}", addr, reason);
-        let resp = encode_control(&ControlMsg::LoginResp {
-            ok: false,
-            err: Some(reason),
-            server_version: crate::protocol::PROTOCOL_VERSION.to_string(),
-        })?;
-        // resp 已是完整帧（encode_control 含帧头）→ 直写，勿再套帧头。
-        let _ = stream.write_all(&resp).await;
-        return Ok(());
+    // 2. 主版本协商（TNL-PROTO-008）。
+    if crate::protocol::major_version(&login.version)
+        != crate::protocol::major_version(crate::protocol::PROTOCOL_VERSION)
+    {
+        return reject_login(
+            &shared,
+            stream,
+            addr,
+            format!("incompatible protocol version: {}", login.version),
+        )
+        .await;
     }
-    // 4. 成功 → 会话控制任务。
+    // 3. 口令模式：两阶段挑战-响应（TNL-SEC-006~010）。
+    if !shared.cfg.token.is_empty() {
+        return handle_challenge_login(shared, stream, addr, login).await;
+    }
+    // 4. legacy（无口令，TNL-SEC-010）：token 必须为空（常数时间比较，
+    // 防时序侧信道 TNL-SEC-001）。
+    if !constant_time_eq(login.token.as_bytes(), b"") {
+        return reject_login(&shared, stream, addr, "invalid token".to_string()).await;
+    }
+    // 5. 认证通过 → 会话建立（legacy 无回执）。
+    start_session(
+        shared,
+        stream,
+        addr,
+        login.hostname,
+        login.device_id,
+        login.ed25519_pub,
+        None,
+    )
+    .await
+}
+
+/// 口令模式两阶段握手（TNL-SEC-006/007、TNL-PROTO-009~013）：
+/// ① 探测 Login#1（`auth_nonce`，token 恒为空）→ ② 下发 `AuthChallenge`
+/// （每连接全新 CSPRNG nonce，TNL-NF-006 防重放，无需去重缓存）→
+/// ③ 证明 Login#2（`auth_digest` 常数时间比较）→ ④ `LoginResp` 携带
+/// 回执（双向认证 TNL-SEC-007）。
+///
+/// 拒绝路径：明文 token（T1）/ digest 作首帧（未挑战先证明）/ 旧客户端无
+/// auth 字段（回显升级提示 T6）/ 错误 digest / 重放旧 (nonce,digest) 对
+/// （server_nonce 每连接全新，验证必然失败）。
+async fn handle_challenge_login(
+    shared: Arc<ServerShared>,
+    mut stream: TcpStream,
+    addr: SocketAddr,
+    login: LoginInfo,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // ① 探测帧校验。
+    if login.auth_digest.is_some() {
+        // digest 作首帧（未挑战先证明）→ 拒绝（T1/T3）。
+        return reject_login(
+            &shared,
+            stream,
+            addr,
+            "unexpected auth_digest in first login frame (challenge not issued)".to_string(),
+        )
+        .await;
+    }
+    let Some(client_nonce) = login.auth_nonce else {
+        // 旧客户端（v1.0，无 auth 字段，含明文 token 旧登录）→ 明确拒绝 +
+        // 升级提示（T6）。
+        return reject_login(
+            &shared,
+            stream,
+            addr,
+            "server requires challenge-response auth; upgrade client".to_string(),
+        )
+        .await;
+    };
+    if !login.token.is_empty() {
+        // 口令明文上线 → 拒绝（TNL-SEC-006 / T1）。
+        return reject_login(
+            &shared,
+            stream,
+            addr,
+            "plain-text token login is not accepted; use challenge-response auth (upgrade client)"
+                .to_string(),
+        )
+        .await;
+    }
+    // ② 挑战（每连接全新随机 nonce）。
+    let server_nonce = random_nonce();
+    let frame = encode_control(&ControlMsg::AuthChallenge { nonce: server_nonce })?;
+    // frame 已是完整帧 → 直写，勿再套帧头。
+    stream.write_all(&frame).await?;
+    // ③ 证明帧（限时；超时/断连 → 静默关闭，不记审计）。
+    let proof = match tokio::time::timeout(FIRST_FRAME_TIMEOUT, read_frame(&mut stream)).await {
+        Ok(Ok((ty, payload))) => match decode_control(ty, &payload) {
+            Ok(m) => m,
+            Err(e) => {
+                // 证明帧解码失败 → 回显升级提示（T6）。
+                return reject_login(
+                    &shared,
+                    stream,
+                    addr,
+                    format!(
+                        "server requires challenge-response auth; upgrade client (proof decode: {e})"
+                    ),
+                )
+                .await;
+            }
+        },
+        _ => return Ok(()),
+    };
+    let digest = match proof {
+        ControlMsg::Login {
+            auth_digest: Some(d),
+            ..
+        } => d,
+        ControlMsg::Login {
+            auth_digest: None,
+            ..
+        } => {
+            return reject_login(
+                &shared,
+                stream,
+                addr,
+                "server requires challenge-response auth; upgrade client".to_string(),
+            )
+            .await;
+        }
+        other => {
+            return reject_login(
+                &shared,
+                stream,
+                addr,
+                format!("expected auth proof Login, got {other:?}"),
+            )
+            .await;
+        }
+    };
+    // 证明校验（常数时间比较，TNL-SEC-001 延续）：client_digest =
+    // HMAC-SHA256(token, server_nonce ‖ client_nonce)（TNL-PROTO-013）。
+    let expect = crate::auth::client_digest(shared.cfg.token.as_bytes(), &server_nonce, &client_nonce);
+    if !constant_time_eq(&digest, &expect) {
+        // 错误 digest / 重放旧 (nonce,digest) 对（server_nonce 每连接全新）。
+        return reject_login(&shared, stream, addr, "invalid auth digest".to_string()).await;
+    }
+    // ④ 回执（server_digest = HMAC-SHA256(token, client_nonce)，双向认证）
+    // + 会话建立。
+    let receipt = crate::auth::server_digest(shared.cfg.token.as_bytes(), &client_nonce);
+    start_session(
+        shared,
+        stream,
+        addr,
+        login.hostname,
+        login.device_id,
+        login.ed25519_pub,
+        Some(receipt),
+    )
+    .await
+}
+
+/// 拒绝登录：审计 `LoginFailed` + 记握手失败（限流联动 T5）+ 写回
+/// `LoginResp{ok:false}`（带服务器原因，不静默关闭 T6）。
+async fn reject_login(
+    shared: &Arc<ServerShared>,
+    mut stream: TcpStream,
+    addr: SocketAddr,
+    reason: String,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    shared.audit(TunnelAuditEvent::LoginFailed {
+        client: addr,
+        reason: reason.clone(),
+    });
+    shared
+        .rate_limiter
+        .lock()
+        .unwrap()
+        .record_handshake_failure(&addr.ip());
+    warn!("tunnel login failed from {}: {}", addr, reason);
+    let resp = encode_control(&ControlMsg::LoginResp {
+        ok: false,
+        err: Some(reason),
+        server_version: crate::protocol::PROTOCOL_VERSION.to_string(),
+        auth_digest: None,
+    })?;
+    // resp 已是完整帧（encode_control 含帧头）→ 直写，勿再套帧头。
+    let _ = stream.write_all(&resp).await;
+    Ok(())
+}
+
+/// 认证通过后的会话建立（速率复位 + 审计 + 会话对象 + 设备注册 +
+/// `LoginResp{ok:true}` + 控制循环）。
+///
+/// M8-T026-P2 (ID-001/ID-004)：`device_id` 存在时登记在线表（同 ID 不同公钥
+/// → 后到者拒绝 + LoginResp{ok:false}）。
+/// M8-T026-P3：`auth_receipt` 为双向认证回执（仅口令模式携带，TNL-SEC-007）。
+async fn start_session(
+    shared: Arc<ServerShared>,
+    stream: TcpStream,
+    addr: SocketAddr,
+    hostname: String,
+    device_id: Option<String>,
+    ed25519_pub: Option<String>,
+    auth_receipt: Option<Vec<u8>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     shared.rate_limiter.lock().unwrap().reset(&addr.ip());
     shared.audit(TunnelAuditEvent::LoginSuccess {
         client: addr,
@@ -481,6 +768,7 @@ async fn handle_login(
             ok: false,
             err: login_err,
             server_version: crate::protocol::PROTOCOL_VERSION.to_string(),
+            auth_digest: None,
         })?;
         session.control_tx.send(resp).ok();
         shared.sessions.lock().unwrap().remove(&session.id);
@@ -491,6 +779,7 @@ async fn handle_login(
         ok: true,
         err: None,
         server_version: crate::protocol::PROTOCOL_VERSION.to_string(),
+        auth_digest: auth_receipt,
     })?;
     session.control_tx.send(resp).map_err(|_| {
         Box::new(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "control channel closed"))
@@ -558,12 +847,44 @@ async fn run_session(shared: Arc<ServerShared>, session: Arc<ClientSession>, mut
                         }
                     }
                     // M8-T026-P2 (ID-005)：候选刷新（含服务器观察地址附加）。
+                    // S-09（审计 F-9）：候选登记归属校验 —— 仅允许会话为其
+                    // 自身注册的 device_id 提交候选（`reg.device_id ==
+                    // session.device_id`）；会话未注册设备（None）或跨设备
+                    // 覆盖（device_id 不一致）→ 丢弃 + 审计，防任意已认证
+                    // 会话投毒/清空其他设备候选列表。
                     TYPE_CANDIDATE_REGISTER => {
                         if let Ok(reg) = decode_extension::<CandidateRegister>(
                             ty, &payload, TYPE_CANDIDATE_REGISTER,
                         ) {
-                            if !shared.registry.update_candidates(&reg.device_id, reg.candidates).await {
-                                warn!("tunnel session {} candidate register for unknown device '{}'", session.id, reg.device_id);
+                            let session_device = session.device_id.lock().unwrap().clone();
+                            match session_device {
+                                None => {
+                                    shared.audit(TunnelAuditEvent::CandidateRegisterRejected {
+                                        client: session.addr,
+                                        device_id: reg.device_id.clone(),
+                                        reason: "session has no registered device".to_string(),
+                                    });
+                                    warn!(
+                                        "tunnel session {} candidate register rejected: no device registered",
+                                        session.id
+                                    );
+                                }
+                                Some(did) if did != reg.device_id => {
+                                    shared.audit(TunnelAuditEvent::CandidateRegisterRejected {
+                                        client: session.addr,
+                                        device_id: reg.device_id.clone(),
+                                        reason: format!("device_id mismatch (session owns '{did}')"),
+                                    });
+                                    warn!(
+                                        "tunnel session {} candidate register rejected: '{}' != session device '{}'",
+                                        session.id, reg.device_id, did
+                                    );
+                                }
+                                Some(_) => {
+                                    if !shared.registry.update_candidates(&reg.device_id, reg.candidates).await {
+                                        warn!("tunnel session {} candidate register for unknown device '{}'", session.id, reg.device_id);
+                                    }
+                                }
                             }
                         }
                     }
@@ -628,11 +949,86 @@ async fn handle_resolve(
 
 /// M8-T026-P2 (§8.1)：控制器数据连接 —— 登记 pending + 牵线目标设备 +
 /// 等待配对（超时 `work_conn_timeout`）→ `TunnelResp` → 双向泵流。
+///
+/// S-03（审计 F-6）：未认证放大攻击防护 —— ① 按源 IP 未认证限速（独立于
+/// Login 限速，`tunnel_conn_rate_limit`，默认 10 次 / 30s）；② `tunnels`
+/// pending 表硬上限（`max_pending_tunnels`，默认 256）；③ 每目标设备同时
+/// 未配对隧道数上限（`max_pending_per_target`，默认 16）。三者任一超限 →
+/// 直接 `TunnelResp{ok:false}` + 审计，**不**向目标设备下发牵线通知
+/// （TunnelRequest），从源头掐断放大攻击。
 async fn handle_tunnel_conn(
     shared: Arc<ServerShared>,
-    stream: TcpStream,
+    mut stream: TcpStream,
+    addr: SocketAddr,
     req: TunnelConn,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // ① 按源 IP 未认证限速（F-6：攻击者 1 字节即可触发目标设备回连）。
+    let decision = shared
+        .tunnel_conn_limiter
+        .lock()
+        .unwrap()
+        .check_connect(&addr.ip());
+    if decision != RateLimitDecision::Allowed {
+        shared.audit(TunnelAuditEvent::RateLimited {
+            client: addr,
+            reason: format!("tunnel conn {:?}", decision),
+        });
+        warn!("tunnel conn rate limited: {} ({:?})", addr, decision);
+        let resp = TunnelResp {
+            ok: false,
+            err: Some(format!("tunnel conn rate limited: {decision:?}")),
+        };
+        let frame = encode_extension(TYPE_TUNNEL_RESP, &resp)?;
+        // frame 已是完整帧 → 直写，勿再套帧头。
+        let _ = stream.write_all(&frame).await;
+        return Ok(());
+    }
+    // ② pending 表硬上限（全局）。
+    if shared.pending_tunnels.load(Ordering::SeqCst) >= shared.cfg.max_pending_tunnels {
+        shared.audit(TunnelAuditEvent::TunnelRelayClosed {
+            target: req.target_peer_id.clone(),
+            conn_id: 0,
+            reason: format!(
+                "pending tunnel limit reached ({})",
+                shared.cfg.max_pending_tunnels
+            ),
+        });
+        let resp = TunnelResp {
+            ok: false,
+            err: Some("pending tunnel limit reached".to_string()),
+        };
+        let frame = encode_extension(TYPE_TUNNEL_RESP, &resp)?;
+        let _ = stream.write_all(&frame).await;
+        return Ok(());
+    }
+    // ③ 每目标设备未配对隧道数上限。
+    let pending_for_target = shared
+        .pending_by_target
+        .lock()
+        .unwrap()
+        .get(&req.target_peer_id)
+        .copied()
+        .unwrap_or(0);
+    if pending_for_target >= shared.cfg.max_pending_per_target {
+        shared.audit(TunnelAuditEvent::TunnelRelayClosed {
+            target: req.target_peer_id.clone(),
+            conn_id: 0,
+            reason: format!(
+                "pending tunnel limit reached for target ({})",
+                shared.cfg.max_pending_per_target
+            ),
+        });
+        let resp = TunnelResp {
+            ok: false,
+            err: Some(format!(
+                "pending tunnel limit reached for target '{}'",
+                req.target_peer_id
+            )),
+        };
+        let frame = encode_extension(TYPE_TUNNEL_RESP, &resp)?;
+        let _ = stream.write_all(&frame).await;
+        return Ok(());
+    }
     let conn_id = match shared
         .registry
         .register_tunnel(&req.target_peer_id, &req.from_peer, stream)
@@ -653,12 +1049,30 @@ async fn handle_tunnel_conn(
             return Ok(());
         }
     };
+    // pending 计数登记（与 registry pending 表插入 1:1 镜像，S-03）。
+    shared.pending_tunnels.fetch_add(1, Ordering::SeqCst);
+    {
+        let mut m = shared.pending_by_target.lock().unwrap();
+        *m.entry(req.target_peer_id.clone()).or_insert(0) += 1;
+    }
     // 等待设备回连配对（8s 超时，对齐 TNL-SERVER-004）。
-    match shared
+    let pair = shared
         .registry
         .wait_for_pair(conn_id, shared.cfg.work_conn_timeout)
-        .await
+        .await;
+    // pending 计数释放（wait_for_pair 返回时条目已从 registry 表移除，
+    // 成功配对或超时取消二者必居其一 —— 与插入 1:1 镜像，S-03）。
+    shared.pending_tunnels.fetch_sub(1, Ordering::SeqCst);
     {
+        let mut m = shared.pending_by_target.lock().unwrap();
+        if let Some(c) = m.get_mut(&req.target_peer_id) {
+            *c -= 1;
+            if *c == 0 {
+                m.remove(&req.target_peer_id);
+            }
+        }
+    }
+    match pair {
         Some((mut controller, mut device)) => {
             shared.audit(TunnelAuditEvent::TunnelRelayOpened {
                 target: req.target_peer_id.clone(),
@@ -1145,18 +1559,6 @@ fn push_task(session: &ClientSession, handle: AbortHandle) {
 /// 随机 conn_id（uuid 随机源；会话内/全局碰撞概率可忽略）。
 fn random_conn_id() -> u64 {
     uuid::Uuid::new_v4().as_u128() as u64
-}
-
-/// 常数时间字符串比较（TNL-SEC-001，防时序侧信道）。
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 #[cfg(test)]

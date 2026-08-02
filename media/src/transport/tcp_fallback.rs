@@ -34,13 +34,24 @@ use crate::transport::{
 /// TCP(SecureChannel) 媒体传输。给定已握手的 SecureChannel 构造。
 pub struct TcpMediaTransport {
     inner: SecureChannelTransport,
+    /// R-04：音频包缓冲通道发送端（`recv_frame` 内按 ChannelTag 分流）。
+    audio_tx: Option<std::sync::mpsc::Sender<crate::decoder::AudioPacket>>,
+    /// R-04：音频包缓冲通道接收端（会话取出交给 `AudioDecodePipeline`）。
+    audio_rx: Option<std::sync::mpsc::Receiver<crate::decoder::AudioPacket>>,
+    /// R-04：音频接收是否启用（`take_audio_receiver` 置 true；false → 丢弃）。
+    audio_buffering: bool,
 }
 
 impl TcpMediaTransport {
     /// 包装已握手的 SecureChannel（对称 transport.rs 的 SecureChannelTransport::new）。
     pub fn new(channel: SecureChannel) -> Self {
+        // R-04：音频缓冲通道随传输创建（传输 drop → 发送端关闭 → 音频线程退出）。
+        let (audio_tx, audio_rx) = std::sync::mpsc::channel();
         Self {
             inner: SecureChannelTransport::new(channel),
+            audio_tx: Some(audio_tx),
+            audio_rx: Some(audio_rx),
+            audio_buffering: false,
         }
     }
 
@@ -84,6 +95,19 @@ impl MediaTransport for TcpMediaTransport {
 
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
         Some(self)
+    }
+
+    // R-04：音频包 → tag=Audio 走 SecureChannel 既有通道（wire 格式与
+    // SecureChannel 阶段字节流完全兼容，接收侧 recv_tagged 按 tag 分派）。
+    async fn send_audio(&mut self, pkts: &[EncodedPacket]) -> Result<(), TransportError> {
+        self.inner.send_packets(pkts).await
+    }
+
+    fn take_audio_receiver(&mut self) -> Option<std::sync::mpsc::Receiver<crate::decoder::AudioPacket>> {
+        // 启用音频缓冲（recv_frame 据此分流）；再次调用返回 None（已取出）。
+        let rx = self.audio_rx.take()?;
+        self.audio_buffering = true;
+        Some(rx)
     }
 
     async fn send_window(&mut self, window: &EncodedWindow) -> Result<(), TransportError> {
@@ -141,8 +165,25 @@ impl MediaTransport for TcpMediaTransport {
                         data: payload,
                     });
                 }
+                ChannelTag::Audio => {
+                    // R-04：音频包 → 缓冲通道（会话交给 AudioDecodePipeline）；
+                    // 未启用（take_audio_receiver 未被调用）→ 丢弃，不缓冲。
+                    let pkt = crate::decoder::AudioPacket {
+                        pts: header.pts,
+                        data: payload,
+                    };
+                    if self.audio_buffering {
+                        if let Some(tx) = &self.audio_tx {
+                            if tx.send(pkt).is_err() {
+                                // 接收端已关闭（会话结束）→ 停止缓冲。
+                                self.audio_buffering = false;
+                            }
+                        }
+                    }
+                    continue;
+                }
                 other => {
-                    // 方向性错误：媒体接收路径收到 Audio/Input/Control →
+                    // 方向性错误：媒体接收路径收到 Input/Control →
                     // 丢弃并继续（与 recv_input_payload 同款策略）。
                     warn!(
                         "TcpMediaTransport: expected Video tag, got {:?}; dropping",
@@ -263,7 +304,7 @@ mod tests {
             "test.example",
             "tester",
             &server_id,
-            &server_pub,
+            kirin_desk_core::crypto::handshake::PinExpectation::exact_from_base64(&server_pub).expect("server pubkey"),
             "challenge",
         )
         .await
@@ -467,12 +508,13 @@ mod tests {
         }
     }
 
-    /// recv_frame 遇到 Audio tag → 丢弃并继续收到 Video。
+    /// recv_frame 遇到 Audio tag → R-04：转入音频缓冲通道（recv 视频不受
+    /// 干扰）；未启用音频时丢弃。
     #[tokio::test]
     async fn test_wrong_tag_dropped() {
         let (mut server, mut client) = make_transport_pair().await;
 
-        // 服务端先发 Audio（客户端 recv_frame 应跳过），再发两个 Video。
+        // 服务端先发 Audio（客户端 recv_frame 应转入音频通道），再发两个 Video。
         server
             .inner
             .send_packets(&[
@@ -483,11 +525,40 @@ mod tests {
             .await
             .expect("send packets");
 
+        // 未启用音频（take_audio_receiver 未被调用）→ 音频包被丢弃，视频照常。
         let f1 = client.recv_frame().await.expect("recv frame 1");
         assert_eq!(f1.data, vec![0x11; 32]);
 
         let f2 = client.recv_frame().await.expect("recv frame 2");
         assert_eq!(f2.data, vec![0x22; 32]);
+
+        // 启用音频 → 音频包进入缓冲通道（PTS/数据完整），视频仍照常返回。
+        let (mut server2, mut client2) = make_transport_pair().await;
+        let audio_rx = client2.take_audio_receiver().expect("audio receiver");
+        server2
+            .inner
+            .send_packets(&[
+                make_packet(PacketKind::Audio, vec![0xEE; 16], true),
+                make_packet(PacketKind::Video, vec![0x33; 32], true),
+            ])
+            .await
+            .expect("send packets");
+
+        let v = client2.recv_frame().await.expect("recv video");
+        assert_eq!(v.data, vec![0x33; 32], "video unaffected by audio dispatch");
+
+        // 音频包经缓冲通道可消费（std mpsc，会话侧 AudioDecodePipeline 读取）。
+        let audio = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match audio_rx.recv() {
+                    Ok(p) => return p,
+                    Err(_) => panic!("audio channel closed unexpectedly"),
+                }
+            }
+        })
+        .await
+        .expect("audio packet should arrive");
+        assert_eq!(audio.data, vec![0xEE; 16]);
     }
 
     /// close 后对端 recv 返回错误（TCP FIN 传播）。

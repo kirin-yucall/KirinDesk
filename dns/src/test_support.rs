@@ -56,6 +56,12 @@ impl MockDns {
             }
         });
 
+        // S-14a 测试放行：显式打开"当前测试线程"的 http 放行开关（仅 cfg(test)
+        // 编译，生产二进制不可达）。必须放在最后一个 await 之后——保证与调用方
+        // 随后构造 GoDaddyClient 的代码在同一线程（无迁移点），线程本地状态
+        // 不会被 tokio 多线程运行时换线程打散。
+        crate::godaddy::client::allow_http_for_tests();
+
         Self { state, addr }
     }
 

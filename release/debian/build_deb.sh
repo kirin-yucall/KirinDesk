@@ -15,6 +15,9 @@
 # 依赖：libssl3 / libx11-6 / libwayland-client0 / ffmpeg（见 control.in）
 # 注意：程序 dlopen 的是 libavcodec.so.62（FFmpeg 8）；Ubuntu 24.04 自带
 #       FFmpeg 6（libavcodec60），需系统 FFmpeg 8 或后续随包内嵌 .so。
+#       （R-22 版本断言：主版本 ≠ 8 时拒绝加载；R-14-S2 回退表仅覆盖
+#       8.x minor。随包内嵌 FFmpeg 8 .so 时放到 /usr/lib/kirindesk/ffmpeg/
+#       —— dlls.rs Linux 搜索路径已预留该布局。）
 
 set -euo pipefail
 

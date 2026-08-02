@@ -24,8 +24,14 @@ pub const ECHO_SUPPRESS_MS: u64 = 1000;
 /// 单帧剪贴板分片负载上限（SecureChannel 单帧 ~1200B，留帧头/加密余量）。
 pub const MAX_CLIP_CHUNK: usize = 1000;
 
-/// 远端单次推送总长度上限（1MB，防内存膨胀）。
-pub const MAX_CLIP_TOTAL: usize = 1024 * 1024;
+/// 远端单次推送总长度上限（8 MiB，防内存膨胀）。
+/// S-11a（F-13）：该上限为**累计**语义——START→END 期间重组缓冲总长不得超过
+/// 此值（原实现只校验单片，START + 永不发 END 的分片流可无界增长）。
+/// 取值依据（任务文档 §7 执行记录）：发送侧无总长裁剪，合法大文本/图片
+/// base64 剪贴板可超过 1MB 以分片形式到达——8 MiB 覆盖此类合法用例且与
+/// 本批次 S-11c 的媒体单帧上限 `MAX_FRAME_BYTES`(8 MiB) 口径一致；超出
+/// 部分属异常输入，逐片累计超限即清空重组缓冲（单连接内存上界 8 MiB）。
+pub const MAX_CLIP_TOTAL: usize = 8 * 1024 * 1024;
 
 /// 分片标志：START（首片）。
 pub const CLIP_FLAG_START: u8 = 0x01;
@@ -147,6 +153,15 @@ impl ClipboardSyncState {
             self.reassembly = Some(Vec::new());
         }
         if let Some(buf) = self.reassembly.as_mut() {
+            // S-11a（F-13）：追加前累计上限检查——重组缓冲 + 本片不得超过
+            // MAX_CLIP_TOTAL，超限清空缓冲并丢弃本次流（缓冲有界）。
+            // 合法用例不受影响：编码侧单片 ≤ MAX_CLIP_CHUNK(1000B)，总长
+            // ≤ MAX_CLIP_TOTAL 的合法分片流逐片追加必然通过本检查（取值依据
+            // 见任务文档 §7）。
+            if buf.len().saturating_add(chunk.len()) > MAX_CLIP_TOTAL {
+                self.reassembly = None;
+                return;
+            }
             buf.extend_from_slice(chunk);
         }
         if flags & CLIP_FLAG_END != 0 {
@@ -329,5 +344,79 @@ mod tests {
         // 首字节 = START|END（单片）
         assert_eq!(pkts[0].data[0], CLIP_FLAG_START | CLIP_FLAG_END);
         assert_eq!(&pkts[0].data[1..], "你好 KirinDesk".as_bytes());
+    }
+
+    #[test]
+    fn test_malicious_stream_bounded_by_total_limit() {
+        // S-11d（F-13）：START + 永不发 END 的恶意分片流 → 累计超过
+        // MAX_CLIP_TOTAL 后重组缓冲被清空：不写入本地、内存有界、不 panic。
+        let mut st = ClipboardSyncState::new();
+        let mut io = FakeClipboard::new();
+
+        // START 片（首片，无 END）：文本须超过单片容量，首片才不带 END。
+        let start_text = "x".repeat(MAX_CLIP_CHUNK + 1);
+        let start = encode_clipboard_payloads(&start_text, MAX_CLIP_CHUNK);
+        assert_eq!(start.len(), 2, "超单片容量文本拆 2 片");
+        assert_eq!(start[0][0] & CLIP_FLAG_END, 0, "首片不得带 END");
+        st.apply_remote_frame(0, &start[0], &mut io);
+        assert_eq!(io.set_calls, 0);
+
+        // 中间片（无 START/END 标志），持续追加直到累计超限
+        let mut mid_payload = Vec::with_capacity(1 + MAX_CLIP_CHUNK);
+        mid_payload.push(0u8); // flags = 0
+        mid_payload.resize(1 + MAX_CLIP_CHUNK, b'z');
+        let mut sent = MAX_CLIP_CHUNK;
+        let mut exceeded = false;
+        for _ in 0..(MAX_CLIP_TOTAL / MAX_CLIP_CHUNK + 2) {
+            st.apply_remote_frame(0, &mid_payload, &mut io);
+            sent += MAX_CLIP_CHUNK;
+            if sent > MAX_CLIP_TOTAL {
+                exceeded = true;
+                break;
+            }
+        }
+        assert!(exceeded, "测试必须覆盖超限场景");
+        assert_eq!(io.set_calls, 0, "未收到 END 且超限 → 不应写入本地");
+
+        // 缓冲已清空：随后的合法 START→END 流可正常重组（无残留污染）
+        let good = encode_clipboard_payloads("after-overflow-ok", MAX_CLIP_CHUNK);
+        for f in &good {
+            st.apply_remote_frame(1000, f, &mut io);
+        }
+        assert_eq!(io.last_set.as_deref(), Some("after-overflow-ok"));
+    }
+
+    #[test]
+    fn test_legal_total_at_limit_still_reassembles() {
+        // S-11d（回归）：恰好等于 MAX_CLIP_TOTAL 的合法分片文本不受累计检查影响。
+        let text = "K".repeat(MAX_CLIP_TOTAL);
+        let frames = encode_clipboard_payloads(&text, MAX_CLIP_CHUNK);
+        assert!(frames.len() > 1, "8 MiB 文本必须分片");
+
+        let mut st = ClipboardSyncState::new();
+        let mut io = FakeClipboard::new();
+        for f in &frames {
+            st.apply_remote_frame(0, f, &mut io);
+        }
+        assert_eq!(io.last_set.as_deref(), Some(text.as_str()));
+        assert_eq!(io.set_calls, 1);
+    }
+
+    #[test]
+    fn test_legal_large_transfer_over_1mb_reassembles() {
+        // S-11d（回归，取值依据）：合法大文本超过 1MB（2 MiB，分片到达）
+        // 不得被累计上限误伤——MAX_CLIP_TOTAL(8 MiB) 需覆盖此类合法用例。
+        let text = "KirinDesk 剪贴板大文本".repeat(60_000); // ~2.1 MiB
+        assert!(text.len() > 1024 * 1024, "用例必须超过旧 1MB 上限");
+        let frames = encode_clipboard_payloads(&text, MAX_CLIP_CHUNK);
+        assert!(frames.len() > 1000, "2 MiB 文本拆千余片");
+
+        let mut st = ClipboardSyncState::new();
+        let mut io = FakeClipboard::new();
+        for f in &frames {
+            st.apply_remote_frame(0, f, &mut io);
+        }
+        assert_eq!(io.last_set.as_deref(), Some(text.as_str()));
+        assert_eq!(io.set_calls, 1);
     }
 }

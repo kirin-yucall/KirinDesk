@@ -3,6 +3,23 @@
 //! 媒体帧的分片、加密、组装。
 //! 每帧拆分为多个 DATAGRAM（~1172 字节原始数据），
 //! 接收端根据 header 中的 frame_id/packet_index 重组。
+//!
+//! # R-04（音频接线）：DATAGRAM 头新增 kind 字节
+//!
+//! 音频包与视频包同走 DATAGRAM（P1F：可丢、不同优先级），接收端必须按
+//! type 区分。DATAGRAM 头在既有 `frame_id/packet_index/total/flags` 基础上
+//! 追加 1B `kind`（[`PacketKindWire`] 的 Video/Audio 值，0x01/0x02）：
+//!
+//! ```text
+//! frame_id(8B LE) + packet_index(2B LE) + total_packets(2B LE) + kind(1B) + flags(2B LE) = 15B
+//! ```
+//!
+//! - 视频：payload = NAL 分片（同旧布局，仅多 1B kind）。
+//! - 音频：payload = `PacketHeader(21B) + Opus`（[`stream::frame_packet`] 产出，
+//!   携带 PTS/首包标记；音频恒单 DATAGRAM，不分片）。
+//!
+//! [`PacketKindWire`]: crate::transport::stream::PacketKindWire
+//! [`stream::frame_packet`]: crate::transport::stream::frame_packet
 
 use crate::transport::{MediaCipher, QuicConnection, TransportError};
 
@@ -16,8 +33,11 @@ pub const MAX_DATAGRAM_SIZE: usize = 1200;
 /// AEAD 加密开销：12B nonce + 16B tag = 28 bytes。
 pub const AEAD_OVERHEAD: usize = 12 + 16;
 
-/// DATAGRAM 帧头部大小：frame_id(8B) + packet_index(2B) + total_packets(2B) + flags(2B) = 14B。
-pub const FRAME_HEADER_SIZE: usize = 14;
+/// DATAGRAM 帧头部大小：frame_id(8B) + packet_index(2B) + total_packets(2B)
+/// + kind(1B) + flags(2B) = 15B。
+///
+/// R-04：14B → 15B（新增 kind 字节，见[模块文档](self)）。
+pub const FRAME_HEADER_SIZE: usize = 15;
 
 // ════════════════════════════════════════════════════════════════
 // FramePacket — 接收端返回的已组装帧
@@ -42,10 +62,15 @@ pub struct FramePacket {
 // ════════════════════════════════════════════════════════════════
 
 /// 加密并发送一帧（可能含多个 DATAGRAM 分片）。
+///
+/// `kind` = [`PacketKindWire`](crate::transport::stream::PacketKindWire) 的
+/// wire 字节（视频 0x01 / 音频 0x02）——接收端据此分派（R-04：音频包与
+/// 视频包同通道区分 type）。
 pub async fn send_encrypted_frame(
     conn: &QuicConnection,
     cipher: &MediaCipher,
     frame_id: u64,
+    kind: u8,
     nal_data: &[u8],
     is_key: bool,
     is_window_end: bool,
@@ -60,7 +85,7 @@ pub async fn send_encrypted_frame(
 
     let total = packets.len() as u16;
     for (i, chunk) in packets.iter().enumerate() {
-        // 构建明文 payload: header (14B) + NAL data
+        // 构建明文 payload: header (15B) + NAL data
         let flags = (if is_key { 0x01u16 } else { 0x00 })
             | (if i == total as usize - 1 { 0x02 } else { 0x00 })
             | (if is_window_end { 0x04 } else { 0x00 });
@@ -69,8 +94,9 @@ pub async fn send_encrypted_frame(
         plain.extend_from_slice(&frame_id.to_le_bytes()); // 8B
         plain.extend_from_slice(&(i as u16).to_le_bytes()); // 2B
         plain.extend_from_slice(&total.to_le_bytes()); // 2B
+        plain.push(kind); // 1B（R-04：视频/音频分派）
         plain.extend_from_slice(&flags.to_le_bytes()); // 2B
-        plain.extend_from_slice(chunk); // NAL data
+        plain.extend_from_slice(chunk); // NAL data / stream 帧包
 
         // 加密（AEAD 自动加 nonce + tag）
         let ciphertext = cipher.encrypt(&plain)?;
@@ -88,11 +114,13 @@ pub async fn send_encrypted_frame(
 
 /// 接收并解密一个 DATAGRAM。
 ///
-/// 返回 `(frame_id, packet_index, total_packets, flags, payload)`。
+/// 返回 `(frame_id, packet_index, total_packets, kind, flags, payload)`。
+/// `kind` = [`PacketKindWire`](crate::transport::stream::PacketKindWire) wire
+/// 字节——接收端按此把音频包从媒体通道中分派出来（R-04）。
 pub async fn recv_encrypted_datagram(
     conn: &QuicConnection,
     cipher: &MediaCipher,
-) -> Result<(u64, u16, u16, u16, Vec<u8>), TransportError> {
+) -> Result<(u64, u16, u16, u8, u16, Vec<u8>), TransportError> {
     // 接收 DATAGRAM
     let data = conn.recv_datagram().await?;
 
@@ -110,10 +138,11 @@ pub async fn recv_encrypted_datagram(
     let frame_id = u64::from_le_bytes(plain[0..8].try_into().unwrap());
     let packet_idx = u16::from_le_bytes(plain[8..10].try_into().unwrap());
     let total = u16::from_le_bytes(plain[10..12].try_into().unwrap());
-    let flags = u16::from_le_bytes(plain[12..14].try_into().unwrap());
-    let payload = plain[14..].to_vec();
+    let kind = plain[12];
+    let flags = u16::from_le_bytes(plain[13..15].try_into().unwrap());
+    let payload = plain[15..].to_vec();
 
-    Ok((frame_id, packet_idx, total, flags, payload))
+    Ok((frame_id, packet_idx, total, kind, flags, payload))
 }
 
 #[cfg(test)]
@@ -146,13 +175,13 @@ mod tests {
 
     #[test]
     fn test_max_payload_calculation() {
-        // 1200 - 28 - 14 = 1158 bytes per datagram
+        // 1200 - 28 - 15 = 1157 bytes per datagram
         assert_eq!(MAX_DATAGRAM_SIZE, 1200);
         assert_eq!(AEAD_OVERHEAD, 28);
-        assert_eq!(FRAME_HEADER_SIZE, 14);
-        // max_payload for NAL data: 1200 - 28 - 14 = 1158
+        assert_eq!(FRAME_HEADER_SIZE, 15);
+        // max_payload for NAL data: 1200 - 28 - 15 = 1157
         let max_payload = MAX_DATAGRAM_SIZE - AEAD_OVERHEAD - FRAME_HEADER_SIZE;
-        assert_eq!(max_payload, 1158);
+        assert_eq!(max_payload, 1157);
     }
 
     #[test]
@@ -160,6 +189,7 @@ mod tests {
         let cipher = MediaCipher::new(&make_test_key());
         let nal_data = vec![0xABu8; 100];
         let frame_id = 42u64;
+        let kind = 0x01; // PacketKindWire::Video（R-04 kind 字节）
         let is_key = true;
         let is_window_end = false;
 
@@ -181,6 +211,7 @@ mod tests {
             plain.extend_from_slice(&frame_id.to_le_bytes());
             plain.extend_from_slice(&(i as u16).to_le_bytes());
             plain.extend_from_slice(&total.to_le_bytes());
+            plain.push(kind);
             plain.extend_from_slice(&flags.to_le_bytes());
             plain.extend_from_slice(chunk);
 
@@ -193,12 +224,14 @@ mod tests {
             let got_frame_id = u64::from_le_bytes(decrypted[0..8].try_into().unwrap());
             let got_idx = u16::from_le_bytes(decrypted[8..10].try_into().unwrap());
             let got_total = u16::from_le_bytes(decrypted[10..12].try_into().unwrap());
-            let got_flags = u16::from_le_bytes(decrypted[12..14].try_into().unwrap());
-            let got_payload = &decrypted[14..];
+            let got_kind = decrypted[12];
+            let got_flags = u16::from_le_bytes(decrypted[13..15].try_into().unwrap());
+            let got_payload = &decrypted[15..];
 
             assert_eq!(got_frame_id, frame_id);
             assert_eq!(got_idx, i as u16);
             assert_eq!(got_total, total);
+            assert_eq!(got_kind, kind, "kind byte survives roundtrip");
             assert_eq!(got_flags, flags);
             assert_eq!(got_payload, *chunk);
         }
@@ -207,12 +240,12 @@ mod tests {
     #[test]
     fn test_datagram_multi_packet() {
         let cipher = MediaCipher::new(&make_test_key());
-        // Create data larger than max_payload (1158)
+        // Create data larger than max_payload (1157)
         let big_nal = vec![0xCDu8; 3000];
 
         let max_payload = MAX_DATAGRAM_SIZE - AEAD_OVERHEAD - FRAME_HEADER_SIZE;
         let packets: Vec<&[u8]> = big_nal.chunks(max_payload).collect();
-        // 3000 / 1158 → 3 chunks (1158 + 1158 + 684)
+        // 3000 / 1157 → 3 chunks (1157 + 1157 + 686)
         assert_eq!(packets.len(), 3);
 
         let total = packets.len() as u16;
@@ -225,20 +258,23 @@ mod tests {
             plain.extend_from_slice(&0u64.to_le_bytes());
             plain.extend_from_slice(&(i as u16).to_le_bytes());
             plain.extend_from_slice(&total.to_le_bytes());
+            plain.push(0x01);
             plain.extend_from_slice(&flags.to_le_bytes());
             plain.extend_from_slice(chunk);
 
             let ciphertext = cipher.encrypt(&plain).unwrap();
             let decrypted = cipher.decrypt(&ciphertext).unwrap();
 
-            let got_flags = u16::from_le_bytes(decrypted[12..14].try_into().unwrap());
-            let payload = &decrypted[14..];
+            let got_kind = decrypted[12];
+            let got_flags = u16::from_le_bytes(decrypted[13..15].try_into().unwrap());
+            let payload = &decrypted[15..];
             assembled.extend_from_slice(payload);
 
             // Last packet has LAST_PACKET flag
             if i == total as usize - 1 {
                 assert_eq!(got_flags & 0x02, 0x02);
             }
+            assert_eq!(got_kind, 0x01);
         }
 
         assert_eq!(assembled.len(), 3000);

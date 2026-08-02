@@ -87,7 +87,7 @@ async fn transport_window_flow() {
 
     let client_handle = tokio::spawn(async move {
         let mut t = connect_quic_transport(
-            addr, &client_im, &client_id, "flow.example", "desktop", &server_id, &server_pub, "challenge",
+            addr, &client_im, &client_id, "flow.example", "desktop", &server_id, kirin_desk_core::crypto::handshake::PinExpectation::exact_from_base64(&server_pub).expect("server pubkey"), "challenge",
         )
         .await
         .unwrap();

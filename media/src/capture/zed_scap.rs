@@ -221,6 +221,8 @@ pub fn enumerate_monitors() -> Result<Vec<MonitorInfo>, CaptureError> {
                 width: 0,
                 height: 0,
                 is_primary: i == 0, // ScreenCaptureKit 首个 display 为主显示器
+                // M8-T030（R-06）：macOS 无虚拟屏概念，恒 false。
+                is_virtual: false,
             });
         }
     }

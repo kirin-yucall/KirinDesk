@@ -81,9 +81,8 @@ pub struct AudioPcm {
 /// - Windows：[`WasapiLoopbackCapture`]（WASAPI 环回，float32 native）。
 /// - macOS：[`MacOsAudioCapture`]（CoreAudio AudioUnit HALOutput 环回，
 ///   M12-MAC MAC-T003，float32 非交织 → interleaved）。
-/// - Linux：留桩（[`create_default_capture`] 返回
-///   [`UnsupportedPlatform`](EncodeError::UnsupportedPlatform)，音频禁用，
-///   P1D-linux 阶段实现）。
+/// - Linux：[`PipeWireCapture`]（PipeWire 环回：pw_stream + 
+///   `STREAM_CAPTURE_SINK`，M13-T001 Linux 侧 / R-14-S4，float32）。
 ///
 /// # 线程模型
 ///
@@ -109,10 +108,9 @@ pub trait AudioCapture: Send {
 ///
 /// - Windows：WASAPI 环回（`GetDefaultAudioEndpoint(eRender, eConsole)` loopback）。
 /// - macOS：CoreAudio AudioUnit（HALOutput 环回，M12-MAC MAC-T003）。
-/// - Linux：返回 [`UnsupportedPlatform`](EncodeError::UnsupportedPlatform)
-///   （音频禁用，视频/键鼠不受影响；P1D-linux 阶段实现）。
+/// - Linux：PipeWire 环回（pw_stream + STREAM_CAPTURE_SINK，R-14-S4）。
 ///
-/// 无环回设备（无声卡/被占用）→ `Err(InitFailed)`，**不影响视频/键鼠**
+/// 无环回设备（无声卡/被占用/无 PipeWire）→ `Err(InitFailed)`，**不影响视频/键鼠**
 /// （调用方在独立线程里创建，失败即放弃音频）。
 pub fn create_default_capture() -> Result<Box<dyn AudioCapture>, EncodeError> {
     #[cfg(target_os = "windows")]
@@ -123,11 +121,14 @@ pub fn create_default_capture() -> Result<Box<dyn AudioCapture>, EncodeError> {
     {
         Ok(Box::new(MacOsAudioCapture::new()?))
     }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    #[cfg(target_os = "linux")]
     {
-        // P1D-linux 阶段实现：Pipewire monitor。
+        Ok(Box::new(pipewire::PipeWireCapture::new()?))
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
         Err(EncodeError::UnsupportedPlatform(format!(
-            "audio capture not implemented on {} (P1D-linux 阶段)",
+            "audio capture not implemented on {}",
             std::env::consts::OS,
         )))
     }
@@ -146,6 +147,13 @@ mod macos;
 
 #[cfg(target_os = "macos")]
 pub use macos::MacOsAudioCapture;
+
+// ── Linux PipeWire 环回（M13-T001 Linux 侧 / R-14-S4） ─────────
+#[cfg(target_os = "linux")]
+mod pipewire;
+
+#[cfg(target_os = "linux")]
+pub use pipewire::PipeWireCapture;
 
 // ════════════════════════════════════════════════════════════════
 // OpusEncoder — FFmpeg libopus 编码

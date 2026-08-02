@@ -127,28 +127,74 @@ impl GraphicsCaptureApiHandler for WcHandler {
 // 显示器枚举（windows-capture 唯一后端，替代旧 GDI/DXGI 枚举）
 // ════════════════════════════════════════════════════════════════
 
-/// 枚举所有显示器。
-pub fn enumerate_monitors() -> Result<Vec<MonitorInfo>, CaptureError> {
+/// 显示器名称是否虚拟（M8-T030 §3.3 显示器关键词表；大小写不敏感子串匹配）。
+///
+/// `virtual_keywords`（全局偏好）非空时覆盖默认表（适配器 + 显示器共用开关）。
+fn is_virtual_monitor(name: &str) -> bool {
+    let prefs = crate::gpu::preferences();
+    if prefs.virtual_keywords.is_empty() {
+        crate::gpu::matches_keywords(name, crate::gpu::DEFAULT_MONITOR_KEYWORDS)
+    } else {
+        let kw: Vec<&str> = prefs.virtual_keywords.iter().map(|s| s.as_str()).collect();
+        crate::gpu::matches_keywords(name, &kw)
+    }
+}
+
+/// 枚举显示器（M8-T030 过滤虚拟屏），返回过滤后列表 + 索引映射。
+///
+/// `real_indices[i]` = 过滤后索引 `i` → windows-capture **1-based 全量索引**
+/// （设计文档 §3.6，消除"过滤列表索引 vs 全量索引错位"隐患）。
+///
+/// - `filter_virtual`（全局偏好，默认 true）时按名称关键词剔除虚拟屏；
+///   关闭时全部保留（`is_virtual` 字段仍标记，供审计）。
+/// - 过滤后 `MonitorInfo.id` 重新编号为过滤位置（0-based 连续），
+///   `switch_monitor` 与 wire 索引（`DisplayInfo.index`）天然一致。
+fn enumerate_monitors_filtered() -> Result<(Vec<MonitorInfo>, Vec<usize>), CaptureError> {
     let monitors = Monitor::enumerate()
         .map_err(|e| CaptureError::Capture(format!("Monitor::enumerate: {e}")))?;
     let primary_raw = Monitor::primary()
         .map(|m| m.as_raw_hmonitor())
         .unwrap_or(std::ptr::null_mut());
+    let filter_virtual = crate::gpu::preferences().filter_virtual;
+    let total = monitors.len();
 
-    let mut out = Vec::with_capacity(monitors.len());
+    let mut out = Vec::with_capacity(total);
+    let mut real_indices = Vec::with_capacity(total);
     for (i, m) in monitors.into_iter().enumerate() {
+        let name = m.name().unwrap_or_default();
+        let is_virtual = is_virtual_monitor(&name);
+        if filter_virtual && is_virtual {
+            tracing::debug!(
+                "Monitor: filtered virtual display '{name}' (1-based full index {})",
+                i + 1
+            );
+            continue;
+        }
         out.push(MonitorInfo {
-            id: i,
-            name: m.name().unwrap_or_default(),
+            id: out.len(), // 过滤后位置重新编号（0-based 连续）。
+            name,
             width: m.width().unwrap_or(0),
             height: m.height().unwrap_or(0),
             is_primary: m.as_raw_hmonitor() == primary_raw,
+            is_virtual,
         });
+        real_indices.push(i + 1); // windows-capture 1-based 全量索引。
     }
     if out.is_empty() {
         return Err(CaptureError::NoMonitor);
     }
-    Ok(out)
+    tracing::info!(
+        "Monitor: enumerated {} monitor(s), {} virtual filtered ({} real)",
+        total,
+        total - out.len(),
+        out.len()
+    );
+    Ok((out, real_indices))
+}
+
+/// 枚举所有显示器（过滤虚拟屏；公开 API，供 factory::list_monitors）。
+pub fn enumerate_monitors() -> Result<Vec<MonitorInfo>, CaptureError> {
+    enumerate_monitors_filtered().map(|(list, _)| list)
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -165,6 +211,9 @@ pub struct WindowsCaptureBackend {
     stop_flag: Arc<AtomicBool>,
     /// 显示器列表
     monitors: Vec<MonitorInfo>,
+    /// M8-T030（R-06）：过滤后索引 → windows-capture 1-based 全量索引映射
+    /// （虚拟屏剔除后 `Monitor::from_index` 必须用全量索引，否则列表错位）。
+    real_indices: Vec<usize>,
     /// 当前显示器索引
     monitor_index: usize,
     /// 当前分辨率
@@ -179,16 +228,17 @@ unsafe impl Send for WindowsCaptureBackend {}
 impl WindowsCaptureBackend {
     /// 创建 windows-capture 后端。
     ///
-    /// `monitor_index`: 0-based 显示器索引。
+    /// `monitor_index`: 0-based 显示器索引（过滤虚拟屏后的位置）。
     pub fn new(monitor_index: usize) -> Result<Self, CaptureError> {
-        // 1. 枚举显示器（windows-capture 唯一后端）
-        let monitors = enumerate_monitors()?;
+        // 1. 枚举显示器（M8-T030 过滤虚拟屏；windows-capture 唯一后端）
+        let (monitors, real_indices) = enumerate_monitors_filtered()?;
         if monitor_index >= monitors.len() {
             return Err(CaptureError::InvalidMonitor);
         }
 
-        // 2. 使用 windows-capture 的 Monitor API 获取显示器（1-based index）
-        let wc_monitor = Monitor::from_index(monitor_index + 1) // 1-based
+        // 2. 使用 windows-capture 的 Monitor API 获取显示器（1-based 全量索引
+        //    ——经 real_indices 映射，消除虚拟屏过滤后的索引错位）。
+        let wc_monitor = Monitor::from_index(real_indices[monitor_index])
             .map_err(|e| CaptureError::Capture(format!("Monitor::from_index: {e}")))?;
         let w = wc_monitor.width().unwrap_or(monitors[monitor_index].width);
         let h = wc_monitor
@@ -228,6 +278,7 @@ impl WindowsCaptureBackend {
             capture_control: Some(capture_control),
             stop_flag,
             monitors,
+            real_indices,
             monitor_index,
             width: w,
             height: h,
@@ -310,8 +361,8 @@ impl ScreenCaptureSource for WindowsCaptureBackend {
         // Stop old capture
         self.stop_capture();
 
-        // Start new capture
-        let wc_monitor = Monitor::from_index(index + 1)
+        // Start new capture（M8-T030：经 real_indices 映射全量索引）。
+        let wc_monitor = Monitor::from_index(self.real_indices[index])
             .map_err(|e| CaptureError::Capture(format!("Monitor::from_index: {e}")))?;
         let w = wc_monitor.width().unwrap_or(self.monitors[index].width);
         let h = wc_monitor.height().unwrap_or(self.monitors[index].height);

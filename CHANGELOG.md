@@ -7,6 +7,19 @@
 ## [Unreleased]
 
 ### Added
+- R-02 握手 pin 强制加固（安全收尾 P0，审计 P3-17）：
+  - `core` 新增强类型 `PinExpectation { None(CoreReason), Exact([u8;32]) }` / `CoreReason { InternalLoopback, UserConfirmRequired }`；`client_handshake_generic` / `client_handshake_with_confirm_generic` / `client_handshake` / `client_handshake_with_confirm` 的 pin 参数全部强类型化——**删除"空串 = 跳过 pin 比对"的旧版兼容路径**（`None(UserConfirmRequired)` 无确认回调即拒绝，杜绝信任网络公钥）
+  - loopback 自签兜底：`None(InternalLoopback)` 以客户端自身公钥强制比对（服务端 = 自身），`PunchConfig::loopback` / `PunchHandshake.peer_pin` 不再有空串形态；`PinExpectation::resolve_base64` 供服务端角色（punch）解析
+  - 调用点显式化：`core`（punch、shell/file_transfer e2e）、`media`（`PunchMediaCreds.peer_pin`、`ClientDegrade.server_pin`、`connect_quic_transport(_on)` / `connect_media_transport` 参数）、`ui`（cli.rs 全部连接命令 + self-test、lib.rs `ClientTrust` 两分支）——grep 空串 pin 零命中
+  - 新增用例：空 pin 拒绝（无回调 `UntrustedKey`）、loopback 自签通过/非自签拒绝（`ServerKeyMismatch`）、错误 pin 拒绝回归；core 138 项 + media 363 项 + e2e 全过
+- M8-T030 单 GPU 硬件加速与虚拟设备过滤（R-06）：
+  - `media/src/gpu/` 新建：`AdapterInfo/AdapterKind/GpuPreference/GpuPreferences` + 厂商分类（Intel 0x8086 / NVIDIA 0x10DE / AMD 0x1002）+ 虚拟驱动过滤（`DXGI_ADAPTER_FLAG_SOFTWARE` / vendor 0x1414 / 关键词黑名单 sunlogin·oray·向日葵·virtual·idd·parsec·spacedesk 等，可配置覆盖）+ 单 GPU 选择策略（LUID 显式 → 过滤 → 类别 → auto → None）；`OnceLock` 首用缓存（GPU-NF-006）
+  - Windows DXGI `EnumAdapters1` 枚举（`media/src/gpu/windows.rs`）+ 选定适配器上创建 D3D11 设备（`KgpuKernel::init` 复用入口，GPU-FR-006）
+  - 编码/解码 HW 设备显式绑定：`av_hwdevice_ctx_create` 按候选设备串绑定选定 GPU（`ffmpeg_hw.rs` 两侧）。**R-06 实测定案**：FFmpeg 8.1.2 d3d11va 设备串只接受十进制适配器索引（`atoi` 解析；LUID 十六进制静默变 0 无效）——`device_strings` 输出 `[DXGI 枚举索引]`；候选非空全失败 → 回退链继续（env=nvidia 时 qsv MFX 失败自然落 nvenc 绑定 NVIDIA），候选为空 → None 现状默认设备（GPU-NF-002）
+  - 虚拟显示器过滤：`enumerate_monitors` 按名称关键词剔除虚拟屏 + `MonitorInfo.is_virtual` + `real_indices` 索引映射（过滤后 `switch_monitor` 不错位，GPU-FR-007）
+  - 脏点 CPU 兜底：`TileDiff::classify_cpu` 真实 CPU tile-hash（64×64 tile 全像素 CRC32 + 帧间 diff → 三态决策，与 GPU hash 语义一致），无 GPU 内核时决策链路可用（GPU-FR-008）
+  - 配置 `[media.gpu]`（prefer / filter_virtual / virtual_keywords）+ `KIRIN_GPU_PREFER` env 覆盖（env > config > auto，GPU-FR-009）；设计文档 `task_docs/共享层/M8-T030_单GPU硬件加速与虚拟设备过滤_需求设计.md`
+  - 顺带修复：`SNAPSHOT_FFMPEG_MAJOR` 8→62（`avcodec_version()` 返回 libavcodec 库版本 62.28.102，原值导致 avcodec-62.dll 环境下 FFmpeg 全链路加载失败）；软编 `FfmpegSwEncoder::ensure_codec_dims` free 前 flush（对齐 HW/Drop，libx264 lookahead 线程残留）
 - M8-T018 多显示器查看模式（客户端查看 + 服务端捕获热切换）：
   - 协议：`ControlMessage::DisplayListReq / DisplayListResp / DisplaySelect / DisplaySelectNack` + `proto::DisplayInfo`（bincode，复用可靠流/控制通道）；`PacketKind::Control` → `ChannelTag::Control`（0x04，与既有控制/心跳通道对齐）
   - 服务端：`factory::enumerate_monitors()`（Windows `Monitor::from_index` 体系 / macOS zed-scap；空时兜底 1 个默认屏）；`ScreenCaptureSource::wait_for_frame_timeout`（静默屏幕定期醒来处理切换，Windows `recv_timeout` 实现）；`switch_monitor` 会话内热切换（同索引 no-op）→ 下一窗口强制 IDR + 重推 `VideoFormat`

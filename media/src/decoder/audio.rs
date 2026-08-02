@@ -29,6 +29,7 @@
 
 use std::ffi::c_void;
 use std::sync::mpsc;
+use std::sync::Arc;
 
 use crate::decoder::{AudioDecoder, AudioPacket, DecodeError};
 use crate::ffmpeg;
@@ -477,6 +478,20 @@ impl AudioJitterBuffer {
 // AudioDecodePipeline — 音频解码流水线入口（P2C T3.4）
 // ════════════════════════════════════════════════════════════════
 
+/// R-04：音频抖动统计（会话侧读取：周期日志 / `ClientSessionStats`）。
+///
+/// `run` 每 ~100 帧刷新一次共享句柄；会话经
+/// [`AudioDecodePipeline::jitter_stats`] 读取快照，或持有
+/// [`AudioDecodePipeline::set_jitter_stats_shared`] 注入的 Arc 供周期任务
+/// 读取（不跨 await 持锁）。
+#[derive(Debug, Clone, Default)]
+pub struct AudioJitterStats {
+    /// jitter 静音补帧数（网络间隙补齐，保持时间轴）。
+    pub silence_inserted: u64,
+    /// jitter 丢弃包数（迟到/重复/溢出）。
+    pub packets_dropped: u64,
+}
+
 /// 音频独立解码流水线：接收 Opus 包 → 解码 → jitter buffer → 播放。
 ///
 /// 调用方为其开**独立线程**（与视频解码线程、UI 线程完全隔离）：
@@ -498,6 +513,8 @@ pub struct AudioDecodePipeline {
     tx: Option<mpsc::Sender<AudioPcm>>,
     /// 接收 Opus 包（来自传输层可靠流/DATAGRAM）。
     rx: mpsc::Receiver<AudioPacket>,
+    /// R-04：共享抖动统计（`run` 每 ~100 帧刷新；会话侧周期读取）。
+    jitter_stats: Arc<std::sync::Mutex<AudioJitterStats>>,
 }
 
 impl AudioDecodePipeline {
@@ -512,7 +529,18 @@ impl AudioDecodePipeline {
             playback: None,
             tx: None,
             rx,
+            jitter_stats: Arc::new(std::sync::Mutex::new(AudioJitterStats::default())),
         })
+    }
+
+    /// R-04：注入共享抖动统计句柄（会话侧周期任务共用；默认内部新建）。
+    pub fn set_jitter_stats_shared(&mut self, stats: Arc<std::sync::Mutex<AudioJitterStats>>) {
+        self.jitter_stats = stats;
+    }
+
+    /// R-04：抖动统计快照（会话结束日志 / 状态栏用）。
+    pub fn jitter_stats(&self) -> AudioJitterStats {
+        self.jitter_stats.lock().unwrap().clone()
     }
 
     /// 启动平台播放设备（绑定 jitter buffer 输出）。
@@ -524,7 +552,12 @@ impl AudioDecodePipeline {
     }
 
     /// 注入播放后端（测试 mock / 集成替换用）。
-    fn attach_playback(
+    ///
+    /// R-04：公开——媒体会话/集成测试在无真实设备环境注入
+    /// [`crate::decoder::audio_playback::AudioPlayback`] mock 做闭环断言
+    /// （P2C 设计「播放后端可注入」契约；生产路径走
+    /// [`start_playback`](Self::start_playback)）。
+    pub fn attach_playback(
         &mut self,
         pb: Box<dyn crate::decoder::audio_playback::AudioPlayback>,
     ) -> Result<(), DecodeError> {
@@ -548,6 +581,8 @@ impl AudioDecodePipeline {
     ///
     /// 发送端关闭（会话结束）→ `Ok(())` 正常返回。
     pub fn run(&mut self) -> Result<(), DecodeError> {
+        // R-04：每 ~100 帧刷新共享抖动统计（会话侧周期日志/状态栏读取）。
+        let mut frame_count: u64 = 0;
         loop {
             let packet = match self.rx.recv() {
                 Ok(p) => p,
@@ -574,6 +609,14 @@ impl AudioDecodePipeline {
                 // 无播放设备（macOS/Linux 桩 / start_playback 失败）：
                 // 解码完成但静音——仍消耗 jitter 保持时间轴状态。
                 while self.jitter.pop().is_some() {}
+            }
+
+            frame_count += 1;
+            if frame_count % 100 == 0 {
+                *self.jitter_stats.lock().unwrap() = AudioJitterStats {
+                    silence_inserted: self.jitter.silence_inserted(),
+                    packets_dropped: self.jitter.packets_dropped(),
+                };
             }
         }
     }

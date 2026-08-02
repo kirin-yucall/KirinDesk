@@ -5,9 +5,14 @@
 //! 审计事件 / 协议版本协商。全部经短间隔参数注入（TNL-STAB-003 单测口径）。
 
 use crate::audit::{AuditSink, TunnelAuditEvent};
+use crate::auth::{client_digest, random_nonce};
 use crate::client::{ProxySpec, TunnelClient, TunnelClientConfig};
+use crate::id_client::IdClientError;
 use crate::protocol::{
-    decode_control, encode_control, read_frame, ControlMsg, PROTOCOL_VERSION,
+    decode_control, decode_extension, encode_control, encode_extension, read_frame, Candidate,
+    CandidateKind, CandidateRegister, ControlMsg, DeviceInfo, ResolveDevice, TunnelConn,
+    TunnelResp, PROTOCOL_VERSION, TYPE_CANDIDATE_REGISTER, TYPE_DEVICE_INFO,
+    TYPE_RESOLVE_DEVICE, TYPE_TUNNEL_CONN, TYPE_TUNNEL_RESP,
 };
 use crate::rate_limit::RateLimiterConfig;
 use crate::server::{TunnelServer, TunnelServerConfig};
@@ -86,6 +91,9 @@ fn server_cfg_on(
         max_proxies: 32,
         max_concurrent_work: 100,
         rate_limit: RateLimiterConfig::default(),
+        tunnel_conn_rate_limit: RateLimiterConfig::tunnel_conn_default(),
+        max_pending_tunnels: 256,
+        max_pending_per_target: 16,
         audit,
         // M8-T026-P2 (ID-SEC-001)：测试用临时服务器密钥，不污染真实 ~/.kirin_desk。
         server_key_path: Some(
@@ -159,29 +167,71 @@ async fn echo_roundtrip(pub_port: u16, payload: &[u8]) -> bool {
     }
 }
 
-/// 手工登录（返回 LoginResp.ok；连接失败/无应答返回 None）。
-async fn raw_login(server_port: u16, token: &str, version: &str) -> Option<bool> {
-    let mut stream = TcpStream::connect(format!("[::1]:{}", server_port)).await.ok()?;
-    let frame = encode_control(&ControlMsg::Login {
-        token: token.to_string(),
+/// 手工认证（复用既有流，M8-T026-P3 探测流程）：
+/// 探测 Login#1（auth_nonce，token 恒为空）→ 服务器挑战 → 证明 Login#2
+/// （auth_digest）→ LoginResp。返回 `(ok, client_nonce, server_nonce, digest)`
+/// 供重放等用例捕获；服务器直接应答（legacy / 版本拒绝 / 探测拒绝）→
+/// 返回 `(ok, 零值, 零值, 空)`；连接失败/无应答/协议异常 → None。
+async fn raw_auth_capture(
+    stream: &mut TcpStream,
+    token: &str,
+    version: &str,
+) -> Option<(bool, [u8; 16], [u8; 16], Vec<u8>)> {
+    let client_nonce = random_nonce();
+    let probe = ControlMsg::Login {
+        token: String::new(),
         version: version.to_string(),
         hostname: "raw".to_string(),
         device_id: None,
         ed25519_pub: None,
-    })
-    .ok()?;
-    stream.write_all(&frame).await.ok()?;
+        auth_nonce: Some(client_nonce),
+        auth_digest: None,
+    };
+    stream.write_all(&encode_control(&probe).ok()?).await.ok()?;
     let (ty, payload) = tokio::time::timeout(
         Duration::from_secs(2),
-        read_frame(&mut stream),
+        read_frame(stream),
     )
     .await
     .ok()?
     .ok()?;
-    match decode_control(ty, &payload).ok()? {
-        ControlMsg::LoginResp { ok, .. } => Some(ok),
+    let msg = decode_control(ty, &payload).ok()?;
+    match msg {
+        ControlMsg::AuthChallenge { nonce: server_nonce } => {
+            let digest = client_digest(token.as_bytes(), &server_nonce, &client_nonce);
+            let proof = ControlMsg::Login {
+                token: String::new(),
+                version: version.to_string(),
+                hostname: "raw".to_string(),
+                device_id: None,
+                ed25519_pub: None,
+                auth_nonce: Some(client_nonce),
+                auth_digest: Some(digest.clone()),
+            };
+            stream.write_all(&encode_control(&proof).ok()?).await.ok()?;
+            let (ty, payload) = tokio::time::timeout(
+                Duration::from_secs(2),
+                read_frame(stream),
+            )
+            .await
+            .ok()?
+            .ok()?;
+            match decode_control(ty, &payload).ok()? {
+                ControlMsg::LoginResp { ok, .. } => {
+                    Some((ok, client_nonce, server_nonce, digest))
+                }
+                _ => None,
+            }
+        }
+        ControlMsg::LoginResp { ok, .. } => Some((ok, [0u8; 16], [0u8; 16], Vec::new())),
         _ => None,
     }
+}
+
+/// 手工登录（返回 LoginResp.ok；连接失败/无应答返回 None）。
+async fn raw_login(server_port: u16, token: &str, version: &str) -> Option<bool> {
+    let mut stream = TcpStream::connect(format!("[::1]:{}", server_port)).await.ok()?;
+    raw_auth_capture(&mut stream, token, version).await.map(|r| r.0)
 }
 
 #[tokio::test]
@@ -377,10 +427,6 @@ async fn test_reconnect_and_reregister() {
     let reconnected = wait_for(
         || {
             let s = client.status();
-            println!(
-                "DBG: status connected={} reconnect={} proxies={:?}",
-                s.connected, s.reconnect_count, s.proxies
-            );
             s.connected && s.reconnect_count >= 1 && !s.proxies.is_empty()
         },
         Duration::from_secs(8),
@@ -388,9 +434,7 @@ async fn test_reconnect_and_reregister() {
     .await;
     assert!(reconnected, "client should reconnect and re-register");
     let (_name2, pub_port2) = client.status().proxies.into_iter().next().unwrap();
-    println!("DBG: after restart pub_port2={}", pub_port2);
     let ok = echo_roundtrip(pub_port2, b"after restart").await;
-    println!("DBG: after restart echo ok={}", ok);
     assert!(ok);
 
     client.stop();
@@ -562,23 +606,12 @@ async fn test_close_proxy_unbinds_port() {
     srv_task.abort();
 }
 
-/// 手工控制会话：Login → NewProxy(remote_port=0) → CloseProxy，返回分配端口。
+/// 手工控制会话：Login（探测流程）→ NewProxy(remote_port=0) → CloseProxy，
+/// 返回分配端口。
 async fn raw_register_then_close(server_port: u16) -> Option<u16> {
     let mut s = TcpStream::connect(format!("[::1]:{}", server_port)).await.ok()?;
-    let frame = encode_control(&ControlMsg::Login {
-        token: "secret".to_string(),
-        version: PROTOCOL_VERSION.to_string(),
-        hostname: "raw".to_string(),
-        device_id: None,
-        ed25519_pub: None,
-    })
-    .ok()?;
-    s.write_all(&frame).await.ok()?;
-    let (ty, payload) = read_frame(&mut s).await.ok()?;
-    if !matches!(
-        decode_control(ty, &payload).ok()?,
-        ControlMsg::LoginResp { ok: true, .. }
-    ) {
+    let (ok, ..) = raw_auth_capture(&mut s, "secret", PROTOCOL_VERSION).await?;
+    if !ok {
         return None;
     }
     let frame = encode_control(&ControlMsg::NewProxy {
@@ -631,4 +664,822 @@ async fn test_server_dual_stack_accepts_ipv4() {
         matches!(res, Ok(Ok(_))),
         "IPv4 client must reach the [::] tunnel listener (port {port})"
     );
+}
+
+// ════════════════════════════════════════════════════════════
+// M8-T026-P3：挑战-响应认证 e2e（TNL-SEC-006~010）
+// ════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_plain_token_login_rejected_and_audited() {
+    // T1/T6：明文 token 登录（旧客户端 v1.0，无 auth 字段）连口令服务端 →
+    // LoginResp{ok:false} + 错误文案含升级提示 + 审计 LoginFailed + 无会话。
+    let audit = Arc::new(AuditCollector::default());
+    let server = TunnelServer::bind(server_cfg("secret", Some(audit.clone())))
+        .await
+        .unwrap();
+    let server_port = server.port();
+    let srv_task = tokio::spawn(server.run());
+
+    let mut stream = TcpStream::connect(format!("[::1]:{}", server_port)).await.unwrap();
+    let frame = encode_control(&ControlMsg::Login {
+        token: "secret".to_string(),
+        version: PROTOCOL_VERSION.to_string(),
+        hostname: "raw".to_string(),
+        device_id: None,
+        ed25519_pub: None,
+        auth_nonce: None,
+        auth_digest: None,
+    })
+    .unwrap();
+    stream.write_all(&frame).await.unwrap();
+    let (ty, payload) = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut stream))
+        .await
+        .unwrap()
+        .unwrap();
+    let ControlMsg::LoginResp { ok: false, err, .. } = decode_control(ty, &payload).unwrap() else {
+        panic!("plain-text login must be rejected");
+    };
+    let err = err.unwrap_or_default();
+    assert!(
+        err.contains("upgrade client"),
+        "error should hint upgrade: {err}"
+    );
+    assert!(
+        wait_for(
+            || audit.count(|e| matches!(e, TunnelAuditEvent::LoginFailed { .. })) >= 1,
+            Duration::from_secs(2)
+        )
+        .await,
+        "plain login failure should be audited"
+    );
+    assert_eq!(
+        audit.count(|e| matches!(e, TunnelAuditEvent::LoginSuccess { .. })),
+        0
+    );
+    srv_task.abort();
+}
+
+#[tokio::test]
+async fn test_digest_as_first_frame_rejected() {
+    // T3：digest 作首帧（未挑战先证明）→ 拒绝 + 审计（不进入挑战）。
+    let audit = Arc::new(AuditCollector::default());
+    let server = TunnelServer::bind(server_cfg("secret", Some(audit.clone())))
+        .await
+        .unwrap();
+    let server_port = server.port();
+    let srv_task = tokio::spawn(server.run());
+
+    let mut stream = TcpStream::connect(format!("[::1]:{}", server_port)).await.unwrap();
+    let frame = encode_control(&ControlMsg::Login {
+        token: String::new(),
+        version: PROTOCOL_VERSION.to_string(),
+        hostname: "raw".to_string(),
+        device_id: None,
+        ed25519_pub: None,
+        auth_nonce: Some([1u8; 16]),
+        auth_digest: Some(vec![1, 2, 3]), // 未挑战先证明
+    })
+    .unwrap();
+    stream.write_all(&frame).await.unwrap();
+    let (ty, payload) = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut stream))
+        .await
+        .unwrap()
+        .unwrap();
+    let ControlMsg::LoginResp { ok: false, .. } = decode_control(ty, &payload).unwrap() else {
+        panic!("digest as first frame must be rejected");
+    };
+    assert!(
+        wait_for(
+            || audit.count(|e| matches!(e, TunnelAuditEvent::LoginFailed { .. })) >= 1,
+            Duration::from_secs(2)
+        )
+        .await,
+        "rejection should be audited"
+    );
+    srv_task.abort();
+}
+
+#[tokio::test]
+async fn test_replay_nonce_digest_pair_rejected() {
+    // T3/TNL-NF-006：重放旧 (client_nonce, server_nonce, digest) 对 →
+    // 新连接 server_nonce 每连接全新 → 验证失败拒绝。
+    let audit = Arc::new(AuditCollector::default());
+    let server = TunnelServer::bind(server_cfg("secret", Some(audit.clone())))
+        .await
+        .unwrap();
+    let server_port = server.port();
+    let srv_task = tokio::spawn(server.run());
+
+    // 1. 合法登录，捕获 (client_nonce, server_nonce, digest)。
+    let mut s1 = TcpStream::connect(format!("[::1]:{}", server_port)).await.unwrap();
+    let (ok, client_nonce, server_nonce, digest) = raw_auth_capture(
+        &mut s1,
+        "secret",
+        PROTOCOL_VERSION,
+    )
+    .await
+    .expect("first login should respond");
+    assert!(ok, "first login should succeed");
+
+    // 2. 新连接：探测（同一 client_nonce）→ 服务器下发全新 nonce →
+    //    用旧 digest 证明 → 拒绝。
+    let mut s2 = TcpStream::connect(format!("[::1]:{}", server_port)).await.unwrap();
+    let probe = ControlMsg::Login {
+        token: String::new(),
+        version: PROTOCOL_VERSION.to_string(),
+        hostname: "raw".to_string(),
+        device_id: None,
+        ed25519_pub: None,
+        auth_nonce: Some(client_nonce),
+        auth_digest: None,
+    };
+    s2.write_all(&encode_control(&probe).unwrap()).await.unwrap();
+    let (ty, payload) = read_frame(&mut s2).await.unwrap();
+    let ControlMsg::AuthChallenge { nonce: new_nonce } = decode_control(ty, &payload).unwrap()
+    else {
+        panic!("expected auth challenge");
+    };
+    assert_ne!(
+        new_nonce, server_nonce,
+        "server nonce must be fresh per connection"
+    );
+    let proof = ControlMsg::Login {
+        token: String::new(),
+        version: PROTOCOL_VERSION.to_string(),
+        hostname: "raw".to_string(),
+        device_id: None,
+        ed25519_pub: None,
+        auth_nonce: Some(client_nonce),
+        auth_digest: Some(digest), // 基于旧 server_nonce 的证明 → 必失败
+    };
+    s2.write_all(&encode_control(&proof).unwrap()).await.unwrap();
+    let (ty, payload) = read_frame(&mut s2).await.unwrap();
+    let ControlMsg::LoginResp { ok: false, .. } = decode_control(ty, &payload).unwrap() else {
+        panic!("replayed digest must be rejected");
+    };
+    assert!(
+        wait_for(
+            || audit.count(|e| matches!(e, TunnelAuditEvent::LoginFailed { .. })) >= 1,
+            Duration::from_secs(2)
+        )
+        .await,
+        "replay rejection should be audited"
+    );
+    srv_task.abort();
+}
+
+#[tokio::test]
+async fn test_client_forged_receipt_disconnects() {
+    // T4 e2e：伪造回执服务器（错误 server_digest）→ 带口令客户端校验失败
+    // → ServerAuthFailed（拒绝继续）。
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let token = "secret-token";
+    let token_owned = token.to_string();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        // 探测 → 挑战。
+        let (ty, payload) = read_frame(&mut stream).await.unwrap();
+        let ControlMsg::Login {
+            auth_nonce: Some(_),
+            ..
+        } = decode_control(ty, &payload).unwrap()
+        else {
+            panic!("bad probe");
+        };
+        let frame = encode_control(&ControlMsg::AuthChallenge { nonce: [9u8; 16] }).unwrap();
+        stream.write_all(&frame).await.unwrap();
+        // 证明 → 伪造回执。
+        let (ty, payload) = read_frame(&mut stream).await.unwrap();
+        assert!(matches!(
+            decode_control(ty, &payload).unwrap(),
+            ControlMsg::Login {
+                auth_digest: Some(_),
+                ..
+            }
+        ));
+        let frame = encode_control(&ControlMsg::LoginResp {
+            ok: true,
+            err: None,
+            server_version: PROTOCOL_VERSION.to_string(),
+            auth_digest: Some(vec![0xde, 0xad, 0xbe, 0xef]), // 伪造
+        })
+        .unwrap();
+        stream.write_all(&frame).await.unwrap();
+        let _ = token_owned;
+    });
+    let err = crate::id_client::resolve_device(
+        &format!("127.0.0.1:{}", port),
+        token,
+        "device-x",
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, IdClientError::ServerAuthFailed(_)),
+        "forged receipt must fail closed, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_client_fail_closed_legacy_server() {
+    // TNL-SEC-008 e2e：带口令客户端连无口令服务器 → fail-closed 拒绝，
+    // 永不建立会话（循环重试也不得注册）。
+    let server = TunnelServer::bind(server_cfg("", None)).await.unwrap();
+    let server_port = server.port();
+    let srv_task = tokio::spawn(server.run());
+    let client = Arc::new(TunnelClient::new(client_cfg(
+        server_port,
+        "secret", // 带口令
+        vec![],
+        Duration::from_millis(50),
+    )));
+    let c = client.clone();
+    let cli_task = tokio::spawn(async move { c.run().await });
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(
+        !client.status().connected,
+        "client with token must fail-closed against unauthenticated server"
+    );
+    client.stop();
+    let _ = tokio::time::timeout(Duration::from_secs(3), cli_task).await;
+    srv_task.abort();
+}
+
+#[tokio::test]
+async fn test_client_fail_closed_no_token() {
+    // TNL-SEC-008 e2e：无口令客户端连口令服务器 → 拒绝继续（无挑战响应
+    // 直接 fail-closed），永不建立会话。
+    let server = TunnelServer::bind(server_cfg("secret", None)).await.unwrap();
+    let server_port = server.port();
+    let srv_task = tokio::spawn(server.run());
+    let client = Arc::new(TunnelClient::new(client_cfg(
+        server_port,
+        "", // 无口令
+        vec![],
+        Duration::from_millis(50),
+    )));
+    let c = client.clone();
+    let cli_task = tokio::spawn(async move { c.run().await });
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(
+        !client.status().connected,
+        "client without token must fail-closed against challenged server"
+    );
+    client.stop();
+    let _ = tokio::time::timeout(Duration::from_secs(3), cli_task).await;
+    srv_task.abort();
+}
+
+#[tokio::test]
+async fn test_legacy_no_token_full_flow() {
+    // TNL-SEC-010：legacy 无口令全流程不变（无口令客户端 + 无口令服务器，
+    // 探测帧被直接应答 → 客户端按 legacy 继续）。
+    let echo_port = spawn_echo_service().await;
+    let server = TunnelServer::bind(server_cfg("", None)).await.unwrap();
+    let server_port = server.port();
+    let srv_task = tokio::spawn(server.run());
+    let client = Arc::new(TunnelClient::new(client_cfg(
+        server_port,
+        "",
+        vec![echo_proxy(echo_port)],
+        Duration::from_millis(50),
+    )));
+    let c = client.clone();
+    let cli_task = tokio::spawn(async move { c.run().await });
+    let (_name, pub_port) = wait_registered(&client, Duration::from_secs(5))
+        .await
+        .expect("legacy client should register");
+    assert!(
+        echo_roundtrip(pub_port, b"legacy echo").await,
+        "legacy flow should pass data"
+    );
+    client.stop();
+    let _ = tokio::time::timeout(Duration::from_secs(3), cli_task).await;
+    srv_task.abort();
+}
+
+#[tokio::test]
+async fn test_legacy_server_accepts_old_client() {
+    // TNL-SEC-010：无口令服务端保留 legacy 明文流程——旧客户端（v1.0，
+    // 5 字段 Login，无 auth 字段）空 token 直接登录成功（TNL-PROTO-011
+    // 回退解码路径）。
+    let server = TunnelServer::bind(server_cfg("", None)).await.unwrap();
+    let server_port = server.port();
+    let srv_task = tokio::spawn(server.run());
+
+    // 手工构造 v1.0 载荷（5 字段，无 auth 字段；wire = 变体标记 + 字段）。
+    #[derive(serde::Serialize)]
+    struct OldLogin<'a> {
+        token: &'a str,
+        version: &'a str,
+        hostname: &'a str,
+        device_id: Option<&'a str>,
+        ed25519_pub: Option<&'a str>,
+    }
+    let bytes = bincode::serialize(&OldLogin {
+        token: "",
+        version: "1.0.0",
+        hostname: "old-client",
+        device_id: None,
+        ed25519_pub: None,
+    })
+    .unwrap();
+    let mut wire = 0u32.to_le_bytes().to_vec(); // ControlMsg::Login 变体标记
+    wire.extend_from_slice(&bytes);
+    let frame = crate::protocol::wrap_frame(crate::protocol::TYPE_CONTROL, &wire);
+    let mut stream = TcpStream::connect(format!("[::1]:{}", server_port)).await.unwrap();
+    stream.write_all(&frame).await.unwrap();
+    let (ty, payload) = read_frame(&mut stream).await.unwrap();
+    let ControlMsg::LoginResp { ok: true, .. } = decode_control(ty, &payload).unwrap() else {
+        panic!("old client must be accepted by legacy server (TNL-SEC-010)");
+    };
+    srv_task.abort();
+}
+
+// ════════════════════════════════════════════════════════════
+// S-03（审计 F-6）：TunnelConn 未认证限速 + pending 上限 e2e
+// ════════════════════════════════════════════════════════════
+
+/// 发送一条 `TunnelConn` 首帧并读取服务器 `TunnelResp`。
+/// 返回 `(ok, err)`；配对挂起（无应答）或连接被关闭 → `None`。
+async fn raw_tunnel_conn(server_port: u16, target: &str) -> Option<(bool, String)> {
+    let mut s = TcpStream::connect(format!("[::1]:{}", server_port)).await.ok()?;
+    let req = TunnelConn {
+        target_peer_id: target.to_string(),
+        from_peer: "pc-a".to_string(),
+    };
+    s.write_all(&encode_extension(TYPE_TUNNEL_CONN, &req).ok()?).await.ok()?;
+    let (ty, payload) = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_frame(&mut s),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let resp: TunnelResp = decode_extension(ty, &payload, TYPE_TUNNEL_RESP).ok()?;
+    Some((resp.ok, resp.err.unwrap_or_default()))
+}
+
+/// 手工登录并注册设备（`device_id` 携带注册字段），返回登录流（须保持存活
+/// 以维持在线表条目）。
+async fn raw_login_device(
+    server_port: u16,
+    token: &str,
+    device_id: &str,
+) -> Option<TcpStream> {
+    let mut stream = TcpStream::connect(format!("[::1]:{}", server_port)).await.ok()?;
+    let client_nonce = random_nonce();
+    let probe = ControlMsg::Login {
+        token: String::new(),
+        version: PROTOCOL_VERSION.to_string(),
+        hostname: "raw-device".to_string(),
+        device_id: Some(device_id.to_string()),
+        ed25519_pub: Some("pub-raw".to_string()),
+        auth_nonce: Some(client_nonce),
+        auth_digest: None,
+    };
+    stream.write_all(&encode_control(&probe).ok()?).await.ok()?;
+    let (ty, payload) = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_frame(&mut stream),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let server_nonce = match decode_control(ty, &payload).ok()? {
+        ControlMsg::AuthChallenge { nonce } => nonce,
+        _ => return None,
+    };
+    let digest = client_digest(token.as_bytes(), &server_nonce, &client_nonce);
+    let proof = ControlMsg::Login {
+        token: String::new(),
+        version: PROTOCOL_VERSION.to_string(),
+        hostname: "raw-device".to_string(),
+        device_id: Some(device_id.to_string()),
+        ed25519_pub: Some("pub-raw".to_string()),
+        auth_nonce: Some(client_nonce),
+        auth_digest: Some(digest),
+    };
+    stream.write_all(&encode_control(&proof).ok()?).await.ok()?;
+    let (ty, payload) = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_frame(&mut stream),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    match decode_control(ty, &payload).ok()? {
+        ControlMsg::LoginResp { ok: true, .. } => Some(stream),
+        _ => None,
+    }
+}
+
+#[tokio::test]
+async fn test_tunnel_conn_unauthenticated_rate_limit() {
+    // S-03a / 审计 F-6 验收：未认证脚本连续触发 TunnelConn → 前 10 次放行
+    //（目标离线 → ok:false 统一文案），第 11 次起被限速拒绝 + 审计。
+    let audit = Arc::new(AuditCollector::default());
+    let server = TunnelServer::bind(server_cfg("secret", Some(audit.clone())))
+        .await
+        .unwrap();
+    let server_port = server.port();
+    let srv_task = tokio::spawn(server.run());
+
+    for i in 0..10 {
+        let (ok, err) = raw_tunnel_conn(server_port, "ghost")
+            .await
+            .expect("rate window内应得到 TunnelResp");
+        assert!(!ok, "第 {} 次：目标离线应拒绝", i + 1);
+        assert!(
+            err.contains("device unavailable"),
+            "第 {} 次应为统一离线文案，got: {err}",
+            i + 1
+        );
+    }
+    // 第 11 次：窗口内超限 → 限速拒绝（独立文案 + 审计）。
+    let (ok, err) = raw_tunnel_conn(server_port, "ghost")
+        .await
+        .expect("限速拒绝应得到 TunnelResp");
+    assert!(!ok);
+    assert!(
+        err.contains("rate limited"),
+        "第 11 次应为限速拒绝文案，got: {err}"
+    );
+    assert!(
+        wait_for(
+            || audit.count(|e| matches!(e, TunnelAuditEvent::RateLimited { .. })) >= 1,
+            Duration::from_secs(3)
+        )
+        .await,
+        "限速拒绝应产生 RateLimited 审计"
+    );
+    // 前 10 次不应被限速（限速审计恰为 1 条）。
+    assert_eq!(
+        audit.count(|e| matches!(e, TunnelAuditEvent::RateLimited { .. })),
+        1,
+        "仅第 11 次被限速"
+    );
+    srv_task.abort();
+}
+
+#[tokio::test]
+async fn test_tunnel_conn_pending_limit_per_target() {
+    // S-03a / 审计 F-6：每目标设备同时未配对隧道数上限（注入 2）→
+    // 3 条并发 TunnelConn 中 1 条被拒（"pending tunnel limit reached for
+    // target"）+ 审计；其余 2 条配对挂起至超时（无应答，None）。
+    let audit = Arc::new(AuditCollector::default());
+    let mut cfg = server_cfg("secret", Some(audit.clone()));
+    cfg.tunnel_conn_rate_limit = RateLimiterConfig {
+        max_attempts: 1000, // 限速关掉（本用例只验证 pending 上限）
+        attempt_window: Duration::from_secs(30),
+        failure_threshold: 5,
+        ban_duration: Duration::from_secs(60),
+    };
+    cfg.max_pending_per_target = 2;
+    cfg.max_pending_tunnels = 256;
+    cfg.heartbeat_timeout = Duration::from_secs(10); // 注册设备期间会话不判死
+    cfg.work_conn_timeout = Duration::from_millis(500); // 配对超时加速
+    let server = TunnelServer::bind(cfg).await.unwrap();
+    let server_port = server.port();
+    let srv_task = tokio::spawn(server.run());
+
+    let _device = raw_login_device(server_port, "secret", "pc-b")
+        .await
+        .expect("设备注册应成功");
+
+    let mut handles = Vec::new();
+    for _ in 0..3 {
+        handles.push(tokio::spawn(raw_tunnel_conn(server_port, "pc-b")));
+    }
+    let mut rejected = 0;
+    let mut pending_no_response = 0;
+    for h in handles {
+        match h.await.unwrap() {
+            Some((false, err)) if err.contains("pending tunnel limit reached for target") => {
+                rejected += 1;
+            }
+            None => pending_no_response += 1,
+            other => panic!("unexpected tunnel conn outcome: {other:?}"),
+        }
+    }
+    assert_eq!(rejected, 1, "第 3 条并发 TunnelConn 应被 per-target 上限拒绝");
+    assert_eq!(pending_no_response, 2, "其余 2 条应挂起至配对超时");
+    assert!(
+        wait_for(
+            || {
+                audit.count(|e| matches!(
+                    e,
+                    TunnelAuditEvent::TunnelRelayClosed { reason, .. }
+                        if reason.contains("pending tunnel limit reached for target")
+                )) >= 1
+            },
+            Duration::from_secs(3)
+        )
+        .await,
+        "per-target 上限拒绝应产生审计"
+    );
+    srv_task.abort();
+}
+
+#[tokio::test]
+async fn test_tunnel_conn_pending_limit_global() {
+    // S-03a / 审计 F-6：pending 表全局硬上限（注入 2）→ 3 个不同目标并发
+    // TunnelConn 中 1 条被拒（"pending tunnel limit reached"）+ 审计。
+    let audit = Arc::new(AuditCollector::default());
+    let mut cfg = server_cfg("secret", Some(audit.clone()));
+    cfg.tunnel_conn_rate_limit = RateLimiterConfig {
+        max_attempts: 1000, // 限速关掉（本用例只验证 pending 上限）
+        attempt_window: Duration::from_secs(30),
+        failure_threshold: 5,
+        ban_duration: Duration::from_secs(60),
+    };
+    cfg.max_pending_tunnels = 2;
+    cfg.max_pending_per_target = 16;
+    cfg.heartbeat_timeout = Duration::from_secs(10);
+    cfg.work_conn_timeout = Duration::from_millis(500);
+    let server = TunnelServer::bind(cfg).await.unwrap();
+    let server_port = server.port();
+    let srv_task = tokio::spawn(server.run());
+
+    // 三条登录流必须同时存活（drop 即离线 → 目标不可用）。
+    let mut devices = Vec::new();
+    for did in ["pc-b1", "pc-b2", "pc-b3"] {
+        let stream = raw_login_device(server_port, "secret", did)
+            .await
+            .unwrap_or_else(|| panic!("设备注册应成功: {did}"));
+        devices.push(stream);
+    }
+
+    let mut handles = Vec::new();
+    for target in ["pc-b1", "pc-b2", "pc-b3"] {
+        handles.push(tokio::spawn(raw_tunnel_conn(server_port, target)));
+    }
+    let mut rejected = 0;
+    let mut pending_no_response = 0;
+    for h in handles {
+        match h.await.unwrap() {
+            Some((false, err)) if err == "pending tunnel limit reached" => rejected += 1,
+            None => pending_no_response += 1,
+            other => panic!("unexpected tunnel conn outcome: {other:?}"),
+        }
+    }
+    assert_eq!(rejected, 1, "第 3 条并发 TunnelConn 应被全局上限拒绝");
+    assert_eq!(pending_no_response, 2, "其余 2 条应挂起至配对超时");
+    assert!(
+        wait_for(
+            || {
+                audit.count(|e| matches!(
+                    e,
+                    TunnelAuditEvent::TunnelRelayClosed { reason, .. }
+                        if reason == "pending tunnel limit reached (2)"
+                )) >= 1
+            },
+            Duration::from_secs(3)
+        )
+        .await,
+        "全局上限拒绝应产生审计"
+    );
+    srv_task.abort();
+}
+
+// ════════════════════════════════════════════════════════════
+// S-09（审计 F-9）：候选登记归属校验 e2e
+// ════════════════════════════════════════════════════════════
+
+/// 手工登录（可指定是否携带 device_id 注册字段），返回登录流
+/// （须保持存活以维持会话 / 在线表条目）。
+async fn raw_login_any(server_port: u16, token: &str, device_id: Option<&str>) -> Option<TcpStream> {
+    let mut stream = TcpStream::connect(format!("[::1]:{}", server_port)).await.ok()?;
+    let client_nonce = random_nonce();
+    let device_id_owned = device_id.map(|s| s.to_string());
+    let probe = ControlMsg::Login {
+        token: String::new(),
+        version: PROTOCOL_VERSION.to_string(),
+        hostname: "raw-device".to_string(),
+        device_id: device_id_owned.clone(),
+        ed25519_pub: Some("pub-raw".to_string()),
+        auth_nonce: Some(client_nonce),
+        auth_digest: None,
+    };
+    stream.write_all(&encode_control(&probe).ok()?).await.ok()?;
+    let (ty, payload) = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_frame(&mut stream),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let server_nonce = match decode_control(ty, &payload).ok()? {
+        ControlMsg::AuthChallenge { nonce } => nonce,
+        _ => return None,
+    };
+    let digest = client_digest(token.as_bytes(), &server_nonce, &client_nonce);
+    let proof = ControlMsg::Login {
+        token: String::new(),
+        version: PROTOCOL_VERSION.to_string(),
+        hostname: "raw-device".to_string(),
+        device_id: device_id_owned,
+        ed25519_pub: Some("pub-raw".to_string()),
+        auth_nonce: Some(client_nonce),
+        auth_digest: Some(digest),
+    };
+    stream.write_all(&encode_control(&proof).ok()?).await.ok()?;
+    let (ty, payload) = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_frame(&mut stream),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    match decode_control(ty, &payload).ok()? {
+        ControlMsg::LoginResp { ok: true, .. } => Some(stream),
+        _ => None,
+    }
+}
+
+/// 从登录流发送一条候选登记（`session_id=None` = 注册表候选刷新）。
+/// 返回写入是否成功。
+async fn send_candidate_register(
+    stream: &mut TcpStream,
+    device_id: &str,
+    candidates: Vec<Candidate>,
+) -> bool {
+    let reg = CandidateRegister {
+        device_id: device_id.to_string(),
+        session_id: None,
+        candidates,
+    };
+    match encode_extension(TYPE_CANDIDATE_REGISTER, &reg) {
+        Ok(frame) => stream.write_all(&frame).await.is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// 匿名会话解析目标设备（Login 无 device_id → ResolveDevice → DeviceInfo）。
+async fn raw_resolve(server_port: u16, device_id: &str) -> Option<DeviceInfo> {
+    let mut stream = raw_login_any(server_port, "secret", None).await?;
+    let req = ResolveDevice {
+        device_id: device_id.to_string(),
+    };
+    stream
+        .write_all(&encode_extension(TYPE_RESOLVE_DEVICE, &req).ok()?)
+        .await
+        .ok()?;
+    let (ty, payload) = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_frame(&mut stream),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    decode_extension::<DeviceInfo>(ty, &payload, TYPE_DEVICE_INFO).ok()
+}
+
+#[tokio::test]
+async fn test_candidate_register_cross_device_rejected() {
+    // S-09a / 审计 F-9 验收：任意已认证会话不得覆盖/清空其他设备候选列表。
+    let audit = Arc::new(AuditCollector::default());
+    let server = TunnelServer::bind(server_cfg("secret", Some(audit.clone())))
+        .await
+        .unwrap();
+    let server_port = server.port();
+    let srv_task = tokio::spawn(server.run());
+
+    // 目标设备 pc-b 在线并登记自有候选（正常归属，S-09c 回归基线）。
+    let mut dev_b = raw_login_any(server_port, "secret", Some("pc-b"))
+        .await
+        .expect("pc-b 注册应成功");
+    let cand_b = Candidate {
+        addr: "192.168.1.5:3389".parse().unwrap(),
+        kind: CandidateKind::Tcp,
+        priority: 100,
+    };
+    assert!(
+        send_candidate_register(&mut dev_b, "pc-b", vec![cand_b.clone()]).await,
+        "pc-b 自身候选登记应成功写入"
+    );
+    // 恶意会话 pc-a（已认证，但注册的是另一设备）。
+    let mut dev_a = raw_login_any(server_port, "secret", Some("pc-a"))
+        .await
+        .expect("pc-a 注册应成功");
+
+    // 确认 pc-b 自有候选已生效（含服务器观察地址附加）。
+    let info = raw_resolve(server_port, "pc-b").await.expect("解析应应答");
+    assert!(info.payload.online);
+    let addrs: Vec<_> = info.payload.candidates.iter().map(|c| c.addr).collect();
+    assert!(
+        addrs.contains(&cand_b.addr),
+        "pc-b 自有候选应生效"
+    );
+
+    // 跨设备覆盖：pc-a 会话为 pc-b 提交候选 → 丢弃 + 审计，pc-b 候选不变。
+    let cand_evil = Candidate {
+        addr: "6.6.6.6:1".parse().unwrap(),
+        kind: CandidateKind::Udp,
+        priority: 255,
+    };
+    assert!(
+        send_candidate_register(&mut dev_a, "pc-b", vec![cand_evil.clone()]).await,
+        "恶意候选登记帧应成功发送（服务器侧丢弃）"
+    );
+    assert!(
+        wait_for(
+            || {
+                audit.count(|e| {
+                    matches!(e, TunnelAuditEvent::CandidateRegisterRejected { .. })
+                }) >= 1
+            },
+            Duration::from_secs(3)
+        )
+        .await,
+        "跨设备候选覆盖应产生归属拒绝审计"
+    );
+    let info = raw_resolve(server_port, "pc-b").await.expect("解析应应答");
+    let addrs: Vec<_> = info.payload.candidates.iter().map(|c| c.addr).collect();
+    assert!(
+        !addrs.contains(&cand_evil.addr),
+        "pc-b 候选不得被跨设备会话覆盖"
+    );
+    assert!(
+        addrs.contains(&cand_b.addr),
+        "pc-b 自有候选应保留（未被投毒/清空）"
+    );
+
+    // 会话未注册设备：匿名登录（无 device_id）提交候选 → 同样拒绝 + 审计。
+    let mut anon = raw_login_any(server_port, "secret", None)
+        .await
+        .expect("匿名登录应成功");
+    assert!(
+        send_candidate_register(&mut anon, "pc-b", vec![cand_evil.clone()]).await,
+        "匿名会话候选登记帧应成功发送（服务器侧丢弃）"
+    );
+    assert!(
+        wait_for(
+            || {
+                audit.count(|e| {
+                    matches!(e, TunnelAuditEvent::CandidateRegisterRejected { .. })
+                }) >= 2
+            },
+            Duration::from_secs(3)
+        )
+        .await,
+        "未注册设备会话提交候选应产生归属拒绝审计"
+    );
+    let info = raw_resolve(server_port, "pc-b").await.expect("解析应应答");
+    let addrs: Vec<_> = info.payload.candidates.iter().map(|c| c.addr).collect();
+    assert!(
+        !addrs.contains(&cand_evil.addr),
+        "pc-b 候选不得被未注册设备会话覆盖"
+    );
+
+    srv_task.abort();
+}
+
+#[tokio::test]
+async fn test_candidate_register_same_device_accepted() {
+    // S-09c 回归：正常候选登记（同 device_id）不被误伤 —— 设备为自身
+    // 提交候选 → 生效（含服务器观察地址附加，ID-002 / PUNCH-PROTO-001）。
+    let audit = Arc::new(AuditCollector::default());
+    let server = TunnelServer::bind(server_cfg("secret", Some(audit.clone())))
+        .await
+        .unwrap();
+    let server_port = server.port();
+    let srv_task = tokio::spawn(server.run());
+
+    let mut dev_a = raw_login_any(server_port, "secret", Some("pc-a"))
+        .await
+        .expect("pc-a 注册应成功");
+    let cand = Candidate {
+        addr: "10.1.2.3:4444".parse().unwrap(),
+        kind: CandidateKind::Udp,
+        priority: 120,
+    };
+    assert!(
+        send_candidate_register(&mut dev_a, "pc-a", vec![cand.clone()]).await,
+        "同 device_id 候选登记帧应成功写入"
+    );
+
+    let info = raw_resolve(server_port, "pc-a").await.expect("解析应应答");
+    assert!(info.payload.online);
+    let addrs: Vec<_> = info.payload.candidates.iter().map(|c| c.addr).collect();
+    assert!(
+        addrs.contains(&cand.addr),
+        "同 device_id 候选登记应生效"
+    );
+    assert_eq!(
+        info.payload.candidates.len(),
+        2,
+        "候选列表 = 自有候选 + 服务器观察地址"
+    );
+
+    // 全程不应出现归属拒绝审计（正常归属不被误伤）。
+    assert_eq!(
+        audit.count(|e| matches!(e, TunnelAuditEvent::CandidateRegisterRejected { .. })),
+        0
+    );
+
+    srv_task.abort();
 }

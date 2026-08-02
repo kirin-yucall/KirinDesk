@@ -3,6 +3,19 @@
 //! 仅用于 quinn 的 DATAGRAM + 流能力，**不参与安全决策**。
 //! 自签名 Ed25519 证书仅满足 quinn API 要求，不验证证书链。
 //! 真正的加密由 `MediaCipher`（封装 core 的 `AeadCipher`）完成。
+//!
+//! # S-17 接线门禁（F-22 · 接线前必读）
+//!
+//! 本模块的 rustls 客户端校验 [`SkipServerVerification`] 全放行是**有意设计**
+//! （仅协议合规；自签名证书无链可验，本层不做证书校验）——安全完全依赖上层
+//! Ed25519 握手：客户端 `connect_quic_transport` 的 `server_pin: PinExpectation`
+//! 强制校验服务端身份（R-02 强类型化，无"无期望跳过"路径），服务端
+//! `accept_quic_transport` 经 `server_handshake_verified_with_nickname_generic`
+//! 做白名单/审批/挑战码策略层校验。
+//!
+//! **任何未来把 QUIC 传输接入主流程的改动，必须先满足 `transport/mod.rs`
+//! 声明处的接线门禁，禁止任何绕过校验的快捷方式**（如恢复"空串 / 忽略 pin"
+//! 或给 `SkipServerVerification` 之外再开放行口）。
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -48,8 +61,18 @@ pub fn generate_quic_cert(device_id: &str) -> Result<(Vec<u8>, Vec<u8>), Transpo
 }
 
 // ════════════════════════════════════════════════════════════════
-// SkipServerVerification — 不验证对端证书
+// SkipServerVerification — 不验证对端证书（有意设计，S-17 门禁 · 勿改）
 // ════════════════════════════════════════════════════════════════
+//
+// 审计证据（安全审计报告 2026-08-02 §4 F-22）：本结构体对 TLS 对端证书
+// 全部放行，安全性完全依赖上层 Ed25519 握手。这是"仅协议合规"的有意设计：
+// 证书为自签名（`generate_quic_cert`），本层无链可验，**不要**在 TLS 层
+// "修复"（补齐证书校验属职责外，徒增维护负担且不构成真实防护）。
+//
+// 客户端侧服务端身份校验由握手层承担：`connect_quic_transport` 的
+// `server_pin: PinExpectation`（R-02 强类型化——旧的 `_server_pubkey_base64`
+// 占位参数已取消，不存在"空串 = 跳过 pin 比对"的路径）。任何接入主流程的
+// 改动禁止绕过该校验（S-17 接线门禁，详见 transport/mod.rs）。
 
 struct SkipServerVerification;
 

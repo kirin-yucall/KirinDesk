@@ -125,6 +125,13 @@ cd ../..
 
 下载 [ffmpeg-8.1.2-full_build-shared.zip](https://github.com/GyanD/codexffmpeg/releases/download/8.1.2/ffmpeg-8.1.2-full_build-shared.zip),解压到 `ffmpeg/ffmpeg-8.1.2-full_build-shared/`。若要直接运行发布版 `release/KirinDesk.exe`,还需把其中的 DLL(`avcodec-62.dll`、`avutil-60.dll`、`swscale-9.dll` 等)复制到 `release/ffmpeg/bin/`。
 
+**FFmpeg 升级步骤**(R-22):编解码路径对 `AVCodecContext`/`AVFrame` 结构体字段按**硬编码字节偏移**直写,偏移基于 FFmpeg **8.1.2**(avcodec-62/avutil-60)实测验证。升级主版本时:
+
+1. 逐一重核 `media/src/ffmpeg/api.rs` 中的全部偏移(`avctx_offset::*`、`AVFRAME_CH_LAYOUT_OFFSET`),对照新版 `avcodec.h`/`frame.h` 的 `offsetof` —— 核对清单已内联在常量上方;
+2. 同步更新 `media/src/ffmpeg/dlls.rs` 中的库名/so 名(`AVCODEC_LIB` 等)、`DLL_VERSION_FALLBACKS` 与 `SNAPSHOT_FFMPEG_MAJOR`。加载器检测到主版本与快照不符会**直接报错**,绝不带过期偏移静默运行;
+3. 核对 `FnTable` 符号表(必需符号缺失 → 加载失败;可选 HW 符号 → 功能降级);
+4. 更新本文件与内联清单中的版本快照字样。
+
 **3. 编译** —— `target/` 由 cargo 生成,不入库:
 
 ```bash
@@ -140,6 +147,24 @@ KirinDesk.exe --cli connect my-server.example.com 22 mynickname
 # IP 模式（直接指定 IPv6 + 端口）
 KirinDesk.exe --cli connect 2001:db8::1 3389 mynickname
 ```
+
+### 内网穿透（Tunnel）加密认证
+
+relay 服务器（`tunnel serve`）的登录认证采用 **挑战-响应（SCRAM 式）** 加密验证
+（M8-T026-P3，协议 v1.1.0）：
+
+- **口令永不明文上线**：登录报文仅携带随机数与 HMAC-SHA256 证明（`auth_digest`），
+  网络抓包无法获得口令原文；
+- **双向认证**：服务器以自身回执证明口令知识，伪造服务器会被客户端拒绝并断开；
+- **fail-closed**：`tunnel serve` 在 `[tunnel].token` 为空时**拒绝启动**；
+  配置了口令的客户端拒绝连接未认证（无口令）的服务器；
+- **口令质量**：建议使用 ≥32 字节高熵随机串（`openssl rand -base64 32`）；
+  长度不足 16 字符会收到警告。
+
+**升级注意事项**：服务端与客户端需使用**同版本**（同仓库发布）。
+旧版本客户端（v1.0）连接已配置口令的新服务端会被明确拒绝并提示
+`upgrade client`；新版本客户端连接旧版本服务端时会明确报错（等待挑战超时或
+服务器未认证拒绝）。两端请同步升级。
 
 ## GUI 操作
 
@@ -199,7 +224,8 @@ kirin_desk <command> [options]
   config               Show current configuration
   register [id] [p]    Register device with GoDaddy DNS
   discover <id>        Discover a remote device
-  connect <t> [p] [c]  Connect to device (domain or IPv6)
+  connect <t> [p] [n]  Connect to device (domain or IPv6)
+                       挑战码：交互式输入（TTY）或 --challenge-stdin（管道）
   shell [port]         Remote shell server (domain whitelist)
   serve [port]         Start listening for connections
   status               Show system status
@@ -236,6 +262,25 @@ enable_hw_decode = true   # 启用硬件解码 (DXVA/VAAPI)
 level = "info"
 format = "text"
 ```
+
+### 配置加密（R-13，M15-T005）
+
+GoDaddy API Key/Secret、Tunnel token 等敏感字段**不以明文写入配置文件**，以
+ChaCha20Poly1305 密文存储（格式 `{v: base64(nonce‖ciphertext)}`，AAD 绑定
+字段上下文，防跨字段替换）。配置文件内可 grep 验证无明文。
+
+主密钥来源分层（自动选择，无需手动配置）：
+
+| 平台 | 密钥来源 |
+|------|---------|
+| Windows | DPAPI（当前用户级保护，blob 存 `config_dir/kirin_config_key.dpapi`） |
+| macOS | Keychain 通用密码条目（`kirindesk-config-key`） |
+| 无密钥环平台 / 任意平台覆盖 | 环境变量 `KIRIN_CONFIG_KEY`（口令，PBKDF2-HMAC-SHA256 派生，优先级最高） |
+| 全部不可用 | **fail-open**：明文存储 + 启动醒目警告（不阻断开发使用） |
+
+迁移行为：旧明文配置首次加载时**自动加密重写**（`#[serde(default)]` 兼容旧
+字段）；迁移失败不破坏原文件（备份 `.bak`）。密钥/令牌不写日志、不进
+`config show` / `status` 输出（掩码 `****`）。
 
 ## License
 

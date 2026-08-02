@@ -131,9 +131,7 @@ impl IdConnector {
             id_client::IdClientError::LoginRejected(r) => IdConnectError::LoginRejected(r),
             id_client::IdClientError::Connect { .. }
             | id_client::IdClientError::Timeout(_)
-            | id_client::IdClientError::Io(_) => {
-                IdConnectError::ServerUnreachable(e.to_string())
-            }
+            | id_client::IdClientError::Io(_) => IdConnectError::ServerUnreachable(e.to_string()),
             other => IdConnectError::ResolveFailed(other.to_string()),
         })?;
         Ok(info)
@@ -146,10 +144,7 @@ impl IdConnector {
 
     /// ID-011 ①：直连候选并行尝试 —— 首个 TCP 建连成功者胜出
     /// （候选按优先级降序，v6/v4 并行，单候选 2s 超时）。
-    pub async fn try_direct(
-        &self,
-        info: &DeviceInfo,
-    ) -> Option<(PathKind, TcpStream)> {
+    pub async fn try_direct(&self, info: &DeviceInfo) -> Option<(PathKind, TcpStream)> {
         let mut tcp_cands: Vec<(PathKind, SocketAddr)> = info
             .payload
             .candidates
@@ -174,8 +169,7 @@ impl IdConnector {
         for (kind, addr) in tcp_cands {
             let tx = tx.clone();
             handles.push(tokio::spawn(async move {
-                match tokio::time::timeout(DIRECT_ATTEMPT_TIMEOUT, TcpStream::connect(addr)).await
-                {
+                match tokio::time::timeout(DIRECT_ATTEMPT_TIMEOUT, TcpStream::connect(addr)).await {
                     Ok(Ok(s)) => {
                         debug!("id mode: direct {} ok via {}", kind, addr);
                         let _ = tx.send((kind, s)).await;
@@ -210,9 +204,7 @@ impl IdConnector {
         )
         .await
         .map_err(|e| match e {
-            id_client::IdClientError::DeviceUnavailable(r) => {
-                IdConnectError::DeviceUnavailable(r)
-            }
+            id_client::IdClientError::DeviceUnavailable(r) => IdConnectError::DeviceUnavailable(r),
             id_client::IdClientError::Connect { .. } | id_client::IdClientError::Timeout(_) => {
                 IdConnectError::ServerUnreachable(e.to_string())
             }
@@ -291,7 +283,11 @@ mod tests {
                         priority: 50,
                     },
                 ],
-                ed25519_pub: if online { "pub-a".to_string() } else { String::new() },
+                ed25519_pub: if online {
+                    "pub-a".to_string()
+                } else {
+                    String::new()
+                },
                 online,
                 ts: 1_752_000_000,
             },
@@ -343,7 +339,10 @@ mod tests {
             signature: vec![],
         };
         let connector = IdConnector::new(test_config());
-        let (kind, stream) = connector.try_direct(&info).await.expect("direct must succeed");
+        let (kind, stream) = connector
+            .try_direct(&info)
+            .await
+            .expect("direct must succeed");
         assert_eq!(kind, PathKind::DirectV4);
         assert!(stream.peer_addr().is_ok());
         accept_task.await.unwrap();

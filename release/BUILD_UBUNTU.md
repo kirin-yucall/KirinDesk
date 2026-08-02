@@ -13,6 +13,18 @@ sudo apt install build-essential libssl-dev pkg-config \
     libpulse-dev libudev-dev ffmpeg libavcodec-dev
 ```
 
+> 说明（R-14，M12-T001/T003/M13-T001 Linux 侧）：
+> - `libpipewire-0.3-dev`：**必需**——屏幕捕获（screen-cast portal 帧流）与
+>   音频捕获/播放（`pw_stream`）均经 PipeWire；pipewire crate（=0.8.0）
+>   编译期经 system-deps 探测它。
+> - `libpulse-dev`：可选（仅 PulseAudio 兼容层/其它构建需要；本仓库音频
+>   走 PipeWire，不直接链接 libpulse）。
+> - 运行时还需要：`libpipewire-0.3-0`、`xdg-desktop-portal`（+ 桌面门户
+>   后端，如 xdg-desktop-portal-gnome/kde）——屏幕捕获经
+>   `org.freedesktop.portal.ScreenCast` 授权；无头服务器不捕获屏幕，无需
+>   门户。
+> - D-Bus 客户端为纯 Rust（zbus），无额外系统包。
+
 ## Build
 
 ```bash

@@ -56,6 +56,10 @@ zed-scap = "=0.0.8-zed"
 windows-capture = "2.0.0"# WASAPI 环回音频捕获（P1D）。features 对应 Win32_Media_Audio（IMMDeviceEnumerator
 # / IAudioClient / IAudioCaptureClient）、Win32_System_Com（CoInitialize）、
 # Win32_Devices_Properties（PROPERTYKEY）。
+# M8-T030（R-06）：DXGI 适配器枚举 + D3D11 设备创建（单 GPU 绑定 / 内核复用）。
+# features 对应 Win32_Graphics_Dxgi（EnumAdapters1/GetDesc1）、
+# Win32_Graphics_Direct3D（D3D_DRIVER_TYPE）、Win32_Graphics_Direct3D11
+# （D3D11CreateDevice）。
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Media_Audio",
@@ -64,7 +68,23 @@ windows = { version = "0.62", features = [
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Variant",
     "Win32_Devices_Properties",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
 ] }
+
+# ══════════════════════════════════════════════════════════════════
+# Linux 捕获 / 音频后端（M12-T001 / M13-T001 Linux 侧，R-14-S1/S4）
+# ══════════════════════════════════════════════════════════════════
+# - pipewire =0.8.0：PipeWire 客户端（screen-cast portal 帧流 + 音频流）。
+#   编译期链接 libpipewire-0.3（pipewire-sys 经 system-deps 探测），Ubuntu
+#   需 `libpipewire-0.3-dev`（见 release/BUILD_UBUNTU.md）。
+# - zbus =3.15.2：纯 Rust D-Bus 客户端（xdg-desktop-portal ScreenCast 会话），
+#   无系统依赖；默认 features 含 blocking。
+[target.'cfg(target_os = "linux")'.dependencies]
+pipewire = "=0.8.0"
+zbus = "=3.15.2"
 
 # ══════════════════════════════════════════════════════════════════
 # Features

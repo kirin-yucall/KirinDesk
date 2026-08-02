@@ -217,7 +217,7 @@ async fn degrade_connect_fallback() {
         "fallback.example",
         "desktop",
         &ids.server_id,
-        &ids.server_pub,
+        kirin_desk_core::crypto::handshake::PinExpectation::exact_from_base64(&ids.server_pub).expect("server pubkey"),
         "challenge",
         Duration::from_secs(1),
     )
@@ -291,7 +291,7 @@ async fn run_degrade_scenario(tag: &str, hold_after_resume: Duration) {
         "degrade.example",
         "desktop",
         &ids.server_id,
-        &ids.server_pub,
+        kirin_desk_core::crypto::handshake::PinExpectation::exact_from_base64(&ids.server_pub).expect("server pubkey"),
         "challenge",
     )
     .await
@@ -356,7 +356,7 @@ async fn run_degrade_scenario(tag: &str, hold_after_resume: Duration) {
                 client_domain: "degrade.example".to_string(),
                 client_device_type: "desktop".to_string(),
                 server_id: cli_srv_id,
-                server_pubkey_base64: cli_srv_pub,
+                server_pin: kirin_desk_core::crypto::handshake::PinExpectation::exact_from_base64(&cli_srv_pub).expect("server pubkey"),
                 challenge: "challenge".to_string(),
                 connect_timeout: Duration::from_secs(3),
             }),
@@ -474,7 +474,7 @@ async fn accept_dual_listen() {
                     "dual.example",
                     "desktop",
                     &ids.server_id,
-                    &ids.server_pub,
+                    kirin_desk_core::crypto::handshake::PinExpectation::exact_from_base64(&ids.server_pub).expect("server pubkey"),
                     "challenge",
                 )
                 .await
@@ -536,7 +536,7 @@ async fn accept_dual_listen() {
                     "dual.example",
                     "desktop",
                     &ids.server_id,
-                    &ids.server_pub,
+                    kirin_desk_core::crypto::handshake::PinExpectation::exact_from_base64(&ids.server_pub).expect("server pubkey"),
                     "challenge",
                 )
                 .await
@@ -594,7 +594,7 @@ async fn mode_forced_tcp() {
         "forced.example",
         "desktop",
         &ids.server_id,
-        &ids.server_pub,
+        kirin_desk_core::crypto::handshake::PinExpectation::exact_from_base64(&ids.server_pub).expect("server pubkey"),
         "challenge",
         Duration::from_secs(3),
     )

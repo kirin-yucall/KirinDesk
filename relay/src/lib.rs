@@ -7,10 +7,14 @@
 //! 模块：
 //! - [`protocol`]：控制消息 + 帧编解码（T001，TNL-PROTO-001/007）+ 0x80+
 //!   扩展区（M8-T026-P2 设备 ID 模式：解析/候选/设备级中继；P1 打洞预留）；
-//! - [`server`]：隧道服务端（T002，frps 等价；M8-T026-P2 集成设备在线表）；
-//! - [`client`]：隧道客户端（T003，frpc 等价）；
+//! - [`auth`]：挑战-响应认证共用逻辑（M8-T026-P3：口令永不明文上线，
+//!   双向认证、fail-closed，TNL-SEC-006~010）；
+//! - [`server`]：隧道服务端（T002，frps 等价；M8-T026-P2 集成设备在线表；
+//!   M8-T026-P3 两阶段挑战-响应握手）；
+//! - [`client`]：隧道客户端（T003，frpc 等价；M8-T026-P3 探测 + 双向认证）；
 //! - [`registry`]：设备在线表（M8-T026-P2：ID-001~005 / ID-SEC-001~003）；
-//! - [`id_client`]：设备侧 ID 注册客户端 + 控制器解析/中继辅助（M8-T026-P2）；
+//! - [`id_client`]：设备侧 ID 注册客户端 + 控制器解析/中继辅助（M8-T026-P2；
+//!   M8-T026-P3 两条路径同步认证）；
 //! - [`rendezvous`]：打洞 rendezvous 服务端（M8-T026-P1：候选登记/互转/
 //!   结果透传/限速/审计；`RendezvousExtension` 供 P2 挂载 Login/ResolveDevice）；
 //! - [`audit`]：隧道审计事件（TNL-SEC-003 扩展 + M8-T026-P2 设备事件 +
@@ -19,6 +23,7 @@
 //!   零 core 依赖自持实现）。
 
 pub mod audit;
+pub mod auth;
 pub mod client;
 pub mod id_client;
 pub mod protocol;

@@ -402,7 +402,14 @@ impl PathManager {
             [] => (PathKind::Relay, PathKind::Relay), // 兜底：中继承载
             [best] => {
                 // 单条 P2P：媒体走它，控制走中继（standby 后控制信令仍可走）
-                (*best, if relay_available { PathKind::Relay } else { *best })
+                (
+                    *best,
+                    if relay_available {
+                        PathKind::Relay
+                    } else {
+                        *best
+                    },
+                )
             }
             [best, second, ..] => (*best, *second),
         };
@@ -459,11 +466,10 @@ mod tests {
     use super::*;
 
     fn mgr() -> PathManager {
-        PathManager::new()
-            .with_thresholds(SwitchThresholds {
-                hold_period: Duration::from_millis(20),
-                ..Default::default()
-            })
+        PathManager::new().with_thresholds(SwitchThresholds {
+            hold_period: Duration::from_millis(20),
+            ..Default::default()
+        })
     }
 
     fn pump_setup() -> (PathManager, Vec<SwitchAction>) {
@@ -531,7 +537,7 @@ mod tests {
         assert_eq!(a.to, PathKind::PunchUdp);
         assert_eq!(a.reason, SwitchReason::BetterPathAvailable);
         assert_eq!(a.budget_ms, 200); // QUIC 迁移预算（PATH-003/NF-002）
-        // 期望分配即时更新；动作不重复产出（pending）
+                                      // 期望分配即时更新；动作不重复产出（pending）
         assert_eq!(m.assignment().video, PathKind::PunchUdp);
         assert!(m.evaluate().is_empty());
         m.on_switch_completed(a);
@@ -545,7 +551,11 @@ mod tests {
         // 打洞路径劣化（丢包 3%）
         m.on_metrics(
             PathKind::PunchUdp,
-            PathMetrics { rtt_ms: 20.0, loss_rate: 0.03, jitter_us: 100.0 },
+            PathMetrics {
+                rtt_ms: 20.0,
+                loss_rate: 0.03,
+                jitter_us: 100.0,
+            },
         );
         assert!(m.evaluate().is_empty(), "未到保持期不换路");
         std::thread::sleep(Duration::from_millis(30));
@@ -574,12 +584,30 @@ mod tests {
         assert_eq!(m.assignment().control, PathKind::PunchUdp);
 
         // 最优 DirectV6 RTT 10ms；PunchUdp 30ms（>13ms = 差 >30%）→ 劣化
-        m.on_metrics(PathKind::DirectV6, PathMetrics { rtt_ms: 10.0, loss_rate: 0.0, jitter_us: 0.0 });
-        m.on_metrics(PathKind::PunchUdp, PathMetrics { rtt_ms: 30.0, loss_rate: 0.0, jitter_us: 0.0 });
+        m.on_metrics(
+            PathKind::DirectV6,
+            PathMetrics {
+                rtt_ms: 10.0,
+                loss_rate: 0.0,
+                jitter_us: 0.0,
+            },
+        );
+        m.on_metrics(
+            PathKind::PunchUdp,
+            PathMetrics {
+                rtt_ms: 30.0,
+                loss_rate: 0.0,
+                jitter_us: 0.0,
+            },
+        );
         assert!(m.evaluate().is_empty(), "未到保持期不换路");
         std::thread::sleep(Duration::from_millis(30));
         let actions = m.evaluate();
-        assert_eq!(actions.len(), 1, "控制路径 PunchUdp RTT 劣化 → 换中继 standby");
+        assert_eq!(
+            actions.len(),
+            1,
+            "控制路径 PunchUdp RTT 劣化 → 换中继 standby"
+        );
         assert_eq!(actions[0].from, PathKind::PunchUdp);
         assert_eq!(actions[0].to, PathKind::Relay);
         assert_eq!(actions[0].reason, SwitchReason::RttDegraded);
@@ -592,7 +620,11 @@ mod tests {
         m.on_switch_completed(upgrade[0]);
         m.on_metrics(
             PathKind::PunchUdp,
-            PathMetrics { rtt_ms: 20.0, loss_rate: 0.05, jitter_us: 0.0 },
+            PathMetrics {
+                rtt_ms: 20.0,
+                loss_rate: 0.05,
+                jitter_us: 0.0,
+            },
         );
         std::thread::sleep(Duration::from_millis(30));
         let actions = m.evaluate();
@@ -601,7 +633,14 @@ mod tests {
         assert_eq!(m.assignment().video, PathKind::Relay);
 
         // 恢复：丢包归零 + RTT 回优
-        m.on_metrics(PathKind::PunchUdp, PathMetrics { rtt_ms: 5.0, loss_rate: 0.0, jitter_us: 0.0 });
+        m.on_metrics(
+            PathKind::PunchUdp,
+            PathMetrics {
+                rtt_ms: 5.0,
+                loss_rate: 0.0,
+                jitter_us: 0.0,
+            },
+        );
         let actions = m.evaluate();
         assert_eq!(actions.len(), 1, "恢复后应触发升舱回打洞路径");
         assert_eq!(actions[0].from, PathKind::Relay);
@@ -628,7 +667,14 @@ mod tests {
     fn test_failed_path_resets_degrade() {
         let mut m = mgr();
         m.register_path(PathKind::PunchUdp);
-        m.on_metrics(PathKind::PunchUdp, PathMetrics { rtt_ms: 100.0, loss_rate: 0.05, jitter_us: 0.0 });
+        m.on_metrics(
+            PathKind::PunchUdp,
+            PathMetrics {
+                rtt_ms: 100.0,
+                loss_rate: 0.05,
+                jitter_us: 0.0,
+            },
+        );
         assert!(m.path(PathKind::PunchUdp).unwrap().degraded_since.is_some());
         m.on_path_state(PathKind::PunchUdp, PathState::Failed);
         let p = m.path(PathKind::PunchUdp).unwrap();

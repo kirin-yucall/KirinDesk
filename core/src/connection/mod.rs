@@ -1,11 +1,12 @@
 //! Connection management
+pub mod client;
 pub mod file_transfer;
 pub mod id_mode;
 pub mod manager;
 pub mod multiplex;
 pub mod path_manager;
-pub mod punch;
 pub mod privacy;
+pub mod punch;
 pub mod reconnection;
 pub mod secure_channel;
 pub mod shell_bridge;
@@ -20,12 +21,21 @@ pub use file_transfer::{
 };
 // M8-T026-P2: 设备 ID 连接模式（ID-010~013：解析/验签/三级路径编排）。
 pub use id_mode::{IdConnectError, IdConnector, IdModeConfig, PathKind};
-pub use manager::{ConnectionManager, ConnectionState, ConnectionEvent, ManagedConnection};
+pub use manager::{
+    ConnectionEvent, ConnectionManager, ConnectionState, ManagedConnection, ReconnectContext,
+};
+// R-03 (R03-S1): 可复用建连链路（CLI/GUI/重连共用）。
+pub use client::{
+    connect_peer, perform_handshake, resolve_peer, ConnectError, ConnectOutcome, ConnectionOptions,
+    DnsConfig, RefusalReason, ResolvedPeer, TrustPolicy,
+};
 // M8-T019: 隐私模式（黑屏 / 锁屏）状态机与平台执行器。
-pub use privacy::{platform_is_locked, platform_lock_screen, PrivacyController, PrivacyLevel, PrivacyOutcome};
 pub use multiplex::{
     decode_header, encode_frame, spawn_demux_loop, Demultiplexer, MultiplexError, MultiplexType,
     Multiplexer,
+};
+pub use privacy::{
+    platform_is_locked, platform_lock_screen, PrivacyController, PrivacyLevel, PrivacyOutcome,
 };
 pub use secure_channel::SecureChannel;
 pub use shell_bridge::{

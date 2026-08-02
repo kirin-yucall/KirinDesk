@@ -37,9 +37,10 @@ pub struct VideoEncoderPipeline {
     /// 帧序号（Incremental 包 [frame_id] 用）。
     frame_id: u32,
     // ── CPU RGBA 适配（windows_capture 当前产 RGBA，非 GpuTexture 句柄） ──
-    // M13-T004（零拷贝）：本层不再复制 RGBA（此前 `pending_rgba` 是死拷贝——
-    // 只写不读，编码器 ffmpeg_sw/ffmpeg_hw 各自持有自己的 pending 缓冲），
-    // 仅缓存尺寸供构造 GpuTexture 哨兵。
+    // M8-T030（R-06，GPU-FR-008）：CPU tile-hash 兜底需要帧像素 ——
+    // `pending_rgba` 由 set_cpu_frame 存留，classify_cpu 消费（非死拷贝；
+    // M13-T004 曾因无消费方移除，现恢复消费）。
+    pending_rgba: Vec<u8>,
     pending_w: u32,
     pending_h: u32,
 }
@@ -67,6 +68,7 @@ impl VideoEncoderPipeline {
             kernel,
             static_streak: 0,
             frame_id: 0,
+            pending_rgba: Vec::new(),
             pending_w: 0,
             pending_h: 0,
         })
@@ -103,11 +105,13 @@ impl VideoEncoderPipeline {
     /// 喂入 CPU RGBA（适配 `windows_capture`：当前捕获后端无 GPU 句柄）。
     /// 调用方在 [`on_frame`](Self::on_frame) 前调用本方法把当前帧 RGBA 喂入。
     ///
-    /// M13-T004（零拷贝）：只转发给编码器并缓存尺寸，**不在本层复制像素数据**
-    /// （此前 `pending_rgba` 全量拷贝且无人读取——死拷贝，已移除）。
+    /// M8-T030（R-06）：本层保留一份 RGBA 副本供 CPU tile-hash 兜底
+    /// （`classify_cpu` 消费；GPU 内核可用时仍只转发编码器 + 缓存尺寸）。
     pub fn set_cpu_frame(&mut self, rgba: &[u8], w: u32, h: u32, force_idr: bool) {
         self.encoder.set_cpu_frame(rgba, w, h, force_idr);
-        // 缓存 RGBA 尺寸，便于 CPU 模式下构造 GpuTexture 哨兵。
+        // 缓存 RGBA（CPU tile-hash 消费）+ 尺寸。
+        self.pending_rgba.clear();
+        self.pending_rgba.extend_from_slice(rgba);
         self.pending_w = w;
         self.pending_h = h;
     }
@@ -123,12 +127,18 @@ impl VideoEncoderPipeline {
     ) -> Result<Vec<EncodedPacket>, EncodeError> {
         self.frame_id = self.frame_id.wrapping_add(1);
 
-        // 决策：GPU 内核可用 → classify；否则（CPU RGBA 模式）直接 FullFrame。
+        // 决策：GPU 内核可用 → classify（纹理 hash）；否则 CPU 路径
+        // （tex 为 null 哨兵）→ M8-T030 真实 CPU tile-hash 兜底（classify_cpu），
+        // 产出三态决策（首帧 FullFrame / 纯色 Static / 局部微变 Incremental）。
         let decision = if tex.is_null() {
-            // CPU RGBA 路径：无 GPU 纹理，classify 无意义 → FullFrame。
-            // dirty 用整帧标记（ROI 注入可据此；但默认 empty dirty → 不注入，
-            // 整帧均匀编码，符合 CPU 路径语义）。
-            EncodeDecision::FullFrame(DirtyTileMap::default())
+            match self
+                .diff
+                .classify_cpu(&self.pending_rgba, self.pending_w, self.pending_h)
+            {
+                Ok(d) => d,
+                // 兜底失败（未喂 RGBA / 缓冲异常）→ 降级 FullFrame，不丢帧。
+                Err(_) => EncodeDecision::FullFrame(DirtyTileMap::default()),
+            }
         } else {
             match self.diff.classify(tex, self.kernel.as_deref()) {
                 Ok(d) => d,
@@ -158,7 +168,8 @@ impl VideoEncoderPipeline {
                     GpuTexture::new(tex.handle, tex.width(), tex.height())
                 };
                 // P1G：把 classify 产出的 dirty map 原样传给编码器（ROI 注入
-                // 依赖它；此前误传空 map 导致 ROI side data 永不注入）。
+                // 依赖它；M8-T030 后 CPU 路径的 map 来自真实 CPU tile-hash，
+                // ROI 同样生效）。
                 self.encoder
                     .encode(&enc_tex, ts, EncodeDecision::FullFrame(map))
             }

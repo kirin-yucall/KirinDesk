@@ -105,16 +105,13 @@ impl DeviceStore {
     }
 
     /// 保存到指定路径（自动创建父目录）。
+    ///
+    /// S-07 (F-8): 经 `fsutil::write_private` 落盘（0600/0700/O_NOFOLLOW；
+    /// 设备表含公钥等标识信息）。
     pub fn save_to(&self, path: &Path) -> Result<(), DeviceError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| DeviceError::IoError {
-                path: parent.to_path_buf(),
-                source: e,
-            })?;
-        }
         let content = serde_json::to_string_pretty(&self.devices)
             .map_err(|e| DeviceError::SerializeError(e.to_string()))?;
-        std::fs::write(path, &content).map_err(|e| DeviceError::IoError {
+        crate::fsutil::write_private(path, content.as_bytes()).map_err(|e| DeviceError::IoError {
             path: path.to_path_buf(),
             source: e,
         })?;

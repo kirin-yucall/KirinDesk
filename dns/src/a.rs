@@ -1,4 +1,5 @@
 use crate::godaddy::{GoDaddyClient, GoDaddyError, Record};
+use crate::validate;
 use std::net::Ipv4Addr;
 use tracing::debug;
 
@@ -13,6 +14,19 @@ impl<'a> AManager<'a> {
         Self { client, domain }
     }
 
+    /// S-14b / F-18: device_id 统一校验（拒绝 '.' 子域注入等非法字符）。
+    fn check_device_id(&self, device_id: &str) -> Result<(), GoDaddyError> {
+        if !validate::validate_device_id(device_id) {
+            return Err(GoDaddyError::InvalidParameters {
+                body: format!(
+                    "invalid device_id '{}' (charset [a-zA-Z0-9:_-], len 1..=128, no '.' allowed)",
+                    device_id
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// Register or update an A record for a device.
     pub async fn register(
         &self,
@@ -20,6 +34,7 @@ impl<'a> AManager<'a> {
         ipv4_addr: Ipv4Addr,
         ttl: u32,
     ) -> Result<(), GoDaddyError> {
+        self.check_device_id(device_id)?;
         debug!(
             "A register: device={}, ipv4={}, ttl={}",
             device_id, ipv4_addr, ttl
@@ -36,6 +51,7 @@ impl<'a> AManager<'a> {
 
     /// Query A records for a device.
     pub async fn query(&self, device_id: &str) -> Result<Vec<Ipv4Addr>, GoDaddyError> {
+        self.check_device_id(device_id)?;
         debug!("A query: device={}", device_id);
         let records = self.client.get_records(self.domain, "A", device_id).await?;
 
@@ -65,6 +81,7 @@ impl<'a> AManager<'a> {
 
     /// Delete A records for a device.
     pub async fn remove(&self, device_id: &str) -> Result<(), GoDaddyError> {
+        self.check_device_id(device_id)?;
         self.client.delete_record(self.domain, "A", device_id).await
     }
 }

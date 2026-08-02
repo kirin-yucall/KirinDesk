@@ -1,18 +1,20 @@
-//! macOS Keychain 身份存储（M12-MAC MAC-T006，**可选增强**）。
+//! macOS Keychain 身份存储（M12-MAC MAC-T006；S-05/F-4 接入为**默认后端**）。
 //!
 //! 设计依据：`共享层/M12-MAC_macOS支持.md` MAC-T006。用 macOS Keychain
-//! 存储 Ed25519 私钥原始字节（32 字节），优于文件式 PKCS#8 加密存储：
+//! 存储 Ed25519 私钥原始字节（32 字节），优于文件式自定义加密存储
+//! （ChaCha20Poly1305 + device_id 派生密钥，JSON `{nonce,ciphertext}`；
+//! 非 PKCS#8 —— 命名对齐见 `ed25519.rs`，R-20）：
 //! - 系统级加密（Keychain 本身加密磁盘上数据）；
 //! - Touch ID / Apple Watch 解锁能力（后续可加）；
 //! - 防盗用：即使 root 也无法直接读取 keychain item 内容。
 //!
-//! # 回退设计（重要）
+//! # 接线（S-05，审计 F-4）
 //!
-//! **默认仍用文件式 PKCS#8 加密存储**（[`crate::crypto::IdentityManager`]，
-//! ChaCha20Poly1305 + device_id 派生密钥），本模块为可选后端：用户经配置
-//! `identity.backend = "keychain"` 启用后，把 `store_private_key(label, key)`
-//! 的 32 字节私钥交还 [`IdentityManager`] 使用即可（本里程碑只实现存储层，
-//! **不改默认行为**）。
+//! 本模块实现 [`crate::crypto::keystore::KeyStore`] trait，成为 macOS 上的
+//! **默认身份存储后端**（`keystore::default_backend` 优先级 Keychain →
+//! 文件主密钥兜底）：`store_private_key(label, key)` 存 32 字节私钥，
+//! `load_private_key` / `delete_private_key` 读取/删除。Keychain 不可用
+//! （框架加载失败）时降级到文件兜底后端（警告不阻断）。
 //!
 //! # FFI 方式（架构红线：dlopen，不静态链接系统框架）
 //!
@@ -35,6 +37,8 @@ use std::ptr;
 use std::sync::OnceLock;
 
 use libloading::{Library, Symbol};
+
+use crate::crypto::keystore::{KeyStore, KeyStoreError};
 
 // ════════════════════════════════════════════════════════════════
 // 常量（与 <Security/SecItem.h> / <CoreFoundation/CFDictionary.h> 对齐）
@@ -134,8 +138,9 @@ struct KeychainDlls {
     sec_item_add: SecItemAddFn,
     sec_item_copy_matching: SecItemCopyMatchingFn,
     sec_item_delete: SecItemDeleteFn,
-    /// kCFBooleanTrue 单例（全局变量，dlsym 后解引用取值）。
-    k_cf_boolean_true: *const c_void,
+    /// kCFBooleanTrue 单例地址（存 usize 而非裸指针：裸指针非 Send/Sync，
+    /// 会破坏 `static KEYCHAIN: OnceLock`；地址本身是进程级单例，值安全）。
+    k_cf_boolean_true: usize,
 }
 
 static KEYCHAIN: OnceLock<Result<KeychainDlls, KeychainError>> = OnceLock::new();
@@ -200,7 +205,7 @@ impl KeychainDlls {
                 SecItemCopyMatchingFn
             ),
             sec_item_delete: sym!(&security, "SecItemDelete", SecItemDeleteFn),
-            k_cf_boolean_true: k_true,
+            k_cf_boolean_true: k_true as usize,
             _security: security,
             _cf: cf,
         })
@@ -286,6 +291,11 @@ impl Drop for CfDict {
 pub struct MacosKeychain;
 
 impl MacosKeychain {
+    /// Security/CoreFoundation 框架是否可加载（S-05：后端选择探测用）。
+    pub fn available() -> bool {
+        KeychainDlls::get().is_ok()
+    }
+
     /// 存储私钥原始字节到 Keychain（`kSecClassGenericPassword`，
     /// service+account 均由 `label` 派生）。
     ///
@@ -345,7 +355,7 @@ impl MacosKeychain {
         dict.add(dlls, &svce, service.0);
         dict.add(dlls, &acct, account.0);
         // kSecReturnData = kCFBooleanTrue（系统单例）。
-        dict.add(dlls, &ret, dlls.k_cf_boolean_true);
+        dict.add(dlls, &ret, dlls.k_cf_boolean_true as *const c_void);
 
         let mut result: *mut c_void = ptr::null_mut();
         // SAFETY: query 为构造的字典。
@@ -404,5 +414,35 @@ impl MacosKeychain {
             return Err(KeychainError::Status(status));
         }
         Ok(())
+    }
+}
+
+// ════════════════════════════════════════════════════════════════
+// S-05 (F-4)：KeyStore trait 接入（macOS 默认后端）
+// ════════════════════════════════════════════════════════════════
+
+fn map_keychain_err(e: KeychainError) -> KeyStoreError {
+    match e {
+        KeychainError::Load(msg) => KeyStoreError::Backend(msg),
+        KeychainError::Status(code) => KeyStoreError::Backend(format!("Keychain OSStatus={code}")),
+        KeychainError::Malformed(msg) => KeyStoreError::Corrupt(msg),
+    }
+}
+
+impl KeyStore for MacosKeychain {
+    fn set(&self, label: &str, secret: &[u8]) -> Result<(), KeyStoreError> {
+        Self::store_private_key(label, secret).map_err(map_keychain_err)
+    }
+
+    fn get(&self, label: &str) -> Result<Option<Vec<u8>>, KeyStoreError> {
+        match Self::load_private_key(label) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(KeychainError::Status(osstatus::ITEM_NOT_FOUND)) => Ok(None),
+            Err(e) => Err(map_keychain_err(e)),
+        }
+    }
+
+    fn delete(&self, label: &str) -> Result<(), KeyStoreError> {
+        Self::delete_private_key(label).map_err(map_keychain_err)
     }
 }

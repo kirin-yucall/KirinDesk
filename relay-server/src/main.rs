@@ -139,61 +139,124 @@ struct ConsoleAudit;
 
 impl AuditSink for ConsoleAudit {
     fn record(&self, event: TunnelAuditEvent) {
-        use TunnelAuditEvent::*;
-        let line = match event {
-            LoginSuccess { client, hostname } => {
-                format!("login ok ip={client} host={hostname}")
-            }
-            LoginFailed { client, reason } => {
-                format!("login FAILED ip={client} reason={reason}")
-            }
-            ProxyRegistered { client, name, port } => {
-                format!("proxy registered ip={client} name={name} port={port}")
-            }
-            ProxyRemoved { client, name } => {
-                format!("proxy removed ip={client} name={name}")
-            }
-            WorkConnOpened { client, name } => {
-                format!("work conn opened ip={client} proxy={name}")
-            }
-            WorkConnClosed { client, name, reason } => {
-                format!("work conn closed ip={client} proxy={name} reason={reason}")
-            }
-            RateLimited { client, reason } => {
-                format!("rate limited ip={client} reason={reason}")
-            }
-            PunchCandidateRegistered { client, device_id } => {
-                format!("punch candidate registered ip={client} device={device_id}")
-            }
-            PunchForwarded { client, device_id } => {
-                format!("punch forwarded ip={client} device={device_id}")
-            }
-            PunchUnknownSession { client, session_id } => {
-                format!("punch unknown session ip={client} session={session_id}")
-            }
-            DeviceRegistered { client, device_id } => {
-                format!("device registered ip={client} id={device_id}")
-            }
-            DeviceRejected { client, device_id, reason } => {
-                format!("device rejected ip={client} id={device_id} reason={reason}")
-            }
-            DeviceOffline { client, device_id } => {
-                format!("device offline ip={client} id={device_id}")
-            }
-            DeviceResolveAccepted { client, device_id, online } => {
-                format!("device resolve ip={client} id={device_id} online={online}")
-            }
-            DeviceResolveRejected { client, device_id, reason } => {
-                format!("device resolve rejected ip={client} id={device_id} reason={reason}")
-            }
-            TunnelRelayOpened { target, from, conn_id } => {
-                format!("relay opened target={target} from={from} conn={conn_id}")
-            }
-            TunnelRelayClosed { target, conn_id, reason } => {
-                format!("relay closed target={target} conn={conn_id} reason={reason}")
-            }
-        };
-        println!("[audit] {line}");
+        println!("[audit] {}", console_audit_line(&event));
+    }
+}
+
+/// S-16d (F-21): 构造控制台审计行 —— hostname/device_id/reason/name/
+/// session_id/target/from 等**攻击者可控**字符串字段一律经
+/// `escape_control` 转义（`\n` → 反斜杠n 字面量、其余控制字符 → `\xNN`），
+/// 攻击者不能借字段内容伪造日志行或注入终端控制序列。client 为
+/// `SocketAddr`（不能含控制字符）、port/conn_id/online 为数值类型，不转义。
+fn console_audit_line(event: &TunnelAuditEvent) -> String {
+    use TunnelAuditEvent::*;
+    let esc = |s: &str| -> String { kirin_desk_utils::audit::escape_control(s) };
+    match event {
+        LoginSuccess { client, hostname } => {
+            format!("login ok ip={client} host={}", esc(hostname))
+        }
+        LoginFailed { client, reason } => {
+            format!("login FAILED ip={client} reason={}", esc(reason))
+        }
+        ProxyRegistered { client, name, port } => {
+            format!("proxy registered ip={client} name={} port={port}", esc(name))
+        }
+        ProxyRemoved { client, name } => {
+            format!("proxy removed ip={client} name={}", esc(name))
+        }
+        WorkConnOpened { client, name } => {
+            format!("work conn opened ip={client} proxy={}", esc(name))
+        }
+        WorkConnClosed { client, name, reason } => {
+            format!("work conn closed ip={client} proxy={} reason={}", esc(name), esc(reason))
+        }
+        RateLimited { client, reason } => {
+            format!("rate limited ip={client} reason={}", esc(reason))
+        }
+        PunchCandidateRegistered { client, device_id } => {
+            format!("punch candidate registered ip={client} device={}", esc(device_id))
+        }
+        PunchForwarded { client, device_id } => {
+            format!("punch forwarded ip={client} device={}", esc(device_id))
+        }
+        PunchUnknownSession { client, session_id } => {
+            format!("punch unknown session ip={client} session={}", esc(session_id))
+        }
+        DeviceRegistered { client, device_id } => {
+            format!("device registered ip={client} id={}", esc(device_id))
+        }
+        DeviceRejected { client, device_id, reason } => {
+            format!("device rejected ip={client} id={} reason={}", esc(device_id), esc(reason))
+        }
+        DeviceOffline { client, device_id } => {
+            format!("device offline ip={client} id={}", esc(device_id))
+        }
+        DeviceResolveAccepted { client, device_id, online } => {
+            format!("device resolve ip={client} id={} online={online}", esc(device_id))
+        }
+        DeviceResolveRejected { client, device_id, reason } => {
+            format!("device resolve rejected ip={client} id={} reason={}", esc(device_id), esc(reason))
+        }
+        TunnelRelayOpened { target, from, conn_id } => {
+            format!("relay opened target={} from={} conn={conn_id}", esc(target), esc(from))
+        }
+        TunnelRelayClosed { target, conn_id, reason } => {
+            format!("relay closed target={} conn={conn_id} reason={}", esc(target), esc(reason))
+        }
+        CandidateRegisterRejected { client, device_id, reason } => {
+            format!("candidate register rejected ip={client} device={} reason={}", esc(device_id), esc(reason))
+        }
+    }
+}
+
+// S-16e (F-21): ConsoleAudit 输出转义单测 —— 攻击者可控字段含换行/控制
+// 字符时输出恒为单行且为字面量转义。
+#[cfg(test)]
+mod console_audit_escape_tests {
+    use super::console_audit_line;
+    use kirin_desk_relay::audit::TunnelAuditEvent;
+
+    fn addr() -> std::net::SocketAddr {
+        "203.0.113.5:9000".parse().unwrap()
+    }
+
+    #[test]
+    fn test_login_hostname_newline_escaped() {
+        // 攻击者可控 hostname：换行伪造登录行。
+        let line = console_audit_line(&TunnelAuditEvent::LoginSuccess {
+            client: addr(),
+            hostname: "pc-a\nlogin ok ip=127.0.0.1\n".into(),
+        });
+        assert!(
+            line.contains("host=pc-a\\nlogin ok ip=127.0.0.1\\n"),
+            "hostname 换行应为字面量: {line:?}"
+        );
+        assert!(!line.contains('\n'), "输出必须单行: {line:?}");
+    }
+
+    #[test]
+    fn test_device_id_control_chars_escaped() {
+        let line = console_audit_line(&TunnelAuditEvent::DeviceRegistered {
+            client: addr(),
+            device_id: "dev\r\x1b[31mred".into(),
+        });
+        assert!(
+            line.contains("id=dev\\r\\x1b[31mred"),
+            "device_id 控制字符应为字面量: {line:?}"
+        );
+        assert!(!line.contains('\r') && !line.contains('\x1b'), "不得残留控制字符: {line:?}");
+    }
+
+    #[test]
+    fn test_reason_and_target_escaped() {
+        let line = console_audit_line(&TunnelAuditEvent::TunnelRelayClosed {
+            target: "t\n1".into(),
+            conn_id: 7,
+            reason: "eof\r\n".into(),
+        });
+        assert!(line.contains("target=t\\n1"), "{line:?}");
+        assert!(line.contains("reason=eof\\r\\n"), "{line:?}");
+        assert!(!line.contains('\n'), "输出必须单行: {line:?}");
     }
 }
 
@@ -235,6 +298,10 @@ async fn main() {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
+
+    // R-10 (M15-T006): panic hook——panic 消息 + backtrace 落 stderr（控制台）
+    // 与今日日志文件（~/.kirin_desk/logs/）；无 GUI，不弹窗。
+    kirin_desk_utils::logging::install_panic_hook();
 
     tracing::info!("relay-server v{VERSION} starting");
     if cfg.token.is_empty() {

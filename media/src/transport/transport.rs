@@ -27,7 +27,9 @@ use crate::transport::{
 
 use kirin_desk_core::crypto::ed25519::IdentityManager;
 use kirin_desk_core::crypto::handshake as core_handshake;
-use kirin_desk_core::crypto::handshake::{SecureChannel, SecureChannelReader, SecureChannelWriter};
+use kirin_desk_core::crypto::handshake::{
+    PinExpectation, SecureChannel, SecureChannelReader, SecureChannelWriter,
+};
 
 // ════════════════════════════════════════════════════════════════
 // QuicMediaTransport
@@ -54,11 +56,21 @@ pub struct QuicMediaTransport {
     loss_detector: Arc<std::sync::Mutex<LossDetector>>,
     control_sender: Option<quinn::SendStream>,
     control_receiver: Option<quinn::RecvStream>,
+    /// R-04：音频包缓冲通道发送端（`recv_frame` 内按 DATAGRAM kind 字节分流）。
+    audio_tx: Option<std::sync::mpsc::Sender<crate::decoder::AudioPacket>>,
+    /// R-04：音频包缓冲通道接收端（会话取出交给 `AudioDecodePipeline`）。
+    audio_rx: Option<std::sync::mpsc::Receiver<crate::decoder::AudioPacket>>,
+    /// R-04：音频接收是否启用（`take_audio_receiver` 置 true；false → 接收
+    /// 循环丢弃音频包，不缓冲——避免无消费者时通道无界增长）。
+    audio_buffering: bool,
 }
 
 impl QuicMediaTransport {
     /// 创建新的 QUIC 媒体传输。
     pub fn new(conn: QuicConnection, cipher: MediaCipher) -> Self {
+        // R-04：音频缓冲通道随传输创建（接收端由会话经 `take_audio_receiver`
+        // 取出；传输 drop → 发送端关闭 → 音频线程干净退出）。
+        let (audio_tx, audio_rx) = std::sync::mpsc::channel();
         Self {
             conn,
             cipher: Arc::new(cipher),
@@ -67,6 +79,9 @@ impl QuicMediaTransport {
             loss_detector: Arc::new(std::sync::Mutex::new(LossDetector::default())),
             control_sender: None,
             control_receiver: None,
+            audio_tx: Some(audio_tx),
+            audio_rx: Some(audio_rx),
+            audio_buffering: false,
         }
     }
 
@@ -115,7 +130,9 @@ impl QuicMediaTransport {
 
     /// 按 [`crate::transport::QuicKind`] 把一个 EncodedPacket 发到对应 QUIC 通道。
     ///
-    /// - 视频/音频：打成 `PacketHeader + payload` → AEAD 加密 → DATAGRAM。
+    /// - 视频/音频：打成 `PacketHeader + payload` → 经
+    ///   [`datagram::send_encrypted_frame`] 带 **kind 字节**（R-04：DATAGRAM
+    ///   头 1B 区分视频/音频，接收端据此分派）→ AEAD 加密 → DATAGRAM。
     ///   超过 DATAGRAM 负载上限的视频帧应调用方先自行分片（复用 datagram 分片路径）；
     ///   本方法对单片超限返回 [`TransportError::InvalidFrame`]。
     /// - 键鼠（InputEcho）：走控制可靠流（与既有 ControlMessage 复用同一条流，
@@ -132,10 +149,24 @@ impl QuicMediaTransport {
         match quic_kind {
             crate::transport::QuicKind::VideoDatagram
             | crate::transport::QuicKind::AudioDatagram => {
-                // 视频/音频：DATAGRAM。明文 framed 经 AEAD 加密 → 单个 DATAGRAM。
-                let ciphertext = self.cipher.encrypt(&framed)?;
-                self.conn.send_datagram(&ciphertext).await?;
-                Ok(())
+                // 视频/音频：DATAGRAM（kind 字节区分；明文 framed 经 AEAD 加密
+                // → 单个 DATAGRAM，头含 kind=Video/Audio）。
+                let kind_byte = match quic_kind {
+                    crate::transport::QuicKind::AudioDatagram => {
+                        crate::transport::stream::PacketKindWire::Audio as u8
+                    }
+                    _ => crate::transport::stream::PacketKindWire::Video as u8,
+                };
+                datagram::send_encrypted_frame(
+                    &self.conn,
+                    &self.cipher,
+                    frame_id as u64,
+                    kind_byte,
+                    &framed,
+                    pkt.is_key,
+                    false,
+                )
+                .await
             }
             crate::transport::QuicKind::InputReliable => {
                 // 键鼠回声 / 显示器控制：复用控制可靠流（前缀 tag 字节区分于
@@ -224,6 +255,7 @@ impl QuicMediaTransport {
                 &self.conn,
                 &self.cipher,
                 frame_id,
+                crate::transport::stream::PacketKindWire::Video as u8,
                 &nal_data,
                 is_key,
                 is_window_end,
@@ -257,15 +289,49 @@ impl QuicMediaTransport {
             .await
             .map_err(|_| TransportError::Timeout)??;
 
-            let (frame_id, packet_idx, total, flags, payload) = datagram;
+            let (frame_id, packet_idx, total, kind, flags, payload) = datagram;
             debug!(
-                "recv_frame_inner: dg frame_id={} pkt={}/{} flags={:#06x} payload={}B",
+                "recv_frame_inner: dg frame_id={} pkt={}/{} kind={} flags={:#06x} payload={}B",
                 frame_id,
                 packet_idx,
                 total,
+                kind,
                 flags,
                 payload.len()
             );
+
+            // R-04：按 DATAGRAM kind 字节分派——音频包（payload = stream 帧包
+            // `PacketHeader + Opus`，携带 PTS/首包标记）→ 缓冲通道（未启用时
+            // 丢弃）；视频走重组路径。音频恒单 DATAGRAM（frame_packet 上限
+            // 1151B < 分片阈值 1157B），多片音频包视为畸形丢弃。
+            if kind == crate::transport::stream::PacketKindWire::Audio as u8 {
+                if packet_idx == 0 && total == 1 {
+                    match crate::transport::stream::parse_frame(&payload) {
+                        Ok((header, audio_payload)) => {
+                            let pkt = crate::decoder::AudioPacket {
+                                pts: header.pts,
+                                data: audio_payload.to_vec(),
+                            };
+                            if self.audio_buffering {
+                                if let Some(tx) = &self.audio_tx {
+                                    if tx.send(pkt).is_err() {
+                                        // 接收端已关闭（会话结束）→ 停止缓冲。
+                                        self.audio_buffering = false;
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!("[Transport] malformed audio datagram: {e} — dropping");
+                        }
+                    }
+                } else {
+                    warn!(
+                        "[Transport] multi-datagram audio packet (pkt={packet_idx}/{total}) — dropping"
+                    );
+                }
+                continue;
+            }
 
             {
                 let mut ld = self.loss_detector.lock().unwrap();
@@ -295,6 +361,22 @@ impl super::MediaTransport for QuicMediaTransport {
 
     async fn recv_frame(&mut self) -> Result<FramePacket, TransportError> {
         self.recv_frame_inner().await
+    }
+
+    // R-04：音频包 → 独立 DATAGRAM（中优先级，可丢；头带 kind 字节，接收端
+    // 按 type 分派——与视频包互不干扰）。
+    async fn send_audio(&mut self, pkts: &[EncodedPacket]) -> Result<(), TransportError> {
+        for pkt in pkts {
+            self.send_packet_by_kind(pkt).await?;
+        }
+        Ok(())
+    }
+
+    fn take_audio_receiver(&mut self) -> Option<std::sync::mpsc::Receiver<crate::decoder::AudioPacket>> {
+        // 启用音频缓冲（接收循环据此分流）；再次调用返回 None（已取出）。
+        let rx = self.audio_rx.take()?;
+        self.audio_buffering = true;
+        Some(rx)
     }
 
     async fn send_control(&mut self, msg: &ControlMessage) -> Result<(), TransportError> {
@@ -400,7 +482,7 @@ pub async fn connect_quic_transport(
     client_domain: &str,
     client_device_type: &str,
     server_id: &str,
-    _server_pubkey_base64: &str,
+    server_pin: PinExpectation,
     challenge: &str,
 ) -> Result<QuicMediaTransport, TransportError> {
     let conn = QuicEndpoint::connect(addr, client_id).await?;
@@ -415,7 +497,7 @@ pub async fn connect_quic_transport(
         client_domain,
         client_device_type,
         server_id,
-        _server_pubkey_base64,
+        server_pin,
         challenge,
     )
     .await
@@ -450,7 +532,7 @@ pub async fn connect_quic_transport_on(
     client_domain: &str,
     client_device_type: &str,
     server_id: &str,
-    _server_pubkey_base64: &str,
+    server_pin: PinExpectation,
     challenge: &str,
 ) -> Result<QuicMediaTransport, TransportError> {
     let conn = endpoint.connect_on(addr, client_id).await?;
@@ -464,7 +546,7 @@ pub async fn connect_quic_transport_on(
         client_domain,
         client_device_type,
         server_id,
-        _server_pubkey_base64,
+        server_pin,
         challenge,
     )
     .await
@@ -827,6 +909,11 @@ fn tcp_err_to_transport(e: kirin_desk_core::network::tcp::TcpError) -> Transport
             TransportError::Io(source)
         }
         TcpError::Timeout { remote: _ } => TransportError::Timeout,
+        // S-02 (F-5): 长度前缀超限 → 协议级错误（上游应关闭连接）。
+        TcpError::MessageTooLarge { len, max } => TransportError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("message too large: {len} > {max}"),
+        )),
         TcpError::Io(e) => TransportError::Io(e),
     }
 }
@@ -850,10 +937,13 @@ pub async fn connect_media_transport(
     client_domain: &str,
     client_device_type: &str,
     server_id: &str,
-    server_pubkey_base64: &str,
+    server_pin: PinExpectation,
     challenge: &str,
     connect_timeout: Duration,
 ) -> Result<Box<dyn MediaTransport>, TransportError> {
+    // R-02（pin 强类型）：TCP 回退闭包捕获克隆（async 非 move 闭包按引用
+    // 捕获，不能与 QUIC 分支的 move 共用同一值）。
+    let server_pin_tcp = server_pin.clone();
     let connect_tcp = async {
         connect_tcp_transport(
             addr,
@@ -862,7 +952,7 @@ pub async fn connect_media_transport(
             client_domain,
             client_device_type,
             server_id,
-            server_pubkey_base64,
+            server_pin_tcp,
             challenge,
             connect_timeout,
         )
@@ -878,7 +968,7 @@ pub async fn connect_media_transport(
                 client_domain,
                 client_device_type,
                 server_id,
-                server_pubkey_base64,
+                server_pin,
                 challenge,
             ))
             .await;
@@ -911,7 +1001,7 @@ async fn connect_tcp_transport(
     client_domain: &str,
     client_device_type: &str,
     server_id: &str,
-    server_pubkey_base64: &str,
+    server_pin: PinExpectation,
     challenge: &str,
     connect_timeout: Duration,
 ) -> Result<Box<dyn MediaTransport>, TransportError> {
@@ -929,7 +1019,7 @@ async fn connect_tcp_transport(
         client_domain,
         client_device_type,
         server_id,
-        server_pubkey_base64,
+        server_pin,
         challenge,
     )
     .await
@@ -1091,7 +1181,7 @@ mod secure_channel_tests {
             "test.example",
             "tester",
             &server_id,
-            &server_pub,
+            PinExpectation::exact_from_base64(&server_pub).expect("server pubkey"),
             "challenge",
         )
         .await

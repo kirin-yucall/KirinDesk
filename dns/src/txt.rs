@@ -1,4 +1,5 @@
 use crate::godaddy::{GoDaddyClient, GoDaddyError, Record};
+use crate::validate::{self, MAX_PUBLIC_KEY_LEN, MAX_RECORD_DATA_LEN};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, trace};
 
@@ -93,12 +94,15 @@ impl<'a> TxtManager<'a> {
     /// Register or update the device metadata TXT record.
     ///
     /// Writes to the subdomain root: `{device_id}.{domain}` TXT record.
+    ///
+    /// 校验（S-14b/F-18 device_id；S-14c/F-19 公钥长度上限）。
     pub async fn register(
         &self,
         device_id: &str,
         meta: &DeviceMeta,
         ttl: u32,
     ) -> Result<(), GoDaddyError> {
+        validate_device_and_key(device_id, meta)?;
         debug!("TXT register: device={}, device_type={}, ttl={}", device_id, meta.device_type, ttl);
         trace!("TXT register: device={}, full_key={}", device_id, meta.key);
         let records = vec![Record {
@@ -113,6 +117,14 @@ impl<'a> TxtManager<'a> {
 
     /// Query the device metadata from its subdomain TXT record.
     pub async fn query(&self, device_id: &str) -> Result<DeviceMeta, GoDaddyError> {
+        if !validate::validate_device_id(device_id) {
+            return Err(GoDaddyError::InvalidParameters {
+                body: format!(
+                    "invalid device_id '{}' (charset [a-zA-Z0-9:_-], len 1..=128, no '.' allowed)",
+                    device_id
+                ),
+            });
+        }
         debug!("TXT query: device={}", device_id);
         let records = self
             .client
@@ -124,17 +136,60 @@ impl<'a> TxtManager<'a> {
             record_type: "TXT".to_string(),
         })?;
 
-        DeviceMeta::from_txt(&record.data).ok_or_else(|| GoDaddyError::InvalidParameters {
+        let meta = DeviceMeta::from_txt(&record.data).ok_or_else(|| GoDaddyError::InvalidParameters {
             body: format!("Failed to parse device metadata from TXT: {}", record.data),
-        })
+        })?;
+
+        // S-14c / F-19: 读侧公钥长度上限（防脏数据撑爆后续握手）。
+        if meta.raw_public_key().map_or(true, |k| k.len() > MAX_PUBLIC_KEY_LEN) {
+            return Err(GoDaddyError::InvalidParameters {
+                body: format!(
+                    "public key exceeds {} chars (got {})",
+                    MAX_PUBLIC_KEY_LEN,
+                    meta.raw_public_key().map_or(0, |k| k.len())
+                ),
+            });
+        }
+        Ok(meta)
     }
 
     /// Delete the device metadata TXT record (device offline).
     pub async fn remove(&self, device_id: &str) -> Result<(), GoDaddyError> {
+        if !validate::validate_device_id(device_id) {
+            return Err(GoDaddyError::InvalidParameters {
+                body: format!(
+                    "invalid device_id '{}' (charset [a-zA-Z0-9:_-], len 1..=128, no '.' allowed)",
+                    device_id
+                ),
+            });
+        }
         self.client
             .delete_record(self.domain, "TXT", device_id)
             .await
     }
+}
+
+/// device_id + 公钥长度校验（TXT 写侧；S-14b/F-18 + S-14c/F-19）。
+fn validate_device_and_key(device_id: &str, meta: &DeviceMeta) -> Result<(), GoDaddyError> {
+    if !validate::validate_device_id(device_id) {
+        return Err(GoDaddyError::InvalidParameters {
+            body: format!(
+                "invalid device_id '{}' (charset [a-zA-Z0-9:_-], len 1..=128, no '.' allowed)",
+                device_id
+            ),
+        });
+    }
+    if meta.raw_public_key().map_or(true, |k| k.len() > MAX_PUBLIC_KEY_LEN) {
+        return Err(GoDaddyError::InvalidParameters {
+            body: format!("public key exceeds {} chars (got {})", MAX_PUBLIC_KEY_LEN, meta.key.len()),
+        });
+    }
+    if meta.to_txt().len() > MAX_RECORD_DATA_LEN {
+        return Err(GoDaddyError::InvalidParameters {
+            body: format!("TXT record data exceeds {} bytes", MAX_RECORD_DATA_LEN),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]

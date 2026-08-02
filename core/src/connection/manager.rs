@@ -1,3 +1,4 @@
+use crate::connection::client::ConnectionOptions;
 use std::net::Ipv6Addr;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
@@ -29,7 +30,11 @@ impl std::fmt::Display for ConnectionState {
 /// Events that trigger state transitions.
 #[derive(Debug, Clone)]
 pub enum ConnectionEvent {
-    ConnectRequest { peer_id: String, ipv6: Ipv6Addr, port: u16 },
+    ConnectRequest {
+        peer_id: String,
+        ipv6: Ipv6Addr,
+        port: u16,
+    },
     DnsResolved,
     HandshakeSuccess,
     HandshakeFailed(String),
@@ -39,8 +44,19 @@ pub enum ConnectionEvent {
     Disconnect,
 }
 
+/// R-03 (R03-S2)：重连上下文——断线后按原规格自动重连所需的 peer 规格
+/// （域名/IP、期望公钥 pin、确认策略、凭据）。首次建连成功后登记，
+/// `reconnection::try_connect` 据此重建连接。
+#[derive(Clone)]
+pub struct ReconnectContext {
+    /// 建连规格（含信任策略与凭据；重连复用同一身份，不重建）。
+    pub options: ConnectionOptions,
+    /// 展示/日志用昵称。
+    pub server_id: String,
+}
+
 /// A managed connection to a remote device.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ManagedConnection {
     pub state: ConnectionState,
     pub peer_id: String,
@@ -48,6 +64,25 @@ pub struct ManagedConnection {
     pub peer_port: Option<u16>,
     pub reconnect_attempts: u32,
     pub max_reconnect_attempts: u32,
+    /// R-03 (R03-S2)：重连上下文（`attempt_reconnect` 据此重建连接）。
+    pub reconnect_ctx: Option<ReconnectContext>,
+}
+
+impl std::fmt::Debug for ManagedConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ManagedConnection")
+            .field("state", &self.state)
+            .field("peer_id", &self.peer_id)
+            .field("peer_ipv6", &self.peer_ipv6)
+            .field("peer_port", &self.peer_port)
+            .field("reconnect_attempts", &self.reconnect_attempts)
+            .field("max_reconnect_attempts", &self.max_reconnect_attempts)
+            .field(
+                "reconnect_ctx",
+                &self.reconnect_ctx.as_ref().map(|_| "<set>"),
+            )
+            .finish()
+    }
 }
 
 impl ManagedConnection {
@@ -59,12 +94,37 @@ impl ManagedConnection {
             peer_port: None,
             reconnect_attempts: 0,
             max_reconnect_attempts: 5,
+            reconnect_ctx: None,
+        }
+    }
+
+    /// R-03 (R03-S2)：登记重连上下文（断线后自动重连用）。
+    pub fn set_reconnect_context(&mut self, ctx: ReconnectContext) {
+        self.reconnect_ctx = Some(ctx);
+    }
+
+    /// R-03 (R03-S2)：进入重连状态——`Secured` 经 `ConnectionLost` 事件归一
+    /// （记录断开原因）；其它状态直接置位（如建连失败的自动重试）。
+    pub fn enter_reconnecting(&mut self) {
+        if self.state == ConnectionState::Secured {
+            self.apply_event(&ConnectionEvent::ConnectionLost(
+                "connection lost".to_string(),
+            ));
+        } else {
+            self.transition_to(ConnectionState::Reconnecting);
         }
     }
 
     pub fn apply_event(&mut self, event: &ConnectionEvent) {
         match (&self.state, event) {
-            (ConnectionState::Idle, ConnectionEvent::ConnectRequest { peer_id, ipv6, port }) => {
+            (
+                ConnectionState::Idle,
+                ConnectionEvent::ConnectRequest {
+                    peer_id,
+                    ipv6,
+                    port,
+                },
+            ) => {
                 self.peer_id = peer_id.clone();
                 self.peer_ipv6 = Some(*ipv6);
                 self.peer_port = Some(*port);
@@ -101,7 +161,10 @@ impl ManagedConnection {
     }
 
     fn transition_to(&mut self, new_state: ConnectionState) {
-        info!("Connection '{}': {} -> {}", self.peer_id, self.state, new_state);
+        info!(
+            "Connection '{}': {} -> {}",
+            self.peer_id, self.state, new_state
+        );
         self.state = new_state;
     }
 }
@@ -147,7 +210,11 @@ impl ConnectionManager {
 
     pub async fn secured_connections(&self) -> Vec<ManagedConnection> {
         let conns = self.connections.lock().await;
-        conns.iter().filter(|c| c.state == ConnectionState::Secured).cloned().collect()
+        conns
+            .iter()
+            .filter(|c| c.state == ConnectionState::Secured)
+            .cloned()
+            .collect()
     }
 }
 
@@ -195,5 +262,25 @@ mod tests {
         assert_eq!(conn.state, ConnectionState::Idle);
         conn.apply_event(&ConnectionEvent::HandshakeSuccess);
         assert_eq!(conn.state, ConnectionState::Idle);
+    }
+
+    // R-03 (R03-S2): enter_reconnecting 归一化入口（Secured → ConnectionLost 事件；
+    // 其它状态直接置位）。
+    #[test]
+    fn test_enter_reconnecting() {
+        let mut conn = ManagedConnection::new("test-peer");
+        conn.apply_event(&ConnectionEvent::ConnectRequest {
+            peer_id: "test-peer".to_string(),
+            ipv6: "2001:db8::1".parse().unwrap(),
+            port: 3389,
+        });
+        conn.apply_event(&ConnectionEvent::DnsResolved);
+        conn.apply_event(&ConnectionEvent::HandshakeSuccess);
+        assert_eq!(conn.state, ConnectionState::Secured);
+        conn.enter_reconnecting();
+        assert_eq!(conn.state, ConnectionState::Reconnecting);
+        // 幂等：再次调用不改变状态。
+        conn.enter_reconnecting();
+        assert_eq!(conn.state, ConnectionState::Reconnecting);
     }
 }

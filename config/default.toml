@@ -2,8 +2,18 @@
 id = "default-device"
 name = "My Device"
 nickname = ""
+# S-01 (F-1): 挑战码 —— **必填（安全）**，服务端核心凭据。为空（默认）时
+# 服务端 fail-closed：CLI `shell`/`serve` 拒绝启动（除非显式
+# --allow-no-challenge，不推荐）；零凭据连接（未知客户端 + 无挑战码）一律
+# 拒绝；GUI 旁路（IP/Temp mode）要求「固定码或激活窗口」至少其一。
 challenge_code = ""
 
+# R-13 (M15-T005): 敏感字段（api_key / api_secret / tunnel token 等）以
+# ChaCha20Poly1305 密文存储（格式 `{v: base64(nonce‖ciphertext)}`），
+# 配置文件内**无明文**（此处空串为占位默认值，填入后首次保存即加密）。
+# 主密钥来源分层：Windows DPAPI / macOS Keychain；无密钥环平台可设环境变量
+# `KIRIN_CONFIG_KEY`（口令，经 PBKDF2 派生）启用加密；均不可用则明文 +
+# 启动醒目警告（fail-open，不阻断开发使用）。详见 Readme_CN「配置加密」。
 [godaddy]
 api_key = ""
 api_secret = ""
@@ -16,11 +26,24 @@ heartbeat_interval = 30
 dns_ttl = 600
 # M8-T017: 临时连接窗口时长（秒，范围 60–3600，默认 300 = 5 分钟）
 temp_mode_ttl_secs = 300
+# M8-T027: 设备 ID 白名单（按握手 client_id 精确匹配，大小写敏感；
+# 与域名白名单 OR 生效。GUI Settings / `whitelist add-id` 写入，无需手改）
+# allowed_ids = []            # 永久条目（精确；`office-*` = 前缀通配）
+# id_whitelist = []           # 带过期条目（`whitelist add-id <id> <RFC3339>`）
 
 [media]
 encoder = "auto"
 framerate = 30
 bitrate = 5000
+
+# M8-T030: 单 GPU 硬件加速与虚拟设备过滤
+# prefer: auto(默认,第一个真实硬件适配器) | intel | nvidia | amd | luid:0x…(调试)
+# 开发机双 GPU 调试：切 intel 验 QSV / 切 nvidia 验 NVENC
+# （也可用环境变量 KIRIN_GPU_PREFER 覆盖，不动配置文件）
+[media.gpu]
+prefer = "auto"
+filter_virtual = true        # 过滤虚拟驱动（适配器 + 显示器）
+virtual_keywords = []        # 覆盖默认黑名单（空 = 默认表，见 M8-T030 §3.3）
 
 [logging]
 level = "info"
@@ -48,7 +71,11 @@ max_file_size = 4294967296
 enabled = false               # 总开关（默认关闭）
 mode = "client"               # client（frpc 等价，默认）| server（frps 等价）
 server_addr = ""              # relay 服务器地址：域名 / IPv4 / IPv6，支持 :port 后缀
-token = ""                    # 认证 token（建议 ≥32 字节高熵随机串；不写日志）
+# M8-T026-P3（TNL-CFG-005）：认证口令 —— 挑战-响应加密验证（HMAC-SHA256，
+# 口令永不明文上线，TNL-SEC-006）；server 模式必填（空口令拒绝启动，
+# TNL-SEC-008）；建议 ≥32 字节高熵随机串（TNL-SEC-009）；不写日志；
+# R-13 起密文存储，格式同 [godaddy] 段说明）
+token = ""
 # --- 以下为 server 模式 / 稳定性参数（GUI 不占位，直接改本文件） ---
 bind_port = 7000              # server 控制端口（v4/v6 双栈）
 port_range = "60000-61000"    # remote_port=0 时自动分配区间（start-end）
@@ -68,3 +95,7 @@ extra_candidates = []         # 额外连接候选："ip:port" 列表（ID-005�
 # local_addr = "127.0.0.1"
 # local_port = 22
 # remote_port = 6022
+
+# R-07-S4: 自动更新（[update] 段）。
+[update]
+channel = "release"          # 更新通道：release = 正式版（默认）/ beta = 预发布

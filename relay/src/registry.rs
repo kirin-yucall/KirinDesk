@@ -161,10 +161,9 @@ impl Registry {
             let der = key
                 .to_pkcs8_der()
                 .map_err(|e| RegistryError::ServerKey(e.to_string()))?;
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(path, der.as_bytes())?;
+            // S-07 (F-8): 私钥经 write_private 落盘（0600/0700/O_NOFOLLOW +
+            // 原子替换；默认 0644 可被同机低权限用户读取伪造 DeviceInfo 应答）。
+            kirin_desk_utils::fsutil::write_private(path, der.as_bytes())?;
             info!("generated relay server key at {}", path.display());
             Ok(key)
         }
@@ -321,16 +320,18 @@ impl Registry {
     }
 
     /// ID-003：空闲清理 —— `last_seen` 超过 `timeout`（默认 30s）的条目移除，
-    /// 返回被清理的设备 ID（调用方审计 DeviceOffline）。
-    pub async fn sweep_idle(&self, timeout: Duration) -> Vec<String> {
+    /// 返回 `(被清理设备 ID, 服务器观察地址)`（调用方审计 `DeviceOffline`；
+    /// R-24：附带 `observed_addr` 供审计定位设备，返回类型自 `Vec<String>`
+    /// 扩展，`server.rs` 注册心跳 tick 旁挂的全局 sweep 为唯一调用方）。
+    pub async fn sweep_idle(&self, timeout: Duration) -> Vec<(String, SocketAddr)> {
         let now = Instant::now();
         let mut devices = self.devices.write().await;
-        let stale: Vec<String> = devices
+        let stale: Vec<(String, SocketAddr)> = devices
             .iter()
             .filter(|(_, e)| now.duration_since(e.last_seen) > timeout)
-            .map(|(id, _)| id.clone())
+            .map(|(id, e)| (id.clone(), e.observed_addr))
             .collect();
-        for id in &stale {
+        for (id, _) in &stale {
             devices.remove(id);
         }
         stale
@@ -666,7 +667,10 @@ mod tests {
         // 等 10ms 保证 last_seen 已过期（1ms 级断言在 CI 上抖动不可靠）。
         tokio::time::sleep(Duration::from_millis(10)).await;
         let stale = registry.sweep_idle(Duration::ZERO).await;
-        assert_eq!(stale, vec!["pc-a".to_string()]);
+        assert_eq!(
+            stale,
+            vec![("pc-a".to_string(), "10.0.0.5:1".parse().unwrap())]
+        );
         assert!(!registry.is_online("pc-a").await);
     }
 

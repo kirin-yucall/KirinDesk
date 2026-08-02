@@ -89,6 +89,38 @@ pub fn fingerprint(public_key_base64: &str) -> String {
         .join(":")
 }
 
+/// S-15b (F-20): 加载失败（解析错误 / IO 错误）时把损坏文件保留为
+/// `<path>.corrupt` 备份，便于恢复诊断。
+///
+/// - 不覆盖已有备份：`.corrupt` 已存在则依次尝试 `.corrupt.1` / `.corrupt.2` …
+/// - 仅尽力而为：备份失败（权限不足 / 磁盘错误等）静默跳过，
+///   不改变调用方的加载错误语义，也不影响加载路径返回。
+fn backup_corrupt(path: &Path) {
+    let Some(dir) = path.parent() else {
+        return;
+    };
+    let base = match path.file_name() {
+        Some(name) if !name.is_empty() => name.to_string_lossy().into_owned(),
+        _ => return,
+    };
+    if dir.as_os_str().is_empty() {
+        return;
+    }
+    for i in 0..=999 {
+        let name = if i == 0 {
+            format!("{base}.corrupt")
+        } else {
+            format!("{base}.corrupt.{i}")
+        };
+        let dest = dir.join(&name);
+        if dest.exists() {
+            continue;
+        }
+        let _ = std::fs::copy(path, &dest);
+        return;
+    }
+}
+
 impl KnownClientsStore {
     /// 默认存储路径: `{config_dir}/kirin_desk/known_clients.json`（同 M1-T002 策略）。
     pub fn default_path() -> Result<PathBuf, KnownClientsError> {
@@ -111,14 +143,22 @@ impl KnownClientsStore {
     }
 
     /// 从指定路径加载（文件不存在 → 空列表）。
+    ///
+    /// S-15b (F-20): 加载失败（解析错误 / IO 错误）时把损坏文件保留为
+    /// `<path>.corrupt` 备份（不覆盖已有备份，详见 [`backup_corrupt`]）。
     pub fn load_from(path: &Path) -> Result<Self, KnownClientsError> {
         match std::fs::read_to_string(path) {
             Ok(content) => {
-                let clients: Vec<KnownClient> = serde_json::from_str(&content)
-                    .map_err(|e| KnownClientsError::ParseError {
-                        path: path.to_path_buf(),
-                        detail: e.to_string(),
-                    })?;
+                let clients: Vec<KnownClient> = match serde_json::from_str(&content) {
+                    Ok(clients) => clients,
+                    Err(e) => {
+                        backup_corrupt(path);
+                        return Err(KnownClientsError::ParseError {
+                            path: path.to_path_buf(),
+                            detail: e.to_string(),
+                        });
+                    }
+                };
                 Ok(Self {
                     path: path.to_path_buf(),
                     clients,
@@ -128,10 +168,13 @@ impl KnownClientsStore {
                 path: path.to_path_buf(),
                 clients: Vec::new(),
             }),
-            Err(e) => Err(KnownClientsError::IoError {
-                path: path.to_path_buf(),
-                source: e,
-            }),
+            Err(e) => {
+                backup_corrupt(path);
+                Err(KnownClientsError::IoError {
+                    path: path.to_path_buf(),
+                    source: e,
+                })
+            }
         }
     }
 
@@ -141,18 +184,18 @@ impl KnownClientsStore {
     }
 
     /// 保存到指定路径（自动创建父目录）。
+    ///
+    /// S-07 (F-8) / S-15 (F-20): 经 `fsutil::write_private` 落盘——同目录
+    /// 随机名临时文件 + Unix `fsync` + `rename` 原子替换（0600/0700/O_NOFOLLOW），
+    /// 崩溃/断电不产生半截文件、不丢失已确认指纹。
     pub fn save_to(&self, path: &Path) -> Result<(), KnownClientsError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| KnownClientsError::IoError {
-                path: parent.to_path_buf(),
-                source: e,
-            })?;
-        }
         let content = serde_json::to_string_pretty(&self.clients)
             .map_err(|e| KnownClientsError::SerializeError(e.to_string()))?;
-        std::fs::write(path, &content).map_err(|e| KnownClientsError::IoError {
-            path: path.to_path_buf(),
-            source: e,
+        crate::fsutil::write_private(path, content.as_bytes()).map_err(|e| {
+            KnownClientsError::IoError {
+                path: path.to_path_buf(),
+                source: e,
+            }
         })?;
         Ok(())
     }
@@ -302,6 +345,33 @@ mod tests {
         assert!(!store.remove("pc-a"));
         let _ = fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn test_load_parse_failure_backs_up_corrupt() {
+        let dir = test_dir("corrupt");
+        let path = dir.join("known_clients.json");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, b"{ not valid json !!!").unwrap();
+
+        // S-15b: 解析失败 → 返回 ParseError，同时损坏文件保留为 .corrupt 备份
+        let err = KnownClientsStore::load_from(&path).unwrap_err();
+        assert!(matches!(err, KnownClientsError::ParseError { .. }));
+
+        let backup = dir.join("known_clients.json.corrupt");
+        assert!(backup.exists(), ".corrupt backup must exist");
+        assert_eq!(fs::read(&backup).unwrap(), b"{ not valid json !!!");
+        assert!(path.exists(), "original file must be kept");
+
+        // 再次失败 → 追加序号 .corrupt.1（不覆盖已有备份）
+        let err2 = KnownClientsStore::load_from(&path).unwrap_err();
+        assert!(matches!(err2, KnownClientsError::ParseError { .. }));
+        assert!(
+            dir.join("known_clients.json.corrupt.1").exists(),
+            "second backup must use numbered suffix"
+        );
+        assert_eq!(fs::read(&backup).unwrap(), b"{ not valid json !!!");
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
 
 // ── 客户端视角：已知主机指纹验证（CLI-KH-001..004 / M15-T004） ──────────────
@@ -372,14 +442,22 @@ impl KnownHostsStore {
     }
 
     /// 从指定路径加载（文件不存在 → 空列表）。
+    ///
+    /// S-15b (F-20): 加载失败（解析错误 / IO 错误）时把损坏文件保留为
+    /// `<path>.corrupt` 备份（不覆盖已有备份，详见 [`backup_corrupt`]）。
     pub fn load_from(path: &Path) -> Result<Self, KnownHostsError> {
         match std::fs::read_to_string(path) {
             Ok(content) => {
-                let hosts: Vec<KnownHost> = serde_json::from_str(&content)
-                    .map_err(|e| KnownHostsError::ParseError {
-                        path: path.to_path_buf(),
-                        detail: e.to_string(),
-                    })?;
+                let hosts: Vec<KnownHost> = match serde_json::from_str(&content) {
+                    Ok(hosts) => hosts,
+                    Err(e) => {
+                        backup_corrupt(path);
+                        return Err(KnownHostsError::ParseError {
+                            path: path.to_path_buf(),
+                            detail: e.to_string(),
+                        });
+                    }
+                };
                 Ok(Self {
                     path: path.to_path_buf(),
                     hosts,
@@ -389,10 +467,13 @@ impl KnownHostsStore {
                 path: path.to_path_buf(),
                 hosts: Vec::new(),
             }),
-            Err(e) => Err(KnownHostsError::IoError {
-                path: path.to_path_buf(),
-                source: e,
-            }),
+            Err(e) => {
+                backup_corrupt(path);
+                Err(KnownHostsError::IoError {
+                    path: path.to_path_buf(),
+                    source: e,
+                })
+            }
         }
     }
 
@@ -402,18 +483,18 @@ impl KnownHostsStore {
     }
 
     /// 保存到指定路径（自动创建父目录）。
+    ///
+    /// S-07 (F-8) / S-15 (F-20): 经 `fsutil::write_private` 落盘——同目录
+    /// 随机名临时文件 + Unix `fsync` + `rename` 原子替换（0600/0700/O_NOFOLLOW），
+    /// 崩溃/断电不产生半截文件、不丢失已确认指纹。
     pub fn save_to(&self, path: &Path) -> Result<(), KnownHostsError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| KnownHostsError::IoError {
-                path: parent.to_path_buf(),
-                source: e,
-            })?;
-        }
         let content = serde_json::to_string_pretty(&self.hosts)
             .map_err(|e| KnownHostsError::SerializeError(e.to_string()))?;
-        std::fs::write(path, &content).map_err(|e| KnownHostsError::IoError {
-            path: path.to_path_buf(),
-            source: e,
+        crate::fsutil::write_private(path, content.as_bytes()).map_err(|e| {
+            KnownHostsError::IoError {
+                path: path.to_path_buf(),
+                source: e,
+            }
         })?;
         Ok(())
     }
@@ -475,6 +556,7 @@ impl KnownHostsStore {
 mod client_tests {
     use super::*;
     use std::fs;
+    use std::io::Write;
 
     /// 每测试独立目录（并行测试互不干扰——共享目录 + 尾部 remove_dir_all 会竞态）。
     fn test_dir(name: &str) -> PathBuf {
@@ -550,5 +632,113 @@ mod client_tests {
         let path = KnownHostsStore::default_path().unwrap();
         let file_name = path.file_name().unwrap().to_str().unwrap();
         assert_eq!(file_name, "known_hosts");
+    }
+
+    #[test]
+    fn test_interrupted_write_leaves_original_intact() {
+        let dir = test_dir("interrupt");
+        let path = dir.join("known_hosts");
+        let mut store = KnownHostsStore::load_from(&path).unwrap();
+        store.confirm("pc-a", SAMPLE_KEY).unwrap();
+        let original = fs::read(&path).unwrap();
+
+        // S-15a: 模拟崩溃——写入中途句柄被 drop（rename 未执行），同目录只留下
+        // 半截临时文件。目标文件必须完好、可加载，且不阻塞后续保存。
+        let mut partial =
+            std::fs::File::create(dir.join("known_hosts.tmp.0123456789abcdef")).unwrap();
+        partial.write_all(b"{\"hosts\": [{\"id\": \"pc-").unwrap();
+        drop(partial); // 模拟进程中断（write_private 的失败清理同效）
+
+        let reloaded = KnownHostsStore::load_from(&path).unwrap();
+        assert_eq!(
+            reloaded.fingerprint_of_id("pc-a").unwrap(),
+            &fingerprint(SAMPLE_KEY)
+        );
+        assert_eq!(fs::read(&path).unwrap(), original, "original must be intact");
+
+        // 崩溃残留的半截临时文件不阻塞后续保存（write_private 随机名 +
+        // create_new 独占，绝不触碰既有条目），保存后加载完整
+        store.confirm("pc-b", SAMPLE_KEY_2).unwrap();
+        let reloaded2 = KnownHostsStore::load_from(&path).unwrap();
+        assert_eq!(reloaded2.hosts().len(), 2);
+        assert_eq!(reloaded2.check("pc-b", SAMPLE_KEY_2), FingerprintStatus::Match);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_atomic_replace_reader_never_sees_partial() {
+        let dir = test_dir("atomic");
+        let path = dir.join("known_hosts");
+        let mut store = KnownHostsStore::load_from(&path).unwrap();
+        store.confirm("pc-a", SAMPLE_KEY).unwrap();
+
+        // S-15a: 后台线程反复保存，主线程同时反复加载——任何时刻读到的都必须是
+        // 完整可解析文件（截断直写会出现空/半截内容 → load 失败）。
+        let wpath = path.clone();
+        let writer = std::thread::spawn(move || {
+            let mut s = KnownHostsStore::load_from(&wpath).unwrap();
+            for i in 0..100u32 {
+                s.confirm(&format!("pc-{}", i % 8), SAMPLE_KEY_2).unwrap();
+            }
+        });
+
+        let mut reads = 0u32;
+        let mut torn = 0u32;
+        while !writer.is_finished() && reads < 50_000 {
+            reads += 1;
+            if KnownHostsStore::load_from(&path).is_err() {
+                torn += 1;
+            }
+        }
+        writer.join().unwrap();
+
+        assert_eq!(torn, 0, "reader observed torn/partial known_hosts content");
+        assert!(reads > 0);
+        // 写入全部完成后文件完整（pc-a + pc-0..pc-7 = 9 条）
+        let final_store = KnownHostsStore::load_from(&path).unwrap();
+        assert_eq!(final_store.hosts().len(), 9);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_parse_failure_backs_up_corrupt() {
+        let dir = test_dir("corrupt");
+        let path = dir.join("known_hosts");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, b"{ not valid json !!!").unwrap();
+
+        // S-15b: 解析失败 → 返回 ParseError，同时损坏文件保留为 .corrupt 备份
+        let err = KnownHostsStore::load_from(&path).unwrap_err();
+        assert!(matches!(err, KnownHostsError::ParseError { .. }));
+
+        let backup = dir.join("known_hosts.corrupt");
+        assert!(backup.exists(), ".corrupt backup must exist");
+        assert_eq!(fs::read(&backup).unwrap(), b"{ not valid json !!!");
+        assert!(path.exists(), "original file must be kept");
+
+        // 再次失败 → 追加序号 .corrupt.1（不覆盖已有备份）
+        let err2 = KnownHostsStore::load_from(&path).unwrap_err();
+        assert!(matches!(err2, KnownHostsError::ParseError { .. }));
+        assert!(
+            dir.join("known_hosts.corrupt.1").exists(),
+            "second backup must use numbered suffix"
+        );
+        assert_eq!(fs::read(&backup).unwrap(), b"{ not valid json !!!");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_io_error_returns_error_without_backup() {
+        // S-15b: 路径是目录 → 读取必败（IO 错误）：加载返回 Err 且不 panic；
+        // 目录不可复制，备份静默跳过（不产生 .corrupt，错误语义不变）。
+        let dir = test_dir("iodir");
+        let path = dir.join("known_hosts");
+        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir(&path).unwrap();
+
+        let err = KnownHostsStore::load_from(&path).unwrap_err();
+        assert!(matches!(err, KnownHostsError::IoError { .. }));
+        assert!(!dir.join("known_hosts.corrupt").exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

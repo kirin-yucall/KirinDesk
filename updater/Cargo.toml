@@ -9,3 +9,10 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 reqwest.workspace = true
+# R-07-S1: 下载文件 sha256 校验（workspace 已有 sha2 0.10）
+sha2.workspace = true
+tracing.workspace = true
+# S-06c: 安装侧弃用 bat 脚本拼装 → Win32 MoveFileExW（exe 换装，无注入面）。
+# 仅 Windows 使用；windows-sys 0.59 已在 lockfile（arboard 等引入），无新增下载。
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }

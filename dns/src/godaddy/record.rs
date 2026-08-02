@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 pub enum RecordType {
     /// SRV record — service location (port + target).
     SRV,
+    /// A record — IPv4 address（M8-T025-P1 IPv4 发现）。
+    A,
     /// AAAA record — IPv6 address.
     AAAA,
     /// TXT record — arbitrary text data (device public key).
@@ -16,6 +18,7 @@ impl std::fmt::Display for RecordType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RecordType::SRV => write!(f, "SRV"),
+            RecordType::A => write!(f, "A"),
             RecordType::AAAA => write!(f, "AAAA"),
             RecordType::TXT => write!(f, "TXT"),
         }
@@ -133,6 +136,7 @@ mod tests {
     #[test]
     fn test_record_type_display() {
         assert_eq!(RecordType::SRV.to_string(), "SRV");
+        assert_eq!(RecordType::A.to_string(), "A");
         assert_eq!(RecordType::AAAA.to_string(), "AAAA");
         assert_eq!(RecordType::TXT.to_string(), "TXT");
     }

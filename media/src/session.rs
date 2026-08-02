@@ -35,6 +35,7 @@ use tracing::{debug, info, warn};
 
 use kirin_desk_core::crypto::ed25519::IdentityManager;
 use kirin_desk_core::crypto::handshake as core_handshake;
+use kirin_desk_core::crypto::handshake::PinExpectation;
 
 use crate::adaptive::{AdaptiveEngine, FeedbackReport, ReportGenerator};
 use crate::capture::{CaptureError, ScreenCaptureSource};
@@ -45,8 +46,8 @@ use crate::encoder::types::{EncodedPacket, PacketKind, Timestamp};
 use crate::encoder::VideoEncoderPipeline;
 use crate::proto::{EncodeConfig, EncodedWindow, RawFrame, WindowConfig};
 use crate::transport::{
-    control, ChannelTag, ControlMessage, MediaCipher, MediaTransport, QuicMediaTransport,
-    punch_upgrade_accept_task, punch_upgrade_connect_task, PunchUpgrade, SecureChannelReceiver,
+    control, punch_upgrade_accept_task, punch_upgrade_connect_task, ChannelTag, ControlMessage,
+    MediaCipher, MediaTransport, PunchUpgrade, QuicMediaTransport, SecureChannelReceiver,
     SecureChannelSender, TcpMediaTransport, TransportError, TransportMode, MAX_PACKET_PAYLOAD,
 };
 use crate::window_pipeline::WindowPipeline;
@@ -63,6 +64,31 @@ const TARGET_FPS: u32 = 60;
 /// 超时未注入 → 会话以错误结束）。
 const SERVER_DEGRADE_WAIT_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// R-04：会话级音频配置（M8-T008-P1D / M12 参数）。
+///
+/// 服务端据此创建音频捕获+编码流水线（`AudioPipeline`），客户端据此创建
+/// 解码+播放流水线（`AudioDecodePipeline`）。无音频设备/初始化失败 → info
+/// 降级（视频/键鼠不断），不阻断建连。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioConfig {
+    /// 是否启用音频（默认开；`--no-audio` / Settings 开关置 false）。
+    pub enabled: bool,
+    /// 采样率（48000，M12）。
+    pub sample_rate: u32,
+    /// 声道数（2，stereo，M12）。
+    pub channels: u16,
+}
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            sample_rate: crate::encoder::audio::SAMPLE_RATE,
+            channels: crate::encoder::audio::CHANNELS,
+        }
+    }
+}
+
 /// 媒体会话配置。
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
@@ -78,6 +104,8 @@ pub struct SessionConfig {
     /// M8-T025 §3.5：TCP 模式反馈上报周期（毫秒，默认 500——可靠传输无丢包
     /// 语义，放宽周期减少无意义流量）。
     pub tcp_feedback_interval_ms: u64,
+    /// R-04：音频开关与参数（默认开；`--no-audio` / Settings 置 `enabled=false`）。
+    pub audio: AudioConfig,
 }
 
 impl Default for SessionConfig {
@@ -88,6 +116,7 @@ impl Default for SessionConfig {
             feedback_interval_ms: 100,
             graceful_degrade: true,
             tcp_feedback_interval_ms: 500,
+            audio: AudioConfig::default(),
         }
     }
 }
@@ -123,6 +152,10 @@ pub struct ServerSessionStats {
     pub transport_mode: String,
     /// M8-T025 P5-3：传输切换事件计数（QUIC → TCP 降级次数）
     pub transport_switches: u64,
+    /// R-04：音频是否启用并成功启动（无设备/初始化失败 → false，会话照常）。
+    pub audio_enabled: bool,
+    /// R-04：已发送的音频包数（Opus 帧）。
+    pub audio_packets_sent: u64,
 }
 
 /// 客户端会话统计。
@@ -149,6 +182,57 @@ pub struct ClientSessionStats {
     pub transport_mode: String,
     /// M8-T025 P5-3：传输切换事件计数（QUIC → TCP 降级次数）
     pub transport_switches: u64,
+    /// R-04：音频是否启用并成功启动（无解码器/播放设备 → false，会话照常）。
+    pub audio_enabled: bool,
+    /// R-04：jitter 静音补帧数（抖动间隙补齐，日志/诊断用）。
+    pub audio_silence_inserted: u64,
+    /// R-04：jitter 丢弃包数（迟到/重复/溢出，日志/诊断用）。
+    pub audio_packets_dropped: u64,
+}
+
+// ════════════════════════════════════════════════════════════════
+// R-03 (R03-S3)：断线重连后的会话续接
+// ════════════════════════════════════════════════════════════════
+
+/// R-03 (R03-S3)：断线重连成功后的会话续接参数。
+///
+/// 上层（UI/CLI）在重连成功、新传输就绪后调用 [`apply_session_resume`]，
+/// 通知媒体会话立即恢复画面：
+/// - 服务端：下一窗口强制 IDR（`force_idr`，与 P5-3 传输热替换同机制）；
+/// - 客户端：收到 IDR 即 `decoder.flush()` 重同步（既有逻辑，无需动作）。
+///
+/// GUI M9 路径的重连以**全新会话**续接（首窗口天然 IDR，`windows_encoded == 0`），
+/// 本入口面向媒体会话（P5-3 热替换）路径在传输重建后的显式续接；两路径均
+/// 满足"断线恢复后画面 2s 内续上"。与 R-04（音频接线）按函数级分块，互不触碰。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionResume {
+    /// 是否请求服务端立即发送 IDR（默认 true）。
+    pub request_idr: bool,
+}
+
+impl Default for SessionResume {
+    fn default() -> Self {
+        Self { request_idr: true }
+    }
+}
+
+impl SessionResume {
+    /// 续接并请求 IDR（推荐默认）。
+    pub fn with_idr() -> Self {
+        Self::default()
+    }
+}
+
+/// 应用续接信号：置位服务端共享 `force_idr` 标记（P5-3 同机制——下一窗口
+/// 强制关键帧，客户端 `decoder.flush()` 后即重同步，画面快速恢复）。
+pub fn apply_session_resume(resume: SessionResume, force_idr: &AtomicBool) {
+    if resume.request_idr {
+        force_idr.store(true, Ordering::Relaxed);
+    }
+    info!(
+        "[Session] resume signal applied (request_idr={})",
+        resume.request_idr
+    );
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -263,8 +347,9 @@ pub struct ClientDegrade {
     pub client_device_type: String,
     /// 服务端设备 ID（握手昵称）
     pub server_id: String,
-    /// 服务端公钥（base64，TXT 绑定）
-    pub server_pubkey_base64: String,
+    /// 服务端公钥 pin（R-02 强类型：known_hosts / DNS TXT 来源 `Exact`，
+    /// 无"空串跳过"形态——重连凭据与初次连接一致）。
+    pub server_pin: PinExpectation,
     /// 挑战码
     pub challenge: String,
     /// 建连超时（QUIC/TCP 共用，默认 3s）
@@ -305,8 +390,8 @@ fn split_server_control_source(
             Ok((slot, ControlSource::Quic { stream, cipher }))
         }
         TransportMode::Tcp => {
-            let t = tcp_mut(&mut slot)
-                .ok_or_else(|| "server swap: TCP downcast failed".to_string())?;
+            let t =
+                tcp_mut(&mut slot).ok_or_else(|| "server swap: TCP downcast failed".to_string())?;
             let reader = t
                 .take_receiver()
                 .ok_or_else(|| "server swap: no TCP read half".to_string())?;
@@ -331,8 +416,8 @@ fn split_client_control_sink(
             Ok((slot, ControlSink::Quic { stream, cipher }))
         }
         TransportMode::Tcp => {
-            let t = tcp_mut(&mut slot)
-                .ok_or_else(|| "client swap: TCP downcast failed".to_string())?;
+            let t =
+                tcp_mut(&mut slot).ok_or_else(|| "client swap: TCP downcast failed".to_string())?;
             let sender = t
                 .take_sender()
                 .ok_or_else(|| "client swap: no TCP write half".to_string())?;
@@ -354,6 +439,8 @@ enum ServerOut {
         window_id: u64,
         encode_duration_ms: f64,
     },
+    /// R-04：音频捕获+编码任务产出的 Opus 包批次（主循环经 `send_audio` 发送）。
+    Audio(Vec<crate::encoder::types::EncodedPacket>),
     /// M8-T018：显示器切换结果（Ok=新分辨率，Err=失败原因 → Nack）。
     MonitorSwitched(Result<(u32, u32), String>),
     /// 致命错误（捕获不可用等 → 会话终止）
@@ -480,6 +567,8 @@ pub async fn run_server_session(
     // 几乎占满一个 worker 且不 yield）→ quinn 连接驱动任务被饿死，连接
     // 静默冻结。因此整体搬到 blocking 线程池，仅把编码结果经通道送回。
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<ServerOut>(4);
+    // R-04：音频任务复用同一输出通道（在 out_tx 被捕获任务 move 前克隆）。
+    let audio_out_tx = out_tx.clone();
     let pipeline_stop = Arc::clone(&stop);
     let pipeline_config = Arc::clone(&shared_config);
     let force_idr_capture = Arc::clone(&force_idr);
@@ -504,9 +593,12 @@ pub async fn run_server_session(
                 match capture.switch_monitor(idx as usize) {
                     Ok(()) => {
                         let (sw, sh) = capture.resolution();
-                        info!("[Session] capture switched to monitor {idx} ({}x{})", sw, sh);
+                        info!(
+                            "[Session] capture switched to monitor {idx} ({}x{})",
+                            sw, sh
+                        );
                         force_idr_next = true; // 下一窗口 IDR，无需客户端等花屏
-                        // 主循环：推送新 VideoFormat（分辨率变更 → 客户端重建解码上下文）
+                                               // 主循环：推送新 VideoFormat（分辨率变更 → 客户端重建解码上下文）
                         let _ = out_tx.blocking_send(ServerOut::MonitorSwitched(Ok((sw, sh))));
                     }
                     Err(e) => {
@@ -607,6 +699,60 @@ pub async fn run_server_session(
         }
     });
 
+    // ── R-04：音频捕获 + 编码 task（阻塞线程，可选）───────────────
+    // 独立于视频/键鼠（优先级 键鼠 > 音频 > 视频）：创建/启动失败（无环回
+    // 设备、libopus 缺失）→ info 降级，视频会话照常。捕获线程经 `next_packets`
+    // 非阻塞消费 → 批次经 `ServerOut::Audio` 送达主循环发送（发送失败只记
+    // 日志，音频故障不中断视频）。
+    if config.audio.enabled {
+        let audio_out_tx = audio_out_tx.clone();
+        let audio_stop = Arc::clone(&stop);
+        tokio::task::spawn_blocking(move || {
+            // 创建（WASAPI 环回 + libopus）与启动（捕获线程）均可能失败——
+            // 任一失败即放弃音频（视频/键鼠不受影响）。
+            let mut pipeline = match crate::encoder::audio::AudioPipeline::new() {
+                Ok(p) => p,
+                Err(e) => {
+                    info!("[Session] audio disabled (pipeline init failed): {e}");
+                    return;
+                }
+            };
+            if let Err(e) = pipeline.start() {
+                info!("[Session] audio disabled (capture start failed): {e}");
+                return;
+            }
+            info!(
+                "[Session] audio pipeline started ({}Hz/{}ch, 20ms opus frames)",
+                pipeline.sample_rate(),
+                pipeline.channels()
+            );
+            loop {
+                if audio_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                match pipeline.next_packets() {
+                    Ok(pkts) if !pkts.is_empty() => {
+                        // 批次发送；通道满（主循环忙）→ 丢新包保视频（音频
+                        // 可丢，jitter 静音补帧），不阻塞捕获线程。
+                        if audio_out_tx.try_send(ServerOut::Audio(pkts)).is_err() {
+                            debug!("[Session] audio batch dropped (main loop busy)");
+                        }
+                    }
+                    Ok(_) => {
+                        // 无新 PCM：非阻塞轮询节拍（20ms 帧 → 5ms 粒度足够）。
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(e) => {
+                        warn!("[Session] audio pipeline error: {e} — stopping audio");
+                        break;
+                    }
+                }
+            }
+            // 会话结束：AudioPipeline drop → 捕获线程停止、编码器释放。
+            info!("[Session] audio pipeline stopped");
+        });
+    }
+
     // ── P5-3 降级回退 accept task（可选）─────────────────────────
     // 会话期间持续监听 TCP：收到连接 → 完整握手（凭据同初始连接）→ 注入热替换。
     // 注意：主循环只消费热替换（`swap_rx`），发送端由 accept task 独占持有。
@@ -644,17 +790,15 @@ pub async fn run_server_session(
     let mut silent_windows: u64 = 0;
     let mut last_encode_ms: f64 = 0.0;
     let mut transport_switches: u64 = 0;
+    // R-04：已发送音频包数（Opus 帧，统计快照用）。
+    let mut audio_packets_sent: u64 = 0;
     // P5-3：降级等待中（停止媒体发送，编码/捕获管线保留；等热替换或超时）。
     let mut degrading = false;
     let mut degrade_deadline: Option<Instant> = None;
 
     loop {
         // P5-3 触发检测：QUIC 存活轮询（每帧返回节奏驱动，~33ms 级）
-        if mode == TransportMode::Quic
-            && degrade_enabled
-            && !slot.is_alive()
-            && !degrading
-        {
+        if mode == TransportMode::Quic && degrade_enabled && !slot.is_alive() && !degrading {
             warn!(
                 "[Session] QUIC connection dead (is_alive=false, reason: {}) — degrading to TCP",
                 quic_mut(&mut slot)
@@ -773,6 +917,18 @@ pub async fn run_server_session(
                     ServerOut::Fatal(reason) => {
                         warn!("[Session] capture/pipeline fatal: {reason}");
                         break;
+                    }
+                    ServerOut::Audio(pkts) => {
+                        // R-04：音频批次发送。失败只记日志（音频故障不中断
+                        // 视频；QUIC 连接级错误仍由视频路径驱动降级）。
+                        match slot.send_audio(&pkts).await {
+                            Ok(()) => {
+                                audio_packets_sent += pkts.len() as u64;
+                            }
+                            Err(e) => {
+                                warn!("[Session] send audio batch failed: {e} — audio degraded");
+                            }
+                        }
                     }
                     ServerOut::MonitorSwitched(result) => {
                         // M8-T018（SRV-CAP-MON-003）：切换成功 → 重推 VideoFormat
@@ -901,6 +1057,10 @@ pub async fn run_server_session(
         TransportMode::Tcp => "TCP".to_string(),
     };
     st.transport_switches = transport_switches;
+    // R-04：音频统计（enabled 为配置意图；实际启动结果见会话日志的
+    // "audio disabled" / "audio pipeline started" 行）。
+    st.audio_enabled = config.audio.enabled;
+    st.audio_packets_sent = audio_packets_sent;
     Ok(st.clone())
 }
 
@@ -930,7 +1090,8 @@ fn apply_server_swap(
     *slot = new_slot;
     *mode = slot.mode();
     *transport_switches += 1;
-    force_idr.store(true, Ordering::Relaxed);
+    // R-03 (R03-S3)：续接信号——强制下一窗口 IDR（P5-3 同机制）。
+    apply_session_resume(SessionResume::with_idr(), force_idr);
     spawn_server_control_task(
         new_source,
         Arc::clone(engine),
@@ -941,9 +1102,7 @@ fn apply_server_swap(
         switch_tx.clone(),
         fatal_tx.clone(),
     );
-    info!(
-        "[Session] transport switched QUIC → TCP (total {transport_switches}) — IDR forced"
-    );
+    info!("[Session] transport switched QUIC → TCP (total {transport_switches}) — IDR forced");
     Ok(())
 }
 
@@ -1206,6 +1365,27 @@ where
         Duration::from_millis(feedback_interval),
     );
 
+    // 3.5 R-04：音频解码 + 播放任务（独立阻塞线程）。
+    //    传输接收循环（`recv_frame`）内部按 type 分流音频包到缓冲通道；
+    //    无解码器/播放设备 → info 降级（解码完成但静音 / 完全放弃音频），
+    //    视频/键鼠不受影响。热替换（P5-3 降级 / 打洞升舱）后由
+    //    [`apply_client_swap`] 用新传输的通道重启管线。
+    let mut client_audio = if config.audio.enabled {
+        match slot.take_audio_receiver() {
+            Some(rx) => Some(start_client_audio(
+                rx,
+                Arc::clone(&stop),
+                Arc::clone(&stats),
+            )),
+            None => {
+                info!("[Session] audio receive unavailable on transport — degraded");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // 4. 降级热替换通道（P5-3）：QUIC 失效 → 重连 task 经此注入 TCP 传输。
     //    M8-T026-P1 (PATH-004)：打洞升舱同样经此通道热替换（强制 IDR）。
     let (swap_tx, mut swap_rx) = if degrade.is_some() || punch_upgrade.is_some() {
@@ -1283,6 +1463,8 @@ where
                                 &stats,
                                 &stop,
                                 config.tcp_feedback_interval_ms,
+                                &mut client_audio,
+                                config.audio.enabled,
                             );
                         }
                         None => break,
@@ -1324,6 +1506,8 @@ where
                             &stats,
                             &stop,
                             config.tcp_feedback_interval_ms,
+                            &mut client_audio,
+                            config.audio.enabled,
                         );
                         continue;
                     }
@@ -1393,10 +1577,7 @@ where
             }
             Err(e) => {
                 // P5-3：QUIC 连接级错误 → 触发降级（TCP 重建续传）；否则结束会话
-                if mode == TransportMode::Quic
-                    && degrade_enabled
-                    && is_connection_error(&e)
-                {
+                if mode == TransportMode::Quic && degrade_enabled && is_connection_error(&e) {
                     warn!("[Session] recv failed ({e}) — degrading to TCP");
                     trigger_client_degrade(
                         &mut degrading,
@@ -1427,16 +1608,113 @@ where
     }
     let _ = slot.close().await;
 
+    // R-04：音频收尾——slot drop 已关闭音频通道（rx 端 recv 返回 Err → 管线
+    // 线程正常退出）；带超时 join，避免播放设备释放卡住会话返回。
+    if let Some(audio) = client_audio.as_mut() {
+        let _ = tokio::time::timeout(Duration::from_secs(3), &mut audio.task).await;
+    }
+
     let mut st = stats.lock().unwrap();
     st.transport_mode = match mode {
         TransportMode::Quic => "QUIC".to_string(),
         TransportMode::Tcp => "TCP".to_string(),
     };
     st.transport_switches = transport_switches;
+    // R-04：音频统计快照（管线退出日志 + 共享句柄最终值）。
+    st.audio_enabled = client_audio.is_some();
+    if let Some(audio) = &client_audio {
+        let s = audio.stats.lock().unwrap().clone();
+        st.audio_silence_inserted = s.silence_inserted;
+        st.audio_packets_dropped = s.packets_dropped;
+    }
     Ok(st.clone())
 }
 
-/// 客户端热替换：注入的新传输接管接收槽 + 重启反馈 task（TCP 写半）。
+/// R-04：客户端音频会话状态（管线阻塞任务 + 共享抖动统计）。
+struct ClientAudio {
+    /// 管线任务（`run()` 在音频通道关闭时正常返回——会话结束 / 热替换旧
+    /// 传输 drop 均触发；会话收尾带超时 join）。
+    task: tokio::task::JoinHandle<()>,
+    /// 共享抖动统计（管线每 ~100 帧刷新；会话读取快照）。
+    stats: Arc<Mutex<crate::decoder::audio::AudioJitterStats>>,
+}
+
+/// R-04：启动客户端音频管线（独立阻塞线程）+ 周期抖动统计日志任务。
+///
+/// 创建失败（无 libopus）→ info 降级；播放设备缺失 → info 提示后仍解码
+/// （静音）。`run()` 阻塞在音频通道，发送端关闭（会话结束/热替换）即返回。
+#[allow(clippy::too_many_arguments)]
+fn start_client_audio(
+    rx: std::sync::mpsc::Receiver<crate::decoder::AudioPacket>,
+    stop: Arc<AtomicBool>,
+    session_stats: Arc<Mutex<ClientSessionStats>>,
+) -> ClientAudio {
+    let stats: Arc<Mutex<crate::decoder::audio::AudioJitterStats>> = Arc::new(Mutex::new(
+        crate::decoder::audio::AudioJitterStats::default(),
+    ));
+    let stats_task = Arc::clone(&stats);
+    // 管线退出标志（tokio JoinHandle 无 Clone 且不可经 Arc 变借——日志任务
+    // 用共享标志轮询退出，join 句柄留给会话收尾）。
+    let exited = Arc::new(AtomicBool::new(false));
+    let exited_task = Arc::clone(&exited);
+    let task = tokio::task::spawn_blocking(move || {
+        let mut pipe = match crate::decoder::audio::AudioDecodePipeline::new(rx) {
+            Ok(p) => p,
+            Err(e) => {
+                info!("[Session] audio decode disabled (pipeline init failed): {e}");
+                exited_task.store(true, Ordering::Relaxed);
+                return;
+            }
+        };
+        pipe.set_jitter_stats_shared(stats_task);
+        if let Err(e) = pipe.start_playback() {
+            info!("[Session] audio playback unavailable ({e}) — decode-only (silent)");
+        }
+        // run()：rx 关闭（会话结束 / 热替换旧传输 drop）→ Ok 正常返回。
+        let _ = pipe.run();
+        exited_task.store(true, Ordering::Relaxed);
+        let s = pipe.jitter_stats();
+        info!(
+            "[Session] audio pipeline exited: silence_inserted={} packets_dropped={}",
+            s.silence_inserted, s.packets_dropped
+        );
+    });
+    let logger_task = Arc::clone(&exited);
+    let logger_stats = Arc::clone(&stats);
+    let logger_stop = Arc::clone(&stop);
+    let logger_sess = Arc::clone(&session_stats);
+    // 周期日志任务：自终止（stop / 管线退出）→ 句柄即弃（detached）。
+    let _ = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            tick.tick().await;
+            if logger_stop.load(Ordering::Relaxed) {
+                break;
+            }
+            // 管线已退出（会话结束 / 热替换后旧管线收尾）→ 本任务退出。
+            if logger_task.load(Ordering::Relaxed) {
+                break;
+            }
+            let s = logger_stats.lock().unwrap().clone();
+            if s.silence_inserted > 0 || s.packets_dropped > 0 {
+                info!(
+                    "[Session] audio jitter stats: silence_inserted={} packets_dropped={}",
+                    s.silence_inserted, s.packets_dropped
+                );
+            }
+            {
+                let mut st = logger_sess.lock().unwrap();
+                st.audio_silence_inserted = s.silence_inserted;
+                st.audio_packets_dropped = s.packets_dropped;
+            }
+        }
+    });
+    ClientAudio { task, stats }
+}
+
+/// 客户端热替换：注入的新传输接管接收槽 + 重启反馈 task（TCP 写半）+
+/// R-04 音频管线（新传输的音频通道，旧管线随旧传输 drop 退出）。
+#[allow(clippy::too_many_arguments)]
 fn apply_client_swap(
     new_transport: Box<dyn MediaTransport>,
     slot: &mut Box<dyn MediaTransport>,
@@ -1445,6 +1723,8 @@ fn apply_client_swap(
     stats: &Arc<Mutex<ClientSessionStats>>,
     stop: &Arc<AtomicBool>,
     tcp_feedback_interval_ms: u64,
+    client_audio: &mut Option<ClientAudio>,
+    audio_enabled: bool,
 ) {
     let (new_slot, new_sink) = match split_client_control_sink(new_transport) {
         Ok(pair) => pair,
@@ -1468,9 +1748,17 @@ fn apply_client_swap(
         Arc::clone(stop),
         Duration::from_millis(tcp_feedback_interval_ms),
     );
-    info!(
-        "[Session] transport switched QUIC → TCP (total {transport_switches}) — awaiting IDR"
-    );
+    // R-04：热替换后音频重启——新传输的音频通道尚未被取走；旧管线随旧
+    // 传输 drop 自动退出（rx 关闭），旧日志任务在下个 tick 收尾。
+    if audio_enabled {
+        if let Some(rx) = slot.take_audio_receiver() {
+            *client_audio = Some(start_client_audio(rx, Arc::clone(stop), Arc::clone(stats)));
+            info!("[Session] audio pipeline restarted on new transport");
+        } else {
+            warn!("[Session] audio receive unavailable on new transport — audio degraded");
+        }
+    }
+    info!("[Session] transport switched QUIC → TCP (total {transport_switches}) — awaiting IDR");
 }
 
 /// 触发客户端降级：置降级等待状态 + 以同一凭据重拨 TCP（单向降级，不自动
@@ -1510,7 +1798,7 @@ fn trigger_client_degrade(
             &d.client_domain,
             &d.client_device_type,
             &d.server_id,
-            &d.server_pubkey_base64,
+            d.server_pin.clone(),
             &d.challenge,
             d.connect_timeout,
         )
@@ -1557,4 +1845,28 @@ fn spawn_client_feedback_task(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // R-03 (R03-S3): 续接信号 → 服务端强制 IDR 标记；request_idr=false 不置位。
+    #[test]
+    fn test_session_resume_requests_idr() {
+        let flag = AtomicBool::new(false);
+        apply_session_resume(SessionResume::default(), &flag);
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "default resume must force IDR"
+        );
+        assert_eq!(SessionResume::with_idr(), SessionResume::default());
+
+        flag.store(false, Ordering::Relaxed);
+        apply_session_resume(SessionResume { request_idr: false }, &flag);
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "no-IDR resume must not set flag"
+        );
+    }
 }

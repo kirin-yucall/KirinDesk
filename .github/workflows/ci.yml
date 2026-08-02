@@ -6,6 +6,11 @@ name: CI
 #     Windows → zip（exe + FFmpeg DLL + default.toml）
 #     Ubuntu  → .deb（release/debian/build_deb.sh，含 systemd 服务）
 #     macOS   → .app（lipo 通用二进制 + ad-hoc codesign）→ .dmg
+# - S-06d: release job 额外生成 checksums.txt（全资产 SHA-256 汇总清单，随 artifact
+#   上传；publish.sh 在 gh release create 时一并上传；updater 下载后按各资产
+#   `.sha256` 侧车强制校验，缺失即拒绝）。
+# - S-06d: 所有 actions 均 pin 到 commit SHA（2026-08-02 解析；升级 = 人工核对新 SHA）。
+# - 二期登记（S-06d）：macOS 正式签名（Developer ID + notarization）评估中，未实现。
 # 注：CARGO_TARGET_DIR 固定为 target-ci，规避中文路径问题（M14-T001 要求）。
 
 on:
@@ -33,11 +38,15 @@ jobs:
             targets: aarch64-apple-darwin   # M12-MAC：Intel runner 上交叉 check
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # S-06d: actions pin 到 commit SHA（2026-08-02）。
+      # actions/checkout@v4 → 11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      # dtolnay/rust-toolchain @stable → 4cda84d5c5c54efe2404f9d843567869ab1699d4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
         with:
           targets: ${{ matrix.targets }}
-      - uses: Swatinem/rust-cache@v2
+      # Swatinem/rust-cache@v2 → 42dc69e1aa15d09112580998cf2ef0119e2e91ae
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
         with:
           workspaces: target-ci
       - name: Build (debug)
@@ -71,11 +80,15 @@ jobs:
             targets: aarch64-apple-darwin x86_64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # S-06d: actions pin 到 commit SHA（2026-08-02）。
+      # actions/checkout@v4 → 11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      # dtolnay/rust-toolchain @stable → 4cda84d5c5c54efe2404f9d843567869ab1699d4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
         with:
           targets: ${{ matrix.targets }}
-      - uses: Swatinem/rust-cache@v2
+      # Swatinem/rust-cache@v2 → 42dc69e1aa15d09112580998cf2ef0119e2e91ae
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
         with:
           workspaces: target-ci
 
@@ -109,14 +122,34 @@ jobs:
         run: bash release/debian/build_deb.sh "${{ steps.ver.outputs.version }}"
 
       # ── macOS：lipo 通用二进制 → .app → .dmg ──
+      # 二期登记（S-06d）：正式发布签名（Developer ID + notarization）评估中，
+      # 当前为 ad-hoc codesign（release/macos/build_universal.sh）；notarization
+      # 需 Apple Developer 账号与公证流程，列入二期，本次不做实现。
       - name: Package macOS (universal .app + .dmg)
         if: matrix.pkg == 'macos'
         run: |
           bash release/macos/build_universal.sh "${{ steps.ver.outputs.version }}"
           bash release/macos/create_dmg.sh "release/dist" "${{ steps.ver.outputs.version }}"
 
+      # ── S-06d: 生成 checksums.txt（全资产 SHA-256 汇总清单）──
+      # updater 下载后按各资产 `.sha256` 侧车强制校验（缺失 → 拒绝）；本清单随
+      # release 上传供人工核验，并作为二期 Ed25519 签名（checksums.txt.sig）载体。
+      - name: Generate checksums.txt
+        shell: bash
+        run: |
+          if command -v sha256sum >/dev/null 2>&1; then HASH=(sha256sum); else HASH=(shasum -a 256); fi
+          {
+            for pat in KirinDesk-*.zip KirinDesk-*.exe release/dist/*.deb release/dist/*.dmg; do
+              for f in ${pat}; do
+                [ -f "${f}" ] && "${HASH[@]}" "${f}"
+              done
+            done
+          } > checksums.txt
+          cat checksums.txt
+
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        # S-06d: actions/upload-artifact@v4 → ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: kirindesk-${{ matrix.pkg }}
           path: |
@@ -124,4 +157,5 @@ jobs:
             KirinDesk-${{ steps.ver.outputs.version }}-windows-x86_64.exe
             release/dist/*.deb
             release/dist/*.dmg
+            checksums.txt
           if-no-files-found: error

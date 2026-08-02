@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use egui::{RichText, Ui};
 
 use crate::theme::Theme;
-use crate::widgets::{action_button, badge, BadgeKind, ButtonKind, ButtonState, status_dot};
+use crate::widgets::{action_button, badge, status_dot, BadgeKind, ButtonKind, ButtonState};
 
 // ════════════════════════════════════════════════════════════════
 // UI → 会话任务命令
@@ -147,7 +147,8 @@ impl FilePanelState {
                 }
             }
         }
-        self.last_sample.insert(task.transfer_id, (task.done, now_ms));
+        self.last_sample
+            .insert(task.transfer_id, (task.done, now_ms));
         if let Some(existing) = self.find_mut(task.transfer_id) {
             *existing = task;
         } else {
@@ -178,7 +179,10 @@ impl FilePanelState {
 
     /// 排队任务数。
     pub fn queued_count(&self) -> usize {
-        self.tasks.iter().filter(|t| t.status == FileTaskStatus::Queued).count()
+        self.tasks
+            .iter()
+            .filter(|t| t.status == FileTaskStatus::Queued)
+            .count()
     }
 }
 
@@ -242,7 +246,11 @@ pub fn show_file_panel(
             badge(
                 ui,
                 theme,
-                &format!("{} 活跃 / {} 排队", state.active_count(), state.queued_count()),
+                &format!(
+                    "{} 活跃 / {} 排队",
+                    state.active_count(),
+                    state.queued_count()
+                ),
                 BadgeKind::Neutral,
             );
         });
@@ -274,9 +282,7 @@ pub fn show_file_panel(
                     ui.horizontal(|ui| {
                         ui.add(
                             egui::Label::new(
-                                RichText::new(&task.name)
-                                    .size(theme.body_size)
-                                    .strong(),
+                                RichText::new(&task.name).size(theme.body_size).strong(),
                             )
                             .selectable(false),
                         );
@@ -307,7 +313,9 @@ pub fn show_file_panel(
                                 FileTaskStatus::Sending | FileTaskStatus::WaitingAccept => {
                                     if connected {
                                         if ui
-                                            .add(egui::Button::new(RichText::new("暂停").size(theme.small_size)))
+                                            .add(egui::Button::new(
+                                                RichText::new("暂停").size(theme.small_size),
+                                            ))
                                             .clicked()
                                         {
                                             commands.push(FileCommand::Pause {
@@ -365,7 +373,8 @@ pub fn show_file_panel(
                                         && ui
                                             .add(
                                                 egui::Button::new(
-                                                    RichText::new("取消排队").size(theme.small_size),
+                                                    RichText::new("取消排队")
+                                                        .size(theme.small_size),
                                                 )
                                                 .fill(theme.bg_strong),
                                             )
@@ -381,7 +390,8 @@ pub fn show_file_panel(
                                         if ui
                                             .add(
                                                 egui::Button::new(
-                                                    RichText::new("在文件夹中显示").size(theme.small_size),
+                                                    RichText::new("在文件夹中显示")
+                                                        .size(theme.small_size),
                                                 )
                                                 .fill(theme.bg_strong),
                                             )
@@ -487,10 +497,7 @@ pub fn dropped_file_paths(ctx: &egui::Context) -> Vec<PathBuf> {
 #[cfg(target_os = "windows")]
 pub fn show_in_folder(path: &PathBuf) {
     use std::process::Command;
-    let _ = Command::new("explorer")
-        .arg("/select,")
-        .arg(path)
-        .spawn();
+    let _ = Command::new("explorer").arg("/select,").arg(path).spawn();
 }
 
 /// 在系统文件管理器中显示文件（macOS open -R）。
@@ -520,7 +527,12 @@ mod tests {
     #[test]
     fn test_upsert_add_and_update() {
         let mut st = FilePanelState::new();
-        st.upsert(FileTask::queued(1, "a.bin".into(), 1000, FileDirection::Upload));
+        st.upsert(FileTask::queued(
+            1,
+            "a.bin".into(),
+            1000,
+            FileDirection::Upload,
+        ));
         assert_eq!(st.tasks.len(), 1);
         assert_eq!(st.active_count(), 0);
         // 更新为传输中。

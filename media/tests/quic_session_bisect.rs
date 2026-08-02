@@ -110,7 +110,7 @@ async fn client_inline_loop() {
     let stop_client = Arc::clone(&stop);
     let client_handle = tokio::spawn(async move {
         let mut t = connect_quic_transport(
-            addr, &client_im, &client_id, "bisect.example", "desktop", &server_id, &server_pub, "challenge",
+            addr, &client_im, &client_id, "bisect.example", "desktop", &server_id, kirin_desk_core::crypto::handshake::PinExpectation::exact_from_base64(&server_pub).expect("server pubkey"), "challenge",
         )
         .await
         .unwrap();

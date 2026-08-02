@@ -2,7 +2,8 @@
 //!
 //! - Windows: `windows-capture` crate 唯一后端（M8-T008 §Step 1，无回退链）。
 //! - macOS: `zed-scap` crate（ScreenCaptureKit，M12-MAC MAC-T001）。
-//! - Linux: zed-scap（M12 落地，见 远控服务端_需求文档 §3.2.2）。
+//! - Linux: `linux_pipewire`（PipeWire screen-cast portal，X11/Wayland 统一，
+//!   M12-T001 / R-14-S1）。
 
 use crate::capture::{CaptureError, MonitorInfo, ScreenCaptureSource};
 use crate::proto::DisplayInfo;
@@ -13,7 +14,9 @@ use crate::proto::DisplayInfo;
 /// - macOS: zed-scap（ScreenCaptureKit；无 Screen Recording 权限时返回
 ///   `Capture` 错误，由 UI/CLI 调 `zed_scap::ZedScapBackend::request_permission()`
 ///   引导授权）
-/// - Linux: TODO(M12) zed-scap
+/// - Linux: linux_pipewire（PipeWire screen-cast portal；无桌面会话 /
+///   xdg-desktop-portal 服务缺失时返回 `Capture` 错误，调用方回退——无头
+///   场景走 CLI serve，不捕获屏幕）
 #[allow(unused_variables)]
 pub fn create_capture_source(
     monitor_index: usize,
@@ -32,11 +35,17 @@ pub fn create_capture_source(
         Ok(Box::new(cap))
     }
 
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    #[cfg(target_os = "linux")]
     {
-        // TODO(M12): zed-scap 后端（Linux），见 远控服务端_需求文档 §3.2.2
+        let cap = crate::capture::linux_pipewire::LinuxPipewireBackend::new(monitor_index)?;
+        tracing::info!("Capture: selected linux_pipewire (screen-cast portal)");
+        Ok(Box::new(cap))
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
         Err(CaptureError::Capture(
-            "capture on this platform requires zed-scap (M12, see task_docs)".into(),
+            "capture not implemented on this platform".into(),
         ))
     }
 }
@@ -54,6 +63,7 @@ mod tests {
             width: 2560,
             height: 1440,
             is_primary: false,
+            is_virtual: false,
         };
         let d = monitor_to_display(&m);
         assert_eq!(d.index, 1);
@@ -85,7 +95,13 @@ pub fn list_monitors() -> Result<Vec<MonitorInfo>, CaptureError> {
         crate::capture::zed_scap::enumerate_monitors()
     }
 
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    {
+        // portal 无显示器枚举接口 → 默认单屏（真实分辨率首帧协商后更新）。
+        crate::capture::linux_pipewire::enumerate_monitors()
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     {
         Err(CaptureError::NoMonitor)
     }

@@ -29,6 +29,10 @@ pub mod adaptive;
 pub mod capture;
 pub mod encoder;
 pub mod ffmpeg;
+// M8-T030（修复任务 R-06）：单 GPU 适配器选择 + 虚拟设备过滤。
+// 运行时枚举本机真实 GPU（DXGI），按偏好选一个绑定到 FFmpeg HW 编解码；
+// 虚拟显示器从捕获列表剔除（含索引一致性）；详见 gpu/mod.rs。
+pub mod gpu;
 pub mod proto;
 pub mod session;
 pub mod transport;
@@ -44,6 +48,12 @@ pub use capture::{
     ScreenCaptureSource,
 };
 
+// M8-T030（R-06）：重新导出 GPU 类型与偏好注入入口（设计文档 §3.1）。
+pub use gpu::{
+    apply_preferences, hwdevice_candidates, AdapterInfo, AdapterKind, GpuPreference,
+    GpuPreferences,
+};
+
 pub use proto::DirtyRect;
 
 pub use adaptive::AdaptiveEngine;
@@ -53,8 +63,9 @@ pub use encoder::{
 };
 pub use proto::{EncodeConfig, EncodedWindow, RawFrame, WindowConfig};
 pub use session::{
-    run_client_session, run_server_session, ClientDegrade, ClientSessionStats, ServerDegrade,
-    ServerSessionStats, SessionConfig,
+    apply_session_resume, run_client_session, run_server_session, AudioConfig,
+    ClientDegrade, ClientSessionStats, ServerDegrade, ServerSessionStats, SessionConfig,
+    SessionResume,
 };
 pub use window_pipeline::WindowPipeline;
 // 解码层音频（M8-T015 P2C，对称 P1D 编码侧）：客户端接入音频播放流水线。
@@ -63,7 +74,7 @@ pub use window_pipeline::WindowPipeline;
 // 解码层渲染（M8-T015 P2D）：`RenderBridge` 连接解码线程与 UI 线程
 // （抖动缓冲 + 通道投递），UI 层经 `pop_render` 消费 `DecodedFrame`。
 pub use decoder::{
-    audio::{AudioDecodePipeline, AudioJitterBuffer, OpusDecoder},
+    audio::{AudioDecodePipeline, AudioJitterBuffer, AudioJitterStats, OpusDecoder},
     audio_playback::AudioPlayback,
     AudioPacket, DecodeError, DecodedFrame, DecoderPacket, RenderBridge,
 };

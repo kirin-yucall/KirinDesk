@@ -164,8 +164,20 @@ impl FfmpegSwEncoder {
             return Ok(());
         }
         // 释放旧 ctx（含 close + free）。
+        // R-06（M8-T030 实机暴露）：free 前必须 flush（send null + drain）——
+        // 与 Drop 及 HW `ffmpeg_hw.rs::ensure_codec_dims` 对齐。libx264 不
+        // flush 直接 free_context 会残留 lookahead 线程状态（实测重开新尺寸
+        // 后报 "lookahead thread is already stopped" + send_frame 返回
+        // -AVERROR_EXTERNAL）；修复后 320 占位 → 真实尺寸重开路径正常。
         if !self.ctx.is_null() {
             let mut ctx_ref = self.ctx;
+            let _ = ffmpeg::avcodec_send_frame(ctx_ref, ptr::null());
+            loop {
+                match ffmpeg::avcodec_receive_packet(ctx_ref, self.packet) {
+                    Ok(()) => ffmpeg::av_packet_unref(self.packet),
+                    _ => break,
+                }
+            }
             ffmpeg::avcodec_free_context(&mut ctx_ref);
             self.ctx = std::ptr::null_mut();
         }

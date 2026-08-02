@@ -141,7 +141,10 @@ pub fn show_black_overlay(ctx: &egui::Context) -> OverlayOutcome {
                             painter.text(
                                 rect.center() + Vec2::new(0.0, 84.0),
                                 Align2::CENTER_CENTER,
-                                format!("本地恢复：按住 Esc {} 秒（或 {}+{}+{}）", 3, ESCAPE_COMBO.0, ESCAPE_COMBO.1, ESCAPE_COMBO.2),
+                                format!(
+                                    "本地恢复：按住 Esc {} 秒（或 {}+{}+{}）",
+                                    3, ESCAPE_COMBO.0, ESCAPE_COMBO.1, ESCAPE_COMBO.2
+                                ),
                                 FontId::proportional(13.0),
                                 Color32::from_gray(120),
                             );
@@ -151,7 +154,10 @@ pub fn show_black_overlay(ctx: &egui::Context) -> OverlayOutcome {
                         painter.text(
                             rect.center() + Vec2::new(0.0, 84.0),
                             Align2::CENTER_CENTER,
-                            format!("本地恢复：按住 Esc {} 秒（或 {}+{}+{}）", 3, ESCAPE_COMBO.0, ESCAPE_COMBO.1, ESCAPE_COMBO.2),
+                            format!(
+                                "本地恢复：按住 Esc {} 秒（或 {}+{}+{}）",
+                                3, ESCAPE_COMBO.0, ESCAPE_COMBO.1, ESCAPE_COMBO.2
+                            ),
                             FontId::proportional(13.0),
                             Color32::from_gray(120),
                         );
@@ -188,7 +194,11 @@ pub struct PrivacyAckState {
 ///
 /// - 请求 Black 但生效 Lock → 降级提示（SRV-PRIV-013）；
 /// - `ok = false` → 失败提示（平台锁屏调用失败等，SRV-PRIV-012）。
-pub fn ack_toast(ok: bool, active: Option<PrivacyLevel>, requested: Option<PrivacyLevel>) -> String {
+pub fn ack_toast(
+    ok: bool,
+    active: Option<PrivacyLevel>,
+    requested: Option<PrivacyLevel>,
+) -> String {
     match (ok, active) {
         (true, Some(level)) if Some(level) == requested => {
             format!("隐私模式已开启：{}", level.display())

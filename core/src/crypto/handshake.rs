@@ -1,8 +1,9 @@
 use crate::connection::temp_mode::TempModeManager;
+use crate::connection::multiplex::DEFAULT_MAX_FRAME_LEN;
 use crate::crypto::ed25519::IdentityManager;
 use crate::crypto::x25519::EphemeralSession;
 use crate::crypto::aead::AeadCipher;
-use crate::network::tcp::{send_message, receive_message, TcpError};
+use crate::network::tcp::{send_message, receive_message, read_length_prefixed, TcpError};
 use ed25519_dalek::Signature;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -50,6 +51,68 @@ pub enum HandshakeError {
     /// 自报公钥与 known_hosts / DNS TXT 记录不一致（防 MITM，对称于 `ServerKeyMismatch`）。
     #[error("Client public key mismatch: expected '{expected}', got '{got}'")]
     ClientKeyMismatch { expected: String, got: String },
+}
+
+/// 客户端 pin 期望（R-02：把"空串 = 跳过 pin 比对"的隐式语义从类型上消除，
+/// 旧审计证据 `handshake.rs:142-146,226` 空串跳过路径已不可构造）。
+///
+/// 信任策略由 `pin` 与 `key_confirm` 回调组合决定，**不存在"无期望跳过"路径**：
+/// - [`PinExpectation::Exact`]：带外可信公钥（known_hosts / DNS TXT / 自签）
+///   强制比对，不等即拒绝（CLI-HSK-SEC-001），`ServerKeyMismatch` 保留；
+/// - [`PinExpectation::None`] + [`CoreReason::UserConfirmRequired`]：收到服务端
+///   公钥后调用确认回调（首次指纹确认，CLI-KH-001）；**回调缺失或返回 `false`
+///   即拒绝**（R-02：无回调不再静默放行网络公钥，CLI-HSK-006）；
+/// - [`PinExpectation::None`] + [`CoreReason::InternalLoopback`]：loopback 自签
+///   兜底——服务端 = 自身，core 以客户端自身公钥强制比对（R-02-S3）。
+#[derive(Debug, Clone)]
+pub enum PinExpectation {
+    /// 无带外 pin —— 必须由 [`CoreReason`] 显式声明兜底场景，core 层仍执行真实比对。
+    None(CoreReason),
+    /// 带外可信公钥原始字节（Ed25519 32 字节）——强制一致，不等即拒绝。
+    Exact([u8; 32]),
+}
+
+/// [`PinExpectation::None`] 的显式兜底场景声明（R-02：消除"无期望跳过"隐式语义）。
+#[derive(Debug, Clone, Copy)]
+pub enum CoreReason {
+    /// 内部回环 / 自连（服务端 = 自身）：core 以客户端自身公钥作真实 pin 比对。
+    InternalLoopback,
+    /// 用户首次指纹确认（GUI / CLI 确认回调，必填）。
+    UserConfirmRequired,
+}
+
+impl PinExpectation {
+    /// 从 base64 公钥构造强制比对 pin（known_hosts / DNS TXT / 自签来源；
+    /// 解析失败 → [`HandshakeError::Dns`]，复用既有解析错误路径）。
+    pub fn exact_from_base64(base64_key: &str) -> Result<Self, HandshakeError> {
+        let key = IdentityManager::parse_public_key(base64_key)
+            .map_err(|e| HandshakeError::Dns(e.to_string()))?;
+        Ok(PinExpectation::Exact(key.to_bytes()))
+    }
+
+    /// 解析为本端可用的 base64 公钥（供服务端角色 `client_public_key_base64` pin）。
+    /// - `Exact(bytes)` → 编码回 base64；
+    /// - `None(InternalLoopback)` → 本端自身公钥（自签：服务端 = 客户端）；
+    /// - `None(UserConfirmRequired)` → 服务端无确认回调路径，拒绝。
+    pub fn resolve_base64(
+        &self,
+        local_identity: &IdentityManager,
+    ) -> Result<String, HandshakeError> {
+        match self {
+            PinExpectation::Exact(bytes) => {
+                use base64::Engine as _;
+                Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+            }
+            PinExpectation::None(CoreReason::InternalLoopback) => {
+                Ok(local_identity.public_key_base64())
+            }
+            PinExpectation::None(CoreReason::UserConfirmRequired) => {
+                Err(HandshakeError::UntrustedKey(
+                    "UserConfirmRequired has no server-side pin to resolve".to_string(),
+                ))
+            }
+        }
+    }
 }
 
 // ---- Handshake Messages ----
@@ -125,10 +188,12 @@ pub fn negotiate_codec(client_codecs: &[String], server_codecs: &[String]) -> St
 
 /// Generic client handshake — works with any AsyncRead + AsyncWrite + Unpin + Send stream.
 ///
-/// M10: `expected_server_public_key_base64` 非空时，强制与握手响应中的服务端
-/// 公钥比对（Domain 模式传 DNS TXT 记录公钥，实现零信任身份绑定）；
-/// 为空串则跳过比对（旧版兼容——**不安全，新代码请使用
-/// [`client_handshake_with_confirm_generic`] 提供确认回调**，杜绝信任网络公钥）。
+/// R-02: pin 强类型化——`expected_server_public_key_base64: &str` 已改为
+/// [`PinExpectation`]，**不再存在"空串 = 跳过 pin 比对"的旧版兼容语义**
+/// （审计证据：旧 `handshake.rs:142-146,226`，代码自注"旧版兼容，不安全"）。
+/// 需要用户首次指纹确认的调用方请使用
+/// [`client_handshake_with_confirm_generic`] + [`PinExpectation::None`]
+/// （[`CoreReason::UserConfirmRequired`]）提供确认回调。
 pub async fn client_handshake_generic<S: AsyncRead + AsyncWrite + Unpin + Send>(
     stream: S,
     client_identity: &IdentityManager,
@@ -136,30 +201,27 @@ pub async fn client_handshake_generic<S: AsyncRead + AsyncWrite + Unpin + Send>(
     client_domain: &str,
     client_device_type: &str,
     server_id: &str,
-    expected_server_public_key_base64: &str,
+    pin: PinExpectation,
     challenge: &str,
 ) -> Result<SecureChannelGeneric<S>, HandshakeError> {
-    let expected = if expected_server_public_key_base64.is_empty() {
-        None
-    } else {
-        Some(expected_server_public_key_base64.to_string())
-    };
     client_handshake_with_confirm_generic(
         stream, client_identity, client_id, client_domain, client_device_type,
-        server_id, expected, None, challenge,
+        server_id, pin, None, challenge,
     )
     .await
 }
 
 /// 带信任确认回调的通用客户端握手（CLI-HSK-SEC-003 / CLI-KH-001）。
 ///
-/// 信任策略由 `expected_server_public_key_base64` / `key_confirm` 组合决定：
-/// - `Some(expected)`：与服务端响应公钥**强制比对**（带外可信公钥：known_hosts
-///   指纹 / DNS TXT），不等即拒绝（CLI-HSK-SEC-001）；
-/// - `None` + `Some(confirm)`：收到服务端公钥后调用确认回调（首次连接指纹确认），
-///   回调返回 `false` 即断开并报 [`HandshakeError::UntrustedKey`]，**不发送任何
-///   业务数据**（CLI-HSK-006）；
-/// - `None` + `None`：跳过比对（旧版兼容，不安全，仅遗留调用方）。
+/// 信任策略由 `pin` / `key_confirm` 组合决定（R-02，无"无期望跳过"路径）：
+/// - [`PinExpectation::Exact`]：与服务端响应公钥**强制比对**（带外可信公钥：
+///   known_hosts 指纹 / DNS TXT），不等即拒绝（CLI-HSK-SEC-001）；
+/// - [`PinExpectation::None`] + [`CoreReason::UserConfirmRequired`]：收到服务端
+///   公钥后调用确认回调（首次连接指纹确认），回调返回 `false` 即断开并报
+///   [`HandshakeError::UntrustedKey`]，**不发送任何业务数据**（CLI-HSK-006）；
+///   回调缺失 → 直接拒绝（R-02：不再静默信任网络公钥）；
+/// - [`PinExpectation::None`] + [`CoreReason::InternalLoopback`]：loopback 自签
+///   兜底，以客户端自身公钥强制比对（R-02-S3）。
 pub async fn client_handshake_with_confirm_generic<S: AsyncRead + AsyncWrite + Unpin + Send>(
     mut stream: S,
     client_identity: &IdentityManager,
@@ -167,7 +229,7 @@ pub async fn client_handshake_with_confirm_generic<S: AsyncRead + AsyncWrite + U
     client_domain: &str,
     client_device_type: &str,
     server_id: &str,
-    expected_server_public_key_base64: Option<String>,
+    pin: PinExpectation,
     mut key_confirm: Option<Box<dyn Fn(&str) -> bool + Send>>,
     challenge: &str,
 ) -> Result<SecureChannelGeneric<S>, HandshakeError> {
@@ -201,20 +263,43 @@ pub async fn client_handshake_with_confirm_generic<S: AsyncRead + AsyncWrite + U
         .map_err(|e| HandshakeError::InvalidMessage(e.to_string()))?;
 
     let server_pubkey_b64 = &response.server_ed25519_pub_base64;
-    // M10/M15: 服务端公钥信任判定。
-    match &expected_server_public_key_base64 {
-        Some(expected) => {
+    // M10/M15/R-02: 服务端公钥信任判定（无"无期望跳过"路径）。
+    match &pin {
+        PinExpectation::Exact(expected) => {
             // 带外可信公钥 → 强制一致，否则拒绝（CLI-HSK-SEC-001）。
-            if expected != server_pubkey_b64 {
+            let server_key = IdentityManager::parse_public_key(server_pubkey_b64)
+                .map_err(|e| HandshakeError::Dns(e.to_string()))?;
+            if server_key.to_bytes() != *expected {
+                use base64::Engine as _;
                 return Err(HandshakeError::ServerKeyMismatch {
-                    expected: expected.clone(),
+                    expected: base64::engine::general_purpose::STANDARD.encode(expected),
                     got: server_pubkey_b64.clone(),
                 });
             }
         }
-        None => {
-            // 无带外公钥 → 若有确认回调则交由用户首次指纹确认；拒绝即断开。
-            if let Some(confirm) = key_confirm.as_mut() {
+        PinExpectation::None(reason) => match reason {
+            // R-02-S3 自签兜底：服务端 = 自身 → 以客户端自身公钥强制比对
+            // （loopback 握手不再依赖"无期望"跳过）。
+            CoreReason::InternalLoopback => {
+                let self_bytes = client_identity.public_key().to_bytes();
+                let server_key = IdentityManager::parse_public_key(server_pubkey_b64)
+                    .map_err(|e| HandshakeError::Dns(e.to_string()))?;
+                if server_key.to_bytes() != self_bytes {
+                    return Err(HandshakeError::ServerKeyMismatch {
+                        expected: client_identity.public_key_base64(),
+                        got: server_pubkey_b64.clone(),
+                    });
+                }
+            }
+            // 无带外公钥 → 确认回调必填；缺失即拒绝（R-02：不再静默跳过）。
+            CoreReason::UserConfirmRequired => {
+                let Some(confirm) = key_confirm.as_mut() else {
+                    return Err(HandshakeError::UntrustedKey(
+                        "no pinned public key and no user confirmation callback \
+                         — refusing to trust network public key"
+                            .to_string(),
+                    ));
+                };
                 if !confirm(server_pubkey_b64) {
                     return Err(HandshakeError::UntrustedKey(format!(
                         "user declined fingerprint confirmation (server key {})",
@@ -222,8 +307,7 @@ pub async fn client_handshake_with_confirm_generic<S: AsyncRead + AsyncWrite + U
                     )));
                 }
             }
-            // 无回调 → 跳过比对（旧版兼容，不安全，仅遗留调用方）。
-        }
+        },
     }
     let server_pubkey = IdentityManager::parse_public_key(server_pubkey_b64)
         .map_err(|e| HandshakeError::Dns(e.to_string()))?;
@@ -237,8 +321,15 @@ pub async fn client_handshake_with_confirm_generic<S: AsyncRead + AsyncWrite + U
     }
 
     let selected_codec = response.selected_codec;
-    let peer_x25519 = EphemeralSession::parse_public_key(&response.server_x25519_pub);
-    let session_key = session.compute_session_key(&peer_x25519);
+    // S-04 / 审计 F-3: 服务端 X25519 公钥校验（全零/低阶点 → 拒绝，错误计入
+    // 握手失败路径：调用方统一 audit + record_handshake_failure）。
+    let peer_x25519 = EphemeralSession::parse_public_key(&response.server_x25519_pub)
+        .map_err(|e| HandshakeError::InvalidMessage(format!(
+            "invalid server X25519 public key: {e}"
+        )))?;
+    let session_key = session.compute_session_key(&peer_x25519).map_err(|e| {
+        HandshakeError::InvalidMessage(format!("X25519 key exchange failed: {e}"))
+    })?;
     let cipher = AeadCipher::new(&session_key);
 
     Ok(SecureChannelGeneric {
@@ -278,7 +369,14 @@ pub async fn server_handshake_verified_with_nickname_generic<S: AsyncRead + Asyn
     expected_challenge: Option<&str>,
 ) -> Result<SecureChannelGeneric<S>, HandshakeError> {
     let init = server_read_init(&mut stream).await?;
-    verify_server_init(&init, client_public_key_base64, expected_nickname, expected_challenge)?;
+    // S-01a (F-1)：生产路径零凭据（无 pin + 无挑战码 + 无窗口）→ 拒绝。
+    verify_server_init(
+        &init,
+        client_public_key_base64,
+        expected_nickname,
+        expected_challenge,
+        false,
+    )?;
 
     let selected_codec = String::new();
     server_handshake_inner_generic(stream, server_identity, server_id, &init, &selected_codec).await
@@ -289,10 +387,28 @@ pub async fn server_handshake_verified_with_nickname_generic<S: AsyncRead + Asyn
 /// 用于「先解析客户端公钥（known_hosts → DNS TXT）再决定是否应答」的两阶段
 /// 流程（SRV-SEC-KH-001）：调用方用本函数预读 init，经 [`verify_server_init`]
 /// 校验后，再用 [`server_handshake_respond_generic`] 应答 —— 不重复读流。
+///
+/// S-02 (F-5)：读取带 **10s deadline**（单点收口——GUI/CLI/policy 所有调用
+/// 路径自动获得超时）。连接"只连不发" → [`HandshakeError::Timeout`]，调用方
+/// 既有的错误路径（关闭连接 + `record_handshake_failure` + 审计）即可兜住，
+/// 不再需要逐个调用点包裹。
 pub async fn server_read_init<S: AsyncRead + Unpin>(
     stream: &mut S,
 ) -> Result<HandshakeInit, HandshakeError> {
-    let init_data = receive_message(stream).await?;
+    server_read_init_with_timeout(stream, HANDSHAKE_READ_TIMEOUT).await
+}
+
+/// S-02 (F-5)：服务端握手初始化读取超时（连接"只连不发" → 10s 关闭）。
+pub const HANDSHAKE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 带显式超时的 init 读取（`server_read_init` 的内部实现；超时值可测）。
+async fn server_read_init_with_timeout<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    timeout: std::time::Duration,
+) -> Result<HandshakeInit, HandshakeError> {
+    let init_data = tokio::time::timeout(timeout, receive_message(stream))
+        .await
+        .map_err(|_| HandshakeError::Timeout)??;
     bincode::deserialize(&init_data)
         .map_err(|e| HandshakeError::InvalidMessage(e.to_string()))
 }
@@ -302,11 +418,17 @@ pub async fn server_read_init<S: AsyncRead + Unpin>(
 ///
 /// 挑战码**单态**校验（仅固定挑战码，旧版兼容）；二态校验（固定 **或** 窗口内
 /// 临时挑战码，M8-T017 / SRV-TMP-HK-001）请用 [`verify_server_init_with_temp`]。
+///
+/// S-01a（F-1）：`allow_no_credentials` —— 显式 opt-in 开关。生产路径一律传
+/// `false`：无固定挑战码 + 无激活临时窗口时，仅当客户端公钥已 pin
+/// （known_hosts / DNS TXT 身份绑定）才放行，**零凭据（无 pin + 无挑战码 +
+/// 无窗口）一律拒绝**；仅测试/loopback 显式传 `true`。
 pub fn verify_server_init(
     init: &HandshakeInit,
     expected_client_key_base64: &str,
     expected_nickname: Option<&str>,
     expected_challenge: Option<&str>,
+    allow_no_credentials: bool,
 ) -> Result<(), HandshakeError> {
     verify_server_init_inner(
         init,
@@ -314,6 +436,7 @@ pub fn verify_server_init(
         expected_nickname,
         expected_challenge,
         None,
+        allow_no_credentials,
     )
 }
 
@@ -325,12 +448,16 @@ pub fn verify_server_init(
 /// 校验顺序：先固定码，后临时码（HK-002）；两者均失败 → 统一错误消息，
 /// 不区分提示（防枚举，HK-002）。窗口期外（过期/未开启）临时码一律失败
 /// （SRV-TMP-HK-003，`temp_window = None`），不产生任何旁路。
+///
+/// S-01a（F-1）：`allow_no_credentials` 语义同 [`verify_server_init`] ——
+/// 生产路径一律传 `false`（零凭据 → 拒绝），仅测试/loopback 显式传 `true`。
 pub fn verify_server_init_with_temp(
     init: &HandshakeInit,
     expected_client_key_base64: &str,
     expected_nickname: Option<&str>,
     expected_challenge: Option<&str>,
     temp_window: Option<&TempModeManager>,
+    allow_no_credentials: bool,
 ) -> Result<(), HandshakeError> {
     verify_server_init_inner(
         init,
@@ -338,15 +465,20 @@ pub fn verify_server_init_with_temp(
         expected_nickname,
         expected_challenge,
         temp_window,
+        allow_no_credentials,
     )
 }
 
+/// 内部实现：`allow_no_credentials` = true 表示调用方显式 opt-in —— 允许
+/// 「无固定挑战码 + 无激活临时窗口」时即使客户端公钥也未知（零凭据）仍放行
+/// （仅测试/loopback 使用）。
 fn verify_server_init_inner(
     init: &HandshakeInit,
     expected_client_key_base64: &str,
     expected_nickname: Option<&str>,
     expected_challenge: Option<&str>,
     temp_window: Option<&TempModeManager>,
+    allow_no_credentials: bool,
 ) -> Result<(), HandshakeError> {
     // 1. 客户端公钥绑定（SRV-SEC-KH-001）：验签前断言自报公钥与带外可信值一致。
     if !expected_client_key_base64.is_empty()
@@ -370,21 +502,32 @@ fn verify_server_init_inner(
     // 3. 挑战码二态校验（SRV-TMP-HK-001/002）：固定挑战码 **或** 窗口内临时
     //    挑战码任一正确即通过；两者均失败 → 统一错误消息（防枚举，不泄露
     //    固定码/临时码信息）。组合语义：
-    //    - 无固定码 + 无窗口 → 免校验（旧版兼容）；
+    //    - 无固定码 + 无窗口 → S-01a (F-1) fail-closed：仅当客户端公钥已 pin
+    //      （known_clients/DNS-TXT 身份绑定）或显式 `allow_no_credentials`
+    //      （仅测试/loopback）才放行——零凭据（未知客户端 + 无挑战码）拒绝；
     //    - 仅固定码 → 固定码必须正确；
     //    - 仅窗口（无固定码）→ **临时码必填**（杜绝窗口期内无凭据旁路）；
     //    - 固定码 + 窗口 → 任一正确即通过。
     let fixed_expected = expected_challenge.filter(|s| !s.is_empty());
     let fixed_ok = fixed_expected.map_or(true, |f| init.challenge == f);
     let temp_ok = temp_window.map_or(true, |t| t.verify_challenge(&init.challenge));
+    let client_pinned = !expected_client_key_base64.is_empty();
     let challenge_ok = match (fixed_expected.is_some(), temp_window.is_some()) {
-        (false, false) => true,
+        (false, false) => allow_no_credentials || client_pinned,
         (true, false) => fixed_ok,
         (false, true) => temp_ok,
         (true, true) => fixed_ok || temp_ok,
     };
     if !challenge_ok {
-        return Err(HandshakeError::InvalidMessage("challenge mismatch".to_string()));
+        // 零凭据（未知客户端 + 无挑战码 + 无窗口）与错误挑战码统一走
+        // InvalidMessage（HK-002 防枚举）；文案仅落在服务端审计日志，
+        // 不会回传给客户端，区分提示便于运维定位配置问题（F-1）。
+        let msg = if fixed_expected.is_none() && temp_window.is_none() && !client_pinned {
+            "server requires credentials: client unknown (no pinned key), no challenge code, and no temp window"
+        } else {
+            "challenge mismatch"
+        };
+        return Err(HandshakeError::InvalidMessage(msg.to_string()));
     }
 
     // 4. 客户端 Ed25519 签名验证（对自报公钥验签）。
@@ -430,6 +573,25 @@ pub fn domain_matches_whitelist(domain: &str, pattern: &str) -> bool {
     domain == base || domain.ends_with(&format!(".{}", base))
 }
 
+/// M8-T027 (SRV-IDWL-010): 设备 ID 白名单匹配（大小写敏感，与 known_clients
+/// 同 key 语义）。
+///
+/// - 默认**精确匹配**：trim 后完全相等（`device-7` 只匹配 `device-7`）；
+/// - 显式以 `*` 结尾 → 前缀通配（`office-*` 匹配 `office-1`、`office-42`）；
+/// - 空 pattern / 空白 / 裸 `*`（通配前缀为空）→ 不匹配（保守语义，对称
+///   [`domain_matches_whitelist`] 对裸 `*` 的处理）。
+pub fn id_matches_whitelist(device_id: &str, pattern: &str) -> bool {
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        return false;
+    }
+    let device_id = device_id.trim();
+    match pattern.strip_suffix('*') {
+        Some(prefix) if !prefix.is_empty() => device_id.starts_with(prefix),
+        _ => device_id == pattern,
+    }
+}
+
 /// 服务端握手结果（M11：headless shell 服务器 — 无 GUI 审批弹窗）。
 pub enum VerifiedDecision {
     /// 白名单通过 + 签名验证通过 → 已建立安全通道。
@@ -450,18 +612,27 @@ impl std::fmt::Debug for VerifiedDecision {
 
 /// 服务端握手（白名单 + 完整验证，M11-T001/T004）。
 ///
-/// headless 服务器无 GUI 审批弹窗：**先**做域名白名单检查（temp_mode 可绕过），
-/// 非白名单域名在响应之前直接拒绝（连接立即关闭，客户端收到 EOF），
-/// 不泄露服务器 X25519 公钥/响应签名；白名单通过后再完成客户端公钥绑定
-/// （SEC-PATCH / SRV-SEC-KH-001）、签名验证、nickname/challenge 校验与响应。
+/// headless 服务器无 GUI 审批弹窗：**先**做白名单检查（域名 **或** ID 两维，
+/// M8-T027；temp_mode 可绕过），非白名单在响应之前直接拒绝（连接立即关闭，
+/// 客户端收到 EOF），不泄露服务器 X25519 公钥/响应签名；白名单通过后再完成
+/// 客户端公钥绑定（SEC-PATCH / SRV-SEC-KH-001）、签名验证、nickname/challenge
+/// 校验与响应。
 ///
-/// 白名单匹配规则见 [`domain_matches_whitelist`]：完全相等或任意子域，
-/// `*.example.com` 通配等价。
+/// 白名单匹配规则见 [`domain_matches_whitelist`] 与 [`id_matches_whitelist`]：
+/// 域名完全相等或任意子域（`*.example.com` 通配等价）；设备 ID 精确或 `*`
+/// 结尾前缀通配。两维任一命中即放行（OR 语义，域名既有行为不变）。
+///
+/// **遗留接口**（R-05 / SRV-IDWL-022）：无两阶段客户端公钥 pin 流程，
+/// 新代码请使用 `ui::policy::server_accept_handshake`（SRV-SEC-KH-001）。
+#[deprecated(
+    note = "legacy headless path without two-phase client key pin — use ui/policy::server_accept_handshake (SRV-SEC-KH-001)"
+)]
 pub async fn server_handshake_with_whitelist(
     mut stream: tokio::net::TcpStream,
     server_identity: &IdentityManager,
     server_id: &str,
     allowed_domains: &[String],
+    allowed_ids: &[String],
     temp_mode: bool,
     expected_client_key_base64: &str,
     expected_nickname: Option<&str>,
@@ -473,19 +644,31 @@ pub async fn server_handshake_with_whitelist(
     // 2. 白名单检查（headless：无 GUI 审批弹窗，直接拒绝）。
     if !temp_mode {
         let domain = &init.client_domain;
+        // M8-T027 (SRV-IDWL-020): 双白名单 OR 语义——域名命中 **或** ID 命中
+        // 即视为白名单命中（域名维度既有行为不变）。
         let is_whitelisted = allowed_domains
             .iter()
-            .any(|allowed| domain_matches_whitelist(domain, allowed));
+            .any(|allowed| domain_matches_whitelist(domain, allowed))
+            || allowed_ids
+                .iter()
+                .any(|id| id_matches_whitelist(&init.client_id, id));
         if !is_whitelisted {
             return Ok(VerifiedDecision::Rejected(format!(
-                "domain '{}' not in whitelist (headless: no GUI approval)",
-                domain
+                "domain '{}' and id '{}' not in whitelist (headless: no GUI approval)",
+                domain, init.client_id
             )));
         }
     }
 
     // 3. 客户端公钥绑定 + nickname/challenge + 签名验证。
-    verify_server_init(&init, expected_client_key_base64, expected_nickname, expected_challenge)?;
+    // S-01a (F-1)：生产路径零凭据（无 pin + 无挑战码 + 无窗口）→ 拒绝。
+    verify_server_init(
+        &init,
+        expected_client_key_base64,
+        expected_nickname,
+        expected_challenge,
+        false,
+    )?;
 
     // 4. 响应 + 建立安全通道。
     let selected_codec = String::new();
@@ -513,6 +696,14 @@ async fn server_handshake_inner_generic<S: AsyncRead + AsyncWrite + Unpin + Send
     let session = EphemeralSession::new();
     let server_x25519_pub = session.public_key_bytes();
 
+    // S-04 / 审计 F-3: 客户端 X25519 公钥校验（全零/低阶点 → 拒绝）。置于
+    // `send_message` **之前** → 恶意公钥握手"拒绝且不泄露响应"（服务端不
+    // 发送响应即断开，客户端收到 EOF；错误计入握手失败路径）。
+    let peer_x25519 = EphemeralSession::parse_public_key(&init.client_x25519_pub)
+        .map_err(|e| HandshakeError::InvalidMessage(format!(
+            "invalid client X25519 public key: {e}"
+        )))?;
+
     let resp_sig_payload = build_response_sig_payload(
         &server_x25519_pub, &init.client_x25519_pub, &init.nonce, server_id,
     );
@@ -533,8 +724,11 @@ async fn server_handshake_inner_generic<S: AsyncRead + AsyncWrite + Unpin + Send
         .map_err(|e| HandshakeError::Serialization(e.to_string()))?;
     send_message(&mut stream, &resp_data).await?;
 
-    let peer_x25519 = EphemeralSession::parse_public_key(&init.client_x25519_pub);
-    let session_key = session.compute_session_key(&peer_x25519);
+    // S-04b 纵深防御：共享密钥全零 → 拒绝（低阶点已在上方黑名单拦截，
+    // 此处兜底 RFC 7748 §6.1 全零输出检查）。
+    let session_key = session.compute_session_key(&peer_x25519).map_err(|e| {
+        HandshakeError::InvalidMessage(format!("X25519 key exchange failed: {e}"))
+    })?;
     let cipher = AeadCipher::new(&session_key);
 
     Ok(SecureChannelGeneric {
@@ -556,12 +750,12 @@ pub async fn client_handshake(
     client_domain: &str,
     client_device_type: &str,
     server_id: &str,
-    expected_server_public_key_base64: &str,
+    pin: PinExpectation,
     challenge: &str,
 ) -> Result<SecureChannel, HandshakeError> {
     let g = client_handshake_generic(
         stream, client_identity, client_id, client_domain,
-        client_device_type, server_id, expected_server_public_key_base64, challenge,
+        client_device_type, server_id, pin, challenge,
     ).await?;
     Ok(SecureChannel {
         stream: g.stream,
@@ -575,10 +769,11 @@ pub async fn client_handshake(
 
 /// 带信任确认回调的 TcpStream 客户端握手（M15：IP 直连首次连接指纹确认）。
 ///
-/// 语义同 [`client_handshake_with_confirm_generic`]：
-/// - `expected_server_public_key_base64 = Some(key)` → 强制比对；
-/// - `None` + `Some(confirm)` → 回调确认（拒绝即断开）；
-/// - `None` + `None` → 跳过（旧版兼容，不安全）。
+/// 语义同 [`client_handshake_with_confirm_generic`]（R-02，无"无期望跳过"路径）：
+/// - `pin = PinExpectation::Exact(key)` → 强制比对；
+/// - `pin = PinExpectation::None(CoreReason::UserConfirmRequired)` + `Some(confirm)`
+///   → 回调确认（拒绝即断开；回调缺失即拒绝）；
+/// - `pin = PinExpectation::None(CoreReason::InternalLoopback)` → loopback 自签比对。
 pub async fn client_handshake_with_confirm(
     stream: tokio::net::TcpStream,
     client_identity: &IdentityManager,
@@ -586,13 +781,13 @@ pub async fn client_handshake_with_confirm(
     client_domain: &str,
     client_device_type: &str,
     server_id: &str,
-    expected_server_public_key_base64: Option<String>,
+    pin: PinExpectation,
     key_confirm: Option<Box<dyn Fn(&str) -> bool + Send>>,
     challenge: &str,
 ) -> Result<SecureChannel, HandshakeError> {
     let g = client_handshake_with_confirm_generic(
         stream, client_identity, client_id, client_domain, client_device_type,
-        server_id, expected_server_public_key_base64, key_confirm, challenge,
+        server_id, pin, key_confirm, challenge,
     )
     .await?;
     Ok(SecureChannel {
@@ -605,9 +800,12 @@ pub async fn client_handshake_with_confirm(
     })
 }
 
+/// M8-T027 (SRV-IDWL-021 同源语义)：白名单检查（域名 **或** ID 两维，
+/// temp_mode 跳过全部白名单维度）。
 pub async fn server_handshake_check(
     mut stream: tokio::net::TcpStream,
     allowed_domains: &[String],
+    allowed_ids: &[String],
     temp_mode: bool,
 ) -> Result<(WhitelistDecision, HandshakeInit), HandshakeError> {
     let init_data = receive_message(&mut stream).await?;
@@ -620,7 +818,10 @@ pub async fn server_handshake_check(
 
     let is_whitelisted = allowed_domains
         .iter()
-        .any(|allowed| domain_matches_whitelist(&init.client_domain, allowed));
+        .any(|allowed| domain_matches_whitelist(&init.client_domain, allowed))
+        || allowed_ids
+            .iter()
+            .any(|id| id_matches_whitelist(&init.client_id, id));
 
     if is_whitelisted {
         Ok((WhitelistDecision::Accepted, init))
@@ -705,6 +906,11 @@ fn build_response_sig_payload(
 
 // ---- Encrypted Communication (TcpStream only, kept for backward compat) ----
 
+/// S-02 (S-02d)：已握手通道单帧**密文包**上限 = 16 MiB 明文上限
+/// （[`DEFAULT_MAX_FRAME_LEN`]）+ 加密开销余量（12B nonce + 16B tag）。
+/// `SecureChannel::receive` / `SecureChannelReader::receive` 共用。
+const MAX_CHANNEL_FRAME_LEN: usize = DEFAULT_MAX_FRAME_LEN as usize + 64;
+
 impl SecureChannel {
     pub async fn send(&mut self, plaintext: &[u8]) -> Result<(), HandshakeError> {
         use tokio::io::AsyncWriteExt;
@@ -720,12 +926,10 @@ impl SecureChannel {
     }
 
     pub async fn receive(&mut self) -> Result<Vec<u8>, HandshakeError> {
-        use tokio::io::AsyncReadExt;
-        let mut len_buf = [0u8; 4];
-        self.stream.read_exact(&mut len_buf).await?;
-        let len = u32::from_be_bytes(len_buf) as usize;
-        let mut packet = vec![0u8; len];
-        self.stream.read_exact(&mut packet).await?;
+        // S-02 (S-02d)：长度前缀经公共 `read_length_prefixed` 读取并受上限约束
+        // （密文含 12B nonce + 16B tag 开销，上限取 16 MiB 明文 + 余量），
+        // 恶意超长帧 → `TcpError::MessageTooLarge` 报错，内存有界。
+        let packet = read_length_prefixed(&mut self.stream, MAX_CHANNEL_FRAME_LEN).await?;
         if packet.len() < 12 {
             return Err(HandshakeError::InvalidMessage("packet too short".to_string()));
         }
@@ -776,12 +980,9 @@ impl SecureChannel {
 impl SecureChannelReader {
     /// 接收一条消息（与 [`SecureChannel::receive`] 同 wire 格式）。
     pub async fn receive(&mut self) -> Result<Vec<u8>, HandshakeError> {
-        use tokio::io::AsyncReadExt;
-        let mut len_buf = [0u8; 4];
-        self.stream.read_exact(&mut len_buf).await?;
-        let len = u32::from_be_bytes(len_buf) as usize;
-        let mut packet = vec![0u8; len];
-        self.stream.read_exact(&mut packet).await?;
+        // S-02 (S-02d)：同 [`SecureChannel::receive`] —— 公共
+        // `read_length_prefixed` + 上限，恶意超长帧报错关闭，内存有界。
+        let packet = read_length_prefixed(&mut self.stream, MAX_CHANNEL_FRAME_LEN).await?;
         if packet.len() < 12 {
             return Err(HandshakeError::InvalidMessage("packet too short".to_string()));
         }
@@ -842,7 +1043,7 @@ mod tests {
             "alice.local",
             "desktop",
             "bob",
-            &bob_pub,
+            PinExpectation::exact_from_base64(&bob_pub).expect("bob pubkey"),
             "",
         );
         let server_fut = server_handshake_verified_generic(server_end, &bob, "bob", &alice_pub);
@@ -859,6 +1060,7 @@ mod tests {
         let dir = std::env::temp_dir().join("kirin_hs_mismatch");
         let alice = gen_identity(&dir, "alice");
         let bob = gen_identity(&dir, "bob");
+        let mallory = gen_identity(&dir, "mallory"); // 合法公钥但非 bob（R-02）
         let alice_pub = alice.public_key_base64();
         let (client_end, server_end) = tokio::io::duplex(65536);
 
@@ -869,7 +1071,8 @@ mod tests {
             "alice.local",
             "desktop",
             "bob",
-            "WRONG-PUBLIC-KEY-FROM-TXT",
+            PinExpectation::exact_from_base64(&mallory.public_key_base64())
+                .expect("mallory pubkey"),
             "",
         );
         let server_fut = server_handshake_verified_generic(server_end, &bob, "bob", &alice_pub);
@@ -883,10 +1086,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// M10: 预期公钥为空串 → 跳过强制验证（IP flexible 模式兼容旧行为）。
+    /// R-02（空 pin 拒绝）：`None(UserConfirmRequired)` 且**无确认回调**——
+    /// 不再存在"空串跳过比对"的旧版兼容路径（审计证据 handshake.rs:142-146,226），
+    /// core 直接拒绝，杜绝信任网络上来的公钥。
     #[tokio::test]
-    async fn test_client_handshake_expected_pubkey_empty_skips_check() {
-        let dir = std::env::temp_dir().join("kirin_hs_skip");
+    async fn test_pin_none_user_confirm_missing_callback_rejected() {
+        let dir = std::env::temp_dir().join("kirin_hs_no_skip");
         let alice = gen_identity(&dir, "alice");
         let bob = gen_identity(&dir, "bob");
         let alice_pub = alice.public_key_base64();
@@ -899,13 +1104,17 @@ mod tests {
             "alice.local",
             "desktop",
             "bob",
-            "",
+            PinExpectation::None(CoreReason::UserConfirmRequired),
             "",
         );
         let server_fut = server_handshake_verified_generic(server_end, &bob, "bob", &alice_pub);
         let (client_res, server_res) = tokio::join!(client_fut, server_fut);
-        assert!(server_res.is_ok());
-        assert!(client_res.is_ok());
+        assert!(server_res.is_ok(), "server side may complete");
+        match client_res {
+            Err(HandshakeError::UntrustedKey(_)) => {}
+            Ok(_) => panic!("expected UntrustedKey (no skip path), but handshake succeeded"),
+            Err(other) => panic!("expected UntrustedKey, got {:?}", other),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -926,7 +1135,7 @@ mod tests {
             "alice.local",
             "desktop",
             "bob",
-            None,
+            PinExpectation::None(CoreReason::UserConfirmRequired),
             Some(Box::new(move |key: &str| {
                 assert_eq!(key, bob_pub.as_str());
                 true
@@ -956,7 +1165,7 @@ mod tests {
             "alice.local",
             "desktop",
             "bob",
-            None,
+            PinExpectation::None(CoreReason::UserConfirmRequired),
             Some(Box::new(|_| false)),
             "",
         );
@@ -967,6 +1176,43 @@ mod tests {
             Err(HandshakeError::UntrustedKey(_)) => {}
             Ok(_) => panic!("expected UntrustedKey, but handshake succeeded"),
             Err(other) => panic!("expected UntrustedKey, got {:?}", other),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R-02-S3（loopback 自签兜底）：`None(InternalLoopback)` 时 core 以客户端
+    /// **自身公钥**为 pin 强制比对——服务端 = 自身（同身份）→ 握手成功；
+    /// 换用其他身份（非自连）→ `ServerKeyMismatch` 拒绝，不依赖"无期望"跳过。
+    #[tokio::test]
+    async fn test_pin_loopback_self_sign() {
+        let dir = std::env::temp_dir().join("kirin_hs_loopback_self");
+        let alice = gen_identity(&dir, "alice");
+        let bob = gen_identity(&dir, "bob");
+        let alice_pub = alice.public_key_base64();
+
+        // 服务端 = 自身（同一身份 alice）→ 自签 pin 通过。
+        let (client_end, server_end) = tokio::io::duplex(65536);
+        let client_fut = client_handshake_generic(
+            client_end, &alice, "alice", "alice.local", "desktop", "alice",
+            PinExpectation::None(CoreReason::InternalLoopback), "",
+        );
+        let server_fut = server_handshake_verified_generic(server_end, &alice, "alice", &alice_pub);
+        let (client_res, server_res) = tokio::join!(client_fut, server_fut);
+        assert!(server_res.is_ok(), "server side should succeed");
+        assert!(client_res.is_ok(), "self-sign loopback must succeed");
+
+        // 服务端 ≠ 自身（bob 冒充）→ 自签 pin 拒绝。
+        let (client_end, server_end) = tokio::io::duplex(65536);
+        let client_fut = client_handshake_generic(
+            client_end, &alice, "alice", "alice.local", "desktop", "bob",
+            PinExpectation::None(CoreReason::InternalLoopback), "",
+        );
+        let server_fut = server_handshake_verified_generic(server_end, &bob, "bob", &alice_pub);
+        let (client_res, _server_res) = tokio::join!(client_fut, server_fut);
+        match client_res {
+            Err(HandshakeError::ServerKeyMismatch { .. }) => {}
+            Ok(_) => panic!("self-sign pin must reject non-self server"),
+            Err(other) => panic!("expected ServerKeyMismatch, got {:?}", other),
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -984,7 +1230,7 @@ mod tests {
         let (client_end, server_end) = tokio::io::duplex(65536);
 
         let client_fut = client_handshake_generic(
-            client_end, &alice, "alice", "alice.local", "desktop", "bob", &bob_pub, "",
+            client_end, &alice, "alice", "alice.local", "desktop", "bob", PinExpectation::exact_from_base64(&bob_pub).expect("bob pubkey"), "",
         );
         // 服务端以 known_hosts 记录的 alice 公钥作 pin → 应放行。
         let server_fut = server_handshake_verified_with_nickname_generic(
@@ -1009,7 +1255,7 @@ mod tests {
         let (client_end, server_end) = tokio::io::duplex(65536);
 
         let client_fut = client_handshake_generic(
-            client_end, &mallory, "alice", "alice.local", "desktop", "bob", &bob_pub, "",
+            client_end, &mallory, "alice", "alice.local", "desktop", "bob", PinExpectation::exact_from_base64(&bob_pub).expect("bob pubkey"), "",
         );
         // 服务端 known_hosts 里 alice 的**真实**公钥 → 与网络上来的冒充公钥不一致。
         let server_fut = server_handshake_verified_with_nickname_generic(
@@ -1042,13 +1288,14 @@ mod tests {
         let (client_end, mut server_end) = tokio::io::duplex(65536);
 
         let client_fut = client_handshake_generic(
-            client_end, &alice, "alice", "alice.local", "desktop", "bob", &bob_pub, "",
+            client_end, &alice, "alice", "alice.local", "desktop", "bob", PinExpectation::exact_from_base64(&bob_pub).expect("bob pubkey"), "",
         );
         let server_fut = async move {
             // 1. 预读 init（不应答）。
             let init = server_read_init(&mut server_end).await?;
             // 2. 解析 known_hosts/DNS 后 pin 校验（一致 → 通过）。
-            verify_server_init(&init, &alice_pub, None, None)?;
+            // S-01a：测试环回显式 opt-in（无挑战码场景）。
+            verify_server_init(&init, &alice_pub, None, None, true)?;
             // 3. 应答建立通道。
             let g = server_handshake_respond_generic(server_end, &bob, "bob", &init, "").await?;
             Ok::<_, HandshakeError>(g)
@@ -1093,11 +1340,14 @@ mod tests {
         ) -> Result<(), HandshakeError> {
             let (client_end, mut server_end) = tokio::io::duplex(65536);
             let client_fut = client_handshake_generic(
-                client_end, alice, "alice", "alice.local", "desktop", "bob", bob_pub, challenge,
+                client_end, alice, "alice", "alice.local", "desktop", "bob",
+                PinExpectation::exact_from_base64(bob_pub).expect("bob pubkey"), challenge,
             );
             let server_fut = async move {
                 let init = server_read_init(&mut server_end).await?;
-                verify_server_init_with_temp(&init, alice_pub, None, fixed, Some(tm))?;
+                // S-01a：测试环回显式 opt-in（二态校验分支不受该参数影响，
+                // 显式传 true 保持测试语义清晰）。
+                verify_server_init_with_temp(&init, alice_pub, None, fixed, Some(tm), true)?;
                 let _g =
                     server_handshake_respond_generic(server_end, bob, "bob", &init, "").await?;
                 Ok::<_, HandshakeError>(())
@@ -1150,12 +1400,13 @@ mod tests {
         let (client_end, mut server_end) = tokio::io::duplex(65536);
 
         let client_fut = client_handshake_generic(
-            client_end, &alice, "alice", "alice.local", "desktop", "bob", &bob_pub, "",
+            client_end, &alice, "alice", "alice.local", "desktop", "bob", PinExpectation::exact_from_base64(&bob_pub).expect("bob pubkey"), "",
         );
         let server_fut = async move {
             let init = server_read_init(&mut server_end).await?;
             // known_hosts 里记录的 alice 公钥 ≠ 网络上来的公钥 → 拒绝。
-            verify_server_init(&init, "WRONG-PINNED-KEY", None, None)?;
+            // S-01a：测试环回显式 opt-in（本用例验证 pin 不一致路径）。
+            verify_server_init(&init, "WRONG-PINNED-KEY", None, None, true)?;
             unreachable!("must not respond after pin mismatch");
         };
         let (client_res, server_res): (
@@ -1170,9 +1421,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// S-01a (F-1): 零凭据 fail-closed —— 无固定挑战码 + 无激活临时窗口 +
+    /// 客户端未知（无 pin）→ 生产语义（`allow_no_credentials=false`）拒绝；
+    /// 测试/loopback 显式 opt-in（`true`）放行。
+    #[tokio::test]
+    async fn test_verify_server_init_zero_credentials_fail_closed() {
+        let dir = std::env::temp_dir().join("kirin_hs_zero_cred");
+        let alice = gen_identity(&dir, "alice");
+        let bob = gen_identity(&dir, "bob");
+        let bob_pub = bob.public_key_base64();
+
+        /// 一次「未知客户端（空 pin）+ 空挑战码 + 无窗口」的握手往返。
+        async fn run_zero_cred(
+            alice: &IdentityManager,
+            bob: &IdentityManager,
+            bob_pub: &str,
+            allow_no_credentials: bool,
+        ) -> Result<(), HandshakeError> {
+            let (client_end, mut server_end) = tokio::io::duplex(65536);
+            let client_fut = client_handshake_generic(
+                client_end, alice, "alice", "alice.local", "desktop", "bob",
+                PinExpectation::exact_from_base64(bob_pub).expect("bob pubkey"), "",
+            );
+            let server_fut = async move {
+                let init = server_read_init(&mut server_end).await?;
+                verify_server_init(&init, "", None, None, allow_no_credentials)?;
+                let _g =
+                    server_handshake_respond_generic(server_end, bob, "bob", &init, "").await?;
+                Ok::<_, HandshakeError>(())
+            };
+            let (client_res, server_res) = tokio::join!(client_fut, server_fut);
+            server_res?;
+            client_res.map(|_| ())
+        }
+
+        // 生产语义（false）：零凭据 → 拒绝（不再免校验放行）。
+        match run_zero_cred(&alice, &bob, &bob_pub, false).await {
+            Err(HandshakeError::InvalidMessage(msg)) => {
+                assert!(
+                    msg.contains("requires credentials"),
+                    "unexpected message: {msg}"
+                );
+            }
+            other => panic!("zero-credential must be rejected, got {:?}", other),
+        }
+        // 测试/loopback 显式 opt-in（true）：放行。
+        assert!(
+            run_zero_cred(&alice, &bob, &bob_pub, true).await.is_ok(),
+            "explicit opt-in must allow the loopback path"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 白名单握手（headless）集成 pin：`server_handshake_with_whitelist`
     /// 传 known_hosts 公钥 → 一致放行 / 不一致拒绝。
     #[tokio::test]
+    #[allow(deprecated)] // R-05 (SRV-IDWL-022): 遗留接口 e2e 回归
     async fn test_whitelist_handshake_with_pin() {
         let dir = std::env::temp_dir().join("kirin_hs_wl_pin");
         let alice = gen_identity(&dir, "alice");
@@ -1180,21 +1484,23 @@ mod tests {
         let alice_pub = alice.public_key_base64();
         let bob_pub = bob.public_key_base64();
         let allowed = vec!["kirin.local".to_string()];
+        let allowed_ids: Vec<String> = Vec::new();
 
         // 一致 → Accepted
         let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let (bob_ref, allowed_ref, pin_ref) = (bob.clone(), allowed.clone(), alice_pub.clone());
+        let (bob_ref, allowed_ref, ids_ref, pin_ref) =
+            (bob.clone(), allowed.clone(), allowed_ids.clone(), alice_pub.clone());
         let server_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             server_handshake_with_whitelist(
-                stream, &bob_ref, "bob", &allowed_ref, false, &pin_ref, None, None,
+                stream, &bob_ref, "bob", &allowed_ref, &ids_ref, false, &pin_ref, None, None,
             )
             .await
         });
         let client_res = client_handshake(
             tokio::net::TcpStream::connect(addr).await.unwrap(),
-            &alice, "alice", "alice.kirin.local", "desktop", "bob", &bob_pub, "",
+            &alice, "alice", "alice.kirin.local", "desktop", "bob", PinExpectation::exact_from_base64(&bob_pub).expect("bob pubkey"), "",
         )
         .await;
         let decision = server_task.await.unwrap().expect("server handshake");
@@ -1205,17 +1511,18 @@ mod tests {
         let mallory = gen_identity(&dir, "mallory");
         let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let (bob_ref, allowed_ref, pin_ref) = (bob.clone(), allowed.clone(), alice_pub.clone());
+        let (bob_ref, allowed_ref, ids_ref, pin_ref) =
+            (bob.clone(), allowed.clone(), allowed_ids.clone(), alice_pub.clone());
         let server_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             server_handshake_with_whitelist(
-                stream, &bob_ref, "bob", &allowed_ref, false, &pin_ref, None, None,
+                stream, &bob_ref, "bob", &allowed_ref, &ids_ref, false, &pin_ref, None, None,
             )
             .await
         });
         let _client_res = client_handshake(
             tokio::net::TcpStream::connect(addr).await.unwrap(),
-            &mallory, "alice", "alice.kirin.local", "desktop", "bob", &bob_pub, "",
+            &mallory, "alice", "alice.kirin.local", "desktop", "bob", PinExpectation::exact_from_base64(&bob_pub).expect("bob pubkey"), "",
         )
         .await;
         // pin 不一致 → verify_server_init 以 Err(ClientKeyMismatch) 拒绝（错误而非策略拒绝）。
@@ -1226,6 +1533,97 @@ mod tests {
             ),
             "expected ClientKeyMismatch"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// M8-T027 (SRV-IDWL-011): `id_matches_whitelist` 匹配规则——
+    /// 精确命中/未命中、空 pattern、`*` 结尾前缀通配、空白 trim、大小写敏感。
+    #[test]
+    fn test_id_matches_whitelist_rules() {
+        // 精确匹配（trim 后相等）。
+        assert!(id_matches_whitelist("device-7", "device-7"));
+        assert!(id_matches_whitelist(" device-7 ", "device-7"));
+        assert!(id_matches_whitelist("device-7", "  device-7  "));
+        assert!(!id_matches_whitelist("device-8", "device-7"));
+        // 空 pattern / 空白 → 不匹配。
+        assert!(!id_matches_whitelist("device-7", ""));
+        assert!(!id_matches_whitelist("device-7", "   "));
+        // `*` 结尾 → 前缀通配。
+        assert!(id_matches_whitelist("office-1", "office-*"));
+        assert!(id_matches_whitelist("office-42", "office-*"));
+        assert!(id_matches_whitelist("office-", "office-*"));
+        assert!(!id_matches_whitelist("lab-1", "office-*"));
+        assert!(!id_matches_whitelist("myoffice-1", "office-*"));
+        // 裸 `*`（通配前缀为空）→ 保守不匹配（对称 domain 裸 `*` 处理）。
+        assert!(!id_matches_whitelist("device-7", "*"));
+        // 大小写敏感（与 known_clients key 语义一致）。
+        assert!(!id_matches_whitelist("Device-7", "device-7"));
+        assert!(id_matches_whitelist("Device-7", "Device-7"));
+        // 空 device_id。
+        assert!(!id_matches_whitelist("", "device-7"));
+        assert!(!id_matches_whitelist("", ""));
+    }
+
+    /// M8-T027 (SRV-IDWL-020 旧接口): `server_handshake_with_whitelist`
+    /// 双白名单 OR 语义——域名未命中但设备 ID 命中 → 放行（headless 无审批）。
+    #[tokio::test]
+    #[allow(deprecated)] // R-05 (SRV-IDWL-022): 遗留接口 e2e 回归
+    async fn test_whitelist_handshake_id_only_accepted() {
+        let dir = std::env::temp_dir().join("kirin_hs_wl_id_only");
+        let alice = gen_identity(&dir, "alice");
+        let bob = Arc::new(gen_identity(&dir, "bob"));
+        let alice_pub = alice.public_key_base64();
+        let bob_pub = bob.public_key_base64();
+        let allowed: Vec<String> = Vec::new(); // 域名维度为空
+        let allowed_ids = vec!["alice".to_string()];
+
+        let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (bob_ref, allowed_ref, ids_ref) =
+            (bob.clone(), allowed.clone(), allowed_ids.clone());
+        let alice_pub_ref = alice_pub.clone();
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            server_handshake_with_whitelist(
+                stream, &bob_ref, "bob", &allowed_ref, &ids_ref, false, &alice_pub_ref, None,
+                None,
+            )
+            .await
+        });
+        let client_res = client_handshake(
+            tokio::net::TcpStream::connect(addr).await.unwrap(),
+            &alice, "alice", "evil.example.org", "desktop", "bob", PinExpectation::exact_from_base64(&bob_pub).expect("bob pubkey"), "",
+        )
+        .await;
+        let decision = server_task.await.unwrap().expect("server handshake");
+        assert!(
+            matches!(decision, VerifiedDecision::Accepted(_)),
+            "ID whitelist hit must accept despite domain miss"
+        );
+        assert!(client_res.is_ok());
+
+        // 对照：ID 未命中（alice 换 id=bob）→ 双维未命中 → Rejected。
+        let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (bob_ref, allowed_ref, ids_ref) = (bob.clone(), allowed.clone(), allowed_ids.clone());
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            server_handshake_with_whitelist(
+                stream, &bob_ref, "bob", &allowed_ref, &ids_ref, false, &alice_pub, None, None,
+            )
+            .await
+        });
+        let _client_res = client_handshake(
+            tokio::net::TcpStream::connect(addr).await.unwrap(),
+            &alice, "mallory", "evil.example.org", "desktop", "bob", PinExpectation::exact_from_base64(&bob_pub).expect("bob pubkey"), "",
+        )
+        .await;
+        match server_task.await.unwrap().expect("server handshake") {
+            VerifiedDecision::Rejected(reason) => {
+                assert!(reason.contains("not in whitelist"), "reason: {reason}");
+            }
+            other => panic!("expected Rejected, got {:?}", other),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1241,7 +1639,7 @@ mod tests {
         let (client_end, server_end) = tokio::io::duplex(65536);
 
         let client_fut = client_handshake_generic(
-            client_end, &alice, "alice", "alice.local", "desktop", "bob", &bob_pub, "",
+            client_end, &alice, "alice", "alice.local", "desktop", "bob", PinExpectation::exact_from_base64(&bob_pub).expect("bob pubkey"), "",
         );
         let server_fut = server_handshake_verified_generic(server_end, &bob, "bob", &alice_pub);
         let (_client_res, _server_res) = tokio::join!(client_fut, server_fut);
@@ -1254,5 +1652,84 @@ mod tests {
         // 确定性：同公钥同指纹
         assert_eq!(crate::crypto::ed25519::fingerprint(&bob_pub), fp);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── S-02 (F-5)：握手读超时 / 超长前缀拒绝 / 通道帧上限 ─────────────
+
+    /// S-02b：连接"只连不发" → `server_read_init` 在 deadline 内返回
+    /// `HandshakeError::Timeout`（调用方既有错误路径关闭连接 + 计失败 + 审计）。
+    #[tokio::test]
+    async fn test_server_read_init_timeout() {
+        // 对端保持连接打开但不发任何字节（`_client_end` 存活到作用域结束，
+        // drop 会让读侧 EOF 而非超时）。
+        let (_client_end, mut server_end) = tokio::io::duplex(65536);
+        let start = std::time::Instant::now();
+        let err = server_read_init_with_timeout(
+            &mut server_end,
+            std::time::Duration::from_millis(200),
+        )
+        .await
+        .unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(err, HandshakeError::Timeout),
+            "expected Timeout, got {:?}",
+            err
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_millis(150),
+            "timeout fired too early: {:?}",
+            elapsed
+        );
+    }
+
+    /// S-02a/S-02b：`0xFFFFFFFF` 长度前缀 → `MessageTooLarge`（读侧不分配
+    /// 4 GiB，直接报错，由调用方关闭连接）。
+    #[tokio::test]
+    async fn test_server_read_init_oversized_rejected() {
+        use tokio::io::AsyncWriteExt;
+        let (mut client_end, mut server_end) = tokio::io::duplex(65536);
+        client_end.write_all(&u32::MAX.to_be_bytes()).await.unwrap();
+        let err = server_read_init(&mut server_end).await.unwrap_err();
+        match &err {
+            HandshakeError::Tcp(TcpError::MessageTooLarge { len, max }) => {
+                assert_eq!(*len, u32::MAX as usize);
+                assert_eq!(*max, DEFAULT_MAX_FRAME_LEN as usize);
+            }
+            other => panic!("expected Tcp(MessageTooLarge), got {:?}", other),
+        }
+    }
+
+    /// S-02d：`SecureChannel::receive` 对恶意超长帧前缀报错（通道级上限），
+    /// 与 tcp 层共用 `read_length_prefixed`。
+    #[tokio::test]
+    async fn test_secure_channel_receive_oversized_rejected() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ch = SecureChannel {
+                stream,
+                cipher: AeadCipher::new(&[0u8; 32]),
+                peer_id: "peer".to_string(),
+                peer_domain: String::new(),
+                peer_device_type: String::new(),
+                selected_codec: String::new(),
+            };
+            let err = ch.receive().await.unwrap_err();
+            match &err {
+                HandshakeError::Tcp(TcpError::MessageTooLarge { len, max }) => {
+                    assert_eq!(*len, u32::MAX as usize);
+                    // 通道帧上限 = 16 MiB + 加密开销余量（S-02d）。
+                    assert_eq!(*max, DEFAULT_MAX_FRAME_LEN as usize + 64);
+                }
+                other => panic!("expected Tcp(MessageTooLarge), got {:?}", other),
+            }
+        });
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client.write_all(&u32::MAX.to_be_bytes()).await.unwrap();
+        client.flush().await.unwrap();
+        server_task.await.unwrap();
     }
 }

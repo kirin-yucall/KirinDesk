@@ -45,6 +45,10 @@ pub enum TunnelAuditEvent {
     TunnelRelayOpened { target: String, from: String, conn_id: u64 },
     /// M8-T026-P2 (§8.1): 设备级中继关闭（任一端断开 / 配对失败）。
     TunnelRelayClosed { target: String, conn_id: u64, reason: String },
+    /// S-09（审计 F-9）：候选登记归属校验拒绝 —— 会话为**非自身** device_id
+    /// 提交候选（跨设备覆盖/投毒）或会话未注册设备 → 丢弃 + 审计。
+    /// detail 含客户端地址、目标 device_id 与原因（`PunchUnknownSession` 风格）。
+    CandidateRegisterRejected { client: SocketAddr, device_id: String, reason: String },
 }
 
 /// 审计回调（可注入；`None` = 不记录）。

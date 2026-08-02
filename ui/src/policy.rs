@@ -10,8 +10,9 @@
 use kirin_desk_core::connection::temp_mode::TempModeManager;
 use kirin_desk_core::crypto::ed25519::IdentityManager;
 use kirin_desk_core::crypto::handshake::{
-    domain_matches_whitelist, server_handshake_respond_generic, server_read_init,
-    verify_server_init_with_temp, HandshakeError, SecureChannel, VerifiedDecision,
+    domain_matches_whitelist, id_matches_whitelist, server_handshake_respond_generic,
+    server_read_init, verify_server_init_with_temp, HandshakeError, SecureChannel,
+    VerifiedDecision,
 };
 use kirin_desk_dns::godaddy::GoDaddyClient;
 use kirin_desk_dns::txt::TxtManager;
@@ -42,7 +43,10 @@ pub async fn resolve_expected_client_key(
     client_id: &str,
 ) -> (Option<String>, ClientKeyResolution) {
     if let Some(kc) = known.lookup(client_id) {
-        return (Some(kc.public_key_base64.clone()), ClientKeyResolution::KnownHosts);
+        return (
+            Some(kc.public_key_base64.clone()),
+            ClientKeyResolution::KnownHosts,
+        );
     }
 
     if cfg.godaddy.api_key.is_empty() || cfg.godaddy.domain.is_empty() {
@@ -93,23 +97,34 @@ pub fn temp_mode_window_manager() -> Option<TempModeManager> {
 /// （SRV-SEC-KH-001/002）；白名单在验证之前判定（headless：不泄露服务器
 /// X25519 公钥/响应签名），`temp_mode` / `temp_window` 可绕过。
 ///
+/// M8-T027 (SRV-IDWL-020)：`allowed_ids` 为设备 ID 白名单（调用方从
+/// `cfg.id_whitelist_active_ids(Utc::now())` 取得）；访问控制公式为
+/// **`domain_match || id_match`**（双白名单 OR 语义，域名维度既有行为不变），
+/// temp_mode / temp_window 跳过时两维一并跳过（SRV-IDWL-024）。
+///
 /// M13-T005（UA-ACCEPT-001/002）：`unattended = true` 时访问控制切换为
-/// 「自动接受」策略——白名单命中或 known_clients 命中 → 自动允许（无弹窗、
-/// 无需 temp mode）；两者均未命中 → 直接拒绝（`Rejected("unattended: ...")`），
-/// 不存在人工审批路径。调用方应保证无人值守下 `temp_mode` 已置 false
-/// （UA-ACCEPT-004）。
+/// 「自动接受」策略——白名单命中（域名 **或** ID，SRV-IDWL-003）或
+/// known_clients 命中 → 自动允许（无弹窗、无需 temp mode）；两者均未命中 →
+/// 直接拒绝（`Rejected("unattended: ...")`），不存在人工审批路径。调用方应
+/// 保证无人值守下 `temp_mode` 已置 false（UA-ACCEPT-004）。
 ///
 /// M8-T017（SRV-TMP-HK-001/003）：`temp_window` 为激活中的临时连接窗口时，
 /// 挑战码按二态校验（固定 **或** 临时），且与 `temp_mode` 共同跳过白名单；
 /// `None` = 窗口期外，临时码一律失败，不产生任何旁路。
 ///
+/// S-01b（F-1）：**零凭据 fail-closed** —— 客户端未知（`expected_key` 解析为
+/// None，无 known_clients/DNS pin）+ 无固定挑战码 + 无激活临时窗口 →
+/// 拒绝（白名单命中不再等于放行：白名单只匹配自报域名，与身份绑定解耦）。
+/// 已 pin 客户端（身份绑定）不受影响（首次连接确认 / R-02 pin 路径不回归）。
+///
 /// 返回 `VerifiedDecision`（与白名单握手一致）：`Accepted` 建立安全通道；
-/// `Rejected` 为策略拒绝（白名单/无人值守）；`Err` 为验证失败（签名/pin/nickname 等）。
+/// `Rejected` 为策略拒绝（白名单/无人值守/零凭据）；`Err` 为验证失败（签名/pin/nickname 等）。
 pub async fn server_accept_handshake(
     mut stream: tokio::net::TcpStream,
     identity: &IdentityManager,
     server_id: &str,
     allowed_domains: &[String],
+    allowed_ids: &[String],
     temp_mode: bool,
     unattended: bool,
     temp_window: Option<TempModeManager>,
@@ -122,9 +137,13 @@ pub async fn server_accept_handshake(
     let init = server_read_init(&mut stream).await?;
 
     // 2. 访问控制（headless：先白名单后验证，非白名单不泄露信息）。
+    // M8-T027: 双白名单 OR —— 域名命中 **或** 设备 ID 命中即视为白名单命中。
     let is_whitelisted = allowed_domains
         .iter()
-        .any(|allowed| domain_matches_whitelist(&init.client_domain, allowed));
+        .any(|allowed| domain_matches_whitelist(&init.client_domain, allowed))
+        || allowed_ids
+            .iter()
+            .any(|id| id_matches_whitelist(&init.client_id, id));
     if unattended {
         // UA-ACCEPT-001/002：白名单命中 → 自动允许；未命中但 known_clients
         // 已信任 → 自动允许；完全未知 → 自动拒绝（无人值守无人工审批）。
@@ -136,20 +155,35 @@ pub async fn server_accept_handshake(
         }
     } else if !temp_mode && temp_window.is_none() && !is_whitelisted {
         return Ok(VerifiedDecision::Rejected(format!(
-            "domain '{}' not in whitelist (headless: no GUI approval)",
-            init.client_domain
+            "domain '{}' and id '{}' not in whitelist (headless: no GUI approval)",
+            init.client_domain, init.client_id
         )));
     }
 
     // 3. 客户端公钥解析（known_hosts → DNS TXT）+ 校验（pin/nickname/challenge/签名）。
     let (expected_key, _resolution) =
         resolve_expected_client_key(known, cfg, &init.client_id).await;
+
+    // S-01b (F-1): 零凭据 fail-closed —— 客户端未知（无 pin）+ 无固定挑战码 +
+    // 无激活临时窗口 → 拒绝（含无人值守下白名单命中但零凭据的路径；「白名单
+    // 命中」只证明自报域名匹配，不再是放行依据）。
+    let challenge_configured = expected_challenge.map_or(false, |c| !c.is_empty());
+    if expected_key.is_none() && !challenge_configured && temp_window.is_none() {
+        return Ok(VerifiedDecision::Rejected(format!(
+            "no credentials: client '{}' is unknown (no pinned key), and server has \
+             no challenge code and no temp window — zero-credential connection rejected (F-1)",
+            init.client_id
+        )));
+    }
+
+    // S-01a (F-1)：生产路径零凭据 → 拒绝（verify 层兜底，防调用方遗漏）。
     verify_server_init_with_temp(
         &init,
         expected_key.as_deref().unwrap_or(""),
         expected_nickname,
         expected_challenge,
         temp_window.as_ref(),
+        false,
     )?;
 
     // 4. 应答 + 建立安全通道。
@@ -211,7 +245,7 @@ mod tests {
     use super::*;
     use kirin_desk_core::crypto::ed25519::IdentityManager;
     use kirin_desk_core::crypto::handshake::{
-        client_handshake_with_confirm_generic, SecureChannelGeneric,
+        client_handshake_with_confirm_generic, PinExpectation, SecureChannelGeneric,
     };
     use tokio::net::TcpListener;
 
@@ -221,14 +255,17 @@ mod tests {
 
     /// 本地 TCP 对连执行一次服务端握手：
     /// 客户端 alice（domain "alice.local"，类型 desktop）→ 服务端 bob（自生成），
-    /// 按参数给定无人值守标志 / known_clients / 白名单。alice 身份由调用方
-    /// 传入（known_clients 预置的公钥必须与握手客户端一致）。
+    /// 按参数给定无人值守标志 / known_clients / 域名白名单 / ID 白名单 / 挑战码。
+    /// alice 身份由调用方传入（known_clients 预置的公钥必须与握手客户端一致）。
+    /// `challenge` 非空时服务端以该固定挑战码校验（S-01b：零凭据测试显式配置）。
     async fn run_pair(
         tag: &str,
         unattended: bool,
         known: &KnownClientsStore,
         allowed: &[String],
+        allowed_ids: &[String],
         alice: &IdentityManager,
+        challenge: &str,
     ) -> (
         Result<SecureChannelGeneric<tokio::net::TcpStream>, HandshakeError>,
         Result<VerifiedDecision, HandshakeError>,
@@ -242,8 +279,24 @@ mod tests {
         let server_fut = async move {
             let (stream, _) = listener.accept().await.expect("accept");
             let cfg = Config::default();
+            let expected_challenge = if challenge.is_empty() {
+                None
+            } else {
+                Some(challenge)
+            };
             server_accept_handshake(
-                stream, &bob, "bob", allowed, false, unattended, None, None, None, known, &cfg,
+                stream,
+                &bob,
+                "bob",
+                allowed,
+                allowed_ids,
+                false,
+                unattended,
+                None,
+                None,
+                expected_challenge,
+                known,
+                &cfg,
             )
             .await
         };
@@ -256,9 +309,10 @@ mod tests {
                 "alice.local",
                 "desktop",
                 "bob",
-                Some(bob_pub),
+                // R-02：真实 pin 比对（`Exact` 强类型）。
+                PinExpectation::exact_from_base64(&bob_pub).expect("bob pubkey"),
                 None,
-                "",
+                challenge,
             )
             .await
         };
@@ -274,7 +328,7 @@ mod tests {
         let dir = std::env::temp_dir().join("kirin_policy_unknown");
         let alice = gen_identity(&dir, "alice");
         let known = KnownClientsStore::empty();
-        let (client_res, decision) = run_pair("unknown", true, &known, &[], &alice).await;
+        let (client_res, decision) = run_pair("unknown", true, &known, &[], &[], &alice, "").await;
         match decision {
             Ok(VerifiedDecision::Rejected(reason)) => {
                 assert!(reason.contains("unattended"), "reason: {}", reason);
@@ -295,7 +349,7 @@ mod tests {
         let mut known = KnownClientsStore::empty();
         known.upsert("alice", &alice_pub);
 
-        let (client_res, decision) = run_pair("known", true, &known, &[], &alice).await;
+        let (client_res, decision) = run_pair("known", true, &known, &[], &[], &alice, "").await;
         assert!(
             matches!(decision, Ok(VerifiedDecision::Accepted(_))),
             "expected Accepted, got {:?}",
@@ -312,13 +366,69 @@ mod tests {
         let alice = gen_identity(&dir, "alice");
         let known = KnownClientsStore::empty();
         let allowed = vec!["*.local".to_string()];
-        let (client_res, decision) = run_pair("whitelist", true, &known, &allowed, &alice).await;
+        // S-01b (F-1)：无人值守白名单命中但零凭据 → 拒绝；本用例配置挑战码
+        // 验证「白名单 + 凭据齐备」仍自动放行（UA-ACCEPT-001 语义不变）。
+        let (client_res, decision) = run_pair(
+            "whitelist",
+            true,
+            &known,
+            &allowed,
+            &[],
+            &alice,
+            "TEST-CODE",
+        )
+        .await;
         assert!(
             matches!(decision, Ok(VerifiedDecision::Accepted(_))),
             "expected Accepted, got {:?}",
             decision.is_err()
         );
         assert!(client_res.is_ok(), "client handshake should succeed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// S-01b (F-1): 零凭据 fail-closed —— 自签客户端自报白名单域名 + 客户端
+    /// 未知（无 pin）+ 空挑战码 + 无临时窗口 → 拒绝（白名单命中只证明自报
+    /// 域名匹配，不再等于放行）。常规与无人值守两路径均验证。
+    #[tokio::test]
+    async fn test_zero_credentials_whitelisted_rejected() {
+        let dir = std::env::temp_dir().join("kirin_policy_zero_cred");
+        let alice = gen_identity(&dir, "alice");
+        let known = KnownClientsStore::empty();
+        let allowed = vec!["*.local".to_string()]; // 域名白名单命中（自报）
+
+        // 常规模式：白名单命中 + 零凭据 → Rejected(no credentials)。
+        let (client_res, decision) =
+            run_pair("zero_cred", false, &known, &allowed, &[], &alice, "").await;
+        match decision {
+            Ok(VerifiedDecision::Rejected(reason)) => {
+                assert!(reason.contains("no credentials"), "reason: {}", reason);
+            }
+            Ok(_) => panic!("zero-credential whitelist hit must be rejected (F-1)"),
+            Err(e) => panic!("server handshake error: {}", e),
+        }
+        assert!(client_res.is_err(), "channel must not be established");
+
+        // 无人值守：白名单命中 + 零凭据 → 同样拒绝（UA-ACCEPT-001 的自动放行
+        // 不再覆盖零凭据；凭据齐备用例见 test_unattended_whitelist_accepted）。
+        let (client_res, decision) = run_pair(
+            "zero_cred_unattended",
+            true,
+            &known,
+            &allowed,
+            &[],
+            &alice,
+            "",
+        )
+        .await;
+        match decision {
+            Ok(VerifiedDecision::Rejected(reason)) => {
+                assert!(reason.contains("no credentials"), "reason: {}", reason);
+            }
+            Ok(_) => panic!("unattended zero-credential whitelist hit must be rejected (F-1)"),
+            Err(e) => panic!("server handshake error: {}", e),
+        }
+        assert!(client_res.is_err(), "channel must not be established");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -332,7 +442,7 @@ mod tests {
         let mut known = KnownClientsStore::empty();
         known.upsert("alice", &alice_pub);
 
-        let (client_res, decision) = run_pair("normal", false, &known, &[], &alice).await;
+        let (client_res, decision) = run_pair("normal", false, &known, &[], &[], &alice, "").await;
         match decision {
             Ok(VerifiedDecision::Rejected(reason)) => {
                 assert!(reason.contains("whitelist"), "reason: {}", reason);
@@ -371,6 +481,7 @@ mod tests {
             bob_pub: &str,
             known: &KnownClientsStore,
             allowed: &[String],
+            allowed_ids: &[String],
             tm: Option<TempModeManager>,
             challenge: &str,
         ) -> (
@@ -384,7 +495,18 @@ mod tests {
                 let cfg = Config::default();
                 // temp_mode=false（无配置静态旁路）→ 白名单跳过仅靠窗口维度。
                 server_accept_handshake(
-                    stream, bob, "bob", allowed, false, false, tm, None, None, known, &cfg,
+                    stream,
+                    bob,
+                    "bob",
+                    allowed,
+                    allowed_ids,
+                    false,
+                    false,
+                    tm,
+                    None,
+                    None,
+                    known,
+                    &cfg,
                 )
                 .await
             };
@@ -397,7 +519,8 @@ mod tests {
                     "alice.local",
                     "desktop",
                     "bob",
-                    Some(bob_pub.to_string()),
+                    // R-02：真实 pin 比对（`Exact` 强类型）。
+                    PinExpectation::exact_from_base64(bob_pub).expect("bob pubkey"),
                     None,
                     challenge,
                 )
@@ -408,7 +531,15 @@ mod tests {
 
         // 窗口激活 + 临时码 → Accepted（白名单为空也放行）。
         let (client_res, decision) = run_window_pair(
-            &dir, &alice, &bob, &bob_pub, &known, &allowed, Some(tm.clone()), &code,
+            &dir,
+            &alice,
+            &bob,
+            &bob_pub,
+            &known,
+            &allowed,
+            &[],
+            Some(tm.clone()),
+            &code,
         )
         .await;
         match decision {
@@ -422,7 +553,15 @@ mod tests {
 
         // 窗口激活 + 错码 → 拒绝（InvalidMessage(challenge mismatch)，计入握手失败路径）。
         let (client_res, decision) = run_window_pair(
-            &dir, &alice, &bob, &bob_pub, &known, &allowed, Some(tm.clone()), "WRONGCODE",
+            &dir,
+            &alice,
+            &bob,
+            &bob_pub,
+            &known,
+            &allowed,
+            &[],
+            Some(tm.clone()),
+            "WRONGCODE",
         )
         .await;
         match decision {
@@ -430,18 +569,32 @@ mod tests {
                 assert_eq!(msg, "challenge mismatch");
             }
             Ok(VerifiedDecision::Rejected(reason)) => {
-                panic!("expected InvalidMessage(challenge mismatch), got Rejected({})", reason)
+                panic!(
+                    "expected InvalidMessage(challenge mismatch), got Rejected({})",
+                    reason
+                )
             }
             Ok(VerifiedDecision::Accepted(_)) => {
                 panic!("expected InvalidMessage(challenge mismatch), got Accepted")
             }
-            Err(e) => panic!("expected InvalidMessage(challenge mismatch), got Err({})", e),
+            Err(e) => panic!(
+                "expected InvalidMessage(challenge mismatch), got Err({})",
+                e
+            ),
         }
         assert!(client_res.is_err(), "client must fail with wrong temp code");
 
         // 窗口期外（None）→ 临时码一律失败，不产生旁路（SRV-TMP-HK-003）。
         let (client_res, decision) = run_window_pair(
-            &dir, &alice, &bob, &bob_pub, &known, &allowed, None, &code,
+            &dir,
+            &alice,
+            &bob,
+            &bob_pub,
+            &known,
+            &allowed,
+            &[],
+            None,
+            &code,
         )
         .await;
         match decision {
@@ -451,7 +604,10 @@ mod tests {
             Ok(VerifiedDecision::Accepted(_)) => {
                 panic!("expected Rejected(whitelist) outside window, got Accepted")
             }
-            Err(e) => panic!("expected Rejected(whitelist) outside window, got Err({})", e),
+            Err(e) => panic!(
+                "expected Rejected(whitelist) outside window, got Err({})",
+                e
+            ),
         }
         assert!(client_res.is_err());
         let _ = std::fs::remove_dir_all(&dir);
@@ -490,5 +646,214 @@ mod tests {
     #[test]
     fn test_hint_empty_challenge_returns_none() {
         assert!(connect_failure_challenge_hint("").is_none());
+    }
+
+    // ---- M8-T027: 设备 ID 白名单决策表（SRV-IDWL-020/021/023/024） ----
+
+    /// 决策表行「仅 ID 命中」：域名维度未命中但设备 ID 命中 → 放行（新增维度，
+    /// 域名行为不变）；GUI/CLI 常规模式与 headless 一致。
+    #[tokio::test]
+    async fn test_id_whitelist_only_hit_accepted() {
+        let dir = std::env::temp_dir().join("kirin_policy_idwl_hit");
+        let alice = gen_identity(&dir, "alice");
+        let known = KnownClientsStore::empty();
+        let allowed_ids = vec!["alice".to_string()];
+        // S-01b (F-1)：ID 白名单命中但零凭据 → 拒绝；本用例配置挑战码验证
+        // 「ID 白名单 + 凭据齐备」仍放行（SRV-IDWL-020 语义不变）。
+        let (client_res, decision) = run_pair(
+            "idwl_hit",
+            false,
+            &known,
+            &[],
+            &allowed_ids,
+            &alice,
+            "TEST-CODE",
+        )
+        .await;
+        assert!(
+            matches!(decision, Ok(VerifiedDecision::Accepted(_))),
+            "ID whitelist hit must be accepted, got {:?}",
+            decision.as_ref().err()
+        );
+        assert!(client_res.is_ok(), "client handshake should succeed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 决策表行「无人值守 + 仅 ID 命中」：ID 白名单命中 → 自动允许
+    /// （UA-ACCEPT-001 扩展至 ID 维度，SRV-IDWL-003）。
+    #[tokio::test]
+    async fn test_unattended_id_whitelist_accepted() {
+        let dir = std::env::temp_dir().join("kirin_policy_unattended_idwl");
+        let alice = gen_identity(&dir, "alice");
+        let known = KnownClientsStore::empty();
+        let allowed_ids = vec!["alice".to_string()];
+        // S-01b (F-1)：无人值守 + 仅 ID 白名单命中 + 零凭据 → 拒绝；本用例
+        // 配置挑战码验证「白名单 + 凭据齐备」仍自动放行（SRV-IDWL-003 不变）。
+        let (client_res, decision) = run_pair(
+            "unattended_idwl",
+            true,
+            &known,
+            &[],
+            &allowed_ids,
+            &alice,
+            "TEST-CODE",
+        )
+        .await;
+        assert!(
+            matches!(decision, Ok(VerifiedDecision::Accepted(_))),
+            "unattended + ID whitelist hit must auto-accept, got {:?}",
+            decision.as_ref().err()
+        );
+        assert!(client_res.is_ok(), "client handshake should succeed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// IDWL-SEC-001（公钥绑定兜底）: ID 白名单命中**不**跳过 known_clients
+    /// 公钥 pin —— known_clients 记录的公钥与网络自报公钥不一致 → 仍拒绝
+    /// （`ClientKeyMismatch`），防 ID 伪造冒用。
+    #[tokio::test]
+    async fn test_id_whitelist_pin_not_bypassed() {
+        let dir = std::env::temp_dir().join("kirin_policy_idwl_pin");
+        let alice = gen_identity(&dir, "alice");
+        let mallory = gen_identity(&dir, "mallory"); // 冒充 alice 的恶意密钥
+                                                     // known_clients 记录 alice 的**真实**公钥 → 与网络上来的冒充公钥不一致。
+        let mut known = KnownClientsStore::empty();
+        known.upsert("alice", &alice.public_key_base64());
+        let allowed_ids = vec!["alice".to_string()]; // ID 白名单命中 alice
+
+        let (client_res, decision) =
+            run_pair("idwl_pin", false, &known, &[], &allowed_ids, &mallory, "").await;
+        match decision {
+            Err(HandshakeError::ClientKeyMismatch { .. }) => {}
+            Ok(_) => panic!("ID whitelist must not bypass public key pin"),
+            Err(e) => panic!("expected ClientKeyMismatch, got Err({})", e),
+        }
+        assert!(
+            !matches!(client_res, Ok(_)),
+            "channel must not be established"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 决策表行「临时窗口（持临时码）」：窗口激活时跳过域名 + ID 全部白名单
+    /// 维度（SRV-TMP-006 扩展，SRV-IDWL-024）——客户端 ID 不在白名单内，持
+    /// 临时码仍放行；窗口期外（无 temp_mode）→ 两维白名单恢复强制 → 拒绝。
+    #[tokio::test]
+    async fn test_temp_window_skips_id_whitelist() {
+        use kirin_desk_core::connection::temp_mode::TempModeManager;
+        let dir = std::env::temp_dir().join("kirin_policy_temp_skip_idwl");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let tm = TempModeManager::with_state_file(dir.join("temp_mode.json"));
+        let code = tm.enable(300).expect("enable");
+
+        let alice = gen_identity(&dir, "alice");
+        let bob = gen_identity(&dir, "bob");
+        let bob_pub = bob.public_key_base64();
+        let known = KnownClientsStore::empty();
+        // ID 白名单只放行其他设备 —— alice 不在其中（用于验证"跳过 ID 维度"）。
+        let allowed_ids = vec!["other-device".to_string()];
+        let allowed: Vec<String> = Vec::new();
+
+        /// 一次「窗口 + ID 白名单（不含 alice）+ 给定挑战码」的握手往返。
+        async fn run_skip_pair(
+            alice: &IdentityManager,
+            bob: &IdentityManager,
+            bob_pub: &str,
+            known: &KnownClientsStore,
+            allowed: &[String],
+            allowed_ids: &[String],
+            tm: Option<TempModeManager>,
+            challenge: &str,
+        ) -> (
+            Result<SecureChannelGeneric<tokio::net::TcpStream>, HandshakeError>,
+            Result<VerifiedDecision, HandshakeError>,
+        ) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().unwrap();
+            let server_fut = async move {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let cfg = Config::default();
+                server_accept_handshake(
+                    stream,
+                    bob,
+                    "bob",
+                    allowed,
+                    allowed_ids,
+                    false,
+                    false,
+                    tm,
+                    None,
+                    None,
+                    known,
+                    &cfg,
+                )
+                .await
+            };
+            let client_fut = async move {
+                let stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+                client_handshake_with_confirm_generic(
+                    stream,
+                    alice,
+                    "alice",
+                    "alice.local",
+                    "desktop",
+                    "bob",
+                    PinExpectation::exact_from_base64(bob_pub).expect("bob pubkey"),
+                    None,
+                    challenge,
+                )
+                .await
+            };
+            tokio::join!(client_fut, server_fut)
+        }
+
+        // 窗口激活 + 临时码 → 放行（ID 维度被跳过）。
+        let (client_res, decision) = run_skip_pair(
+            &alice,
+            &bob,
+            &bob_pub,
+            &known,
+            &allowed,
+            &allowed_ids,
+            Some(tm.clone()),
+            &code,
+        )
+        .await;
+        match decision {
+            Ok(VerifiedDecision::Accepted(_)) => {}
+            Ok(VerifiedDecision::Rejected(reason)) => {
+                panic!(
+                    "temp window must skip ID whitelist, got Rejected({})",
+                    reason
+                )
+            }
+            Err(e) => panic!("expected Accepted inside window, got Err({})", e),
+        }
+        assert!(client_res.is_ok(), "client must connect with temp code");
+
+        // 窗口期外（None）→ 两维白名单恢复强制：ID 未命中 → 拒绝。
+        let (client_res, decision) = run_skip_pair(
+            &alice,
+            &bob,
+            &bob_pub,
+            &known,
+            &allowed,
+            &allowed_ids,
+            None,
+            &code,
+        )
+        .await;
+        match decision {
+            Ok(VerifiedDecision::Rejected(reason)) => {
+                assert!(reason.contains("whitelist"), "reason: {}", reason);
+            }
+            Ok(VerifiedDecision::Accepted(_)) => {
+                panic!("outside window, ID whitelist must be enforced")
+            }
+            Err(e) => panic!("expected Rejected outside window, got Err({})", e),
+        }
+        assert!(client_res.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

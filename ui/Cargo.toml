@@ -27,3 +27,5 @@ crossterm = "0.29"
 
 # M13-T003: 剪贴板共享（客户端 ⇄ 服务端）
 arboard = "3.4"
+# S-13 (F-16): connect 挑战码 stdin 交互输入（不回显；挑战码不再落命令行）
+rpassword.workspace = true

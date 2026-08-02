@@ -91,6 +91,10 @@ pub enum IdClientError {
     Timeout(String),
     #[error("login rejected: {0}")]
     LoginRejected(String),
+    /// M8-T026-P3：服务器认证失败（双向认证回执校验失败 / fail-closed
+    /// 拒绝，TNL-SEC-007/008）。
+    #[error("server authentication failed: {0}")]
+    ServerAuthFailed(String),
     #[error("device id conflict: {0}")]
     DeviceConflict(String),
     #[error("device unavailable: {0}")]
@@ -241,40 +245,40 @@ impl IdClient {
                 }
             }
         });
-        // 3. Login（ID-001：携带 device_id + ed25519_pub）。
-        let login = ControlMsg::Login {
-            token: cfg.token.clone(),
+        // 3. Login（ID-001：携带 device_id + ed25519_pub）— M8-T026-P3
+        // 挑战-响应认证（TNL-SEC-006~008）：口令永不明文上线；双向认证
+        // 回执校验；带口令客户端遇未认证服务器 fail-closed 拒绝。
+        let auth_fields = crate::auth::LoginFields {
             version: PROTOCOL_VERSION.to_string(),
             hostname: cfg.hostname.clone(),
             device_id: Some(cfg.device_id.clone()),
             ed25519_pub: Some(cfg.ed25519_pub.clone()),
         };
-        let frame = encode_control(&login)?;
-        tx.send(frame)
-            .map_err(|_| IdClientError::Io(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "control channel closed",
-            )))?;
-        let login_resp = tokio::time::timeout(cfg.connect_timeout, read_frame(&mut reader))
-            .await
-            .map_err(|_| IdClientError::Timeout("login response".to_string()))?;
-        let (ty, payload) = login_resp?;
-        match decode_control(ty, &payload)? {
-            ControlMsg::LoginResp { ok: true, .. } => {}
-            ControlMsg::LoginResp { ok: false, err, .. } => {
-                let reason = err.unwrap_or_else(|| "login failed".to_string());
-                return if reason.contains("conflict") || reason.contains("device_id") {
-                    Err(IdClientError::DeviceConflict(reason))
-                } else {
-                    Err(IdClientError::LoginRejected(reason))
-                };
+        // clone 进 async 块（future 不得借用 send 参数）；引用为 Copy，
+        // 外层闭包借引用保持 Fn 语义。
+        let auth_send = |msg: &ControlMsg| {
+            let msg = msg.clone();
+            let tx_ref = &tx;
+            async move {
+                let frame = encode_control(&msg)?;
+                tx_ref.send(frame).map_err(|_| {
+                    IdClientError::Io(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "control channel closed",
+                    ))
+                })
             }
-            _ => {
-                return Err(IdClientError::Protocol(
-                    crate::protocol::ProtocolError::Bincode("expected LoginResp".to_string()),
-                ));
-            }
-        }
+        };
+        let outcome = crate::auth::authenticate(
+            &mut reader,
+            auth_send,
+            &cfg.token,
+            cfg.connect_timeout,
+            &auth_fields,
+        )
+        .await
+        .map_err(map_id_auth_error)?;
+        debug!("id client auth outcome: {:?}", outcome);
         // 4. 候选登记（ID-005；本地候选 + 配置 extra）。
         let candidates = collect_local_candidates(&cfg.extra_candidates).await;
         let reg = crate::protocol::CandidateRegister {
@@ -470,6 +474,39 @@ pub async fn collect_local_candidates(extra: &[Candidate]) -> Vec<Candidate> {
     out
 }
 
+/// 认证错误 → ID 客户端错误映射（M8-T026-P3 语义保持：登录被拒保留
+/// DeviceConflict 判定；双向认证 / fail-closed → ServerAuthFailed）。
+fn map_id_auth_error(e: crate::auth::ClientAuthError) -> IdClientError {
+    use crate::auth::ClientAuthError;
+    match e {
+        ClientAuthError::LoginRejected(reason) => {
+            if reason.contains("conflict") || reason.contains("device_id") {
+                IdClientError::DeviceConflict(reason)
+            } else {
+                IdClientError::LoginRejected(reason)
+            }
+        }
+        ClientAuthError::Timeout(t) => IdClientError::Timeout(t),
+        ClientAuthError::NoTokenForChallenge => IdClientError::ServerAuthFailed(
+            "server requires challenge-response auth, but no token is configured locally (TNL-SEC-008)"
+                .to_string(),
+        ),
+        ClientAuthError::LegacyServerRejected => IdClientError::ServerAuthFailed(
+            "server did not issue an auth challenge (unauthenticated server); refusing to continue with token configured (TNL-SEC-008)"
+                .to_string(),
+        ),
+        ClientAuthError::ServerReceiptMismatch => IdClientError::ServerAuthFailed(
+            "server auth receipt verification failed (T4)".to_string(),
+        ),
+        ClientAuthError::ServerReceiptMissing => IdClientError::ServerAuthFailed(
+            "server login response lacks auth receipt (T4)".to_string(),
+        ),
+        other => IdClientError::Protocol(crate::protocol::ProtocolError::Bincode(
+            other.to_string(),
+        )),
+    }
+}
+
 /// ID-010：控制器一次性解析（Login 纯控制连接 → ResolveDevice → DeviceInfo）。
 pub async fn resolve_device(
     server_addr: &str,
@@ -484,41 +521,47 @@ pub async fn resolve_device(
             server: server_addr.to_string(),
             source: e,
         })?;
-    let (mut reader, mut writer) = stream.into_split();
-    // Login（ID-001：纯解析不注册，device_id = None）。
-    let login = ControlMsg::Login {
-        token: token.to_string(),
+    let (mut reader, writer) = stream.into_split();
+    // Login（ID-001：纯解析不注册，device_id = None）— M8-T026-P3
+    // 挑战-响应认证（TNL-SEC-006~008）：口令永不明文上线；带口令客户端
+    // 遇未认证服务器 fail-closed 拒绝。
+    let auth_fields = crate::auth::LoginFields {
         version: PROTOCOL_VERSION.to_string(),
         hostname: "resolver".to_string(),
         device_id: None,
         ed25519_pub: None,
     };
-    // 完整帧直写（encode_control 已含帧头）。
-    writer.write_all(&encode_control(&login)?).await?;
-    writer.flush().await?;
-    let (ty, payload) = tokio::time::timeout(connect_timeout, read_frame(&mut reader))
-        .await
-        .map_err(|_| IdClientError::Timeout("login response".to_string()))??;
-    match decode_control(ty, &payload)? {
-        ControlMsg::LoginResp { ok: true, .. } => {}
-        ControlMsg::LoginResp { ok: false, err, .. } => {
-            return Err(IdClientError::LoginRejected(
-                err.unwrap_or_else(|| "login failed".to_string()),
-            ));
+    // 写半经 Arc<Mutex> 共享（future 不得借用 send 参数）；完整帧直写
+    // （encode_control 已含帧头）。
+    let writer = std::sync::Arc::new(tokio::sync::Mutex::new(writer));
+    let auth_writer = writer.clone();
+    let auth_send = move |msg: &ControlMsg| {
+        let w = auth_writer.clone();
+        let msg = msg.clone();
+        async move {
+            let mut w = w.lock().await;
+            let frame = encode_control(&msg).map_err(|e| e.to_string())?;
+            w.write_all(&frame).await.map_err(|e| e.to_string())?;
+            w.flush().await.map_err(|e| e.to_string())
         }
-        _ => return Err(IdClientError::Protocol(crate::protocol::ProtocolError::Bincode(
-            "expected LoginResp".to_string(),
-        ))),
-    }
+    };
+    crate::auth::authenticate(
+        &mut reader,
+        auth_send,
+        token,
+        connect_timeout,
+        &auth_fields,
+    )
+    .await
+    .map_err(map_id_auth_error)?;
     // ResolveDevice（ID-010）。
     let req = crate::protocol::ResolveDevice {
         device_id: device_id.to_string(),
     };
     // 完整帧直写（encode_extension 已含帧头）。
-    writer
-        .write_all(&encode_extension(crate::protocol::TYPE_RESOLVE_DEVICE, &req)?)
-        .await?;
-    writer.flush().await?;
+    let frame = encode_extension(crate::protocol::TYPE_RESOLVE_DEVICE, &req)?;
+    writer.lock().await.write_all(&frame).await?;
+    writer.lock().await.flush().await?;
     let (ty, payload) = tokio::time::timeout(connect_timeout, read_frame(&mut reader))
         .await
         .map_err(|_| IdClientError::Timeout("resolve response".to_string()))??;

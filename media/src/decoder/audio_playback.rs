@@ -9,8 +9,8 @@
 //!   - macOS：CoreAudio AudioUnit（DefaultOutputUnit）——留桩（返回
 //!     [`UnsupportedPlatform`](DecodeError::UnsupportedPlatform)，解码完成但
 //!     静音，视频/控制不受影响），P2C-mac 阶段实现。
-//!   - Linux：Pipewire / PulseAudio（`pw_stream` render）——留桩（同上），
-//!     P2C-linux 阶段实现。
+//!   - Linux：**PipeWire**（`pw_stream` Output 渲染，R-14-S4）——自动连接
+//!     默认 sink，48k/stereo/f32 软适配到设备格式。
 //!
 //! # WASAPI 共享渲染要点
 //!
@@ -63,28 +63,27 @@ pub trait AudioPlayback: Send {
 /// 创建本机默认播放器（共享渲染）。
 ///
 /// - Windows：WASAPI 共享渲染（`GetDefaultAudioEndpoint(eRender, eConsole)`）。
-/// - macOS/Linux：返回 [`UnsupportedPlatform`](DecodeError::UnsupportedPlatform)
-///   （音频静音，视频/键鼠不受影响；P2C-mac/linux 阶段实现）。
+/// - Linux：PipeWire（`pw_stream` Output 渲染，R-14-S4）。
+/// - macOS：返回 [`UnsupportedPlatform`](DecodeError::UnsupportedPlatform)
+///   （音频静音，视频/键鼠不受影响；P2C-mac 阶段实现）。
 ///
-/// 无播放设备（无声卡/被占用）→ `Err(InitFailed)`，**不影响视频/键鼠**
+/// 无播放设备（无声卡/被占用/无 PipeWire）→ `Err(InitFailed)`，**不影响视频/键鼠**
 /// （调用方在独立线程里创建，失败即放弃音频）。
 pub fn create_default_playback() -> Result<Box<dyn AudioPlayback>, DecodeError> {
     #[cfg(target_os = "windows")]
     {
         Ok(Box::new(WasapiPlayback::new()?))
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
     {
-        // P2C-mac / P2C-linux 阶段实现：CoreAudio DefaultOutputUnit /
-        // Pipewire pw_stream render。
+        Ok(Box::new(crate::decoder::pipewire_playback::PipeWirePlayback::new()?))
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        // P2C-mac 阶段实现：CoreAudio DefaultOutputUnit。
         Err(DecodeError::UnsupportedPlatform(format!(
-            "audio playback not implemented on {} (P2C-{os} 阶段)",
+            "audio playback not implemented on {} (P2C-mac 阶段)",
             std::env::consts::OS,
-            os = if cfg!(target_os = "macos") {
-                "mac"
-            } else {
-                "linux"
-            }
         )))
     }
 }

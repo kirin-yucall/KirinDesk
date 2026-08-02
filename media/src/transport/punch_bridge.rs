@@ -12,6 +12,7 @@
 //!   对齐 M8-T025 降级机制）——"中继 → 直连"升舱（PATH-004）的执行端。
 
 use kirin_desk_core::crypto::ed25519::IdentityManager;
+use kirin_desk_core::crypto::handshake::PinExpectation;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -53,8 +54,9 @@ pub struct PunchMediaCreds {
     pub device_type: String,
     /// 对端设备 ID。
     pub peer_device_id: String,
-    /// 对端 Ed25519 公钥（base64，pin 绑定）。
-    pub peer_public_key_base64: String,
+    /// 对端公钥 pin（R-02 强类型：known_hosts / DNS TXT 来源 `Exact`；
+    /// 回环自签 `None(InternalLoopback)`——无"空串跳过"形态）。
+    pub peer_pin: PinExpectation,
     /// 挑战码。
     pub challenge: String,
 }
@@ -84,7 +86,7 @@ pub async fn connect_punch_transport(
         &creds.domain,
         &creds.device_type,
         &creds.peer_device_id,
-        &creds.peer_public_key_base64,
+        creds.peer_pin.clone(),
         &creds.challenge,
     )
     .await?;
@@ -101,11 +103,17 @@ pub async fn accept_punch_transport(
 ) -> Result<(QuicEndpoint, Box<QuicMediaTransport>), TransportError> {
     let endpoint =
         QuicEndpoint::from_socket(socket, creds.cert_der.clone(), creds.key_der.clone()).await?;
+    // 服务端角色：pin 解析为客户端公钥 base64（R-02：`Exact` 编码回 base64；
+    // `InternalLoopback` 取本端自身公钥——自签；`UserConfirmRequired` 无服务端路径）。
+    let client_key_b64 = creds
+        .peer_pin
+        .resolve_base64(&creds.identity)
+        .map_err(|e| TransportError::Handshake(e.to_string()))?;
     let transport = accept_quic_transport(
         &endpoint,
         &creds.identity,
         &creds.device_id,
-        &creds.peer_public_key_base64,
+        &client_key_b64,
         Some(&creds.peer_device_id),
         Some(&creds.challenge),
     )

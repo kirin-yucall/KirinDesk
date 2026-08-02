@@ -35,6 +35,9 @@
 
 pub mod audio;
 pub mod audio_playback;
+// Linux PipeWire 播放（M8-T015 P2C T3.3 Linux 侧 / R-14-S4）。
+#[cfg(target_os = "linux")]
+pub mod pipewire_playback;
 pub mod factory;
 pub mod render;
 pub mod video;

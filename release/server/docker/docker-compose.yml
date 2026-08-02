@@ -1,0 +1,39 @@
+# KirinDesk 内网穿透服务端 —— Docker Compose 一键部署
+#
+# 用法：
+#   1. cp .env.example .env  并填入高熵 token
+#   2. docker compose up -d --build
+#   3. docker compose logs -f   # 查看启动信息（含 Server pubkey，客户端
+#                               # ID 模式需预置到 [tunnel] server_pubkey）
+#   4. docker compose down      # 停止（密钥卷保留，pubkey 不变）
+#
+# 防火墙：放行 7000/tcp 与 60000-60099/tcp（UDP 无需，纯 TCP 隧道）。
+
+services:
+  relay-server:
+    build:
+      context: ../..              # 仓库根（workspace，含 relay/relay-server）
+      dockerfile: release/server/docker/Dockerfile
+    image: kirin-relay-server
+    container_name: kirin-relay-server
+    restart: unless-stopped
+    environment:
+      # 缺少时会直接报错退出，防止空 token 上线（fail-closed，TNL-SEC-006）
+      - KIRIN_RELAY_TOKEN=${KIRIN_RELAY_TOKEN:?请在 .env 设置 KIRIN_RELAY_TOKEN（高熵 ≥32 字节）}
+      - RUST_LOG=${RUST_LOG:-info}
+    ports:
+      - "7000:7000/tcp"                 # 控制端口（可用环境变量覆盖，见下）
+      - "60000-60099:60000-60099/tcp"   # 自动分配端口范围
+    volumes:
+      # Ed25519 服务器密钥持久化：容器重建后 pubkey 不变，
+      # 客户端预置的 server_pubkey 无需同步更新
+      - relay-server-key:/home/relay/.kirin_desk
+
+volumes:
+  relay-server-key:
+
+# 自定义端口示例（取消注释并按需修改）：
+#   ports:
+#     - "9000:9000/tcp"
+#     - "50000-50099:50000-50099/tcp"
+#   command: ["--bind-port", "9000", "--port-range", "50000-50099"]

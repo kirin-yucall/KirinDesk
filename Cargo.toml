@@ -32,9 +32,12 @@ aes-gcm = "0.10"
 chacha20poly1305 = "0.10"
 rand = "0.8"
 sha2 = "0.10"
+hmac = "0.12"
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
+# S-13 (F-16): CLI connect 挑战码交互输入（不回显，避免落进程命令行）
+rpassword = "7"

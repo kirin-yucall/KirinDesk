@@ -58,9 +58,7 @@ pub fn status_dot(ui: &mut Ui, color: Color32, text: &str) -> egui::Response {
 
 /// 状态点变体：显式指定圆点字符（保留既有 `○ Stopped` 等文案）。
 pub fn status_dot_char(ui: &mut Ui, color: Color32, dot: &str, text: &str) -> egui::Response {
-    ui.add(
-        egui::Label::new(RichText::new(format!("{dot} {text}")).color(color)).selectable(false),
-    )
+    ui.add(egui::Label::new(RichText::new(format!("{dot} {text}")).color(color)).selectable(false))
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -140,12 +138,7 @@ pub fn action_button(
 }
 
 /// 导航/分段选中胶囊：选中 = 品牌色底 + 对比文字；未选中 hover 高亮。
-pub fn selectable_pill(
-    ui: &mut Ui,
-    theme: &Theme,
-    text: &str,
-    selected: bool,
-) -> egui::Response {
+pub fn selectable_pill(ui: &mut Ui, theme: &Theme, text: &str, selected: bool) -> egui::Response {
     let saved = ui.visuals().clone();
     {
         let v = ui.visuals_mut();
@@ -179,12 +172,7 @@ pub fn selectable_pill(
 }
 
 /// 分段控件（§4 SegmentedControl）：选中项品牌色底；返回是否变更。
-pub fn segmented_control(
-    ui: &mut Ui,
-    theme: &Theme,
-    items: &[&str],
-    selected: &mut usize,
-) -> bool {
+pub fn segmented_control(ui: &mut Ui, theme: &Theme, items: &[&str], selected: &mut usize) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
         for (i, item) in items.iter().enumerate() {
@@ -241,8 +229,7 @@ pub fn copy_button(ui: &mut Ui, theme: &Theme, text: &str) -> (egui::Response, b
     let resp = ui
         .add_enabled(
             !text.is_empty(),
-            egui::Button::new(RichText::new(icon).size(12.0))
-                .min_size(egui::vec2(26.0, 20.0)),
+            egui::Button::new(RichText::new(icon).size(12.0)).min_size(egui::vec2(26.0, 20.0)),
         )
         .on_hover_text("Copy");
     let mut copied = false;
@@ -287,8 +274,12 @@ pub fn labeled_input(
 ) -> egui::Response {
     ui.vertical(|ui| {
         ui.add(
-            egui::Label::new(RichText::new(label).size(theme.small_size).color(theme.fg_weak))
-                .selectable(false),
+            egui::Label::new(
+                RichText::new(label)
+                    .size(theme.small_size)
+                    .color(theme.fg_weak),
+            )
+            .selectable(false),
         );
         let resp = ui
             .horizontal(|ui| {
@@ -307,7 +298,10 @@ pub fn labeled_input(
                 };
                 let mut te = egui::TextEdit::singleline(target)
                     .hint_text(placeholder)
-                    .desired_width((ui.available_width() - if secret.is_some() { 44.0 } else { 0.0 }).max(120.0));
+                    .desired_width(
+                        (ui.available_width() - if secret.is_some() { 44.0 } else { 0.0 })
+                            .max(120.0),
+                    );
                 if mono {
                     te = te.font(egui::TextStyle::Monospace);
                 }
@@ -338,7 +332,10 @@ pub fn labeled_input(
                     let prev_len = value.chars().count();
                     let new_len = masked.chars().count();
                     if new_len > prev_len
-                        && masked.chars().take(prev_len).eq(prev_masked.chars().take(prev_len))
+                        && masked
+                            .chars()
+                            .take(prev_len)
+                            .eq(prev_masked.chars().take(prev_len))
                     {
                         for c in masked.chars().skip(prev_len) {
                             value.push(c);
@@ -367,8 +364,12 @@ pub fn labeled_input(
             .inner;
         if let Validity::Invalid(msg) = validity {
             ui.add(
-                egui::Label::new(RichText::new(msg).size(theme.small_size).color(theme.danger))
-                    .selectable(false),
+                egui::Label::new(
+                    RichText::new(msg)
+                        .size(theme.small_size)
+                        .color(theme.danger),
+                )
+                .selectable(false),
             );
         }
         resp
@@ -390,12 +391,7 @@ pub struct StatRow<'a> {
 
 /// 信息卡片（§4 StatCard）：标题栏（Small 弱色）+ 分隔线 + 键值行。
 /// 返回本帧被复制的内容（`None` = 未复制；M8-T028 状态栏浮出提示用）。
-pub fn stat_card(
-    ui: &mut Ui,
-    theme: &Theme,
-    title: &str,
-    rows: &[StatRow<'_>],
-) -> Option<String> {
+pub fn stat_card(ui: &mut Ui, theme: &Theme, title: &str, rows: &[StatRow<'_>]) -> Option<String> {
     let mut copied: Option<String> = None;
     egui::Frame::none()
         .fill(theme.bg_panel)
@@ -418,7 +414,9 @@ pub fn stat_card(
                 ui.horizontal(|ui| {
                     ui.add(
                         egui::Label::new(
-                            RichText::new(row.key).size(theme.small_size).color(theme.fg_weak),
+                            RichText::new(row.key)
+                                .size(theme.small_size)
+                                .color(theme.fg_weak),
                         )
                         .selectable(false),
                     );
@@ -470,7 +468,9 @@ pub fn stepper(ui: &mut Ui, theme: &Theme, steps: &[&str], current: usize) {
             if i > 0 {
                 ui.add(
                     egui::Label::new(
-                        RichText::new("→").size(theme.small_size).color(theme.fg_weak),
+                        RichText::new("→")
+                            .size(theme.small_size)
+                            .color(theme.fg_weak),
                     )
                     .selectable(false),
                 );
@@ -553,7 +553,10 @@ pub fn log_view(ui: &mut Ui, theme: &Theme, text: &str, opts: &LogViewOptions<'_
                 let color = level_color(theme, line);
                 ui.add(
                     egui::Label::new(
-                        RichText::new(line).monospace().size(theme.mono_size).color(color),
+                        RichText::new(line)
+                            .monospace()
+                            .size(theme.mono_size)
+                            .color(color),
                     )
                     .selectable(true),
                 );
@@ -736,13 +739,18 @@ mod tests {
 
     /// 密文编辑启发式：追加/回删同步真实值。
     #[test]
-    fn test_secret_sync_heuristic() {        let mut value = "abc".to_owned();
+    fn test_secret_sync_heuristic() {
+        let mut value = "abc".to_owned();
         let prev: String = "•".repeat(value.chars().count());
         // 追加
         let mut edited = prev.clone();
         edited.push('x');
         let prev_len = value.chars().count();
-        if edited.chars().take(prev_len).eq(prev.chars().take(prev_len)) {
+        if edited
+            .chars()
+            .take(prev_len)
+            .eq(prev.chars().take(prev_len))
+        {
             for c in edited.chars().skip(prev_len) {
                 value.push(c);
             }

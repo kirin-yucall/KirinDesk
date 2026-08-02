@@ -96,7 +96,7 @@ async fn ipv4_loopback_end_to_end() {
 
     let client_handle = tokio::spawn(async move {
         let mut t = connect_quic_transport(
-            addr, &client_im, &client_id, "v4.example", "desktop", &server_id, &server_pub,
+            addr, &client_im, &client_id, "v4.example", "desktop", &server_id, kirin_desk_core::crypto::handshake::PinExpectation::exact_from_base64(&server_pub).expect("server pubkey"),
             "challenge",
         )
         .await

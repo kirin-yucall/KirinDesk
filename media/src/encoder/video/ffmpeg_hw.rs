@@ -212,15 +212,19 @@ impl FfmpegHwEncoder {
 
         // Step 1: 创建 hw device（失败 → 该编码器本机不可用，回退）。
         //         QSV/D3D11VA/VAAPI/VT 各自的 AVHWDeviceType。
-        let hw_device_ctx = match ffmpeg::av_hwdevice_ctx_create(hw_type.hwdevice_type(), None) {
-            Ok(ctx) => ctx,
-            Err(e) => {
-                return Err(EncodeError::InitFailed(format!(
-                    "av_hwdevice_ctx_create({:?} for {enc_name}): {e}",
-                    hw_type
-                )))
-            }
-        };
+        // M8-T030（R-06）：按选定适配器设备串候选绑定（十进制适配器索引，
+        // 实测定案见设计文档 §3.5）；无选定适配器时直接 None（现状）。
+        let hw_device_ctx =
+            match create_hw_device_with_candidates(hw_type.hwdevice_type(), &crate::gpu::hwdevice_candidates())
+            {
+                Ok(ctx) => ctx,
+                Err(e) => {
+                    return Err(EncodeError::InitFailed(format!(
+                        "av_hwdevice_ctx_create({:?} for {enc_name}): {e}",
+                        hw_type
+                    )))
+                }
+            };
 
         // Step 2: 分配 codec context + 复用 frame/packet。
         let ctx = match ffmpeg::avcodec_alloc_context3(codec) {
@@ -445,9 +449,12 @@ impl FfmpegHwEncoder {
             ffmpeg::avcodec_free_context(&mut ctx_ref2);
             self.ctx = ptr::null_mut();
         }
-        // 重建 hw device。
-        let hw_device_ctx = ffmpeg::av_hwdevice_ctx_create(self.hw_type.hwdevice_type(), None)
-            .map_err(|e| EncodeError::InitFailed(format!("hw reinit hwdevice: {e}")))?;
+        // 重建 hw device（M8-T030 R-06：同样按选定适配器设备串候选绑定）。
+        let hw_device_ctx = create_hw_device_with_candidates(
+            self.hw_type.hwdevice_type(),
+            &crate::gpu::hwdevice_candidates(),
+        )
+        .map_err(|e| EncodeError::InitFailed(format!("hw reinit hwdevice: {e}")))?;
         // 全新 ctx + open2（结构体字段 + framerate）。
         let codec = ffmpeg::avcodec_find_encoder_by_name(self.name)
             .map_err(|e| EncodeError::InitFailed(format!("hw reinit find_encoder: {e}")))?;
@@ -1051,6 +1058,53 @@ fn encoder_hw_type(name: &str) -> Option<HwType> {
         "h264_vaapi" | "hevc_vaapi" => Some(HwType::VAAPI),
         _ => None,
     }
+}
+
+/// 创建 hw device：按候选设备串逐个尝试绑定（M8-T030 §3.5）。
+///
+/// 候选顺序（[`crate::gpu::device_strings`]）：LUID 高32-低32 → 低32-高32 →
+/// 描述名。
+///
+/// **失败语义（R-06 实测修正）**：
+/// - `candidates` 为空（无选定适配器 / 非 Windows）→ 直接 `None`（现状
+///   默认设备行为，GPU-NF-002；videotoolbox/vaapi 平台行为不变）；
+/// - `candidates` 非空但全部失败 → **返回错误**（该编码器在本机不可用）——
+///   让回退链自然继续：如 `KIRIN_GPU_PREFER=nvidia` 时 qsv 子设备（Intel
+///   专属）创建失败 → create 落 nvenc（用 NVIDIA 串成功）。若此处 None
+///   兜底，qsv 会在 FFmpeg 默认设备（Intel）上"成功"，单 GPU 绑定失效
+///   （设计文档 §3.5）。
+///
+/// 绑定成功输出 info 日志（GPU-NF-005）；单个候选失败仅 debug。
+fn create_hw_device_with_candidates(
+    device_type: i32,
+    candidates: &[String],
+) -> Result<*mut ffmpeg::AVBufferRef, EncodeError> {
+    if candidates.is_empty() {
+        // 无选定适配器：保持现状默认设备行为（GPU-NF-002）。
+        return ffmpeg::av_hwdevice_ctx_create(device_type, None).map_err(|e| {
+            EncodeError::InitFailed(format!("av_hwdevice_ctx_create(default device): {e}"))
+        });
+    }
+    for d in candidates {
+        // 描述名含 NUL 时跳过（理论不可能，防御）。
+        let Ok(c) = std::ffi::CString::new(d.as_str()) else {
+            continue;
+        };
+        match ffmpeg::av_hwdevice_ctx_create(device_type, Some(&c)) {
+            Ok(ctx) => {
+                tracing::info!("FfmpegHwEncoder: hwdevice created on '{d}'");
+                return Ok(ctx);
+            }
+            Err(e) => {
+                tracing::debug!("FfmpegHwEncoder: hwdevice '{d}' failed: {e}");
+            }
+        }
+    }
+    Err(EncodeError::InitFailed(
+        "av_hwdevice_ctx_create: all candidate device strings failed \
+         (GPU binding mismatch, fallback chain continues)"
+            .into(),
+    ))
 }
 
 /// 是否为软编名（libx264/libx265）。

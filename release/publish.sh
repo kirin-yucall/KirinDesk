@@ -132,13 +132,43 @@ for pat in "${ROOT}/release/dist/"*.exe "${ROOT}/release/dist/"*.zip "${ROOT}/re
         [ -f "${f}" ] && FILES+=("${f}")
     done
 done
+
+# ── 5.5 生成 sha256 侧车（R-07：updater 下载后校验，`<asset>.sha256`） ──
+# updater 在下载完资产后拉取 `{download_url}.sha256` 强制校验（S-06 统一策略：
+# 侧车缺失 → `ChecksumMissing` 拒绝，legacy 通道 deprecated 并引导用户升级）——
+# 本脚本从本次发布起一律为每个资产生成侧车，杜绝"无校验资产"发布。
+CHECKSUM_FILES=()
+if command -v sha256sum >/dev/null 2>&1; then
+    HASH_TOOL=(sha256sum)
+else
+    HASH_TOOL=(shasum -a 256)   # macOS 无 sha256sum
+fi
+for f in "${FILES[@]}"; do
+    "${HASH_TOOL[@]}" "${f}" | awk '{print $1}' > "${f}.sha256"
+    CHECKSUM_FILES+=("${f}.sha256")
+done
+echo "==> 生成 $((${#CHECKSUM_FILES[@]})) 个 sha256 侧车"
+
+# ── 5.6 生成 checksums.txt（S-06d：全资产 SHA-256 汇总清单，随 release 上传） ──
+# CI release job 亦生成同名清单；本文件供人工核验，并作为二期发布者 Ed25519
+# 签名（checksums.txt.sig，计划二期）的载体。
+CHECKSUMS_TXT="${ROOT}/release/dist/checksums.txt"
+: > "${CHECKSUMS_TXT}"
+for f in "${FILES[@]}"; do
+    hex="$("${HASH_TOOL[@]}" "${f}" | awk '{print $1}')"
+    echo "${hex}  $(basename "${f}")" >> "${CHECKSUMS_TXT}"
+done
+echo "==> 生成 checksums.txt（$(wc -l < "${CHECKSUMS_TXT}") 项）"
+
 gh release create "${TAG}" \
     --title "KirinDesk ${VERSION}" \
     --notes "${NOTES}" \
-    "${FILES[@]}" 2>/dev/null || {
+    "${FILES[@]}" "${CHECKSUM_FILES[@]}" "${CHECKSUMS_TXT}" 2>/dev/null || {
     echo "warning: 自动创建失败，请手动执行：" >&2
     echo "  gh release create ${TAG} --title \"KirinDesk ${VERSION}\" --notes \"${NOTES}\"" >&2
     echo "  gh release upload ${TAG} release/dist/*.exe release/dist/*.zip release/dist/*.deb release/dist/*.dmg" >&2
+    echo "  gh release upload ${TAG} release/dist/*.sha256" >&2
+    echo "  gh release upload ${TAG} release/dist/checksums.txt" >&2
     exit 1
 }
 

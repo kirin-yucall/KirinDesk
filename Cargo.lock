@@ -2714,6 +2714,7 @@ dependencies = [
  "kirin-desk-core",
  "kirin-desk-relay",
  "libloading 0.8.9",
+ "pipewire",
  "quinn",
  "quinn-proto",
  "rand 0.8.7",
@@ -2729,6 +2730,7 @@ dependencies = [
  "tracing-subscriber",
  "windows 0.62.2",
  "windows-capture 2.0.0",
+ "zbus",
  "zed-scap",
 ]
 
@@ -2740,8 +2742,11 @@ dependencies = [
  "bincode",
  "ed25519-dalek",
  "get_if_addrs 0.5.3",
+ "hmac",
+ "kirin-desk-utils",
  "rand 0.8.7",
  "serde",
+ "sha2",
  "socket2 0.6.5",
  "thiserror 2.0.19",
  "tokio",
@@ -2767,6 +2772,7 @@ dependencies = [
  "kirin-desk-relay",
  "kirin-desk-updater",
  "kirin-desk-utils",
+ "rpassword",
  "serde",
  "serde_json",
  "tokio",
@@ -2781,8 +2787,11 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.19",
  "tokio",
+ "tracing",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2790,8 +2799,15 @@ name = "kirin-desk-utils"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
+ "chacha20poly1305",
  "chrono",
  "dirs-next",
+ "hmac",
+ "libc",
+ "libloading 0.8.9",
+ "pbkdf2",
+ "rand 0.8.7",
  "serde",
  "serde_json",
  "sha2",
@@ -2800,6 +2816,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "windows 0.62.2",
  "winreg 0.52.0",
 ]
 
@@ -3539,6 +3556,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
+name = "pbkdf2"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8ed6a7761f76e3b9f92dfb0a60a6a6477c61024b775147ff0973a02653abaf2"
+dependencies = [
+ "digest",
+ "hmac",
+]
+
+[[package]]
 name = "pem"
 version = "3.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4069,6 +4096,7 @@ name = "relay-server"
 version = "0.1.0"
 dependencies = [
  "kirin-desk-relay",
+ "kirin-desk-utils",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -4130,6 +4158,27 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "rpassword"
+version = "7.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2da316a15f47e3d053de9cb2c439650bd8fa4aaeb9365f2e5f27f492ff73c196"
+dependencies = [
+ "libc",
+ "rtoolbox",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "rtoolbox"
+version = "0.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "50a0e551c1e27e1731aba276dbeaeac73f53c7cd34d1bda485d02bd1e0f36844"
+dependencies = [
+ "libc",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

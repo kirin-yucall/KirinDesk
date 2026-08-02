@@ -4,6 +4,11 @@ P2P Remote Desktop - IPv6 + GoDaddy DNS + Zero Trust
 
 > 💜 **Made with love by an individual developer — a non-profit, open-source project with no monetization of any kind. No ads, no tracking, no subscriptions. Free, forever.**
 
+## Relay Server（内网穿透服务端）
+
+见 [`server/`](server/) —— Windows 已构建 `relay-server.exe`；
+Linux 按 `server/BUILD_LINUX.md` 本机编译（附 systemd 示例）。
+
 ## Windows Desktop App
 
 Native Windows GUI (egui) with CLI fallback.

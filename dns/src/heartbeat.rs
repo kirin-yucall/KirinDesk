@@ -3,6 +3,7 @@ use crate::aaaa::AaaaManager;
 use crate::godaddy::GoDaddyClient;
 use crate::srv::SrvManager;
 use crate::txt::{DeviceMeta, TxtManager};
+use crate::validate;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -114,6 +115,18 @@ impl HeartbeatService {
     }
 
     async fn register_all(&self, pubkey: &str) {
+        // S-14b / F-18: device_id/domain 在任何写入前做一次显式校验——
+        // 非法配置早退 + 显式警告（不静默；各 manager 层校验为兜底）。
+        if !validate::validate_device_id(&self.device_id)
+            || !validate::validate_hostname(&self.domain)
+        {
+            warn!(
+                "Heartbeat skipped: invalid device_id '{}' or domain '{}' \
+                 (see dns::validate rules; device_id: [a-zA-Z0-9:_-] len 1..=128, no '.')",
+                self.device_id, self.domain
+            );
+            return;
+        }
         let target = format!("{}.{}.", self.device_id, self.domain);
 
         // SRV (port)
@@ -344,6 +357,18 @@ mod tests {
         let hb = HeartbeatService::new(client, "my-pc", "example.com", 3389, 30, 600);
         assert_eq!(hb.device_id, "my-pc");
         assert_eq!(hb.port, 3389);
+    }
+
+    // S-14b / F-18: 非法 device_id 早退，不产生任何 API 调用
+    #[tokio::test]
+    async fn test_heartbeat_skips_invalid_device_id() {
+        let mock = MockDns::start().await;
+        let client = Arc::new(GoDaddyClient::new("k", "s", mock.base_url()));
+        let hb = HeartbeatService::new(client, "bad id!", "example.com", 3389, 30, 600);
+        hb.register_all("testpubkey").await;
+        assert!(mock.records_of("SRV", "_remote._tcp.bad id!").is_empty());
+        assert!(mock.records_of("TXT", "bad id!").is_empty());
+        assert!(mock.records_of("A", "bad id!").is_empty());
     }
 
     #[test]

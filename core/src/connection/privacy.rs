@@ -87,7 +87,11 @@ impl PrivacyController {
     /// 新建控制器。`headless = true`（无 GUI，如 CLI Server 模式）时
     /// Black 请求自动降级为 Lock（SRV-PRIV-013）；GUI 模式传 `false`。
     pub fn new(headless: bool) -> Self {
-        Self::with_hooks(headless, Box::new(platform_lock_screen), Box::new(platform_is_locked))
+        Self::with_hooks(
+            headless,
+            Box::new(platform_lock_screen),
+            Box::new(platform_is_locked),
+        )
     }
 
     /// 注入平台钩子的构造器（测试与嵌入式场景用；默认路径走 [`Self::new`]）。
@@ -247,7 +251,11 @@ pub fn platform_is_locked() -> Result<bool, String> {
 #[link(name = "user32")]
 extern "system" {
     fn LockWorkStation() -> i32;
-    fn OpenInputDesktop(dw_flags: u32, f_inherit: i32, dw_desired_access: u32) -> *mut std::ffi::c_void;
+    fn OpenInputDesktop(
+        dw_flags: u32,
+        f_inherit: i32,
+        dw_desired_access: u32,
+    ) -> *mut std::ffi::c_void;
     fn CloseDesktop(h_desktop: *mut std::ffi::c_void) -> i32;
 }
 
@@ -324,9 +332,11 @@ fn is_locked_linux() -> Result<bool, String> {
 fn lock_screen_macos() -> Result<(), String> {
     use std::process::Command;
     // 1) CGSession（系统自带的锁屏工具）。
-    let cg = Command::new("/System/Library/CoreServices/Menu Extras/User.menu/Contents/Resources/CGSession")
-        .arg("-suspend")
-        .output();
+    let cg = Command::new(
+        "/System/Library/CoreServices/Menu Extras/User.menu/Contents/Resources/CGSession",
+    )
+    .arg("-suspend")
+    .output();
     if let Ok(out) = cg {
         if out.status.success() {
             return Ok(());

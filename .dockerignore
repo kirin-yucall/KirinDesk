@@ -1,0 +1,18 @@
+# Docker 构建上下文精简（对应 .gitignore；只影响 docker build，不影响 git）
+target/
+.git/
+**/node_modules/
+**/dist/
+ffmpeg/ffmpeg-8.1.2-full_build-shared/
+release/ffmpeg/
+release/dist/
+release/*.exe
+release/server/relay-server.exe
+*.log
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp

@@ -72,11 +72,42 @@ pub const SWSCALE_LIB: &str = "libswscale.so.9";
 #[cfg(target_os = "macos")]
 pub const SWSCALE_LIB: &str = "libswscale.9.dylib";
 
+/// 字段偏移快照对应的 **libavcodec 库主版本**（R-22；R-06 修正语义）。
+///
+/// `api.rs::avctx_offset` 与 `AVFRAME_CH_LAYOUT_OFFSET` 的偏移按 FFmpeg 8.1.2
+/// （GyanD/BtbN full shared）实测确认；加载完成后断言 `avcodec_version()` 的
+/// major 与此一致，不符**直接加载失败报错**——绝不带着错偏移静默运行。
+/// 升级流程见 `api.rs` 升级核对清单与 `Readme.md`「FFmpeg 升级步骤」。
+///
+/// **R-06 修正（2026-08-02）**：`avcodec_version()` 返回的是 **libavcodec
+/// 库版本**（`LIBAVCODEC_VERSION_INT = major<<16|minor<<8|micro`），不是
+/// FFmpeg 项目版本——FFmpeg 8.1.2 的 libavcodec 为 62.28.102（avcodec-62.dll）。
+/// R-22 原值 8 与实际 DLL（major=62）恒不匹配，导致所有 avcodec-62.dll
+/// 环境下 `ensure_loaded` 永远失败（产品 FFmpeg 全链路不可用 + 阻塞 R-06
+/// 实机验证）；实机探测确认后修正为 62。
+pub const SNAPSHOT_FFMPEG_MAJOR: u32 = 62;
+
+/// 校验 FFmpeg 主版本与偏移快照一致（纯函数，R-22；单测见 tests 模块）。
+fn check_snapshot_major(ver: u32) -> Result<(), AvError> {
+    let major = (ver >> 16) & 0xFF;
+    if major == SNAPSHOT_FFMPEG_MAJOR {
+        Ok(())
+    } else {
+        Err(AvError::LoadFailed(format!(
+            "FFmpeg major version {major} != snapshot {SNAPSHOT_FFMPEG_MAJOR}: \
+             AVCodecContext/AVFrame 字段偏移须按升级核对清单重核 \
+             （media/src/ffmpeg/api.rs avctx_offset / AVFRAME_CH_LAYOUT_OFFSET）"
+        )))
+    }
+}
+
 /// Search paths for libraries, in priority order.
 ///
-/// Only used on Windows where we need to locate the DLLs relative to the
-/// executable. On Unix the system linker handles discovery (`LD_LIBRARY_PATH`
-/// etc.).
+/// Windows: bundled DLLs relative to the executable.
+/// Linux (M12-T003 / R-14-S2): bundled/packaged locations first, then distro
+/// multiarch system paths, then loader default (`""`, i.e. `ldconfig` /
+/// `LD_LIBRARY_PATH`).
+/// macOS: rely on system paths (Homebrew etc.).
 #[cfg(target_os = "windows")]
 pub const LIB_SEARCH_PATHS: &[&str] = &[
     "{exe_dir}/../ffmpeg/bin/",
@@ -84,7 +115,20 @@ pub const LIB_SEARCH_PATHS: &[&str] = &[
     "{exe_dir}/ffmpeg/bin/",
     "",
 ];
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
+pub const LIB_SEARCH_PATHS: &[&str] = &[
+    // deb 打包布局（release/debian/build_deb.sh 预留目录：/usr/lib/kirindesk/ffmpeg）。
+    "{exe_dir}/../lib/kirindesk/ffmpeg/",
+    // 便携/自解压布局（与 Windows 打包目录同名）。
+    "{exe_dir}/ffmpeg/",
+    // Debian/Ubuntu 多架构系统路径（FFmpeg 8 shared build 随包安装时）。
+    "/usr/lib/x86_64-linux-gnu/",
+    "/usr/lib/aarch64-linux-gnu/",
+    "/usr/lib/",
+    "/usr/local/lib/",
+    "", // 系统默认（ldconfig / LD_LIBRARY_PATH）。
+];
+#[cfg(target_os = "macos")]
 pub const LIB_SEARCH_PATHS: &[&str] = &[""]; // rely on system paths
 
 /// DLL soname fallback table.
@@ -104,7 +148,17 @@ pub const DLL_VERSION_FALLBACKS: &[(&str, &[&str])] = &[
     (AVUTIL_LIB, &["avutil-59.dll", "avutil-58.dll"]),
     (SWSCALE_LIB, &["swscale-8.dll", "swscale-7.dll"]),
 ];
-#[cfg(not(target_os = "windows"))]
+// M12-T003（R-14-S2）：Linux 回退表——Ubuntu 24.04 自带 FFmpeg 6
+// （libavcodec.so.60），Debian 12 = FFmpeg 5（.59）。注意：主版本 ≠ 8 时
+// `SNAPSHOT_FFMPEG_MAJOR` 断言（R-22）会拒绝加载，回退表仅覆盖 FFmpeg
+// 8.x 各 minor（.62→.61）的场景；7.x/6.x 的偏移兼容留待升级核对清单。
+#[cfg(target_os = "linux")]
+pub const DLL_VERSION_FALLBACKS: &[(&str, &[&str])] = &[
+    (AVCODEC_LIB, &["libavcodec.so.61"]),
+    (AVUTIL_LIB, &["libavutil.so.59"]),
+    (SWSCALE_LIB, &["libswscale.so.8"]),
+];
+#[cfg(target_os = "macos")]
 pub const DLL_VERSION_FALLBACKS: &[(&str, &[&str])] = &[];
 
 // ════════════════════════════════════════════════════════════════
@@ -537,6 +591,9 @@ fn load_all() -> Result<(Libraries, FnTable), AvError> {
         av_frame_get_buffer: sym_opt!(&lib_avutil, av_frame_get_buffer, AvFrameGetBufferFn),
     };
 
+    // R-22：主版本断言（偏移快照核对）——不符直接报错，防止升级后错乱。
+    check_snapshot_major(unsafe { (fn_table.avcodec_version)() })?;
+
     Ok((
         Libraries {
             _avcodec: lib_avcodec,
@@ -599,6 +656,25 @@ mod tests {
         }
     }
 
+    /// R-22：版本断言单测 —— mock 主版本不符 → 明确报错（升级 FFmpeg 时
+    /// 字段偏移须重核，绝不静默错乱）。
+    #[test]
+    fn test_check_snapshot_major() {
+        // 快照版本 8.1.2 → 通过；同 major 的 8.0.0 也通过（偏移按 major 绑定）。
+        let snapshot = (SNAPSHOT_FFMPEG_MAJOR << 16) | (1 << 8) | 2;
+        assert!(check_snapshot_major(snapshot).is_ok());
+        assert!(check_snapshot_major(SNAPSHOT_FFMPEG_MAJOR << 16).is_ok());
+        // 7.x / 9.x → 明确报错并提示重核路径。
+        for bad in [
+            ((SNAPSHOT_FFMPEG_MAJOR - 1) << 16) | (1 << 8) | 2, // 7.1.2
+            ((SNAPSHOT_FFMPEG_MAJOR + 1) << 16),                // 9.0.0
+        ] {
+            let msg = check_snapshot_major(bad).unwrap_err().to_string();
+            assert!(msg.contains("major version"), "msg: {msg}");
+            assert!(msg.contains("重核"), "msg: {msg}");
+        }
+    }
+
     /// P1A Tests §ffmpeg: 主版本缺 DLL → 回退表生效。
     ///
     /// 本阶段回退表为静态数据（[`DLL_VERSION_FALLBACKS`]），且真实回退由
@@ -606,8 +682,9 @@ mod tests {
     /// 主名与回退名不重复），DLL 缺失场景在集成测试中覆盖。
     #[test]
     fn test_dlls_version_fallback() {
-        // Windows 有回退条目；Unix 上回退表为空（依赖系统 ldconfig）。
-        #[cfg(target_os = "windows")]
+        // Windows/Linux 有回退条目（M12-T003/R-14-S2 为 Linux 补了
+        // 8.x minor 回退）；macOS 为空（依赖系统 ldconfig/Homebrew）。
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         {
             assert!(DLL_VERSION_FALLBACKS.len() >= 3, "应至少为三个库配置回退");
             for (primary, fallbacks) in DLL_VERSION_FALLBACKS {
@@ -617,10 +694,36 @@ mod tests {
                 }
             }
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(target_os = "macos")]
         {
             assert!(DLL_VERSION_FALLBACKS.is_empty());
         }
+    }
+
+    /// M12-T003（R-14-S2）：Linux 搜索路径含打包/系统布局且末项为空串
+    /// （系统默认兜底）；Windows 含 exe 相对路径。
+    #[test]
+    fn test_search_paths_target_layout() {
+        #[cfg(target_os = "linux")]
+        {
+            assert!(
+                LIB_SEARCH_PATHS.iter().any(|p| p.contains("/usr/lib/")),
+                "Linux 应含多架构系统路径"
+            );
+            assert!(
+                LIB_SEARCH_PATHS.iter().any(|p| p.contains("{exe_dir}")),
+                "Linux 应含打包/便携路径"
+            );
+        }
+        #[cfg(target_os = "windows")]
+        {
+            assert!(
+                LIB_SEARCH_PATHS.iter().all(|p| p.contains("{exe_dir}") || p.is_empty()),
+                "Windows 路径应相对 exe 或空串兜底"
+            );
+        }
+        // 末项恒为空串：系统默认（ldconfig / PATH）兜底。
+        assert_eq!(LIB_SEARCH_PATHS.last(), Some(&""));
     }
 
     #[test]

@@ -31,6 +31,36 @@ impl WhitelistEntry {
     }
 }
 
+/// M8-T027 (SRV-IDWL-002): ID 白名单条目 — 设备 ID + 可选过期时间。
+///
+/// `device_id` 为握手 `HandshakeInit.client_id`（与 known_clients 同 key，
+/// 大小写敏感精确匹配）；`expiry` 为 `Some` 时到期自动失效（对称
+/// [`WhitelistEntry`] 的 SRV-SEC-WL-003 语义）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IdWhitelistEntry {
+    /// 设备 ID：握手自报 client_id，精确匹配（大小写敏感，与 known_clients 一致）。
+    pub device_id: String,
+    /// 过期时间（UTC）；`None` 表示永久有效。
+    pub expiry: Option<DateTime<Utc>>,
+}
+
+impl IdWhitelistEntry {
+    pub fn new(device_id: &str, expiry: Option<DateTime<Utc>>) -> Self {
+        Self {
+            device_id: device_id.trim().to_string(),
+            expiry,
+        }
+    }
+
+    /// 条目是否仍有效（未过期）。
+    pub fn is_active(&self, now: DateTime<Utc>) -> bool {
+        match self.expiry {
+            Some(exp) => now < exp,
+            None => true,
+        }
+    }
+}
+
 /// 判断域名是否匹配白名单模式（SRV-SEC-WL-004）。
 ///
 /// - 精确模式：`example.com` 只匹配自身；
@@ -84,6 +114,30 @@ pub struct Config {
     /// M8-T026: 内网穿透设置（`[tunnel]` 段：FRP 式通用 TCP 反向代理）
     #[serde(default)]
     pub tunnel: TunnelConfig,
+
+    /// R-07-S4: 自动更新设置（`[update]` 段：更新通道）
+    #[serde(default)]
+    pub update: UpdateConfig,
+}
+
+/// R-07-S4: 自动更新配置（`[update]` 段）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateConfig {
+    /// 更新通道：`release`（正式版，默认）/ `beta`（预发布）。
+    #[serde(default = "default_update_channel")]
+    pub channel: String,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            channel: default_update_channel(),
+        }
+    }
+}
+
+fn default_update_channel() -> String {
+    "release".to_string()
 }
 
 /// M8-T025 P5-4: 传输配置（`[transport]` 段，主文档 §3.6）。
@@ -351,10 +405,33 @@ pub struct FileTransferConfig {
     /// 默认 4 GiB。
     #[serde(default = "default_max_file_size")]
     pub max_file_size: u64,
+
+    /// S-10b (F-11): 单会话累计接收字节配额（默认 4 GiB，与单文件上限一致，
+    /// 单文件整传不误伤；`0` = 不限制）。超限后新 Offer 被拒绝；配额状态由
+    /// 传输会话层跟踪（core `SessionQuota` 的 reserve/release）。
+    #[serde(default = "default_session_max_bytes")]
+    pub session_max_bytes: u64,
+
+    /// S-10b (F-11): 单会话接收文件数配额（默认 64；`0` = 不限制）。
+    /// 超限后新 Offer 被拒绝。
+    #[serde(default = "default_session_max_files")]
+    pub session_max_files: u64,
 }
 
 fn default_max_file_size() -> u64 {
     4 * 1024 * 1024 * 1024
+}
+
+/// S-10b (F-11): 单会话字节配额默认值（4 GiB，对齐 core
+/// `DEFAULT_SESSION_MAX_BYTES`）。
+fn default_session_max_bytes() -> u64 {
+    4 * 1024 * 1024 * 1024
+}
+
+/// S-10b (F-11): 单会话文件数配额默认值（64，对齐 core
+/// `DEFAULT_SESSION_MAX_FILES`）。
+fn default_session_max_files() -> u64 {
+    64
 }
 
 impl Default for FileTransferConfig {
@@ -362,6 +439,8 @@ impl Default for FileTransferConfig {
         Self {
             download_dir: None,
             max_file_size: default_max_file_size(),
+            session_max_bytes: default_session_max_bytes(),
+            session_max_files: default_session_max_files(),
         }
     }
 }
@@ -506,6 +585,17 @@ pub struct NetworkConfig {
     /// 兼容旧 `allowed_domains`（无过期、永久有效），两者共同生效。
     #[serde(default)]
     pub whitelist: Vec<WhitelistEntry>,
+
+    /// M8-T027 (SRV-IDWL-001): 设备 ID 白名单 — 永久精确条目（对称
+    /// `allowed_domains`；GUI Settings 文本框 / `whitelist add-id` 写入，
+    /// 与 known_clients 同 key，大小写敏感）。
+    #[serde(default)]
+    pub allowed_ids: Vec<String>,
+
+    /// M8-T027 (SRV-IDWL-002): 设备 ID 白名单带过期条目（对称 `whitelist`，
+    /// `whitelist add-id <id> <RFC3339>` 写入；到期自动失效，`prune_expired` 清理）。
+    #[serde(default)]
+    pub id_whitelist: Vec<IdWhitelistEntry>,
 }
 
 fn default_port() -> u16 {
@@ -542,6 +632,53 @@ pub struct MediaConfig {
     /// Video bitrate in kbps
     #[serde(default = "default_bitrate")]
     pub bitrate: u32,
+
+    /// M8-T030（R-06）：单 GPU 硬件加速与虚拟设备过滤（`[media.gpu]` 段）。
+    /// 旧配置无此段 → 默认值，正常解析。
+    #[serde(default)]
+    pub gpu: GpuConfig,
+}
+
+/// M8-T030（R-06）：单 GPU 偏好（`[media.gpu]` 段，GPU-FR-009）。
+///
+/// UI 启动时经 `kirin_desk_media::gpu::apply_preferences` 注入；
+/// `KIRIN_GPU_PREFER` 环境变量在读取偏好时覆盖 `prefer`（env > config > auto）。
+///
+/// `Default`：`MediaConfig` 的 `#[serde(default)]` 要求本类型实现 Default
+/// （并行任务接线时编译器校验发现缺失，补齐）；手写实现与字段级 serde
+/// 默认值保持一致（prefer=auto / filter_virtual=true）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GpuConfig {
+    /// 偏好：auto(默认,第一个真实硬件适配器) | intel | nvidia | amd |
+    /// luid:0x…(调试)。开发机双 GPU 调试：切 intel 验 QSV / nvidia 验 NVENC。
+    #[serde(default = "default_gpu_prefer")]
+    pub prefer: String,
+
+    /// 过滤虚拟驱动（适配器 + 显示器共用开关；默认 true）。
+    #[serde(default = "default_gpu_filter_virtual")]
+    pub filter_virtual: bool,
+
+    /// 覆盖默认黑名单关键词（空 = 用默认表，见 M8-T030 §3.3）。
+    #[serde(default)]
+    pub virtual_keywords: Vec<String>,
+}
+
+impl Default for GpuConfig {
+    fn default() -> Self {
+        Self {
+            prefer: default_gpu_prefer(),
+            filter_virtual: default_gpu_filter_virtual(),
+            virtual_keywords: Vec::new(),
+        }
+    }
+}
+
+fn default_gpu_prefer() -> String {
+    "auto".to_string()
+}
+
+fn default_gpu_filter_virtual() -> bool {
+    true
 }
 
 fn default_encoder() -> String {
@@ -609,11 +746,18 @@ impl Default for Config {
                 temp_mode: false,
                 temp_mode_ttl_secs: default_temp_mode_ttl_secs(),
                 whitelist: Vec::new(),
+                allowed_ids: Vec::new(),
+                id_whitelist: Vec::new(),
             },
             media: MediaConfig {
                 encoder: default_encoder(),
                 framerate: default_framerate(),
                 bitrate: default_bitrate(),
+                gpu: GpuConfig {
+                    prefer: default_gpu_prefer(),
+                    filter_virtual: default_gpu_filter_virtual(),
+                    virtual_keywords: Vec::new(),
+                },
             },
             logging: LoggingConfig {
                 level: default_log_level(),
@@ -626,6 +770,7 @@ impl Default for Config {
             file_transfer: FileTransferConfig::default(),
             transport: TransportConfig::default(),
             tunnel: TunnelConfig::default(),
+            update: UpdateConfig::default(),
         }
     }
 }
@@ -678,17 +823,14 @@ impl Config {
     }
 
     /// Save configuration to a specific path
+    ///
+    /// S-07 (F-8): 经 `fsutil::write_private` 落盘——Unix 0600 + 父目录 0700 +
+    /// O_NOFOLLOW + 原子替换（config 含 challenge/token/GoDaddy 凭据，同机
+    /// 低权限用户不可读）；父目录由 write_private 自动创建。
     pub fn save_to(&self, path: &std::path::Path) -> Result<(), ConfigError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| ConfigError::IoError {
-                    path: parent.to_path_buf(),
-                    source: e,
-                })?;
-        }
         let content = toml::to_string_pretty(self)
             .map_err(|e| ConfigError::SerializeError(e.to_string()))?;
-        std::fs::write(path, &content)
+        crate::fsutil::write_private(path, content.as_bytes())
             .map_err(|e| ConfigError::IoError {
                 path: path.to_path_buf(),
                 source: e,
@@ -781,10 +923,11 @@ impl Config {
         Ok(removed)
     }
 
-    /// 从 CSV 导入白名单（SRV-SEC-WL-002）。
+    /// 从 CSV 导入白名单（SRV-SEC-WL-002 / CLI-IDWL-004）。
     ///
     /// 格式：每行 `pattern[,expiry]`，`expiry` 为 RFC3339（如 `2026-08-01T12:00:00Z`）
-    /// 或留空表示永久；空行与 `#` 注释行跳过；非法行跳过并计入未导入数。
+    /// 或留空表示永久；**`id:` 前缀行**（`id:device-1[,expiry]`）路由到设备 ID
+    /// 白名单维度（M8-T027）；空行与 `#` 注释行跳过；非法行跳过并计入未导入数。
     /// 返回成功导入的条目数，并立即保存。
     pub fn whitelist_import_csv(&mut self, path: &Path) -> Result<usize, ConfigError> {
         let content = std::fs::read_to_string(path).map_err(|e| ConfigError::IoError {
@@ -797,19 +940,29 @@ impl Config {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
+            // M8-T027 (CLI-IDWL-004)：`id:` 前缀行 → ID 白名单维度。
+            if let Some(rest) = line.strip_prefix("id:") {
+                let mut parts = rest.split(',');
+                let device_id = parts.next().unwrap_or("").trim();
+                let expiry_str = parts.next().map(|s| s.trim()).unwrap_or("");
+                if device_id.is_empty() {
+                    continue;
+                }
+                let Some(expiry) = Self::parse_csv_expiry(expiry_str) else {
+                    continue; // 非法时间戳 → 跳过该行
+                };
+                let _ = self.id_whitelist_add(device_id, expiry)?;
+                imported += 1;
+                continue;
+            }
             let mut parts = line.split(',');
             let pattern = parts.next().unwrap_or("").trim();
             let expiry_str = parts.next().map(|s| s.trim()).unwrap_or("");
             if pattern.is_empty() {
                 continue;
             }
-            let expiry = if expiry_str.is_empty() {
-                None
-            } else {
-                match DateTime::parse_from_rfc3339(expiry_str) {
-                    Ok(dt) => Some(dt.with_timezone(&Utc)),
-                    Err(_) => continue, // 非法时间戳 → 跳过该行
-                }
+            let Some(expiry) = Self::parse_csv_expiry(expiry_str) else {
+                continue; // 非法时间戳 → 跳过该行
             };
             let _ = self.whitelist_add(pattern, expiry)?;
             imported += 1;
@@ -817,9 +970,23 @@ impl Config {
         Ok(imported)
     }
 
-    /// 导出白名单到 CSV（SRV-SEC-WL-002）：每行 `pattern,expiry`。
+    /// 解析 CSV 行中的过期时间（RFC3339；空 → `None` = 永久；非法 → `None`，
+    /// 由调用方决定跳过该行）。
+    fn parse_csv_expiry(expiry_str: &str) -> Option<Option<DateTime<Utc>>> {
+        if expiry_str.is_empty() {
+            return Some(None);
+        }
+        DateTime::parse_from_rfc3339(expiry_str)
+            .ok()
+            .map(|dt| Some(dt.with_timezone(&Utc)))
+    }
+
+    /// 导出白名单到 CSV（SRV-SEC-WL-002 / CLI-IDWL-004）：域名行保持原格式
+    /// （向后兼容），ID 行带 `id:` 前缀（可与域名行共存、往返导入）。
     pub fn whitelist_export_csv(&self, path: &Path) -> Result<(), ConfigError> {
-        let mut lines = String::from("# pattern,expiry (RFC3339, empty = permanent)\n");
+        let mut lines = String::from(
+            "# pattern,expiry (RFC3339, empty = permanent); id:<device-id>[,expiry]\n",
+        );
         for pattern in self.whitelist_active_patterns(Utc::now()) {
             let entry = self
                 .network
@@ -832,17 +999,34 @@ impl Config {
                 .unwrap_or_default();
             lines.push_str(&format!("{},{}\n", pattern, expiry));
         }
+        for device_id in self.id_whitelist_active_ids(Utc::now()) {
+            let entry = self
+                .network
+                .id_whitelist
+                .iter()
+                .find(|e| e.device_id == device_id);
+            let expiry = entry
+                .and_then(|e| e.expiry)
+                .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+                .unwrap_or_default();
+            lines.push_str(&format!("id:{},{}\n", device_id, expiry));
+        }
         std::fs::write(path, lines).map_err(|e| ConfigError::IoError {
             path: path.to_path_buf(),
             source: e,
         })
     }
 
-    /// 导出白名单到 JSON（SRV-SEC-WL-002）。
+    /// 导出白名单到 JSON（SRV-SEC-WL-002 / CLI-IDWL-004）：同时输出域名与
+    /// ID 两维条目。
     pub fn whitelist_export_json(&self, path: &Path) -> Result<(), ConfigError> {
-        let content = serde_json::to_string_pretty(&self.network.whitelist)
+        let content = serde_json::json!({
+            "domains": self.network.whitelist,
+            "id_whitelist": self.network.id_whitelist,
+        });
+        let text = serde_json::to_string_pretty(&content)
             .map_err(|e| ConfigError::SerializeError(e.to_string()))?;
-        std::fs::write(path, content).map_err(|e| ConfigError::IoError {
+        std::fs::write(path, text).map_err(|e| ConfigError::IoError {
             path: path.to_path_buf(),
             source: e,
         })
@@ -855,6 +1039,157 @@ impl Config {
             .whitelist
             .retain(|e| e.is_active(now));
         before - self.network.whitelist.len()
+    }
+
+    // ---------- M8-T027: 设备 ID 白名单（SRV-IDWL-001..008） ----------
+
+    /// 当前生效的设备 ID 白名单（合并 `allowed_ids` 永久条目 + 未过期
+    /// `id_whitelist` 条目，去重返回，供握手层精确匹配）。
+    pub fn id_whitelist_active_ids(&self, now: DateTime<Utc>) -> Vec<String> {
+        let mut ids: Vec<String> = self.network.allowed_ids.clone();
+        for entry in &self.network.id_whitelist {
+            if entry.is_active(now) && !ids.contains(&entry.device_id) {
+                ids.push(entry.device_id.clone());
+            }
+        }
+        ids
+    }
+
+    /// 设备 ID 是否在 ID 白名单内（`allowed_ids` 或未过期 `id_whitelist`
+    /// 任一维度精确命中，SRV-IDWL-005；过期条目自动失效）。
+    pub fn id_whitelist_check(&self, device_id: &str) -> bool {
+        let device_id = device_id.trim();
+        if self.network.allowed_ids.iter().any(|id| id == device_id) {
+            return true;
+        }
+        self.network
+            .id_whitelist
+            .iter()
+            .any(|e| e.device_id == device_id && e.is_active(Utc::now()))
+    }
+
+    /// 新增 ID 白名单条目（按设备 ID 去重；已存在只更新过期时间），返回
+    /// 是否新增成功，并立即保存（SRV-IDWL-006）。`expiry: None` 永久有效；
+    /// 永久条目已存在于 `allowed_ids` 时不再重复登记（返回 false）。
+    pub fn id_whitelist_add(
+        &mut self,
+        device_id: &str,
+        expiry: Option<DateTime<Utc>>,
+    ) -> Result<bool, ConfigError> {
+        let device_id = device_id.trim().to_string();
+        if device_id.is_empty() {
+            return Ok(false);
+        }
+        if let Some(entry) = self
+            .network
+            .id_whitelist
+            .iter_mut()
+            .find(|e| e.device_id == device_id)
+        {
+            // 已存在 → 只更新过期时间
+            entry.expiry = expiry;
+            self.save()?;
+            return Ok(false);
+        }
+        if expiry.is_none() && self.network.allowed_ids.contains(&device_id) {
+            // 永久条目已登记于 allowed_ids → 无变化
+            return Ok(false);
+        }
+        self.network
+            .id_whitelist
+            .push(IdWhitelistEntry::new(&device_id, expiry));
+        self.save()?;
+        Ok(true)
+    }
+
+    /// 删除 ID 白名单条目（**同时清理** `allowed_ids` 与 `id_whitelist`，
+    /// CLI-IDWL-002），返回是否删除成功，并立即保存。
+    pub fn id_whitelist_remove(&mut self, device_id: &str) -> Result<bool, ConfigError> {
+        let before_wl = self.network.id_whitelist.len();
+        self.network.id_whitelist.retain(|e| e.device_id != device_id);
+        let before_ai = self.network.allowed_ids.len();
+        self.network.allowed_ids.retain(|id| id != device_id);
+        let removed = self.network.id_whitelist.len() != before_wl
+            || self.network.allowed_ids.len() != before_ai;
+        if removed {
+            self.save()?;
+        }
+        Ok(removed)
+    }
+
+    /// 从 CSV 导入 ID 白名单（SRV-IDWL-007）。
+    ///
+    /// 格式：每行 `id:<device-id>[,expiry]`，`expiry` 为 RFC3339 或留空表示
+    /// 永久；空行与 `#` 注释行跳过；非 `id:` 前缀行与非法行跳过。返回成功
+    /// 导入的条目数，并立即保存。
+    pub fn id_whitelist_import_csv(&mut self, path: &Path) -> Result<usize, ConfigError> {
+        let content = std::fs::read_to_string(path).map_err(|e| ConfigError::IoError {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        let mut imported = 0usize;
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some(rest) = line.strip_prefix("id:") else {
+                continue;
+            };
+            let mut parts = rest.split(',');
+            let device_id = parts.next().unwrap_or("").trim();
+            let expiry_str = parts.next().map(|s| s.trim()).unwrap_or("");
+            if device_id.is_empty() {
+                continue;
+            }
+            let Some(expiry) = Self::parse_csv_expiry(expiry_str) else {
+                continue; // 非法时间戳 → 跳过该行
+            };
+            let _ = self.id_whitelist_add(device_id, expiry)?;
+            imported += 1;
+        }
+        Ok(imported)
+    }
+
+    /// 导出 ID 白名单到 CSV（SRV-IDWL-007）：每行 `id:<device-id>,expiry`。
+    pub fn id_whitelist_export_csv(&self, path: &Path) -> Result<(), ConfigError> {
+        let mut lines = String::from("# id:<device-id>,expiry (RFC3339, empty = permanent)\n");
+        for device_id in self.id_whitelist_active_ids(Utc::now()) {
+            let entry = self
+                .network
+                .id_whitelist
+                .iter()
+                .find(|e| e.device_id == device_id);
+            let expiry = entry
+                .and_then(|e| e.expiry)
+                .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+                .unwrap_or_default();
+            lines.push_str(&format!("id:{},{}\n", device_id, expiry));
+        }
+        std::fs::write(path, lines).map_err(|e| ConfigError::IoError {
+            path: path.to_path_buf(),
+            source: e,
+        })
+    }
+
+    /// 导出 ID 白名单到 JSON（SRV-IDWL-007）。
+    pub fn id_whitelist_export_json(&self, path: &Path) -> Result<(), ConfigError> {
+        let content = serde_json::to_string_pretty(&self.network.id_whitelist)
+            .map_err(|e| ConfigError::SerializeError(e.to_string()))?;
+        std::fs::write(path, content).map_err(|e| ConfigError::IoError {
+            path: path.to_path_buf(),
+            source: e,
+        })
+    }
+
+    /// 物理清除过期 ID 白名单条目，返回清除数量（匹配时过期条目已被跳过，
+    /// 此方法用于清理；IDWL-SEC-005）。
+    pub fn id_whitelist_prune_expired(&mut self, now: DateTime<Utc>) -> usize {
+        let before = self.network.id_whitelist.len();
+        self.network
+            .id_whitelist
+            .retain(|e| e.is_active(now));
+        before - self.network.id_whitelist.len()
     }
 }
 
@@ -911,6 +1246,58 @@ mod tests {
         let path = std::env::temp_dir().join("kirin_desk_nonexistent.toml");
         let result = Config::load_from(&path);
         assert!(result.is_err());
+    }
+
+    // ---------- M8-T030（R-06）: 单 GPU 配置测试 ----------
+
+    #[test]
+    fn test_gpu_config_defaults() {
+        // 默认值：auto + 过滤虚拟 + 空关键词（用默认黑名单表）。
+        let config = Config::default();
+        assert_eq!(config.media.gpu.prefer, "auto");
+        assert!(config.media.gpu.filter_virtual);
+        assert!(config.media.gpu.virtual_keywords.is_empty());
+    }
+
+    #[test]
+    fn test_gpu_legacy_toml_missing_section() {
+        // 旧配置无 [media.gpu] 段 → 加载不失败，使用默认值（R-06 验收 §5）。
+        let dir = std::env::temp_dir().join("kirin_desk_test_gpu");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.toml");
+        std::fs::write(
+            &path,
+            "[device]\nid = \"old-device\"\nname = \"Old\"\n\
+             [godaddy]\napi_key = \"\"\napi_secret = \"\"\ndomain = \"example.com\"\n\
+             [network]\nport = 3389\n\
+             [media]\nencoder = \"auto\"\nframerate = 30\nbitrate = 5000\n\
+             [logging]\nlevel = \"info\"\nformat = \"text\"\n",
+        )
+        .unwrap();
+        let loaded = Config::load_from(&path).unwrap();
+        assert_eq!(loaded.device.id, "old-device");
+        assert_eq!(loaded.media.gpu.prefer, "auto");
+        assert!(loaded.media.gpu.filter_virtual);
+        assert!(loaded.media.gpu.virtual_keywords.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_gpu_config_roundtrip() {
+        // 完整 [media.gpu] 段读写往返（含自定义关键词）。
+        let mut config = Config::default();
+        config.media.gpu.prefer = "nvidia".to_string();
+        config.media.gpu.filter_virtual = false;
+        config.media.gpu.virtual_keywords = vec!["sunlogin".to_string()];
+        let dir = std::env::temp_dir().join("kirin_desk_test_config_gpu");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.toml");
+        config.save_to(&path).unwrap();
+        let loaded = Config::load_from(&path).unwrap();
+        assert_eq!(loaded.media.gpu.prefer, "nvidia");
+        assert!(!loaded.media.gpu.filter_virtual);
+        assert_eq!(loaded.media.gpu.virtual_keywords, vec!["sunlogin"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---------- M8-T017: 临时连接 TTL 配置测试 ----------
@@ -1215,6 +1602,226 @@ mod tests {
         let loaded = Config::load_from(&path).unwrap();
         assert!(loaded.whitelist_check("a.example.com"));
         assert_eq!(loaded.network.whitelist.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------- M8-T027: 设备 ID 白名单测试（SRV-IDWL-001..008） ----------
+
+    #[test]
+    fn test_id_whitelist_defaults_and_legacy_toml() {
+        // 默认：两维均为空；旧配置（无新字段）加载不失败（向后兼容）。
+        let config = Config::default();
+        assert!(config.network.allowed_ids.is_empty());
+        assert!(config.network.id_whitelist.is_empty());
+        assert!(config.id_whitelist_active_ids(Utc::now()).is_empty());
+        assert!(!config.id_whitelist_check("device-7"));
+
+        let dir = std::env::temp_dir().join("kirin_desk_test_idwl_legacy");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.toml");
+        std::fs::write(
+            &path,
+            "[device]\nid = \"old-device\"\nname = \"Old\"\n\
+             [godaddy]\napi_key = \"\"\napi_secret = \"\"\ndomain = \"example.com\"\n\
+             [network]\nport = 3389\n\
+             [media]\nencoder = \"auto\"\nframerate = 30\nbitrate = 5000\n\
+             [logging]\nlevel = \"info\"\nformat = \"text\"\n",
+        )
+        .unwrap();
+        let loaded = Config::load_from(&path).unwrap();
+        assert!(loaded.network.allowed_ids.is_empty());
+        assert!(loaded.network.id_whitelist.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_id_whitelist_add_remove_and_expiry() {
+        let mut config = Config::default();
+        // 新增永久条目 + 带过期条目。
+        assert!(config.id_whitelist_add("device-7", None).unwrap());
+        assert!(
+            config
+                .id_whitelist_add(
+                    "device-temp",
+                    Some(Utc::now() + chrono::Duration::minutes(5)),
+                )
+                .unwrap()
+        );
+        // 重复添加 → false（只更新过期时间，不新增）。
+        assert!(!config.id_whitelist_add("device-7", None).unwrap());
+        assert!(!config.id_whitelist_add("", None).unwrap());
+
+        let active = config.id_whitelist_active_ids(Utc::now());
+        assert_eq!(active.len(), 2);
+        assert!(active.contains(&"device-7".to_string()));
+
+        // 过期条目自动失效（active_ids / check 均不命中）。
+        let past = Utc::now() - chrono::Duration::minutes(1);
+        config.id_whitelist_add("device-expired", Some(past)).unwrap();
+        assert_eq!(config.id_whitelist_active_ids(Utc::now()).len(), 2);
+        assert!(!config.id_whitelist_check("device-expired"));
+        // prune 物理清理。
+        assert_eq!(config.id_whitelist_prune_expired(Utc::now()), 1);
+        assert_eq!(config.network.id_whitelist.len(), 2);
+
+        // remove 同时清理 id_whitelist 与 allowed_ids 两维。
+        config.network.allowed_ids.push("device-9".to_string());
+        assert!(config.id_whitelist_check("device-9"));
+        assert!(config.id_whitelist_remove("device-9").unwrap());
+        assert!(!config.id_whitelist_check("device-9"));
+        assert!(config.network.allowed_ids.is_empty());
+        assert!(!config.id_whitelist_remove("device-9").unwrap());
+    }
+
+    #[test]
+    fn test_id_whitelist_active_ids_dedup() {
+        // allowed_ids 与 id_whitelist 同 key → 去重，且永久条目不被过期条目遮蔽。
+        let mut config = Config::default();
+        config.network.allowed_ids.push("device-7".to_string());
+        config
+            .id_whitelist_add("device-7", Some(Utc::now() + chrono::Duration::days(1)))
+            .unwrap();
+        let active = config.id_whitelist_active_ids(Utc::now());
+        assert_eq!(active.len(), 1);
+        assert!(config.id_whitelist_check("device-7"));
+    }
+
+    #[test]
+    fn test_id_whitelist_import_export_csv() {
+        let dir = std::env::temp_dir().join("kirin_desk_test_idwl_csv");
+        std::fs::create_dir_all(&dir).unwrap();
+        let csv = dir.join("idwl.csv");
+        std::fs::write(
+            &csv,
+            "# comment\nid:device-1,\nid:device-2,2026-12-31T00:00:00Z\nid:,no-id\nid:device-3,not-a-date\n",
+        )
+        .unwrap();
+        let mut config = Config::default();
+        let imported = config.id_whitelist_import_csv(&csv).unwrap();
+        assert_eq!(imported, 2); // 空 id 与非法时间戳行跳过
+        assert!(config.id_whitelist_check("device-1"));
+        assert!(config.id_whitelist_check("device-2"));
+        assert!(!config.id_whitelist_check("device-3"));
+
+        // 导出再导入到新配置（往返）。
+        let out = dir.join("idwl_out.csv");
+        config.id_whitelist_export_csv(&out).unwrap();
+        let mut config2 = Config::default();
+        let n2 = config2.id_whitelist_import_csv(&out).unwrap();
+        assert_eq!(n2, 2);
+        assert!(config2.id_whitelist_check("device-1"));
+        assert!(config2.id_whitelist_check("device-2"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_whitelist_import_csv_routes_id_lines() {
+        // 混合 CSV：域名行保持原格式，`id:` 前缀行路由到 ID 维度（CLI-IDWL-004）。
+        let dir = std::env::temp_dir().join("kirin_desk_test_mixed_csv");
+        std::fs::create_dir_all(&dir).unwrap();
+        let csv = dir.join("mixed.csv");
+        std::fs::write(
+            &csv,
+            "# mixed\n*.example.com,\nid:device-7,\nid:device-8,2026-12-31T00:00:00Z\n",
+        )
+        .unwrap();
+        let mut config = Config::default();
+        let imported = config.whitelist_import_csv(&csv).unwrap();
+        assert_eq!(imported, 3);
+        assert!(config.whitelist_check("a.example.com"));
+        assert!(config.id_whitelist_check("device-7"));
+        assert!(config.id_whitelist_check("device-8"));
+        assert!(config.network.allowed_ids.is_empty(), "id: 行不进 allowed_ids");
+
+        // 导出 CSV 同时含两维，可整体往返。
+        let out = dir.join("mixed_out.csv");
+        config.whitelist_export_csv(&out).unwrap();
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert!(text.contains("id:device-7"));
+        let mut config2 = Config::default();
+        let n2 = config2.whitelist_import_csv(&out).unwrap();
+        assert!(n2 >= 3);
+        assert!(config2.whitelist_check("a.example.com"));
+        assert!(config2.id_whitelist_check("device-7"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_id_whitelist_json_and_toml_roundtrip() {
+        let dir = std::env::temp_dir().join("kirin_desk_test_idwl_rt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = Config::default();
+        config.network.allowed_ids.push("device-7".to_string());
+        config
+            .id_whitelist_add("device-8", Some(Utc::now() + chrono::Duration::days(1)))
+            .unwrap();
+        config.whitelist_add("*.example.com", None).unwrap();
+
+        // TOML 往返（新字段序列化 + 旧字段兼容）。
+        let path = dir.join("test.toml");
+        config.save_to(&path).unwrap();
+        let loaded = Config::load_from(&path).unwrap();
+        assert_eq!(loaded.network.allowed_ids, vec!["device-7".to_string()]);
+        assert_eq!(loaded.network.id_whitelist.len(), 1);
+        assert!(loaded.id_whitelist_check("device-7"));
+        assert!(loaded.id_whitelist_check("device-8"));
+        assert!(loaded.whitelist_check("a.example.com"));
+
+        // export-json 同时输出两维（CLI-IDWL-004）。
+        let json_path = dir.join("wl.json");
+        config.whitelist_export_json(&json_path).unwrap();
+        let text = std::fs::read_to_string(&json_path).unwrap();
+        assert!(text.contains("\"pattern\""), "domain 维保留 pattern 字段");
+        assert!(text.contains("\"device_id\""), "JSON 含 ID 维条目");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------- M13-T006 / S-10: 文件传输配额配置测试 ----------
+
+    #[test]
+    fn test_file_transfer_quota_defaults() {
+        // 默认：字节配额 4 GiB + 文件数 64（S-10b/F-11）。
+        let config = Config::default();
+        assert_eq!(config.file_transfer.max_file_size, 4 * 1024 * 1024 * 1024);
+        assert_eq!(config.file_transfer.session_max_bytes, 4 * 1024 * 1024 * 1024);
+        assert_eq!(config.file_transfer.session_max_files, 64);
+    }
+
+    #[test]
+    fn test_file_transfer_quota_legacy_toml_and_roundtrip() {
+        // 旧配置无新字段 → 追加式默认值，加载不失败。
+        let dir = std::env::temp_dir().join("kirin_desk_test_ft_quota");
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = dir.join("legacy.toml");
+        std::fs::write(
+            &legacy,
+            "[device]\nid = \"old-device\"\nname = \"Old\"\n\
+             [godaddy]\napi_key = \"\"\napi_secret = \"\"\ndomain = \"example.com\"\n\
+             [network]\nport = 3389\n\
+             [media]\nencoder = \"auto\"\nframerate = 30\nbitrate = 5000\n\
+             [logging]\nlevel = \"info\"\nformat = \"text\"\n",
+        )
+        .unwrap();
+        let loaded = Config::load_from(&legacy).unwrap();
+        assert_eq!(loaded.file_transfer.session_max_bytes, 4 * 1024 * 1024 * 1024);
+        assert_eq!(loaded.file_transfer.session_max_files, 64);
+
+        // 自定义值 TOML 往返（含 0 = 不限制语义）。
+        let mut cfg = Config::default();
+        cfg.file_transfer.session_max_bytes = 1024;
+        cfg.file_transfer.session_max_files = 2;
+        let path = dir.join("quota.toml");
+        cfg.save_to(&path).unwrap();
+        let loaded2 = Config::load_from(&path).unwrap();
+        assert_eq!(loaded2.file_transfer.session_max_bytes, 1024);
+        assert_eq!(loaded2.file_transfer.session_max_files, 2);
+        let mut cfg3 = Config::default();
+        cfg3.file_transfer.session_max_bytes = 0;
+        cfg3.file_transfer.session_max_files = 0;
+        cfg3.save_to(&dir.join("quota0.toml")).unwrap();
+        let loaded3 = Config::load_from(&dir.join("quota0.toml")).unwrap();
+        assert_eq!(loaded3.file_transfer.session_max_bytes, 0);
+        assert_eq!(loaded3.file_transfer.session_max_files, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -242,6 +242,20 @@ pub fn av_opt_set_pixel_fmt(obj: *mut c_void, name: &str, val: i32) -> Result<()
 //
 // 偏移取自 FFmpeg 8.1 `libavcodec/avcodec.h` 的 `offsetof(AVCodecContext, x)`，
 // 经运行时实测确认（libx264 open2 成功出码流）。**升级 FFmpeg 主版本时必须重核**。
+//
+// ## 升级核对清单（R-22，快照 FFmpeg 8.1.2 / avcodec-62 / avutil-60）
+//
+// 升级 FFmpeg 主版本（≥9）或大改共享构建时，按序核对：
+// 1. 下方 `avctx_offset::*` 全部偏移：对照新版 `libavcodec/avcodec.h`
+//    `offsetof(AVCodecContext, x)` 逐一重核（含 `hw_frames_ctx`/`hw_device_ctx`
+//    指针字段与 `time_base`/`framerate` 的 AVRational 布局）；
+// 2. [`AVFRAME_CH_LAYOUT_OFFSET`]（`AVFrame.ch_layout`）：对照
+//    `libavutil/frame.h` 字段顺序（64-bit ABI，含对齐）重核；
+// 3. `dlls.rs`：库名常量（`avcodec-62.dll` → 新版 soname）、`DLL_VERSION_FALLBACKS`、
+//    `SNAPSHOT_FFMPEG_MAJOR`（与 `avcodec_version()` major 断言联动）同步更新；
+// 4. `FnTable` 符号表：新增/移除符号核对（`sym!` 必需符号缺失会加载失败）；
+// 5. 更新本清单与 `Readme.md`「FFmpeg 升级步骤」中的版本快照字样。
+// 主版本不符时 `ensure_loaded` 直接报错（`dlls.rs` 版本断言），不会带错偏移运行。
 
 /// AVCodecContext 字段偏移（FFmpeg 8.1.2 x86-64，经实测确认）。
 pub mod avctx_offset {
@@ -740,6 +754,7 @@ pub fn av_frame_set_ch_layout(
 ///
 /// `ch_layout`（AVChannelLayout，24B/align 8）紧跟 private_ref 之后 → **偏移 384**。
 /// 该偏移对 FFmpeg 7/8（新声道布局 API）成立；本仓库仅在音频路径使用。
+/// 升级核对：见上方 `avctx_offset` 升级核对清单第 2 条（R-22）。
 const AVFRAME_CH_LAYOUT_OFFSET: usize = 384;
 
 // ── Frame / Packet lifecycle ─────────────────────────────────

@@ -311,7 +311,10 @@ mod tests {
         assert!(mgr.verify_challenge(&code));
         assert!(!mgr.verify_challenge("XXXXXXXX"));
         assert!(!mgr.verify_challenge(""));
-        assert!(!mgr.verify_challenge(&code.to_lowercase()), "case-sensitive");
+        assert!(
+            !mgr.verify_challenge(&code.to_lowercase()),
+            "case-sensitive"
+        );
         cleanup("verify");
     }
 
@@ -331,7 +334,10 @@ mod tests {
         assert_eq!(mgr.remaining_secs(), 1);
         std::thread::sleep(std::time::Duration::from_millis(1500));
         assert!(!mgr.is_active(), "window must expire after ttl");
-        assert!(!mgr.verify_challenge(&code), "SRV-TMP-HK-003: expired code fails");
+        assert!(
+            !mgr.verify_challenge(&code),
+            "SRV-TMP-HK-003: expired code fails"
+        );
         cleanup("expiry");
     }
 
