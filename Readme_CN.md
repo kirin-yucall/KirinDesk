@@ -94,6 +94,32 @@ cargo build --release -p kirin-desk-ui
 ./target/release/kirin-desk-ui --cli serve 22
 ```
 
+### 克隆后从源码构建
+
+```bash
+git clone https://github.com/kirin-yucall/KirinDesk.git
+cd KirinDesk
+```
+
+**1. 前端依赖** —— `ui/frontend/node_modules/` 不入库,需先还原:
+
+```bash
+cd ui/frontend
+npm ci                # 按 package-lock.json 安装
+npm run build         # 生成 dist/(Tauri 应用运行时读取)
+cd ../..
+```
+
+**2. FFmpeg 二进制** —— `ffmpeg/ffmpeg-8.1.2-full_build-shared/` 同样不入库:
+
+下载 [ffmpeg-8.1.2-full_build-shared.zip](https://github.com/GyanD/codexffmpeg/releases/download/8.1.2/ffmpeg-8.1.2-full_build-shared.zip),解压到 `ffmpeg/ffmpeg-8.1.2-full_build-shared/`。若要直接运行发布版 `release/KirinDesk.exe`,还需把其中的 DLL(`avcodec-62.dll`、`avutil-60.dll`、`swscale-9.dll` 等)复制到 `release/ffmpeg/bin/`。
+
+**3. 编译** —— `target/` 由 cargo 生成,不入库:
+
+```bash
+cargo build --release -p kirin-desk-ui
+```
+
 ### 客户端连接
 
 ```bash
