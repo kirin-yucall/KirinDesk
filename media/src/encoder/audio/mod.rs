@@ -4,8 +4,8 @@
 //! - [`AudioCapture`] trait + 平台实现：系统声音环回捕获（Windows WASAPI
 //!   环回 / macOS CoreAudio AudioUnit 环回（M12-MAC MAC-T003）/ Linux 留桩），
 //!   产出 float32 interleaved PCM。
-//! - [`OpusEncoder`]：FFmpeg libopus 进程内编码（`avcodec_find_encoder
-//!   (AV_CODEC_ID_OPUS)`），48kHz / stereo / 64kbps / 20ms 帧，实现
+//! - [`OpusEncoder`]：FFmpeg libopus 进程内编码（`avcodec_find_encoder_by_name
+//!   ("libopus")`），48kHz / stereo / 64kbps / 20ms 帧，实现
 //!   [`crate::encoder::video::AudioEncoder`] trait。
 //! - [`AudioPipeline`]：独立线程的捕获 + 编码流水线（不阻塞视频/键鼠）。
 //!
@@ -20,16 +20,19 @@
 //!
 //! # FFmpeg 8.x 音频编码要点
 //!
-//! - libopus 经 avcodec 要求 **planar float32**（`AV_SAMPLE_FMT_FLTP`）；捕获
-//!   侧 WASAPI 环回产 packed（interleaved）float32（`AV_SAMPLE_FMT_FLT`），
-//!   编码前由本模块 deinterleave。
+//! - libopus 经 avcodec 支持 **s16 / packed float32**（`AV_SAMPLE_FMT_FLT`，
+//!   8.1.2 捆绑构建实测）；**不支持** planar float32 `AV_SAMPLE_FMT_FLTP`——
+//!   曾用 `avcodec_find_encoder(AV_CODEC_ID_OPUS)` + 强制 fltp，open2 报
+//!   EINVAL（修复计划 2026-08-03 P1）。现显式 `avcodec_find_encoder_by_name
+//!   ("libopus")` 钉死实现，帧格式与捕获侧 packed f32 直接对齐，**无需
+//!   deinterleave**（单平面整块拷贝）。
 //! - FFmpeg 7+ 用 `AVChannelLayout ch_layout` 取代旧 `channel_layout`/
 //!   `channels`；libopus 在 `send_frame` 时读 `frame->ch_layout`。本仓库
 //!   `AVFrame` 映射不覆盖该字段（ABI 不稳定），故经
 //!   [`crate::ffmpeg::av_frame_set_ch_layout`] 按字段偏移写入 NATIVE 立体声
 //!   布局。
 //! - 帧缓冲由 [`crate::ffmpeg::av_frame_get_buffer`] 按 `format/nb_samples/
-//!   ch_layout` 分配（planar float32 → data[0]=L plane、data[1]=R plane）。
+//!   ch_layout` 分配（packed float32 → 单平面 data[0]，interleaved 顺序）。
 
 use std::ffi::c_void;
 use std::sync::mpsc;
@@ -134,12 +137,35 @@ pub fn create_default_capture() -> Result<Box<dyn AudioCapture>, EncodeError> {
     }
 }
 
+/// M8-T032：创建本机默认麦克风捕获器（客户端 talkback 回传）。
+///
+/// - Windows：WASAPI `eCapture`/`eCommunications`（默认通话麦克风，无 loopback）。
+/// - macOS/Linux：暂未实现 → `Err(Unsupported)`（优雅降级：捕获初始化失败 →
+///   info 日志，视频/键鼠不受影响；文档登记 TODO）。
+pub fn create_mic_capture() -> Result<Box<dyn AudioCapture>, EncodeError> {
+    #[cfg(target_os = "windows")]
+    {
+        Ok(Box::new(WasapiMicCapture::new()?))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        tracing::info!(
+            "microphone capture not implemented on {} (M8-T032 TODO: Windows only)",
+            std::env::consts::OS
+        );
+        Err(EncodeError::Unsupported(format!(
+            "microphone capture not implemented on {}",
+            std::env::consts::OS,
+        )))
+    }
+}
+
 // ── Windows WASAPI 环回 ──────────────────────────────────────
 #[cfg(target_os = "windows")]
 mod wasapi;
 
 #[cfg(target_os = "windows")]
-pub use wasapi::WasapiLoopbackCapture;
+pub use wasapi::{WasapiLoopbackCapture, WasapiMicCapture};
 
 // ── macOS CoreAudio 环回（M12-MAC MAC-T003） ──────────────────
 #[cfg(target_os = "macos")]
@@ -177,7 +203,7 @@ pub use pipewire::PipeWireCapture;
 pub struct OpusEncoder {
     /// AVCodecContext*（opus；不透明）。
     ctx: *mut ffmpeg::AVCodecContext,
-    /// 复用 AVFrame（48000Hz stereo float32 planar）。
+    /// 复用 AVFrame（48000Hz stereo packed float32，libopus 支持 FLT）。
     frame: *mut ffmpeg::AVFrame,
     /// 复用 AVPacket。
     packet: *mut ffmpeg::AVPacket,
@@ -196,15 +222,18 @@ pub struct OpusEncoder {
 unsafe impl Send for OpusEncoder {}
 
 impl OpusEncoder {
-    /// 创建：`avcodec_find_encoder(AV_CODEC_ID_OPUS)` →
-    /// `avcodec_alloc_context3` → 设 sample_rate/ch_layout/b/sample_fmt →
-    /// `avcodec_open2`。
+    /// 创建：`avcodec_find_encoder_by_name("libopus")`（钉死实现，避免
+    /// `avcodec_find_encoder` 按注册顺序取首个导致的实现歧义——本构建首个
+    /// OPUS 编码器即 libopus，且其不支持 fltp）→ `avcodec_alloc_context3` →
+    /// 设 sample_rate/ch_layout/b/sample_fmt（FLT，libopus 支持 packed f32）
+    /// → `avcodec_open2`。
     pub fn new() -> Result<Self, EncodeError> {
         ffmpeg::ensure_loaded()
             .map_err(|e| EncodeError::InitFailed(format!("FFmpeg DLLs: {e}")))?;
 
-        let codec = ffmpeg::avcodec_find_encoder(ffmpeg::AV_CODEC_ID_OPUS)
-            .map_err(|_| EncodeError::Unsupported("opus not available in ffmpeg build".into()))?;
+        let codec = ffmpeg::avcodec_find_encoder_by_name("libopus").map_err(|_| {
+            EncodeError::Unsupported("libopus encoder not available in ffmpeg build".into())
+        })?;
         let ctx = ffmpeg::avcodec_alloc_context3(codec)
             .map_err(|e| EncodeError::InitFailed(format!("avcodec_alloc_context3: {e}")))?;
 
@@ -220,9 +249,11 @@ impl OpusEncoder {
         let _ = ffmpeg::av_opt_set(obj, "ch_layout", "stereo");
         let _ = ffmpeg::av_opt_set_int(obj, "b", BIT_RATE);
         let _ = ffmpeg::av_opt_set_int(obj, "bit_rate", BIT_RATE);
-        // libopus 要求 fltp（planar float32）。
-        let _ = ffmpeg::av_opt_set_int(obj, "sample_fmt", ffmpeg::AV_SAMPLE_FMT_FLTP as i64);
-        let _ = ffmpeg::av_opt_set(obj, "sample_fmt", "fltp");
+        // libopus 支持 s16 / packed float32（flt）；**不支持 fltp**（8.1.2
+        // 捆绑构建实测，强制 fltp → open2 EINVAL，见修复计划 2026-08-03 P1）。
+        // 捕获侧即 packed f32，帧格式对齐 flt，无需 deinterleave。
+        let _ = ffmpeg::av_opt_set_int(obj, "sample_fmt", ffmpeg::AV_SAMPLE_FMT_FLT as i64);
+        let _ = ffmpeg::av_opt_set(obj, "sample_fmt", "flt");
         // 帧长 20ms（libopus 接受 2.5/5/10/20/40/60ms；20ms 与 M12 一致）。
         let _ = ffmpeg::av_opt_set_int(obj, "frame_size", FRAME_SAMPLES as i64);
         // VBR（libopus 默认）；application=audio|voip|lowdelay。
@@ -232,7 +263,8 @@ impl OpusEncoder {
             let mut ctx_opt = ctx;
             ffmpeg::avcodec_free_context(&mut ctx_opt);
             return Err(EncodeError::InitFailed(format!(
-                "avcodec_open2(opus): {e}（构建是否含 --enable-libopus？）"
+                "avcodec_open2(libopus): {e}（构建需含 libopus 编码器；若为 \
+                 sample format 不匹配请检查 encoder/audio 帧格式配置）"
             )));
         }
 
@@ -276,7 +308,7 @@ impl OpusEncoder {
         unsafe {
             // 配帧：nb_samples / format / ch_layout。
             (*self.frame).nb_samples = FRAME_SAMPLES as std::ffi::c_int;
-            (*self.frame).format = ffmpeg::AV_SAMPLE_FMT_FLTP;
+            (*self.frame).format = ffmpeg::AV_SAMPLE_FMT_FLT;
             // 清掉残留的 data 指针（上一帧 get_buffer 分配的会被 free 于 unref，
             // 但 av_frame_get_buffer 要求 data 为空或已 unref）。
             // av_frame_get_buffer 内部会 av_frame_unref，故无需手动。
@@ -285,22 +317,19 @@ impl OpusEncoder {
             ffmpeg::av_frame_set_ch_layout(self.frame, &self.ch_layout)
                 .map_err(|e| EncodeError::InitFailed(format!("av_frame_set_ch_layout: {e}")))?;
 
-            // 分配 planar float32 平面缓冲（data[0]=L、data[1]=R）。
+            // 分配 packed float32 单平面缓冲（libopus 支持 FLT，interleaved
+            // 顺序与捕获侧一致）。
             ffmpeg::av_frame_get_buffer(self.frame, 0)
                 .map_err(|e| EncodeError::EncodeFailed(format!("av_frame_get_buffer: {e}")))?;
 
-            // deinterleave：interleaved [L,R,L,R,...] → data[0]=L plane、data[1]=R plane。
-            let l_ptr = (*self.frame).data[0] as *mut f32;
-            let r_ptr = (*self.frame).data[1] as *mut f32;
-            if l_ptr.is_null() || r_ptr.is_null() {
+            // 单平面整块拷贝：interleaved [L,R,L,R,...] → data[0]。
+            let data_ptr = (*self.frame).data[0] as *mut f32;
+            if data_ptr.is_null() {
                 return Err(EncodeError::EncodeFailed(
-                    "av_frame_get_buffer returned null audio plane".into(),
+                    "av_frame_get_buffer returned null audio buffer".into(),
                 ));
             }
-            for i in 0..FRAME_SAMPLES {
-                *l_ptr.add(i) = interleaved[i * 2];
-                *r_ptr.add(i) = interleaved[i * 2 + 1];
-            }
+            std::ptr::copy_nonoverlapping(interleaved.as_ptr(), data_ptr, FRAME_INTERLEAVED);
         }
 
         // 设 PTS（会话毫秒；符号缺失回退字段写——但音频帧字段 pts 在本仓库映射
@@ -460,6 +489,23 @@ impl AudioPipeline {
         let encoder = OpusEncoder::new()?;
         // 占位 rx（start() 时替换为真实通道）；Disconnected 状态下 next_packets
         // 返回空（不阻塞）。
+        let (tx, rx) = mpsc::channel::<AudioPcm>();
+        drop(tx);
+        Ok(Self {
+            capture,
+            encoder,
+            rx,
+            started: false,
+        })
+    }
+
+    /// M8-T032：创建麦克风捕获流水线（客户端本机麦克风 → 服务端播放，
+    /// talkback）。捕获端为 [`WasapiMicCapture`]（Windows `eCapture`；
+    /// 非 Windows 由 [`create_mic_capture`] 返回 `Err(Unsupported)` 优雅降级），
+    /// 编码参数与环回完全一致（Opus 48kHz/stereo/64kbps/20ms）。
+    pub fn new_mic() -> Result<Self, EncodeError> {
+        let capture = create_mic_capture()?;
+        let encoder = OpusEncoder::new()?;
         let (tx, rx) = mpsc::channel::<AudioPcm>();
         drop(tx);
         Ok(Self {
@@ -793,6 +839,46 @@ mod tests {
         // 无法强制「无设备」，仅验证 create_default_capture 不 panic；
         // 真实无设备场景在集成测试覆盖。
         let _ = create_default_capture();
+    }
+
+    /// M8-T032 Tests §mic：麦克风捕获创建/析构冒烟——Windows 下
+    /// `create_mic_capture` 不 panic（有麦克风 → Ok，无 → Err(InitFailed)）；
+    /// 非 Windows 返回 `Err(Unsupported)`（优雅降级路径）。
+    #[test]
+    fn test_mic_capture_create_drop() {
+        #[cfg(target_os = "windows")]
+        {
+            // 无法强制「无麦克风」，仅验证不 panic + 类型正确。
+            if let Ok(mut cap) = create_mic_capture() {
+                assert_eq!(cap.sample_rate(), SAMPLE_RATE);
+                assert_eq!(cap.channels(), CHANNELS);
+                cap.stop(); // 未 start 时 stop 幂等。
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let err = create_mic_capture().unwrap_err();
+            assert!(
+                matches!(err, EncodeError::Unsupported(_)),
+                "非 Windows mic 捕获须返回 Unsupported（优雅降级），got: {err}"
+            );
+        }
+    }
+
+    /// M8-T032 Tests §mic：`AudioPipeline::new_mic` 与环回参数一致
+    /// （48kHz/stereo；Windows 无麦克风 → Err 不 panic）。
+    #[test]
+    fn test_mic_pipeline_params() {
+        match AudioPipeline::new_mic() {
+            Ok(p) => {
+                assert_eq!(p.sample_rate(), SAMPLE_RATE);
+                assert_eq!(p.channels(), CHANNELS);
+            }
+            Err(e) => {
+                // Windows 无麦克风设备 / 非 Windows：Err 是合法降级路径。
+                tracing::info!("new_mic unavailable (expected on some envs): {e}");
+            }
+        }
     }
 
     /// 编码参数常量自洽（无 FFmpeg 也可跑）。

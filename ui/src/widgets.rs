@@ -247,6 +247,104 @@ pub fn copy_button(ui: &mut Ui, theme: &Theme, text: &str) -> (egui::Response, b
 /// M8-T028 (UI-BTY-028): 📋 复制成功反馈持续时间（按钮 ✓ 瞬态）。
 const COPY_BUTTON_FEEDBACK: std::time::Duration = std::time::Duration::from_millis(1500);
 
+/// M8-T036: 状态按钮（开/关二态颜色切换）——ON = 品牌蓝填充 + `on_primary`
+/// 文字，OFF = `bg_strong` 灰填充 + `fg_weak` 文字（与 `toggle_switch` 语义
+/// 一致：灰=停用，蓝=启用）。状态由调用方持有（`on` 为只读快照，点击后自行
+/// 翻转并持久化）。
+pub fn state_button(ui: &mut Ui, theme: &Theme, label: &str, on: bool) -> egui::Response {
+    let btn = egui::Button::new(
+        egui::RichText::new(label).color(if on { theme.on_primary } else { theme.fg_weak }),
+    );
+    let saved = ui.visuals().clone();
+    {
+        let v = ui.visuals_mut();
+        for w in [
+            &mut v.widgets.inactive,
+            &mut v.widgets.hovered,
+            &mut v.widgets.active,
+        ] {
+            w.bg_fill = if on { theme.primary } else { theme.bg_strong };
+            w.rounding = egui::Rounding::same(theme.rounding_control);
+        }
+    }
+    let resp = ui.add(btn);
+    *ui.visuals_mut() = saved;
+    resp
+}
+
+// ════════════════════════════════════════════════════════════════
+// 滑动开关（M8-T034）
+// ════════════════════════════════════════════════════════════════
+
+/// 滑动开关（M8-T034）：自绘圆角轨道 + 滑动圆钮，状态由调用方持有
+/// （`on` 为只读快照；调用方读 `.clicked()` 后自行翻转并持久化）。
+/// - ON = 品牌主色轨道 + `on_primary` 圆钮；OFF = `bg_strong` 轨道 +
+///   `fg_weak` 圆钮；仅 hover/pressed 状态色切换，无持续动画（UI-NF-001）；
+/// - `status` 渲染于开关右侧（small_size 弱色）——「连接状态放按钮上」。
+pub fn toggle_switch(
+    ui: &mut Ui,
+    theme: &Theme,
+    label: &str,
+    on: bool,
+    status: Option<&str>,
+) -> egui::Response {
+    const TRACK_W: f32 = 44.0;
+    const TRACK_H: f32 = 24.0;
+    const KNOB_D: f32 = 18.0;
+
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::Label::new(RichText::new(label).size(theme.body_size).color(theme.fg))
+                .selectable(false),
+        );
+        ui.add_space(4.0);
+        let (rect, resp) = ui.allocate_exact_size(
+            egui::vec2(TRACK_W, TRACK_H),
+            egui::Sense::click(),
+        );
+        let hovered = resp.hovered() || resp.highlighted();
+        let track_color = if on {
+            if hovered {
+                theme.primary_hover
+            } else {
+                theme.primary
+            }
+        } else if hovered {
+            theme.bg_panel
+        } else {
+            theme.bg_strong
+        };
+        let knob_color = if on { theme.on_primary } else { theme.fg_weak };
+        let painter = ui.painter();
+        painter.rect_filled(rect, TRACK_H / 2.0, track_color);
+        painter.rect_stroke(
+            rect,
+            TRACK_H / 2.0,
+            Stroke::new(theme.border_width, theme.border),
+        );
+        // 圆钮位置：ON 靠右 / OFF 靠左（瞬时跳变，无持续动画）。
+        let cx = if on {
+            rect.right() - KNOB_D / 2.0 - 3.0
+        } else {
+            rect.left() + KNOB_D / 2.0 + 3.0
+        };
+        painter.circle_filled(egui::pos2(cx, rect.center().y), KNOB_D / 2.0, knob_color);
+        if let Some(status) = status {
+            ui.add_space(6.0);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(status)
+                        .size(theme.small_size)
+                        .color(theme.fg_weak),
+                )
+                .selectable(false),
+            );
+        }
+        resp
+    })
+    .inner
+}
+
 // ════════════════════════════════════════════════════════════════
 // 输入
 // ════════════════════════════════════════════════════════════════
@@ -382,11 +480,13 @@ pub fn labeled_input(
 // ════════════════════════════════════════════════════════════════
 
 /// StatCard 一行：键（弱色 Small）+ 值（Body/Mono）+ 可选复制按钮。
+/// `small`（M8-T034）：值改用 `theme.small_size`（身份卡整体小字号）。
 pub struct StatRow<'a> {
     pub key: &'a str,
     pub value: String,
     pub mono: bool,
     pub copy: bool,
+    pub small: bool,
 }
 
 /// 信息卡片（§4 StatCard）：标题栏（Small 弱色）+ 分隔线 + 键值行。
@@ -423,8 +523,17 @@ pub fn stat_card(ui: &mut Ui, theme: &Theme, title: &str, rows: &[StatRow<'_>]) 
                     ui.add_space(6.0);
                     let mut rt = RichText::new(&row.value).color(theme.fg);
                     if row.mono {
-                        rt = rt.monospace().size(theme.mono_size);
+                        rt = rt.monospace();
                     }
+                    // M8-T034: `small` → small_size（身份卡小字号）；否则按
+                    // mono/body 既有字号。
+                    rt = rt.size(if row.small {
+                        theme.small_size
+                    } else if row.mono {
+                        theme.mono_size
+                    } else {
+                        theme.body_size
+                    });
                     ui.add(egui::Label::new(rt).selectable(true));
                     if row.copy {
                         let (_, was_copied) = copy_button(ui, theme, &row.value);
@@ -641,12 +750,14 @@ mod tests {
                                 value: "my-pc".to_owned(),
                                 mono: true,
                                 copy: true,
+                                small: true,
                             },
                             StatRow {
                                 key: "API:",
                                 value: "Ready".to_owned(),
                                 mono: false,
                                 copy: false,
+                                small: false,
                             },
                         ],
                     );
@@ -737,10 +848,48 @@ mod tests {
         });
     }
 
+    /// M8-T034: 滑动开关 headless 行为——正常渲染（含状态文字）不 panic、
+    /// 无点击不上抛；帧 2 点击轨道 → `clicked()` 上抛（on 翻转由调用方完成，
+    /// 组件本身只报点击）。
+    #[test]
+    fn test_toggle_switch_click_and_layout() {
+        let ctx = egui::Context::default();
+        let mut switch_rect = egui::Rect::NOTHING;
+        ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let t = &Theme::LIGHT;
+                let r = toggle_switch(ui, t, "允许受控", true, Some("监听中 :3389"));
+                switch_rect = r.rect;
+                assert!(r.enabled());
+                assert!(!r.clicked());
+                let r2 = toggle_switch(ui, t, "临时连接", false, None);
+                assert!(!r2.clicked());
+            });
+        });
+        // 帧 2：按下 + 释放（同一帧）→ 点击当帧生效。
+        let press = |pressed: bool| egui::Event::PointerButton {
+            pos: switch_rect.center(),
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        ctx.run(
+            egui::RawInput {
+                events: vec![press(true), press(false)],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let r = toggle_switch(ui, &Theme::LIGHT, "允许受控", true, Some("监听中 :3389"));
+                    assert!(r.clicked());
+                });
+            },
+        );
+    }
+
     /// 密文编辑启发式：追加/回删同步真实值。
     #[test]
-    fn test_secret_sync_heuristic() {
-        let mut value = "abc".to_owned();
+    fn test_secret_sync_heuristic() {        let mut value = "abc".to_owned();
         let prev: String = "•".repeat(value.chars().count());
         // 追加
         let mut edited = prev.clone();

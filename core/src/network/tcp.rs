@@ -1,10 +1,8 @@
-use std::net::Ipv6Addr;
-use std::net::SocketAddr;
-use std::net::SocketAddrV6;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// S-02 (F-5)：长度前缀消息默认上限（16 MiB，对齐
 /// `multiplex.rs` 的 [`DEFAULT_MAX_FRAME_LEN`]，同 crate 复用避免重复常量）。
@@ -13,10 +11,9 @@ use crate::connection::multiplex::DEFAULT_MAX_FRAME_LEN;
 /// Error types for TCP operations.
 #[derive(Debug, thiserror::Error)]
 pub enum TcpError {
-    #[error("Failed to bind to [{addr}]:{port}: {source}")]
+    #[error("Failed to bind to {socket}: {source}")]
     Bind {
-        addr: Ipv6Addr,
-        port: u16,
+        socket: SocketAddr,
         source: std::io::Error,
     },
     #[error("Failed to connect to {remote}: {source}")]
@@ -36,54 +33,187 @@ pub enum TcpError {
 }
 
 /// TCP server wrapper.
+///
+/// M8-T033：双栈监听。`[::]` 监听在 Windows 上为 IPv6-only（v4 连接被拒），
+/// 故按「v6 双栈 → v6-only + v4 双监听 → 仅 v4」逐级回退，保证 v4 客户端
+/// 可连（详见 [`TcpServer::bind`]）。`accept` 把 v4 连接统一映射为
+/// v4-mapped v6（`::ffff:a.b.c.d`），调用方签名不变。
 pub struct TcpServer {
-    listener: TcpListener,
+    /// 主监听：v6 双栈（v4-mapped 承接 v4）或 v6-only。
+    v6: Option<TcpListener>,
+    /// v4 兜底监听（仅 v6-only 路径存在；双栈路径无需）。
+    v4: Option<TcpListener>,
+    /// 统一端口（两监听同端口，取 v6 的实际端口）。
     port: u16,
 }
 
 impl TcpServer {
+    /// 双栈绑定 `port`（0 = 系统分配），逐级回退，任一成功即组合生效：
+    ///
+    /// 1. **v6 双栈**：socket2 v6 socket + `set_only_v6(false)` + `[::]:port`
+    ///    —— Linux/macOS 及支持 `IPV6_V6ONLY=0` 的 Windows 上一步到位
+    ///    （v4-mapped 连接由 v6 监听承接）；
+    /// 2. **v6-only + v4**：`set_only_v6(true)` 绑 `[::]:port` 成功 → 同端口
+    ///    再绑 `0.0.0.0:port`（Windows 典型路径）；v4 绑失败不影响 v6（仅日志）；
+    /// 3. **仅 v4**：v6 不可用（无 IPv6 栈）→ `0.0.0.0:port`。
     pub async fn bind(port: u16) -> Result<Self, TcpError> {
         debug!("TcpServer::bind(port={})", port);
-        let addr = format!("[::]:{}", port);
-        if let Ok(listener) = TcpListener::bind(&addr).await {
-            let addr = listener.local_addr()
-                .map_err(|e| TcpError::Bind {
-                    addr: Ipv6Addr::UNSPECIFIED, port, source: e,
-                })?;
-            return Ok(Self { listener, port: addr.port() });
+
+        // 1) v6 双栈（IPV6_V6ONLY=0）：v4-mapped 连接经 v6 监听承接。
+        if let Some(socket) = Self::new_v6_socket() {
+            let dual_ok = socket.set_only_v6(false).is_ok()
+                && socket
+                    .bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)).into())
+                    .is_ok();
+            if dual_ok {
+                match socket.listen(1024) {
+                    Ok(_) => {
+                        let listener = tokio::net::TcpListener::from_std(socket.into())
+                            .map_err(TcpError::Io)?;
+                        let addr = listener.local_addr().map_err(|source| TcpError::Bind {
+                            socket: SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)),
+                            source,
+                        })?;
+                        debug!("TcpServer::bind: dual-stack [::]:{}", addr.port());
+                        return Ok(Self {
+                            v6: Some(listener),
+                            v4: None,
+                            port: addr.port(),
+                        });
+                    }
+                    Err(e) => warn!("dual-stack listen [::]:{port} failed: {e}; trying v6-only + v4"),
+                }
+            }
         }
-        let addr4 = format!("0.0.0.0:{}", port);
-        let listener = TcpListener::bind(&addr4)
-            .await
-            .map_err(|e| TcpError::Bind {
-                addr: Ipv6Addr::UNSPECIFIED, port, source: e,
-            })?;
-        let addr = listener.local_addr()
-            .map_err(|e| TcpError::Bind {
-                addr: Ipv6Addr::UNSPECIFIED, port, source: e,
-            })?;
-        Ok(Self { listener, port: addr.port() })
+
+        // 2) v6-only + v4 兜底：显式 v6-only 绑 `[::]:port`（保证 v4 端口可用），
+        //    成功后再补绑同端口 `0.0.0.0`（v4 失败仅日志，v6 保持监听）。
+        if let Some(socket) = Self::new_v6_socket() {
+            let v6_only_ok = socket.set_only_v6(true).is_ok()
+                && socket
+                    .bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)).into())
+                    .is_ok();
+            if v6_only_ok {
+                match socket.listen(1024) {
+                    Ok(_) => {
+                        let v6 = match tokio::net::TcpListener::from_std(socket.into()) {
+                            Ok(l) => l,
+                            Err(e) => return Err(TcpError::Io(e)),
+                        };
+                        let addr = v6.local_addr().map_err(|source| TcpError::Bind {
+                            socket: SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)),
+                            source,
+                        })?;
+                        // 同端口补绑 v4（port=0 时以 v6 实际端口为准）。
+                        let v4 = match Self::bind_v4(addr.port()).await {
+                            Ok(l) => {
+                                debug!("TcpServer::bind: v4 fallback 0.0.0.0:{}", addr.port());
+                                Some(l)
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "v4 fallback bind 0.0.0.0:{} failed: {e}; \
+                                     v6-only listener keeps serving",
+                                    addr.port()
+                                );
+                                None
+                            }
+                        };
+                        return Ok(Self {
+                            v6: Some(v6),
+                            v4,
+                            port: addr.port(),
+                        });
+                    }
+                    Err(e) => warn!("v6-only listen [::]:{port} failed: {e}; trying v4-only"),
+                }
+            }
+        }
+
+        // 3) 仅 v4：无 IPv6 栈（或 v6 绑定失败）→ `0.0.0.0:port`。
+        let listener = Self::bind_v4(port).await?;
+        let addr = listener.local_addr()?;
+        debug!("TcpServer::bind: v4-only 0.0.0.0:{}", addr.port());
+        Ok(Self {
+            v6: None,
+            v4: Some(listener),
+            port: addr.port(),
+        })
     }
 
+    /// 创建 v6 TCP socket（失败 = 无 IPv6 栈）。
+    fn new_v6_socket() -> Option<socket2::Socket> {
+        socket2::Socket::new(
+            socket2::Domain::IPV6,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )
+        .ok()
+    }
+
+    /// 绑 `0.0.0.0:port` 监听（v4 兜底路径共用）。
+    async fn bind_v4(port: u16) -> Result<TcpListener, TcpError> {
+        TcpListener::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)))
+            .await
+            .map_err(|source| TcpError::Bind {
+                socket: SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)),
+                source,
+            })
+    }
+
+    /// Accept 一条入站连接。v4 连接映射为 v4-mapped v6（`::ffff:a.b.c.d`），
+    /// 下游限速/审计经 `IpAddr::to_canonical()` 还原 v4，行为不变。
     pub async fn accept(&self) -> Result<(TcpStream, SocketAddrV6), TcpError> {
-        let (stream, addr) = self.listener.accept().await?;
-        let v6_addr = match addr {
-            std::net::SocketAddr::V6(v6) => v6,
-            std::net::SocketAddr::V4(v4) => {
+        let (stream, addr) = match (&self.v6, &self.v4) {
+            (Some(v6), Some(v4)) => {
+                tokio::select! {
+                    r = v6.accept() => r?,
+                    r = v4.accept() => r?,
+                }
+            }
+            (Some(v6), None) => v6.accept().await?,
+            (None, Some(v4)) => v4.accept().await?,
+            (None, None) => unreachable!("TcpServer always holds at least one listener"),
+        };
+        Ok((stream, Self::map_addr(addr)))
+    }
+
+    /// 把 accept 得到的 [`SocketAddr`] 统一映射为 v6（v4 → v4-mapped）。
+    fn map_addr(addr: SocketAddr) -> SocketAddrV6 {
+        match addr {
+            SocketAddr::V6(v6) => v6,
+            SocketAddr::V4(v4) => {
                 let octets = v4.ip().octets();
                 SocketAddrV6::new(
-                    Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff,
+                    Ipv6Addr::new(
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0xffff,
                         (octets[0] as u16) << 8 | octets[1] as u16,
-                        (octets[2] as u16) << 8 | octets[3] as u16),
-                    v4.port(), 0, 0,
+                        (octets[2] as u16) << 8 | octets[3] as u16,
+                    ),
+                    v4.port(),
+                    0,
+                    0,
                 )
             }
-        };
-        Ok((stream, v6_addr))
+        }
     }
 
-    pub fn port(&self) -> u16 { self.port }
-    pub fn listener(&self) -> &TcpListener { &self.listener }
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// 主监听（v6 优先；纯 v4 环境返回 v4 监听）。
+    pub fn listener(&self) -> &TcpListener {
+        self.v6
+            .as_ref()
+            .or(self.v4.as_ref())
+            .expect("TcpServer always holds at least one listener")
+    }
 }
 
 /// TCP client for connecting to remote hosts.
@@ -178,19 +308,41 @@ mod tests {
 
     #[tokio::test]
     async fn test_connect_ipv4_loopback() {
-        // Note: TcpServer::bind's `[::]` listener is IPv6-only on Windows
-        // (v4 connects are refused), and TcpServer is frozen by the P2
-        // parallel contract — so bind a plain 127.0.0.1 listener here. The
-        // IPv6 loopback test below still exercises TcpServer.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        // M8-T033: TcpServer 双栈后 v4 回环直连可用（旧版 `[::]` 监听在
+        // Windows 为 IPv6-only、v4 被拒，此处只能绑裸 127.0.0.1 绕开）。
+        let server = TcpServer::bind(0).await.unwrap();
+        let port = server.port();
         let handle = tokio::spawn(async move {
-            listener.accept().await.unwrap();
+            server.accept().await.unwrap();
         });
         let remote = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
         let stream = TcpClient::connect(remote).await.unwrap();
         assert!(stream.peer_addr().is_ok());
         handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_dual_stack_accepts_ipv4() {
+        // M8-T033: 双栈路径（v6 双栈或 v6-only+v4 双监听）下 v4 回环可连
+        // TcpServer，且 accept 把 v4 地址映射为 v4-mapped v6 —— 下游限速/
+        // 审计 `to_canonical()` 还原 v4，行为不变。
+        let server = TcpServer::bind(0).await.unwrap();
+        let port = server.port();
+        let handle = tokio::spawn(async move {
+            server.accept().await.unwrap()
+        });
+        let remote = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        let stream = TcpClient::connect(remote).await.unwrap();
+        let (_stream, addr) = handle.await.unwrap();
+        // v4 连接 → v4-mapped v6（`::ffff:127.0.0.1`），下游 canonical 化还原 v4。
+        let octets = addr.ip().octets();
+        assert_eq!(&octets[..10], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(&octets[10..12], &[0xff, 0xff]);
+        assert_eq!(
+            addr.ip().to_canonical(),
+            std::net::IpAddr::from(Ipv4Addr::LOCALHOST)
+        );
+        assert!(stream.peer_addr().is_ok());
     }
 
     #[tokio::test]

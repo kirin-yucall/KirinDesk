@@ -26,8 +26,10 @@ use std::str::FromStr;
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// GitHub repository info for updates.
+/// M8-T036: 仓库名修正为 `KirinDesk`（与 git remote origin 完全一致；
+/// 检查更新走 GitHub Releases API，需在 GitHub 仓库发布 Release 后生效）。
 const GITHUB_OWNER: &str = "kirin-yucall";
-const GITHUB_REPO: &str = "kirin_desk";
+const GITHUB_REPO: &str = "KirinDesk";
 
 /// Update channel.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -214,6 +216,15 @@ impl Updater {
         };
 
         if !response.status().is_success() {
+            // M8-T036: 404 = 仓库尚无 Release（更新检查的常态失败）——给出可执行
+            // 的引导而非裸状态码（需在 GitHub 仓库发布 Release 后自动更新生效）。
+            if response.status() == reqwest::StatusCode::NOT_FOUND {
+                return UpdateStatus::Error(format!(
+                    "GitHub 仓库 {}/{} 暂无 Release 发布（HTTP 404）— \
+                     请在 GitHub 发布 Release 后重试",
+                    GITHUB_OWNER, GITHUB_REPO
+                ));
+            }
             return UpdateStatus::Error(format!("HTTP {}", response.status()));
         }
 

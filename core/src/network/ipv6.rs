@@ -90,6 +90,33 @@ pub fn is_global_unicast_ipv6(addr: &Ipv6Addr) -> bool {
     true
 }
 
+/// M8-T036: 是否**公网** IPv6 地址（对端可直接访问的全局单播）。
+///
+/// 在 `is_global_unicast_ipv6`（仅过滤环回/链路本地/组播/未指定）基础上进一步
+/// 剔除**非公网可达**段（公网检测据此判定「无公网 → 内网穿透」）：
+/// - `fc00::/7` 唯一本地地址 ULA（`fd00::1` 等，局域网可达 ≠ 公网可达）
+/// - `fe80::/10` 链路本地、`::1` 环回、`::` 未指定、`ff00::/8` 组播
+/// - `2001:db8::/32` 文档示例段（RIPE NCC 保留）
+pub fn is_public_ipv6(addr: &Ipv6Addr) -> bool {
+    if addr.is_loopback() || addr.is_multicast() || addr.is_unspecified() {
+        return false;
+    }
+    let octets = addr.octets();
+    // fe80::/10 = link-local
+    if octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80 {
+        return false;
+    }
+    // fc00::/7 = ULA（唯一本地地址）
+    if octets[0] == 0xfc || octets[0] == 0xfd {
+        return false;
+    }
+    // 2001:db8::/32 = 文档示例
+    if octets[0] == 0x20 && octets[1] == 0x01 && octets[2] == 0x0d && octets[3] == 0xb8 {
+        return false;
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,6 +143,30 @@ mod tests {
     fn test_is_global_unicast_accepts_ula() {
         let addr: Ipv6Addr = "fd00::1".parse().unwrap();
         assert!(is_global_unicast_ipv6(&addr));
+    }
+
+    #[test]
+    fn test_is_public_ipv6_rejects_non_public() {
+        for s in [
+            "fd00::1",     // ULA
+            "fc00::1",     // ULA
+            "fe80::1",     // 链路本地
+            "::1",         // 环回
+            "::",          // 未指定
+            "ff02::1",     // 组播
+            "2001:db8::1", // 文档示例
+        ] {
+            let addr: Ipv6Addr = s.parse().unwrap();
+            assert!(!is_public_ipv6(&addr), "{} 不应判为公网", s);
+        }
+    }
+
+    #[test]
+    fn test_is_public_ipv6_accepts_public() {
+        for s in ["2408:4000::1", "2606:4700:4700::1111", "2001:4860:4860::8888"] {
+            let addr: Ipv6Addr = s.parse().unwrap();
+            assert!(is_public_ipv6(&addr), "{} 应判为公网", s);
+        }
     }
 
     #[test]

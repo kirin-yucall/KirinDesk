@@ -203,8 +203,10 @@ impl IdentityManager {
     /// - 旧格式文件 `ed25519.json` 存在 → 自动迁移到系统钥匙串后端
     ///   （DPAPI / Keychain / secret-tool），**先写新后端并读回验证、再备份原文件**
     ///   （失败回退不覆盖，计划 §5 风险 3）；
-    /// - 文件存在但损坏 / 不可解密 → [`Ed25519Error::CorruptIdentity`] 报错 +
-    ///   审计告警，**不静默再生**；
+    /// - 文件存在但损坏 / 不可解密 → **M8-T031 未配发残留恢复**：仅当后端无
+    ///   身份且从未配发（无 `identity.provisioned` 标记）时，备份损坏文件为
+    ///   `ed25519.json.corrupt.<ts>` 后全新生成（与"全新安装"同语义）；
+    ///   曾配发或后端已有身份 → 维持 fail-closed / 后端优先（S-05 不放松）；
     /// - 存储全部丢失但曾配发过身份（`identity.provisioned` 标记）→ 拒绝启动；
     /// - 全新安装（无文件、无后端条目、无标记）→ 生成并持久化。
     pub fn load_or_generate(key_path: PathBuf, device_id: &str) -> Result<Self, Ed25519Error> {
@@ -225,16 +227,82 @@ impl IdentityManager {
         let label = identity_label(device_id);
         let marker = provision_marker_path(&key_path);
 
-        // 1) 旧格式文件存在 → 必须可迁移，否则 fail-closed。
+        // 1) 旧格式文件存在。
         if key_path.exists() {
             if !key_path.is_file() {
                 return Err(fail_corrupt(format!(
                     "identity path {key_path:?} exists but is not a regular file"
                 )));
             }
-            let secret = Self::try_migrate_legacy(&key_path, device_id, keystore, &label)?;
-            ensure_marker_has_label(&marker, &label)?;
-            return Self::from_secret(secret, key_path);
+            match Self::try_migrate_legacy(&key_path, device_id, keystore, &label) {
+                // 迁移成功 → 既有路径（原文件已备份，密钥已入后端）。
+                Ok(secret) => {
+                    ensure_marker_has_label(&marker, &label)?;
+                    return Self::from_secret(secret, key_path);
+                }
+                // M8-T031: 迁移失败（损坏/不可解密）→ 评估"未配发残留恢复"：
+                // 后端已有身份 → 忽略损坏旧文件，用后端身份继续（警告 + 审计）；
+                // 曾配发过 → 保持 fail-closed，不生成；
+                // 从未配发（无后端条目 + 无标记）→ 备份残留文件后走全新生成路径
+                // （与"全新安装"同语义）。安全边界（S-05 不放松）：恢复只对
+                // "从未配发 + 文件不可用"的残留生效，攻击者植入垃圾文件最多
+                // 触发重新生成新身份（同全新安装），不会绕过任何凭据校验。
+                Err(migrate_err) => {
+                    tracing::warn!(
+                        target: "identity",
+                        "legacy identity migration failed for {key_path:?}: {migrate_err}"
+                    );
+                    match keystore.get(&label) {
+                        Ok(Some(secret)) => {
+                            tracing::warn!(
+                                target: "identity",
+                                "legacy identity file {key_path:?} is unusable but keystore \
+                                 backend already holds {label:?}; ignoring stale legacy file \
+                                 (M8-T031)"
+                            );
+                            audit_identity_recovered(&format!(
+                                "path={key_path:?} label={label:?} action=used_keystore_identity"
+                            ));
+                            if let Err(e) = ensure_marker_has_label(&marker, &label) {
+                                tracing::warn!(
+                                    target: "identity",
+                                    "identity recovered from keystore but provision marker could \
+                                     not be updated: {e}"
+                                );
+                            }
+                            return Self::from_secret(secret, key_path);
+                        }
+                        Ok(None) => {}
+                        // fail-closed：后端故障不得作为换身份的理由。
+                        Err(e) => return Err(e.into()),
+                    }
+                    if marker_has_label(&marker, &label)? {
+                        return Err(fail_corrupt(format!(
+                            "legacy identity file {key_path:?} exists but cannot be decrypted \
+                             (device_id changed or file damaged) and identity {label:?} was \
+                             previously provisioned; refusing to generate a new identity"
+                        )));
+                    }
+                    // 从未配发 = 过期残留：备份损坏文件（0600）后走全新生成路径
+                    // （生成 + 落 keystore + 标记，与"全新安装"同语义）。
+                    if let Err(e) = crate::crypto::keystore::set_private_permissions(&key_path) {
+                        tracing::warn!(
+                            target: "identity",
+                            "cannot set private permissions on {key_path:?} before backup: {e}"
+                        );
+                    }
+                    let backup = corrupt_backup_path(&key_path);
+                    std::fs::rename(&key_path, &backup)?;
+                    tracing::warn!(
+                        target: "identity",
+                        "undecryptable legacy identity file {key_path:?} is an unprovisioned \
+                         leftover (M8-T031); backed up to {backup:?} and generating a new identity"
+                    );
+                    audit_identity_recovered(&format!(
+                        "path={key_path:?} label={label:?} action=generated_new backup={backup:?}"
+                    ));
+                }
+            }
         }
 
         // 2) 后端已有身份 → 直接使用（并补齐配发标记，幂等）。
@@ -278,6 +346,9 @@ impl IdentityManager {
     /// 2. `keystore.set` 写入新后端并读回验证；
     /// 3. 原文件先置 0600 再改名为 `ed25519.json.bak.<ts>`（备份保留，可删）。
     /// 任何一步失败 → 原文件原样保留，下次启动重试。
+    ///
+    /// M8-T031: 失败返回**普通错误**（不在此 fail-closed）——是否 fail-closed
+    /// 由 `load_or_generate_with` 依据"是否曾配发"统一裁决。
     fn try_migrate_legacy(
         key_path: &Path,
         device_id: &str,
@@ -286,7 +357,7 @@ impl IdentityManager {
     ) -> Result<Vec<u8>, Ed25519Error> {
         let enc_key = derive_identity_key(device_id);
         let legacy = Self::load(key_path.to_path_buf(), &enc_key).map_err(|e| {
-            fail_corrupt(format!(
+            Ed25519Error::Encryption(format!(
                 "legacy identity file {key_path:?} exists but cannot be decrypted \
                  (device_id changed or file damaged): {e}"
             ))
@@ -298,7 +369,7 @@ impl IdentityManager {
         match keystore.get(label) {
             Ok(Some(verify)) if verify == key_array => {}
             Ok(_) => {
-                return Err(fail_corrupt(format!(
+                return Err(Ed25519Error::Encryption(format!(
                     "migration read-back verification failed for {label:?}; \
                      original file {key_path:?} left untouched"
                 )))
@@ -382,6 +453,17 @@ fn provision_marker_path(key_path: &Path) -> PathBuf {
 
 /// 迁移备份路径：`<name>.bak.<unix_ts>`（时间戳避免覆盖历史备份）。
 fn legacy_backup_path(key_path: &Path) -> PathBuf {
+    backup_path(key_path, "bak")
+}
+
+/// M8-T031: 未配发残留备份路径：`<name>.corrupt.<unix_ts>`（损坏文件备份
+/// 保留，可删；时间戳避免覆盖历史备份）。
+fn corrupt_backup_path(key_path: &Path) -> PathBuf {
+    backup_path(key_path, "corrupt")
+}
+
+/// 共享备份路径构造：`<name>.<tag>.<unix_ts>`。
+fn backup_path(key_path: &Path, tag: &str) -> PathBuf {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -390,7 +472,18 @@ fn legacy_backup_path(key_path: &Path) -> PathBuf {
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "ed25519.json".to_string());
-    key_path.with_file_name(format!("{name}.bak.{ts}"))
+    key_path.with_file_name(format!("{name}.{tag}.{ts}"))
+}
+
+/// M8-T031: 身份凭证恢复审计（AuditLogger 独立打开；失败仅 warn，
+/// 不影响主流程——恢复是罕见一次性事件，开销可忽略）。
+fn audit_identity_recovered(detail: &str) {
+    use kirin_desk_utils::audit::{AuditEvent, AuditLogger};
+    if let Ok(mut logger) = AuditLogger::open_default() {
+        if let Err(e) = logger.record(AuditEvent::IdentityRecovered, detail) {
+            tracing::warn!(target: "identity", "identity recovery audit write failed: {e}");
+        }
+    }
 }
 
 /// fail-closed 告警 + 错误构造（审计告警走 tracing::error，身份不可静默更换）。
@@ -593,43 +686,114 @@ mod tests {
     }
 
     #[test]
-    fn s05_corrupt_file_fails_closed_not_overwritten() {
-        let dir = s05_temp_dir("corrupt");
+    fn s05_garbage_file_unprovisioned_recovers() {
+        // M8-T031: 垃圾文件 + 从未配发（无后端条目、无标记）= 过期残留 →
+        // 恢复（备份损坏文件后全新生成），不再 fail-closed。
+        let dir = s05_temp_dir("garbage");
         let path = dir.join("ed25519.json");
         let garbage = b"not a json file at all";
         std::fs::write(&path, garbage).unwrap();
 
         let ks = MemoryKeyStore::new();
-        let err = load_with(&ks, &dir, "dev-1").unwrap_err();
-        assert!(
-            matches!(err, Ed25519Error::CorruptIdentity(_)),
-            "expected CorruptIdentity, got {err:?}"
-        );
-        // 原文件未被覆盖，且未产生新身份
-        assert_eq!(std::fs::read(&path).unwrap(), garbage);
-        assert!(ks.get(&identity_label("dev-1")).unwrap().is_none());
+        let _ = load_with(&ks, &dir, "dev-1").unwrap();
+        // 新身份已落 keystore + 配发标记
+        assert_eq!(ks.get(&identity_label("dev-1")).unwrap().unwrap().len(), 32);
+        assert!(dir.join("identity.provisioned").exists());
+        // 损坏文件已备份为 ed25519.json.corrupt.<ts>（原路径不再覆盖）
+        assert!(!path.exists());
+        let corrupt: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("ed25519.json.corrupt."))
+            .collect();
+        assert_eq!(corrupt.len(), 1, "expected exactly one corrupt backup");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn s05_undecryptable_legacy_fails_closed() {
+    fn s05_undecryptable_legacy_unprovisioned_recovers() {
+        // M8-T031: 旧格式文件不可解密（device_id 变动）+ 从未配发 → 恢复：
+        // 备份损坏文件 → 全新生成身份（等价全新安装），不再 fail-closed。
         let dir = s05_temp_dir("undecryptable");
         let path = dir.join("ed25519.json");
         // 用另一 device_id 的密钥写旧格式 → 当前 device_id 解不开
         let id = IdentityManager::generate(path.clone()).unwrap();
         id.save(&derive_identity_key("other-device")).unwrap();
-        let before = std::fs::read(&path).unwrap();
 
         let ks = MemoryKeyStore::new();
+        let loaded = load_with(&ks, &dir, "dev-1").unwrap();
+        // 新身份已持久化（keystore + 标记）
+        assert_eq!(ks.get(&identity_label("dev-1")).unwrap().unwrap().len(), 32);
+        assert!(dir.join("identity.provisioned").exists());
+        // 原文件已备份为 ed25519.json.corrupt.<ts>（不覆盖）
+        assert!(!path.exists());
+        let corrupt: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("ed25519.json.corrupt."))
+            .collect();
+        assert_eq!(corrupt.len(), 1, "expected exactly one corrupt backup");
+
+        // 二次加载 → 同一身份
+        let again = load_with(&ks, &dir, "dev-1").unwrap();
+        assert_eq!(loaded.public_key_base64(), again.public_key_base64());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn s05_undecryptable_legacy_provisioned_fails_closed() {
+        // M8-T031 安全边界: 曾配发过（marker 含 label）+ 后端条目丢失 + 旧文件
+        // 不可解密 → 维持 fail-closed（不生成新身份、不动损坏文件）。
+        let dir = s05_temp_dir("provisioned");
+        let ks = MemoryKeyStore::new();
+
+        // 先正常配发（生成标记）
+        let _ = load_with(&ks, &dir, "dev-1").unwrap();
+        assert!(dir.join("identity.provisioned").exists());
+        // 模拟身份存储丢失 + 残留损坏旧文件
+        ks.delete(&identity_label("dev-1")).unwrap();
+        let path = dir.join("ed25519.json");
+        let id = IdentityManager::generate(path.clone()).unwrap();
+        id.save(&derive_identity_key("other-device")).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
         let err = load_with(&ks, &dir, "dev-1").unwrap_err();
         assert!(
             matches!(err, Ed25519Error::CorruptIdentity(_)),
             "expected CorruptIdentity, got {err:?}"
         );
-        // 原文件原样保留
+        // 原文件原样保留（fail-closed 不产生 corrupt 备份）
         assert_eq!(std::fs::read(&path).unwrap(), before);
-        assert!(ks.get(&identity_label("dev-1")).unwrap().is_none());
+        let corrupt: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("ed25519.json.corrupt."))
+            .collect();
+        assert!(corrupt.is_empty(), "fail-closed must not back up the file");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn s05_keystore_entry_with_corrupt_legacy_uses_backend() {
+        // M8-T031: 后端已有身份 + 旧文件损坏 → 忽略损坏文件，用后端身份继续。
+        let dir = s05_temp_dir("ks_backend");
+        let ks = MemoryKeyStore::new();
+
+        let first = load_with(&ks, &dir, "dev-1").unwrap();
+        // 植入损坏旧文件（后端条目与标记保留）
+        let path = dir.join("ed25519.json");
+        std::fs::write(&path, b"not a json file at all").unwrap();
+
+        let loaded = load_with(&ks, &dir, "dev-1").unwrap();
+        // 后端身份优先，公钥一致；标记保持
+        assert_eq!(first.public_key_base64(), loaded.public_key_base64());
+        assert!(dir.join("identity.provisioned").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

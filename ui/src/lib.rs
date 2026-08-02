@@ -50,8 +50,9 @@ use terminal::Terminal;
 use theme::{Theme, ThemeMode};
 use widgets::{
     action_button, badge, card, copy_button, labeled_input, log_view, segmented_control,
-    selectable_pill, stat_card, status_dot, status_dot_char, stepper, toolbar_button, BadgeKind,
-    ButtonKind, ButtonState, LogViewOptions, StatRow, Validity,
+    selectable_pill, stat_card, state_button, status_dot, status_dot_char, stepper,
+    toggle_switch, toolbar_button, BadgeKind, ButtonKind, ButtonState, LogViewOptions, StatRow,
+    Validity,
 };
 
 // M10: 设备列表持久化 + DNS 发现连接。
@@ -72,7 +73,7 @@ use kirin_desk_input::injector::{
 use kirin_desk_media::encoder::types::{EncodedPacket, PacketKind, Timestamp};
 use kirin_desk_media::proto::DisplayInfo;
 use kirin_desk_media::transport::{
-    ChannelTag, ControlMessage, SecureChannelReceiver, SecureChannelSender,
+    ChannelTag, ControlMessage, MAX_PACKET_PAYLOAD, SecureChannelReceiver, SecureChannelSender,
 };
 // M14-T005: 自动更新（Settings Update 面板 + 每周后台检查）。
 use kirin_desk_updater::{InstallOutcome, ReleaseInfo, UpdateChannel, UpdateStatus, Updater};
@@ -106,6 +107,79 @@ fn server_stop_signal() -> &'static AtomicBool {
     &STOP
 }
 
+/// M8-T034: 服务端真实运行态（监听线程写 → GUI 每帧读）。
+/// 修复旧实现「bind 失败只打日志、`server_running` 保持 true」的假死：
+/// 失败时写 `error` 并置 `listening=false`，开关即时回 OFF 并展示原因。
+#[derive(Debug, Clone, Default)]
+struct ServerRuntimeState {
+    /// bind 进行中（GUI 点击后置位，监听线程 bind 完成后复位）。
+    starting: bool,
+    /// 是否在监听（bind 成功且未 stop）。
+    listening: bool,
+    /// 实际监听端口（bind 成功后写回；0 = 未知）。
+    port: u16,
+    /// bind/运行错误（None = 无错误；Some → 开关回 OFF 并展示原因）。
+    error: Option<String>,
+}
+
+/// 服务端运行态共享槽（GUI 每帧读，监听线程写）。
+fn server_runtime_state() -> &'static Mutex<ServerRuntimeState> {
+    static S: OnceLock<Mutex<ServerRuntimeState>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(ServerRuntimeState::default()))
+}
+
+/// M8-T036: 公网出口探测状态（Dashboard「公网检测」混合判定的一部分）。
+/// 仅当本地地址全部非公网时触发一次：后台线程向 `api.ipify.org` 查询公网出口
+/// IP（4s 超时）；探测结果与本地任一地址相同 → 本机直持公网地址。
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum PublicProbeState {
+    /// 未触发（本地已有公网地址时保持）。
+    Idle,
+    /// 探测线程运行中。
+    Probing,
+    /// 已完成（None = 探测失败/无网络）。
+    Done(Option<std::net::IpAddr>),
+}
+
+fn public_probe_state() -> &'static Mutex<PublicProbeState> {
+    static S: OnceLock<Mutex<PublicProbeState>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(PublicProbeState::Idle))
+}
+
+/// 惰性触发一次公网出口探测（仅 Idle → Probing 时启动线程；线程结束后写回）。
+fn ensure_public_probe() {
+    let mut state = public_probe_state().lock().unwrap();
+    if *state != PublicProbeState::Idle {
+        return;
+    }
+    *state = PublicProbeState::Probing;
+    drop(state);
+    std::thread::spawn(|| {
+        let ip = probe_public_ip();
+        *public_probe_state().lock().unwrap() = PublicProbeState::Done(ip);
+        tracing::info!(
+            "[public-ip] external probe finished: {}",
+            ip.map(|i| i.to_string()).unwrap_or_else(|| "failed".to_string())
+        );
+    });
+}
+
+/// 公网出口 IP 探测：纯 TCP HTTP GET `api.ipify.org`（无 TLS 依赖，4s 超时）。
+fn probe_public_ip() -> Option<std::net::IpAddr> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+    let addr: std::net::SocketAddr = "api.ipify.org:80".parse().ok()?;
+    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(4)).ok()?;
+    s.set_read_timeout(Some(Duration::from_secs(4))).ok()?;
+    s.write_all(b"GET / HTTP/1.1\r\nHost: api.ipify.org\r\nConnection: close\r\n\r\n")
+        .ok()?;
+    let mut buf = String::new();
+    s.read_to_string(&mut buf).ok()?;
+    let body = buf.rsplit("\r\n\r\n").next().unwrap_or("").trim();
+    body.parse::<std::net::IpAddr>().ok()
+}
+
 /// Shared connection status (server/connect threads → GUI).
 fn connection_status() -> &'static Mutex<String> {
     static S: OnceLock<Mutex<String>> = OnceLock::new();
@@ -127,10 +201,90 @@ pub(crate) fn audio_enabled() -> bool {
 }
 
 /// R-04：音频开关写入（Settings 勾选 / CLI `--no-audio` 解析）。
+///
+/// M8-T032：本开关为**总开关**——`false` 同时关三个子开关
+/// （① 服务端发送 / ② 客户端播放 / ③ 客户端麦克风回传），兼容
+/// CLI `--no-audio` 全关语义；重新开启 → 三个子开关恢复默认
+/// （开 / 开 / 关，M8-T032 §3.1）。
 pub(crate) fn set_audio_enabled(enabled: bool) {
     audio_enabled_global().store(enabled, Ordering::Relaxed);
+    if !enabled {
+        set_server_audio_allowed(false);
+        set_client_audio_play(false);
+        set_client_mic_enabled(false);
+    }
     tracing::info!(
         "[audio] session audio {}",
+        if enabled { "enabled" } else { "disabled" }
+    );
+}
+
+// ════════════════════════════════════════════════════════════════
+// M8-T032：音频三开关（进程级原子量，会话任务循环内逐轮读取——
+// 运行时切换立即生效，无需重连）
+// ════════════════════════════════════════════════════════════════
+
+/// ① 服务端「允许麦克风」：服务端是否把本机声音（WASAPI 环回）传给客户端。
+/// Dashboard Server 卡开关读写；关 → 服务端不启动/停止音频发送。
+/// M8-T035：**默认关**（需求 8；总开关开启不回写子开关默认值，故
+/// 「总开关 开→关→开」循环后本开关仍保持关）。
+fn server_audio_allowed_global() -> &'static AtomicBool {
+    static ALLOWED: AtomicBool = AtomicBool::new(false);
+    &ALLOWED
+}
+
+/// ① 读取。
+pub(crate) fn server_audio_allowed() -> bool {
+    server_audio_allowed_global().load(Ordering::Relaxed)
+}
+
+/// ① 写入（Dashboard 开关）。
+pub(crate) fn set_server_audio_allowed(enabled: bool) {
+    server_audio_allowed_global().store(enabled, Ordering::Relaxed);
+    tracing::info!(
+        "[audio] server audio (loopback → client) {}",
+        if enabled { "enabled" } else { "disabled" }
+    );
+}
+
+/// ② 客户端「播放音频」：是否播放服务端传来的音频。连接窗口开关读写；
+/// 关 → 丢弃到达的音频包（动态静音）。默认开。
+fn client_audio_play_global() -> &'static AtomicBool {
+    static PLAY: AtomicBool = AtomicBool::new(true);
+    &PLAY
+}
+
+/// ② 读取。
+pub(crate) fn client_audio_play() -> bool {
+    client_audio_play_global().load(Ordering::Relaxed)
+}
+
+/// ② 写入（连接窗口开关）。
+pub(crate) fn set_client_audio_play(enabled: bool) {
+    client_audio_play_global().store(enabled, Ordering::Relaxed);
+    tracing::info!(
+        "[audio] client playback {}",
+        if enabled { "enabled" } else { "muted" }
+    );
+}
+
+/// ③ 客户端「麦克风」：是否捕获本机麦克风并回传服务端播放（talkback）。
+/// 连接窗口开关读写；关 → 停发（动态）。**默认关**（新功能，旧行为零变化）。
+fn client_mic_enabled_global() -> &'static AtomicBool {
+    static MIC: AtomicBool = AtomicBool::new(false);
+    &MIC
+}
+
+/// ③ 读取。
+pub(crate) fn client_mic_enabled() -> bool {
+    client_mic_enabled_global().load(Ordering::Relaxed)
+}
+
+/// ③ 写入（连接窗口开关）。
+pub(crate) fn set_client_mic_enabled(enabled: bool) {
+    client_mic_enabled_global().store(enabled, Ordering::Relaxed);
+    tracing::info!(
+        "[audio] client microphone (talkback) {}",
         if enabled { "enabled" } else { "disabled" }
     );
 }
@@ -2520,6 +2674,41 @@ impl FileSession {
     }
 }
 
+/// P2（修复计划 2026-08-03）：音频包发送——大小分流 + 失败不中断。
+///
+/// - 单包 ≤ [`MAX_PACKET_PAYLOAD`]（≈1151B）走 `send_packets` 小分片路径
+///   （与未来 QUIC datagram 迁移语义一致，保持"音频不排视频大帧后面"的
+///   设计意图）；
+/// - 超限（高码率 opus 单帧可至 1275B > 1151B）改走 `send_big_packet`
+///   大帧路径（16 MiB 上限，与视频/文件传输共用）；
+/// - 任一路径失败仅记 warn 丢弃该批（音频可丢，播放端静音补位），**不中断
+///   发送循环**——与视频"失败即断"语义区分，杜绝一帧超限静音整条音频。
+async fn send_audio_packets(
+    sender: &Arc<tokio::sync::Mutex<SecureChannelSender>>,
+    pkts: &[EncodedPacket],
+) {
+    let mut s = sender.lock().await;
+    let mut small: Vec<EncodedPacket> = Vec::new();
+    let mut big: Vec<EncodedPacket> = Vec::new();
+    for pkt in pkts {
+        if pkt.data.len() > MAX_PACKET_PAYLOAD {
+            big.push(pkt.clone());
+        } else {
+            small.push(pkt.clone());
+        }
+    }
+    if !small.is_empty() {
+        if let Err(e) = s.send_packets(&small).await {
+            tracing::warn!("Audio send failed (small path): {e} — dropping batch");
+        }
+    }
+    for pkt in big {
+        if let Err(e) = s.send_big_packet(&pkt).await {
+            tracing::warn!("Audio send failed (big path): {e} — dropping packet");
+        }
+    }
+}
+
 /// M10-T001/T003: 共享客户端会话启动器（IP 模式 + Domain 模式共用）。
 ///
 /// 流程: TCP 连接 → 完整握手（`ClientTrust` 信任策略：known_hosts 指纹 / DNS TXT
@@ -3096,6 +3285,75 @@ async fn run_client_session_with_channel(
         }
         None
     };
+    // M8-T032：② 播放开关进程级持久——上次会话关闭的播放开关跨会话保持，
+    // 新会话初始徽标对齐（关 → 静音；总开关关时不覆盖 Disabled）。
+    if audio_pkt_tx.is_some() && !client_audio_play() {
+        if let Ok(mut m) = audio_window_state().lock() {
+            m.insert(session_id, AudioUiState::Muted);
+        }
+    }
+
+    // M8-T032：③ 客户端麦克风回传（talkback）——本机麦克风 → 服务端播放。
+    // 捕获+编码为阻塞调用 → blocking 线程池；`client_mic_enabled()` 逐轮读取
+    // （关 → 停发，动态生效）；批次经 tokio 通道交发送循环（与输入/控制/文件
+    // 写半互斥，tag=Audio，wire 映射与 ChannelTag 对齐——无需协议改动）。
+    // 会话结束（窗口关闭 / 断链）→ 发送循环退出 → 通道关闭 → 捕获线程退出。
+    if audio_enabled_global().load(Ordering::Relaxed) {
+        let sender_mic = sender_shared.clone();
+        let (mic_pkt_tx, mut mic_pkt_rx) =
+            tokio::sync::mpsc::channel::<Vec<EncodedPacket>>(32);
+        tokio::task::spawn_blocking(move || {
+            let mut pipeline = match kirin_desk_media::AudioPipeline::new_mic() {
+                Ok(p) => p,
+                Err(e) => {
+                    // 非 Windows / 无麦克风设备：优雅降级（info 日志，视频/键鼠不受影响）。
+                    tracing::info!("Microphone disabled (pipeline init failed): {e}");
+                    return;
+                }
+            };
+            if let Err(e) = pipeline.start() {
+                tracing::info!("Microphone disabled (capture start failed): {e}");
+                return;
+            }
+            tracing::info!(
+                "Microphone capture started ({}Hz/{}ch)",
+                pipeline.sample_rate(),
+                pipeline.channels()
+            );
+            loop {
+                // M8-T032：③ 动态门控——关 → 停发（消费丢弃防通道堆积）；
+                // 再开 → 恢复（无需重连）。
+                if !client_mic_enabled() {
+                    let _ = pipeline.next_packets();
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    continue;
+                }
+                match pipeline.next_packets() {
+                    Ok(pkts) if !pkts.is_empty() => {
+                        // 发送循环忙（通道满）→ 丢批次（音频可丢，播放端静音补位）。
+                        if mic_pkt_tx.try_send(pkts).is_err() {
+                            tracing::debug!("Mic batch dropped (send loop busy)");
+                        }
+                    }
+                    Ok(_) => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(e) => {
+                        tracing::warn!("Microphone pipeline error: {e} — stopping mic");
+                        break;
+                    }
+                }
+            }
+            tracing::info!("Microphone capture stopped");
+        });
+        // 发送循环：会话结束（stop / 断链）→ 通道关闭 → 退出。
+        tokio::spawn(async move {
+            while let Some(pkts) = mic_pkt_rx.recv().await {
+                // P2（修复计划 2026-08-03）：大小分流 + 失败不中断（音频可丢）。
+                send_audio_packets(&sender_mic, &pkts).await;
+            }
+        });
+    }
 
     // 2. 接收循环（tokio，瘦身：仅重组 + 投递 DecoderPacket，不再解码）。
     // NOTE: runs in the SAME tokio runtime as the handshake to avoid
@@ -3109,6 +3367,8 @@ async fn run_client_session_with_channel(
         let mut current_fps: f32 = 0.0;
         let mut current_bandwidth: f32 = 0.0;
         let mut current_resolution = String::new();
+        // M8-T032：② 播放开关上次值（状态变化检测 → 徽标同步）。
+        let mut audio_play_last = client_audio_play();
         loop {
             // M9/P1F: tag 分帧接收——按 tag 分发（Video → 解码；Clipboard → 剪贴板）。
             let (tag, _header, payload) = match video_receiver.recv_tagged().await {
@@ -3180,14 +3440,32 @@ async fn run_client_session_with_channel(
             }
             // R-04：音频包（Opus 帧）→ 音频解码/播放线程（PTS 来自帧头，
             // jitter 排序 + WASAPI 播放；会话开关关闭时服务端不发音频包）。
+            // M8-T032：② 播放开关——关 → 丢弃到达的包（动态静音），
+            // 状态切换时同步徽标（静音/播放中）。
             if tag == ChannelTag::Audio {
-                if let Some(tx) = &audio_pkt_tx {
-                    let pkt = kirin_desk_media::decoder::AudioPacket {
-                        pts: _header.pts,
-                        data: payload,
-                    };
-                    if tx.send(pkt).is_err() {
-                        break; // 音频线程已退出（会话结束）
+                let play = client_audio_play();
+                if play != audio_play_last && audio_pkt_tx.is_some() {
+                    if let Ok(mut m) = audio_window_state().lock() {
+                        m.insert(
+                            session_id,
+                            if play {
+                                AudioUiState::Playing
+                            } else {
+                                AudioUiState::Muted
+                            },
+                        );
+                    }
+                }
+                audio_play_last = play;
+                if play {
+                    if let Some(tx) = &audio_pkt_tx {
+                        let pkt = kirin_desk_media::decoder::AudioPacket {
+                            pts: _header.pts,
+                            data: payload,
+                        };
+                        if tx.send(pkt).is_err() {
+                            break; // 音频线程已退出（会话结束）
+                        }
                     }
                 }
                 continue;
@@ -3433,6 +3711,9 @@ struct KirinDeskApp {
     /// GoDaddy API base URL（Settings 未保存时回退生产环境）。
     api_url: String,
     domain: String,
+    /// M8-T035 (需求 10-12): DNS 域名维护服务商 id（Settings DNS 组 ComboBox；
+    /// 值 = `dns_providers` 注册表 id，未知值回退 "godaddy"）。
+    dns_provider: String,
     device_id: String,
     nickname: String,
     challenge_code: String,
@@ -3454,6 +3735,8 @@ struct KirinDeskApp {
     next_pending_id: u64,
     // Status bar
     local_ipv6: String,
+    // M8-T033: 本机全局 IPv4（身份卡展示；无则 "N/A"）。
+    local_ipv4: String,
     config_loaded: bool,
     // Real-time log display
     gui_log: String,
@@ -3495,6 +3778,8 @@ struct KirinDeskApp {
     temp_window_was_active: bool,
     /// 卡片内操作结果提示（enable 失败等）。
     temp_status: String,
+    /// M8-T034: Dashboard 服务端设置保存反馈（小保存按钮旁展示）。
+    dashboard_status: String,
     /// M8-T028 (UI-BTY-028): 复制成功浮出提示（(预览文案, 点击时刻)，2s 自动消失）。
     copied_feedback: Option<(String, std::time::Instant)>,
 }
@@ -3738,6 +4023,32 @@ impl eframe::App for KirinDeskApp {
         self.temp_window_was_active = temp_active;
         if temp_active {
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        }
+
+        // M8-T034: 每帧从共享运行态同步服务端状态——bind 失败 / 监听线程
+        // 退出即时反映到「允许受控」开关（修复旧实现 bind 失败只打日志、
+        // `server_running` 假死）。`server_status` 保留连接审批等消息文案
+        // （仅「Starting…」阶段由运行态接管为「监听中 :port」）。
+        {
+            let stop_requested = server_stop_signal().load(Ordering::Relaxed);
+            let st = server_runtime_state().lock().unwrap();
+            if st.starting {
+                // bind 进行中（乐观态：点击后 → 线程写回结果前保持 ON）。
+                self.server_running = true;
+            } else if st.listening && !stop_requested {
+                self.server_running = true;
+                if self.server_status.is_empty() || self.server_status.starts_with("Starting") {
+                    self.server_status = format!("监听中 :{}", st.port);
+                }
+            } else if self.server_running {
+                // 已请求停止（线程退出中）或从未成功（bind 失败）→ 回 OFF。
+                self.server_running = false;
+                self.server_status = st
+                    .error
+                    .clone()
+                    .map(|e| format!("启动失败: {}", e))
+                    .unwrap_or_else(|| "已停止".to_string());
+            }
         }
 
         // --- Approval dialog (top-level modal for pending connections) ---
@@ -4442,6 +4753,45 @@ impl eframe::App for KirinDeskApp {
                                             .clicked()
                                         {
                                             win.show_special_key_panel = !win.show_special_key_panel;
+                                        }
+                                        // M8-T032：② 播放音频开关（进程级原子量，
+                                        // 会话内动态生效，无需重连）。关 → 丢弃
+                                        // 到达的音频包（动态静音）+ 徽标立即同步。
+                                        if audio_enabled_global().load(Ordering::Relaxed) {
+                                            let mut play = client_audio_play();
+                                            if toolbar_button(
+                                                ui,
+                                                &theme,
+                                                if play { "🔊" } else { "🔇" },
+                                                "播放音频：服务端声音 → 本机（关闭 = 静音）",
+                                            )
+                                            .clicked()
+                                            {
+                                                play = !play;
+                                                set_client_audio_play(play);
+                                                win.audio_state = if play {
+                                                    AudioUiState::Playing
+                                                } else {
+                                                    AudioUiState::Muted
+                                                };
+                                                if let Ok(mut m) = audio_window_state().lock() {
+                                                    m.insert(win.session_id, win.audio_state);
+                                                }
+                                            }
+                                            // M8-T032：③ 麦克风开关（talkback）——
+                                            // 本机麦克风 → 服务端播放（默认关）。
+                                            let mut mic = client_mic_enabled();
+                                            if toolbar_button(
+                                                ui,
+                                                &theme,
+                                                if mic { "🎙️" } else { "🎤" },
+                                                "麦克风：本机麦克风 → 服务端播放（talkback，默认关）",
+                                            )
+                                            .clicked()
+                                            {
+                                                mic = !mic;
+                                                set_client_mic_enabled(mic);
+                                            }
                                         }
                                         if toolbar_button(ui, &theme, "📁", "文件传输面板 (拖拽发送)")
                                             .clicked()
@@ -5149,7 +5499,14 @@ impl KirinDeskApp {
             self.api_secret = cfg.godaddy.api_secret;
             self.api_url = cfg.godaddy.api_url.clone();
             self.domain = cfg.godaddy.domain;
-            self.device_id = cfg.device.id;
+            // M8-T035 (需求 11): DNS 服务商加载（非法 id 回退 "godaddy"）。
+            self.dns_provider = cfg.dns.provider.clone();
+            if kirin_desk_utils::dns_providers::dns_provider_def(&self.dns_provider).is_none() {
+                self.dns_provider = "godaddy".to_string();
+            }
+            // M8-T031: 配置留空 / 旧占位 `default-device` → 自动派生
+            // （系统盘硬盘 UUID 等）；显式值原样保留。
+            self.device_id = kirin_desk_utils::device::effective_device_id(&cfg.device.id);
             self.nickname = cfg.device.nickname;
             self.challenge_code = cfg.device.challenge_code;
             self.allowed_domains = cfg.network.allowed_domains.join(", ");
@@ -5180,12 +5537,15 @@ impl KirinDeskApp {
         } else {
             self.local_ipv6 = "N/A".to_string();
         }
-        // Load or generate persistent device identity
-        let device_id = if self.device_id.is_empty() {
-            "default"
+        // M8-T033: 本机全局 IPv4（失败显示 N/A）。
+        if let Ok(ip) = kirin_desk_core::network::ipv4::get_global_ipv4() {
+            self.local_ipv4 = ip.to_string();
         } else {
-            &self.device_id
-        };
+            self.local_ipv4 = "N/A".to_string();
+        }
+        // Load or generate persistent device identity
+        // M8-T031: device_id 已解析（空/占位 → 自动硬盘 UUID），不再回落 "default"。
+        let device_id = &self.device_id;
         match IdentityManager::load_or_generate(
             std::path::PathBuf::from(
                 dirs_next::home_dir()
@@ -5261,246 +5621,364 @@ impl KirinDeskApp {
     fn show_dashboard(&mut self, ui: &mut egui::Ui, theme: &Theme) {
         ui.heading("Dashboard");
         ui.separator();
-
-        // M15-T008: ① 身份信息卡（值 Mono + 📋 复制按钮）
-        let wl = if self.allowed_domains.is_empty() {
-            "Any (insecure)".to_string()
-        } else {
-            self.allowed_domains.clone()
-        };
-        let api = if self.api_key.is_empty() {
-            "Not set"
-        } else {
-            "Ready"
-        };
-        // M8-T028 (UI-BTY-024): 身份卡三行（Device ID / IPv6 / Domain）均带 📋；
-        // stat_card 返回本帧复制的内容 → 状态栏浮出提示（UI-BTY-028）。
-        if let Some(copied) = stat_card(
-            ui,
-            theme,
-            "Identity",
-            &[
-                StatRow {
-                    key: "Device ID:",
-                    value: self.device_id.clone(),
-                    mono: true,
-                    copy: true,
-                },
-                StatRow {
-                    key: "Nickname:",
-                    value: self.nickname.clone(),
-                    mono: false,
-                    copy: false,
-                },
-                StatRow {
-                    key: "IPv6:",
-                    value: self.local_ipv6.clone(),
-                    mono: true,
-                    copy: true,
-                },
-                StatRow {
-                    key: "Domain:",
-                    value: self.domain.clone(),
-                    mono: true,
-                    copy: true,
-                },
-                StatRow {
-                    key: "Listen Port:",
-                    value: self.listen_port.clone(),
-                    mono: true,
-                    copy: false,
-                },
-                StatRow {
-                    key: "API:",
-                    value: api.to_string(),
-                    mono: false,
-                    copy: false,
-                },
-                StatRow {
-                    key: "Allowed:",
-                    value: wl,
-                    mono: false,
-                    copy: false,
-                },
-            ],
-        ) {
-            self.notify_copied(&copied);
-        }
-        ui.add_space(theme.spacing);
-
-        // M15-T008: ② 服务器控制卡（大号主/次按钮 + StatusDot + Temp Mode Badge）
-        card(ui, theme, "Server", |ui| {
-            ui.horizontal(|ui| {
-                if self.server_running {
-                    status_dot(ui, theme.success, "Listening");
+        // M8-T035 (需求 9): Dashboard 整体滚动区（对齐 Settings 页做法；
+        // Live Log 内部滚动条保留，双滚动不冲突）。
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            // M15-T008: ① 身份信息卡（值 Mono + 📋 复制按钮）
+            // M8-T035 (需求 13): 移除 Nickname/API/Allowed 三行——Nickname 在
+            // 服务端设置卡可编辑、白名单配置仍在 Settings → Whitelist；本卡仅保留
+            // 设备身份五行（Device ID / IPv6 / IPv4 / Domain / Listen Port）。
+            // M8-T028 (UI-BTY-024): 身份卡三行（Device ID / IPv6 / Domain）均带 📋；
+            // stat_card 返回本帧复制的内容 → 状态栏浮出提示（UI-BTY-028）。
+            // M8-T033: 增加 IPv4 行（与 IPv6 并列；无本机 IPv4 时显示 N/A）。
+            // M8-T034: 各行 `small: true`——身份卡字号整体调小。
+            if let Some(copied) = stat_card(
+                ui,
+                theme,
+                "Identity",
+                &[
+                    StatRow {
+                        key: "Device ID:",
+                        value: self.device_id.clone(),
+                        mono: true,
+                        copy: true,
+                        small: true,
+                    },
+                    StatRow {
+                        key: "IPv6:",
+                        value: self.local_ipv6.clone(),
+                        mono: true,
+                        copy: true,
+                        small: true,
+                    },
+                    StatRow {
+                        key: "IPv4:",
+                        value: self.local_ipv4.clone(),
+                        mono: true,
+                        copy: true,
+                        small: true,
+                    },
+                    StatRow {
+                        key: "Domain:",
+                        value: self.domain.clone(),
+                        mono: true,
+                        copy: true,
+                        small: true,
+                    },
+                    StatRow {
+                        key: "Listen Port:",
+                        value: self.listen_port.clone(),
+                        mono: true,
+                        copy: false,
+                        small: true,
+                    },
+                ],
+            ) {
+                self.notify_copied(&copied);
+            }
+            // M8-T036: 公网检测行（紧邻身份卡 IP 行）——混合判定：
+            // ① 本地 IPv4/IPv6 任一是公网段（is_public_*，含 ULA/CGNAT 剔除）；
+            // ② 本地全非公网 → 惰性触发一次外部出口探测（api.ipify.org，4s 超时），
+            //    探测 IP 与本机任一地址相同 → 直持公网；否则视为无公网。
+            // 无公网 → 红点提示开启内网穿透（Settings → Tunnel）。
+            {
+                let local_v4 = self.local_ipv4.parse::<std::net::Ipv4Addr>().ok();
+                let local_v6 = self.local_ipv6.parse::<std::net::Ipv6Addr>().ok();
+                let local_public = local_v4
+                    .as_ref()
+                    .map(|a| kirin_desk_core::network::ipv4::is_public_ipv4(a))
+                    .unwrap_or(false)
+                    || local_v6
+                        .as_ref()
+                        .map(|a| kirin_desk_core::network::ipv6::is_public_ipv6(a))
+                        .unwrap_or(false);
+                ui.horizontal(|ui| {
                     ui.add(
                         egui::Label::new(
-                            egui::RichText::new(format!("Port: {}", self.listen_port))
-                                .monospace()
-                                .size(theme.mono_size),
+                            egui::RichText::new("公网检测:")
+                                .size(theme.small_size)
+                                .color(theme.fg_weak),
+                        )
+                        .selectable(false),
+                    );
+                    if local_public {
+                        status_dot(ui, theme.success, "具备公网地址");
+                    } else {
+                        // 本地无公网 → 外部探测兜底（Idle → 触发一次后台探测）。
+                        ensure_public_probe();
+                        let probe = *public_probe_state().lock().unwrap();
+                        let ext_matches_local = match probe {
+                            PublicProbeState::Done(Some(ext)) => {
+                                Some(ext) == local_v4.map(std::net::IpAddr::V4)
+                                    || Some(ext) == local_v6.map(std::net::IpAddr::V6)
+                            }
+                            _ => false,
+                        };
+                        if matches!(probe, PublicProbeState::Probing) {
+                            status_dot(ui, theme.fg_weak, "公网检测中…");
+                        } else if ext_matches_local {
+                            status_dot(ui, theme.success, "具备公网地址");
+                        } else {
+                            status_dot(
+                                ui,
+                                theme.danger,
+                                "无公网地址 — 建议开启内网穿透（Settings → Tunnel）",
+                            );
+                        }
+                    }
+                });
+            }
+            ui.add_space(theme.spacing);
+
+            // M15-T008: ② 服务器控制卡（M8-T034 重构——滑动开关替代 Start/Stop
+            // 按钮，连接状态实时呈现在开关旁；含麦克风/模式/临时连接开关）
+            // M8-T035 (需求 6/7): 「允许受控」+「允许麦克风」同一行；停止态不再
+            // 显示「已停止 / ○ Stopped」文字（开关位置即状态）；「允许音频」会话级
+            // 总开关迁自 Settings Server 组（需求 4）；高危警告同步迁入（需求 4）。
+            card(ui, theme, "Server", |ui| {
+                // ── ① 允许受控 + 允许麦克风（同一行，需求 7）──
+                // 允许受控：开关 = 服务端启停；状态文字 = 真实运行态。
+                let runtime_status = {
+                    let st = server_runtime_state().lock().unwrap();
+                    if st.listening {
+                        Some(format!("监听中 :{}", st.port))
+                    } else if let Some(e) = &st.error {
+                        // 截断避免撑破卡片（完整原因在下方 server_status 行 + Live Log）。
+                        let mut s = format!("启动失败: {}", e);
+                        const MAX: usize = 56;
+                        if s.chars().count() > MAX {
+                            let t: String = s.chars().take(MAX - 1).collect();
+                            s = format!("{t}…");
+                        }
+                        Some(s)
+                    } else {
+                        // M8-T035 (需求 6): 停止态不显示「已停止」——开关位置已直观表达。
+                        None
+                    }
+                };
+                ui.horizontal(|ui| {
+                    let was_running = self.server_running;
+                    let resp = toggle_switch(
+                        ui,
+                        theme,
+                        "允许受控",
+                        self.server_running,
+                        runtime_status.as_deref(),
+                    )
+                    .on_hover_text(
+                        "开：开始监听（下次生效昵称/挑战码/工作模式）；\
+                         关：停止监听。bind 失败时开关自动回位并显示原因。",
+                    );
+                    if resp.clicked() {
+                        if was_running {
+                            // OFF → 停止：stop 信号 + 运行态立即复位（监听线程随后退出）。
+                            server_stop_signal().store(true, Ordering::Relaxed);
+                            self.server_running = false;
+                            self.server_status = "已停止".to_string();
+                            {
+                                let mut st = server_runtime_state().lock().unwrap();
+                                st.starting = false;
+                                st.listening = false;
+                                st.error = None;
+                            }
+                            tracing::info!("Server stop signal sent");
+                        } else {
+                            self.start_server();
+                        }
+                    }
+                    // ── ② 允许麦克风（M8-T032 ①：服务端声音 → 客户端，动态生效）──
+                    let mic_on = server_audio_allowed();
+                    let mic_resp =
+                        toggle_switch(ui, theme, "允许麦克风", mic_on, Some("服务端声音 → 客户端"))
+                            .on_hover_text(
+                                "关：服务端不再发送本机声音——运行中会话立即停止，再开即恢复（无需重连）",
+                            );
+                    if mic_resp.clicked() {
+                        set_server_audio_allowed(!mic_on);
+                    }
+                });
+                // ── ③ 允许音频（会话级总开关，迁自 Settings Server 组；关 → 三个
+                // 子开关全部停用——服务端发送 / 客户端播放 / 麦克风回传）──
+                {
+                    let on = audio_enabled_global().load(Ordering::Relaxed);
+                    let resp = toggle_switch(ui, theme, "允许音频 (会话级)", on, None).on_hover_text(
+                        "总开关：关 → 服务端声音、客户端播放、麦克风回传全部停用。\
+                         子开关：① 服务端「允许麦克风」在本卡；②「播放音频」与 ③「麦克风」\
+                         在连接窗口工具栏（会话内动态生效）。",
+                    );
+                    if resp.clicked() {
+                        set_audio_enabled(!on);
+                        self.server_status = if !on {
+                            "Audio enabled (takes effect on new sessions)".to_string()
+                        } else {
+                            "Audio disabled (takes effect on new sessions)".to_string()
+                        };
+                    }
+                }
+                ui.add_space(4.0);
+                if !self.server_status.is_empty() {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&self.server_status)
+                                .size(theme.small_size)
+                                .color(theme.fg_weak),
                         )
                         .selectable(true),
                     );
-                    if self.temp_mode {
-                        badge(
-                            ui,
-                            theme,
-                            "Temp Mode: ON (whitelist bypassed)",
-                            BadgeKind::Warning,
-                        );
-                    }
-                    // M8-T017 (UI-TMP-004): 临时连接窗口激活徽标（状态栏）。
-                    if crate::policy::temp_mode_window_active() {
-                        badge(ui, theme, "Temp Window: ON", BadgeKind::Warning);
-                    }
-                    // M13-T005 (UA-UI-002): 无人值守模式徽标。
-                    if self.unattended_enabled {
-                        badge(ui, theme, "Unattended", BadgeKind::Info);
-                    }
-                } else {
-                    // 原文案 `○ Stopped` 保留
-                    status_dot_char(ui, theme.fg_weak, "○", "Stopped");
                 }
-            });
-            if !self.server_status.is_empty() {
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(&self.server_status)
-                            .size(theme.small_size)
-                            .color(theme.fg_weak),
-                    )
-                    .selectable(true),
-                );
-            }
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                if self.server_running {
-                    // Stop Listening → 危险语义
-                    if action_button(
-                        ui,
-                        theme,
-                        ButtonKind::Danger,
-                        "■ Stop Listening",
-                        ButtonState::Enabled,
-                    )
-                    .clicked()
-                    {
-                        server_stop_signal().store(true, Ordering::Relaxed);
-                        self.server_running = false;
-                        self.server_status = "Stopped".to_string();
-                        tracing::info!("Server stop signal sent");
-                    }
-                    // 待审批计数 → 红色 Badge
-                    let waiting_count = self
-                        .pending_connections
-                        .iter()
-                        .filter(|p| p.status == PendingStatus::Waiting)
-                        .count();
-                    if waiting_count > 0 {
-                        badge(
-                            ui,
-                            theme,
-                            &format!("{} pending connection(s)", waiting_count),
-                            BadgeKind::Danger,
-                        );
-                    }
-                } else {
-                    if action_button(
-                        ui,
-                        theme,
-                        ButtonKind::Primary,
-                        "Start Listening",
-                        ButtonState::Enabled,
-                    )
-                    .clicked()
-                    {
-                        self.start_server();
-                    }
-                }
-            });
-        });
-        ui.add_space(theme.spacing);
-
-        // M8-T017 (UI-TMP-001~006): ③ 临时连接卡片——开启生成 10 位临时挑战码
-        // （S-20 / F-25：8 → 10），窗口期内跳过域名白名单；开启态展示码 + 倒计时 + 关闭按钮。
-        card(ui, theme, "临时连接", |ui| {
-            if self.unattended_enabled {
-                // UI-TMP-006: 无人值守下禁用（UA-ACCEPT-004）。
-                badge(ui, theme, "Temp Mode", BadgeKind::Info);
                 ui.add_space(4.0);
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(
-                            "无人值守模式下不可用（不提供任何临时放行未知设备的旁路）。",
-                        )
-                        .size(theme.small_size)
-                        .color(theme.fg_weak),
-                    )
-                    .selectable(false),
-                );
-                return;
-            }
-            let temp_active = crate::policy::temp_mode_window_active();
-            if temp_active {
-                // 开启态（UI-TMP-003）：徽标 + mm:ss 倒计时（每秒刷新）。
+                // ── ④ 工作模式：IP ⟷ Domain 单按钮互换（Settings/Connect 页同字段）──
                 ui.horizontal(|ui| {
-                    badge(ui, theme, "Temp Mode", BadgeKind::Warning);
-                    let remaining = TempModeManager::new()
-                        .map(|m| m.remaining_secs())
-                        .unwrap_or(0);
-                    let mm = remaining / 60;
-                    let ss = remaining % 60;
+                    let mode_label = if self.ip_mode_allowed {
+                        "工作模式: IP Mode"
+                    } else {
+                        "工作模式: Domain Mode"
+                    };
+                    if action_button(
+                        ui,
+                        theme,
+                        ButtonKind::Secondary,
+                        mode_label,
+                        ButtonState::Enabled,
+                    )
+                    .clicked()
+                    {
+                        self.ip_mode_allowed = !self.ip_mode_allowed;
+                        tracing::info!(
+                            "Server mode switched to {}",
+                            if self.ip_mode_allowed { "IP" } else { "Domain" }
+                        );
+                    }
                     ui.add(
                         egui::Label::new(
-                            egui::RichText::new(format!("{:02}:{:02}", mm, ss))
-                                .monospace()
-                                .size(theme.mono_size)
-                                .color(theme.fg),
+                            egui::RichText::new("点击互换（下次启动服务端生效；保存后重启保持）")
+                                .size(theme.small_size)
+                                .color(theme.fg_weak),
                         )
-                        .selectable(true),
+                        .selectable(false),
                     );
                 });
                 ui.add_space(4.0);
-                match self.temp_code.clone() {
-                    Some(code) => {
-                        // S-22 (F-27)：对齐 CLI「显示 1 次」语义——大号等宽码
-                        // （UI-BTY-004）+ 一键复制（M8-T028）+ 「隐藏临时码」
-                        // 折叠按钮（防肩窥：隐藏后本窗口期不再展示，重新查看
-                        // 需重新开启生成新码）。
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(&code)
-                                        .monospace()
-                                        .size(theme.mono_size + 6.0)
-                                        .strong()
-                                        .color(theme.fg),
-                                )
-                                .selectable(true),
-                            );
-                            self.copied_button(ui, theme, &code);
-                            if action_button(
-                                ui,
-                                theme,
-                                ButtonKind::Secondary,
-                                "隐藏临时码",
-                                ButtonState::Enabled,
-                            )
-                            .clicked()
-                            {
-                                self.temp_code = None;
-                                self.temp_status = "临时码已隐藏（仅展示一次）".to_string();
+                // ── ⑤ 临时连接开关（替代原开启/关闭按钮；窗口过期自动回位）──
+                if self.unattended_enabled {
+                    // UI-TMP-006: 无人值守下禁用（UA-ACCEPT-004）。
+                    toggle_switch(ui, theme, "临时连接", false, Some("无人值守模式下不可用"));
+                } else {
+                    let temp_active = crate::policy::temp_mode_window_active();
+                    let temp_status = if temp_active {
+                        let remaining = TempModeManager::new()
+                            .map(|m| m.remaining_secs())
+                            .unwrap_or(0);
+                        format!(
+                            "剩余 {:02}:{:02}（窗口期内跳过白名单）",
+                            remaining / 60,
+                            remaining % 60
+                        )
+                    } else {
+                        "窗口期内跳过白名单（默认 5 分钟，过期自动关闭）".to_string()
+                    };
+                    let resp = toggle_switch(ui, theme, "临时连接", temp_active, Some(&temp_status))
+                        .on_hover_text(
+                            "开：生成 10 位临时挑战码并限时跳过域名白名单；\
+                             关：立即恢复白名单验证；过期自动回位（逐连接判定，无需重连）。",
+                        );
+                    if resp.clicked() {
+                        if temp_active {
+                            // OFF（手动）→ 审计 Disabled；清标记避免归零误报 Expired。
+                            let closed = TempModeManager::new()
+                                .and_then(|m| m.disable())
+                                .unwrap_or(false);
+                            self.temp_code = None;
+                            self.temp_window_was_active = false;
+                            let mut logger = kirin_desk_utils::audit::AuditLogger::open_default().ok();
+                            if closed {
+                                audit_record(
+                                    &mut logger,
+                                    kirin_desk_utils::audit::AuditEvent::TempModeDisabled,
+                                    "reason=manual_gui",
+                                );
+                                self.temp_status = "临时连接已关闭".to_string();
+                            } else {
+                                self.temp_status = "临时连接已失效".to_string();
                             }
-                        });
+                        } else {
+                            // ON → 生成 10 位临时挑战码 + 审计 TempModeEnabled。
+                            let cfg = kirin_desk_utils::config::Config::load().unwrap_or_default();
+                            let ttl = cfg.network.effective_temp_mode_ttl();
+                            match TempModeManager::new() {
+                                Ok(mgr) => match mgr.enable(ttl) {
+                                    Ok(code) => {
+                                        self.temp_code = Some(code);
+                                        self.temp_status =
+                                            format!("临时连接已开启（{} 分钟）", ttl / 60);
+                                        let mut logger =
+                                            kirin_desk_utils::audit::AuditLogger::open_default().ok();
+                                        audit_record(
+                                            &mut logger,
+                                            kirin_desk_utils::audit::AuditEvent::TempModeEnabled,
+                                            &format!(
+                                                "ttl={}s state={}",
+                                                ttl,
+                                                mgr.state_file_path().display()
+                                            ),
+                                        );
+                                    }
+                                    Err(e) => self.temp_status = format!("开启失败：{}", e),
+                                },
+                                Err(e) => self.temp_status = format!("开启失败：{}", e),
+                            }
+                        }
                     }
-                    None => {
-                        // 窗口由 CLI/其他进程开启或已隐藏：码仅在开启时展示
-                        // 一次（TMP-SEC-001 / S-22）；再次查看需重新开启。
+                    if temp_active {
+                        // 开启态：码 + 复制 + 隐藏（S-22：仅展示一次）+ 说明。
+                        ui.add_space(4.0);
+                        match self.temp_code.clone() {
+                            Some(code) => {
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&code)
+                                                .monospace()
+                                                .size(theme.mono_size + 6.0)
+                                                .strong()
+                                                .color(theme.fg),
+                                        )
+                                        .selectable(true),
+                                    );
+                                    self.copied_button(ui, theme, &code);
+                                    if action_button(
+                                        ui,
+                                        theme,
+                                        ButtonKind::Secondary,
+                                        "隐藏临时码",
+                                        ButtonState::Enabled,
+                                    )
+                                    .clicked()
+                                    {
+                                        self.temp_code = None;
+                                        self.temp_status = "临时码已隐藏（仅展示一次）".to_string();
+                                    }
+                                });
+                            }
+                            None => {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(
+                                            "临时码已在开启时展示一次，未落盘保存（TMP-SEC-001）；\
+                                             再次查看需重新开启（生成新码）。",
+                                        )
+                                        .size(theme.small_size)
+                                        .color(theme.fg_weak),
+                                    )
+                                    .selectable(false),
+                                );
+                            }
+                        }
+                        ui.add_space(4.0);
                         ui.add(
                             egui::Label::new(
                                 egui::RichText::new(
-                                    "临时码已在开启时展示一次，未落盘保存（TMP-SEC-001）；\
-                                     再次查看需重新开启（生成新码）。",
+                                    "窗口期内跳过域名白名单，任何持有此码的客户端均可连接。",
                                 )
                                 .size(theme.small_size)
                                 .color(theme.fg_weak),
@@ -5508,164 +5986,231 @@ impl KirinDeskApp {
                             .selectable(false),
                         );
                     }
-                }
-                ui.add_space(4.0);
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(
-                            "窗口期内跳过域名白名单，任何持有此码的客户端均可连接。",
-                        )
-                        .size(theme.small_size)
-                        .color(theme.fg_weak),
-                    )
-                    .selectable(false),
-                );
-                if !self.temp_status.is_empty() {
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(&self.temp_status)
-                                .size(theme.small_size)
-                                .color(theme.fg_weak),
-                        )
-                        .selectable(true),
-                    );
-                }
-                ui.add_space(4.0);
-                if action_button(
-                    ui,
-                    theme,
-                    ButtonKind::Danger,
-                    "关闭临时连接",
-                    ButtonState::Enabled,
-                )
-                .clicked()
-                {
-                    let closed = TempModeManager::new()
-                        .and_then(|m| m.disable())
-                        .unwrap_or(false);
-                    self.temp_code = None;
-                    // 手动关闭 → 审计 Disabled；清标记避免归零误报 Expired。
-                    self.temp_window_was_active = false;
-                    let mut logger = kirin_desk_utils::audit::AuditLogger::open_default().ok();
-                    if closed {
-                        audit_record(
-                            &mut logger,
-                            kirin_desk_utils::audit::AuditEvent::TempModeDisabled,
-                            "reason=manual_gui",
+                    if !self.temp_status.is_empty() {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&self.temp_status)
+                                    .size(theme.small_size)
+                                    .color(theme.fg_weak),
+                            )
+                            .selectable(true),
                         );
-                        self.temp_status = "临时连接已关闭".to_string();
-                    } else {
-                        self.temp_status = "临时连接已失效".to_string();
                     }
                 }
-            } else {
-                // 关闭态（UI-TMP-002）：说明文案 + 主按钮。
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(
-                            "临时授权访问：开启后生成 10 位临时挑战码，窗口期内跳过域名白名单，任何持有此码的客户端均可连接（默认 5 分钟，过期自动失效）。",
-                        )
-                        .size(theme.small_size)
-                        .color(theme.fg_weak),
-                    )
-                    .selectable(false),
-                );
-                if !self.temp_status.is_empty() {
+                // 状态行：运行态 StatusDot + 临时模式/无人值守/待审批徽标。
+                // M8-T035 (需求 6): 仅运行时渲染——停止时无「○ Stopped」。
+                if self.server_running {
+                    ui.horizontal(|ui| {
+                        status_dot(ui, theme.success, "Listening");
+                        if self.temp_mode {
+                            badge(
+                                ui,
+                                theme,
+                                "Temp Mode: ON (whitelist bypassed)",
+                                BadgeKind::Warning,
+                            );
+                        }
+                        // M8-T017 (UI-TMP-004): 临时连接窗口激活徽标（状态行）。
+                        if crate::policy::temp_mode_window_active() {
+                            badge(ui, theme, "Temp Window: ON", BadgeKind::Warning);
+                        }
+                        // M13-T005 (UA-UI-002): 无人值守模式徽标。
+                        if self.unattended_enabled {
+                            badge(ui, theme, "Unattended", BadgeKind::Info);
+                        }
+                        // 待审批计数 → 红色 Badge
+                        let waiting_count = self
+                            .pending_connections
+                            .iter()
+                            .filter(|p| p.status == PendingStatus::Waiting)
+                            .count();
+                        if waiting_count > 0 {
+                            badge(
+                                ui,
+                                theme,
+                                &format!("{} pending connection(s)", waiting_count),
+                                BadgeKind::Danger,
+                            );
+                        }
+                    });
+                }
+                // S-01c (F-1/F-2): 高危配置警告——旁路（IP/Temp mode）开启但挑战码
+                // 为空 → 旁路零凭据连接全部被拒（fail-closed），提示用户在下方
+                // 「服务端设置」配置挑战码（凭据是旁路放行的前提）。迁自 Settings。
+                if (self.ip_mode_allowed || self.temp_mode)
+                    && self.challenge_code.trim().is_empty()
+                {
+                    ui.add_space(4.0);
                     ui.add(
                         egui::Label::new(
-                            egui::RichText::new(&self.temp_status)
-                                .size(theme.small_size)
-                                .color(theme.fg_weak),
+                            egui::RichText::new(
+                                "⚠ HIGH RISK: whitelist bypass (IP/Temp mode) is ON but \
+                                 Challenge Code is empty — bypass connections carry zero \
+                                 credentials and will be REJECTED (fail-closed, F-1/F-2). \
+                                 Set a challenge code in 服务端设置 below to allow them.",
+                            )
+                            .size(theme.small_size)
+                            .color(theme.danger),
                         )
-                        .selectable(true),
+                        .selectable(false),
                     );
                 }
-                ui.add_space(4.0);
-                if action_button(
-                    ui,
-                    theme,
-                    ButtonKind::Primary,
-                    "开启临时连接（5 分钟）",
-                    ButtonState::Enabled,
-                )
-                .clicked()
-                {
-                    let cfg = kirin_desk_utils::config::Config::load().unwrap_or_default();
-                    let ttl = cfg.network.effective_temp_mode_ttl();
-                    match TempModeManager::new() {
-                        Ok(mgr) => match mgr.enable(ttl) {
-                            Ok(code) => {
-                                self.temp_code = Some(code);
-                                self.temp_status = format!("临时连接已开启（{} 分钟）", ttl / 60);
-                                let mut logger =
-                                    kirin_desk_utils::audit::AuditLogger::open_default().ok();
-                                audit_record(
-                                    &mut logger,
-                                    kirin_desk_utils::audit::AuditEvent::TempModeEnabled,
-                                    &format!(
-                                        "ttl={}s state={}",
-                                        ttl,
-                                        mgr.state_file_path().display()
-                                    ),
-                                );
-                            }
-                            Err(e) => self.temp_status = format!("开启失败：{}", e),
-                        },
-                        Err(e) => self.temp_status = format!("开启失败：{}", e),
-                    }
-                }
-            }
-        });
-        ui.add_space(theme.spacing);
+            });
+            ui.add_space(theme.spacing);
 
-        // M13-T006 (UI-FT-005): 服务端文件传输面板（连接建立后可用；
-        // 拖拽文件到主窗口 = 推送（下载方向，服务端主动）。无 GUI 时静默接收）。
-        card(ui, theme, "文件传输（服务端）", |ui| {
-            let connected = server_file_tx().lock().unwrap().is_some();
-            if !connected {
+            // M8-T034: ③ 服务端设置（小字号；端口/昵称/挑战码迁自 Settings，
+            // 下次启动服务端生效；页面内小保存按钮即时落盘）
+            // M8-T035 (需求 1/2): 端口输入迁入（原 Settings Server 组 Listen Port），
+            // 三项横向一排——端口定窄宽、昵称/挑战码弹性宽度。
+            card(ui, theme, "服务端设置", |ui| {
+                // 整体字号压到 small_size（仅本卡内生效，渲染后还原）。
+                let saved_style: egui::Style = ui.style().as_ref().clone();
+                {
+                    let s = ui.style_mut();
+                    s.text_styles.insert(
+                        egui::TextStyle::Body,
+                        egui::FontId::new(theme.small_size, egui::FontFamily::Proportional),
+                    );
+                }
+                // M8-T035: 端口校验（1–65535）——非法红边 + 提示 + 禁用保存。
+                let port_validity = match self.listen_port.parse::<u16>() {
+                    Ok(p) if p >= 1 => Validity::None,
+                    _ => Validity::Invalid("端口需为 1–65535"),
+                };
+                ui.horizontal(|ui| {
+                    let row_w = ui.available_width();
+                    let port_w = 130.0;
+                    let field_w = ((row_w - port_w - 24.0) / 2.0).max(160.0);
+                    ui.vertical(|ui| {
+                        ui.set_width(port_w);
+                        labeled_input(
+                            ui,
+                            theme,
+                            "Port:",
+                            &mut self.listen_port,
+                            "3389",
+                            port_validity,
+                            None,
+                            true,
+                        );
+                    });
+                    ui.vertical(|ui| {
+                        ui.set_width(field_w);
+                        labeled_input(
+                            ui,
+                            theme,
+                            "Nickname:",
+                            &mut self.nickname,
+                            "required",
+                            Validity::None,
+                            None,
+                            false,
+                        );
+                    });
+                    ui.vertical(|ui| {
+                        ui.set_width(field_w);
+                        // M15-T008: 挑战码密文输入（圆点遮蔽 + 👁 切换）。
+                        labeled_input(
+                            ui,
+                            theme,
+                            "Challenge Code:",
+                            &mut self.challenge_code,
+                            "optional",
+                            Validity::None,
+                            Some(&mut self.show_secret_challenge),
+                            false,
+                        );
+                    });
+                });
+                *ui.style_mut() = saved_style;
                 ui.add(
                     egui::Label::new(
                         egui::RichText::new(
-                            "无已连接客户端 — 客户端连接后，可拖拽文件到本窗口推送（服务端 → 客户端）。\n客户端推送的文件将静默接收至下载目录。",
+                            "服务端启动时读取本值——下次启动服务端生效（不热改已运行会话）。\
+                             传入客户端必须携带该昵称；挑战码为白名单旁路放行的前提。",
                         )
                         .size(theme.small_size)
                         .color(theme.fg_weak),
                     )
                     .selectable(false),
                 );
-                return;
-            }
-            // 拖拽 → 推送。
-            let dropped = file_panel::dropped_file_paths(ui.ctx());
-            if !dropped.is_empty() {
-                ui.ctx().input_mut(|i| i.raw.dropped_files.clear());
-                let tx = server_file_tx().lock().unwrap().clone();
-                if let Some(tx) = tx {
-                    for path in dropped {
-                        tracing::info!("Server file drop → push: {}", path.display());
-                        let _ = tx.send(FileCommand::SendFile { path });
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let port_ok = self
+                        .listen_port
+                        .parse::<u16>()
+                        .map(|p| p >= 1)
+                        .unwrap_or(false);
+                    if ui
+                        .add_enabled(port_ok, egui::Button::new("保存").small())
+                        .clicked()
+                    {
+                        self.save_dashboard_settings();
+                    }
+                    if !self.dashboard_status.is_empty() {
+                        let ok = self.dashboard_status.starts_with("已保存");
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&self.dashboard_status)
+                                    .size(theme.small_size)
+                                    .color(if ok { theme.success } else { theme.danger }),
+                            )
+                            .selectable(true),
+                        );
+                    }
+                });
+            });
+            ui.add_space(theme.spacing);
+
+            // M13-T006 (UI-FT-005): 服务端文件传输面板（连接建立后可用；
+            // 拖拽文件到主窗口 = 推送（下载方向，服务端主动）。无 GUI 时静默接收）。
+            card(ui, theme, "文件传输（服务端）", |ui| {
+                let connected = server_file_tx().lock().unwrap().is_some();
+                if !connected {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(
+                                "无已连接客户端 — 客户端连接后，可拖拽文件到本窗口推送（服务端 → 客户端）。\n客户端推送的文件将静默接收至下载目录。",
+                            )
+                            .size(theme.small_size)
+                            .color(theme.fg_weak),
+                        )
+                        .selectable(false),
+                    );
+                    return;
+                }
+                // 拖拽 → 推送。
+                let dropped = file_panel::dropped_file_paths(ui.ctx());
+                if !dropped.is_empty() {
+                    ui.ctx().input_mut(|i| i.raw.dropped_files.clear());
+                    let tx = server_file_tx().lock().unwrap().clone();
+                    if let Some(tx) = tx {
+                        for path in dropped {
+                            tracing::info!("Server file drop → push: {}", path.display());
+                            let _ = tx.send(FileCommand::SendFile { path });
+                        }
                     }
                 }
-            }
-            let tx = server_file_tx().lock().unwrap().clone();
-            let mut state = server_file_panel_state().lock().unwrap();
-            file_panel::show_file_panel(ui, theme, &mut state, tx.as_ref());
+                let tx = server_file_tx().lock().unwrap().clone();
+                let mut state = server_file_panel_state().lock().unwrap();
+                file_panel::show_file_panel(ui, theme, &mut state, tx.as_ref());
+            });
+            ui.add_space(theme.spacing);
+    
+            // M15-T008: ③ Live Log → LogView（级别着色 + 清空/复制）
+            log_view(
+                ui,
+                theme,
+                &self.gui_log,
+                &LogViewOptions {
+                    title: "Live Log",
+                    empty: "(no log output yet)",
+                    max_height: 280.0,
+                    clearable: true,
+                    clear: Some(clear_gui_log),
+                },
+            );
         });
-        ui.add_space(theme.spacing);
-
-        // M15-T008: ③ Live Log → LogView（级别着色 + 清空/复制）
-        log_view(
-            ui,
-            theme,
-            &self.gui_log,
-            &LogViewOptions {
-                title: "Live Log",
-                empty: "(no log output yet)",
-                max_height: 280.0,
-                clearable: true,
-                clear: Some(clear_gui_log),
-            },
-        );
     }
 
     /// M8-T015 P2D: 提取 EncodedWindow 内逐帧 NALU 列表。
@@ -5735,12 +6280,8 @@ impl KirinDeskApp {
     fn start_server(&mut self) {
         use tracing::{error, info};
         let port: u16 = self.listen_port.parse().unwrap_or(3389);
-        let allowed: Vec<String> = self
-            .allowed_domains
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
+        // M8-T035 (需求 5): 白名单快照不再在启动时冻结——握手层逐连接
+        // 读取 `whitelist_active_patterns()`（含 CLI 条目，与 headless 一致）。
         let temp_mode = self.temp_mode;
         let ip_mode = self.ip_mode_allowed;
         let expected_nick = if self.nickname.is_empty() {
@@ -5752,6 +6293,15 @@ impl KirinDeskApp {
 
         self.server_running = true;
         self.server_status = format!("Starting on port {}...", port);
+        // M8-T034: 运行态置「启动中」——bind 结果由监听线程回写
+        // （成功 → listening/port；失败 → error）。
+        {
+            let mut st = server_runtime_state().lock().unwrap();
+            st.starting = true;
+            st.listening = false;
+            st.port = 0;
+            st.error = None;
+        }
         // Log device identity
         if let Some(id) = global_identity().get() {
             info!(
@@ -5814,6 +6364,14 @@ impl KirinDeskApp {
                 match kirin_desk_core::network::tcp::TcpServer::bind(port).await {
                     Ok(server) => {
                         info!("Server listening on port {}", server.port());
+                        // M8-T034: 运行态回写——GUI 每帧读取（开关状态/端口真实化）。
+                        {
+                            let mut st = server_runtime_state().lock().unwrap();
+                            st.starting = false;
+                            st.listening = true;
+                            st.port = server.port();
+                            st.error = None;
+                        }
                         loop {
                             if stop.load(Ordering::Relaxed) {
                                 info!("Server stopping by user request");
@@ -5825,7 +6383,6 @@ impl KirinDeskApp {
                                     // "只连不发" / 60s 审批等待不再冻结 accept 循环；
                                     // 64 并发上限，超出者在任务内排队（信号量）。
                                     let sem = conn_semaphore.clone();
-                                    let allowed = allowed.clone();
                                     let cfg = cfg.clone();
                                     let server_nickname = server_nickname.clone();
                                     let server_challenge = server_challenge.clone();
@@ -5839,7 +6396,6 @@ impl KirinDeskApp {
                                         Self::handle_incoming_connection(
                                             stream,
                                             addr,
-                                            allowed,
                                             cfg,
                                             skip_whitelist,
                                             unattended,
@@ -5857,13 +6413,48 @@ impl KirinDeskApp {
                                 }
                             }
                         }
+                        // M8-T034: 监听线程退出（用户停止）→ 运行态回写。
+                        {
+                            let mut st = server_runtime_state().lock().unwrap();
+                            st.listening = false;
+                        }
                     }
                     Err(e) => {
                         error!("Server bind error on port {}: {}", port, e);
+                        // M8-T034: bind 失败 → 回写运行态（GUI 开关回 OFF +
+                        // 展示失败原因，修复旧实现「只打日志、开关假死」）。
+                        {
+                            let mut st = server_runtime_state().lock().unwrap();
+                            st.starting = false;
+                            st.listening = false;
+                            st.port = 0;
+                            st.error = Some(format!("bind port {} failed: {}", port, e));
+                        }
                     }
                 }
             });
         });
+    }
+
+    /// M8-T034: Dashboard「服务端设置」保存——ip_mode + 端口 + 昵称 + 挑战码
+    /// 即时落盘（Settings 统一 Save 仍保留完整落盘；本按钮提供 Dashboard 页面
+    /// 内保存入口）。已运行会话不受影响（下次启动服务端生效）。
+    fn save_dashboard_settings(&mut self) {
+        let mut cfg = kirin_desk_utils::config::Config::load().unwrap_or_default();
+        cfg.network.ip_mode_allowed = self.ip_mode_allowed;
+        cfg.device.nickname = self.nickname.clone();
+        cfg.device.challenge_code = self.challenge_code.clone();
+        // M8-T035 (需求 1): 端口迁入服务端设置——随本按钮一并落盘（非法值
+        // 已被 UI 校验禁用保存，此处仍防御性跳过）。
+        if let Ok(p) = self.listen_port.parse::<u16>() {
+            cfg.network.port = p;
+        }
+        match cfg.save() {
+            Ok(()) => {
+                self.dashboard_status = "已保存（下次启动服务端生效）".to_string();
+            }
+            Err(e) => self.dashboard_status = format!("保存失败: {}", e),
+        }
     }
 
     /// S-02 (F-5): 处理一条入站连接（accept 循环每连接 `tokio::spawn` 并发调用）。
@@ -5875,11 +6466,14 @@ impl KirinDeskApp {
     /// 打开（append 模式多句柄并发安全，同隐私审计路径）。
     ///
     /// 本函数即 S-01c 追加每连接校验的落点（合并顺序 S-02 → S-01c）。
+    /// M8-T035 (需求 5): 域名白名单判定改用 `whitelist_active_patterns()`——
+    /// 含旧 `allowed_domains` + CLI `whitelist add` 写入的 `network.whitelist`
+    /// 带过期/通配条目（去重），与 headless/CLI 语义完全一致（原 `allowed`
+    /// 快照仅含 GUI 文本域条目，CLI 条目在 GUI 模式下不生效）。
     #[allow(clippy::too_many_arguments)]
     async fn handle_incoming_connection(
         stream: tokio::net::TcpStream,
         addr: std::net::SocketAddrV6,
-        allowed: Vec<String>,
         cfg: kirin_desk_utils::config::Config,
         skip_whitelist: bool,
         unattended: bool,
@@ -5991,10 +6585,17 @@ impl KirinDeskApp {
             // 域名命中 **或** ID 命中即视为白名单命中（域名
             // 行为不变）；ID 列表**逐连接**从配置快照读取，
             // Settings 保存后即时生效（UI-IDWL-001）。
+            // M8-T035 (需求 5): 域名维度改用 `whitelist_active_patterns`——
+            // 旧 `allowed_domains` + CLI `whitelist add` 写入的
+            // `network.whitelist`（带过期/通配条目，去重）共同生效，
+            // 与 headless/CLI 语义一致：白名单命中 → 免人工审批，
+            // 直接进入凭据校验（known_clients pin / 挑战码 / 临时窗口）。
+            let now = chrono::Utc::now();
+            let active_patterns = cfg.whitelist_active_patterns(now);
             let allowed_ids = kirin_desk_utils::config::Config::load()
-                .map(|c| c.id_whitelist_active_ids(chrono::Utc::now()))
+                .map(|c| c.id_whitelist_active_ids(now))
                 .unwrap_or_default();
-            let is_whitelisted = allowed
+            let is_whitelisted = active_patterns
                 .iter()
                 .any(|a| domain_matches_whitelist(&init.client_domain, a))
                 || allowed_ids
@@ -6271,10 +6872,11 @@ impl KirinDeskApp {
                 let sender_shared: Arc<tokio::sync::Mutex<SecureChannelSender>> =
                     Arc::new(tokio::sync::Mutex::new(sender));
 
-                // R-04：音频捕获 + 编码线程（会话级开关；无环回设备/libopus
-                // → info 降级，视频/键鼠不断）。捕获+编码为阻塞调用 → blocking
-                // 线程池；批次经 tokio 通道交发送循环（与视频写半互斥，tag=Audio）。
-                if audio_enabled_global().load(Ordering::Relaxed) {
+                // R-04 + M8-T032：音频捕获 + 编码线程（总开关 × ① 服务端允许
+                // 麦克风；无环回设备/libopus → info 降级，视频/键鼠不断）。
+                // 捕获+编码为阻塞调用 → blocking 线程池；批次经 tokio 通道交
+                // 发送循环（与视频写半互斥，tag=Audio）。
+                if audio_enabled_global().load(Ordering::Relaxed) && server_audio_allowed() {
                     let sender_audio = sender_shared.clone();
                     let stop_audio = stop_capture.clone();
                     tokio::spawn(async move {
@@ -6303,6 +6905,14 @@ impl KirinDeskApp {
                                 if stop_pipe.load(Ordering::Relaxed) {
                                     break;
                                 }
+                                // M8-T032：① 动态门控——关 → 停发（消费丢弃
+                                // 防通道堆积，捕获线程保活）；再开 → 恢复
+                                // （无需重连，PTS 由编码器单调计数接续）。
+                                if !server_audio_allowed() {
+                                    let _ = pipeline.next_packets();
+                                    std::thread::sleep(std::time::Duration::from_millis(50));
+                                    continue;
+                                }
                                 match pipeline.next_packets() {
                                     Ok(pkts) if !pkts.is_empty() => {
                                         // 主循环忙（通道满）→ 丢批次（音频可丢，播放端静音补位）。
@@ -6325,10 +6935,9 @@ impl KirinDeskApp {
                         });
                         // 发送循环：会话结束（stop / 断链）→ 通道关闭 → 退出。
                         while let Some(pkts) = audio_pkt_rx.recv().await {
-                            if let Err(e) = sender_audio.lock().await.send_packets(&pkts).await {
-                                tracing::warn!("Audio send failed: {e} — audio degraded");
-                                break;
-                            }
+                            // P2（修复计划 2026-08-03）：大小分流 + 失败不中断
+                            // （音频可丢，播放端静音补位）。
+                            send_audio_packets(&sender_audio, &pkts).await;
                         }
                     });
                 }
@@ -6420,6 +7029,53 @@ impl KirinDeskApp {
                 )));
                 // 捕获循环持有的另一句柄（切换成功后更新基准）。
                 let injector_capture = injector.clone();
+                // M8-T032：服务端 talkback 播放线程——客户端麦克风回传（③）
+                // → 本机扬声器（WASAPI 共享渲染）。与客户端播放线程同模式：
+                // `AudioDecodePipeline::new(rx)` + `start_playback()` + `run()`；
+                // 线程退出条件 = 会话结束（talkback_tx drop → run 返回），
+                // 无新增泄漏。总开关关 → 不建线程（客户端也不会发）。
+                let talkback_tx = if audio_enabled_global().load(Ordering::Relaxed) {
+                    let (talkback_tx, talkback_rx) = std::sync::mpsc::channel::<
+                        kirin_desk_media::decoder::AudioPacket,
+                    >();
+                    let _talkback_handle = std::thread::Builder::new()
+                        .name("kirin-audio-talkback".into())
+                        .spawn(move || {
+                            let mut pipe = match kirin_desk_media::decoder::audio::
+                                AudioDecodePipeline::new(talkback_rx)
+                            {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    tracing::info!(
+                                        "Talkback playback disabled (init failed): {e}"
+                                    );
+                                    return;
+                                }
+                            };
+                            match pipe.start_playback() {
+                                Ok(()) => {
+                                    tracing::info!(
+                                        "Talkback playback started (WASAPI shared render)"
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::info!(
+                                        "Talkback playback unavailable ({e}) — decode-only (silent)"
+                                    );
+                                }
+                            }
+                            // run()：音频通道关闭（会话结束）→ Ok 返回，线程干净退出。
+                            let _ = pipe.run();
+                            tracing::info!("Talkback pipeline exited");
+                        })
+                        .expect("spawn talkback playback thread");
+                    // 线程句柄持有即保活（std::thread 句柄 drop 不 join）；
+                    // 退出由通道关闭驱动（talkback_tx 随分发任务 drop）。
+                    let _ = _talkback_handle;
+                    Some(talkback_tx)
+                } else {
+                    None
+                };
                 tokio::spawn(async move {
                     // src = 客户端坐标空间：客户端按服务端捕获分辨率
                     // (base_w/base_h) 发像素坐标 → src == dst。
@@ -6562,7 +7218,21 @@ impl KirinDeskApp {
                                 }
                                 Err(e) => warn!("File frame decode failed: {}", e),
                             },
-                            // 其余 tag（Video/Audio/Clipboard 等）无服务端消费方，静默忽略。
+                            // M8-T032：客户端麦克风回传（③）→ 解码 + WASAPI
+                            // 播放（talkback）。投递失败 = 播放线程已退出
+                            // （会话结束）→ 随接收循环退出。
+                            ChannelTag::Audio => {
+                                if let Some(tx) = &talkback_tx {
+                                    let pkt = kirin_desk_media::decoder::AudioPacket {
+                                        pts: _header.pts,
+                                        data: payload,
+                                    };
+                                    if tx.send(pkt).is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                            // 其余 tag（Video/Clipboard 等）无服务端消费方，静默忽略。
                             _ => {}
                         }
                     }
@@ -6663,7 +7333,12 @@ impl KirinDeskApp {
                                         encoded_window.base_h
                                     );
 
-                                    // Serialize and send over SecureChannel (tag 分帧 Video)
+                                    // Serialize and send over SecureChannel (tag 分帧 Video)。
+                                    // 视频帧（编码窗口，4K 下可达 ~125KB）远超
+                                    // `stream::MAX_PACKET_PAYLOAD`（≈1151B）小分片上限，
+                                    // 走 `send_big_packet` 大帧路径（16MiB 上限，
+                                    // 与 M13-T006 文件传输同路径，线格式一致：
+                                    // `PacketHeader + payload`，客户端 parse_frame 无改动）。
                                     match bincode::serialize(&encoded_window) {
                                         Ok(bytes) => {
                                             let pkt = EncodedPacket {
@@ -6675,7 +7350,7 @@ impl KirinDeskApp {
                                             if let Err(e) = sender_shared
                                                 .lock()
                                                 .await
-                                                .send_packets(&[pkt])
+                                                .send_big_packet(&pkt)
                                                 .await
                                             {
                                                 error!(
@@ -7079,7 +7754,7 @@ impl KirinDeskApp {
             ui,
             theme,
             &[
-                "IP Mode (direct IPv6 connection)",
+                "IP Mode (direct IP connection)",
                 "Domain Mode (DNS-based discovery)",
                 "ID Mode (relay device ID)",
             ],
@@ -7090,13 +7765,49 @@ impl KirinDeskApp {
         }
         ui.separator();
 
+        // M8-T036 (需求 2): 双栏布局——左 = 表单（输入框 + Connect 按钮），
+        // 右 = 连接日志（原页面底部 LogView 移至右侧，与表单并排）。
+        ui.horizontal_top(|ui| {
+            ui.vertical(|ui| {
+                ui.set_width(480.0);
+                self.show_connect_form(ui, theme);
+            });
+            ui.vertical(|ui| {
+                // 右侧：连接日志（级别着色 + 清空/复制；列内高度自适应）。
+                log_view(
+                    ui,
+                    theme,
+                    &self.gui_log,
+                    &LogViewOptions {
+                        title: "Connection Log:",
+                        empty: "(no connection log yet)",
+                        max_height: 480.0,
+                        clearable: true,
+                        clear: Some(clear_gui_log),
+                    },
+                );
+            });
+        });
+        ui.separator();
+
+        // M8-T036 (需求 2): Connect 页下方展示「连接过的设备」（Devices 页同源
+        // 数据 self.devices）——单击自动填入表单，右键菜单：连接/编辑/删除。
+        self.show_connect_devices(ui, theme);
+    }
+
+    /// M8-T036: Connect 页左侧连接表单（IP / Domain / ID 三模式共用入口；
+    /// 原 show_connect 主体，双栏化后独立成方法）。
+    fn show_connect_form(&mut self, ui: &mut egui::Ui, theme: &Theme) {
+        let status = connection_status().lock().unwrap().clone();
+
         if self.ip_mode_allowed {
-            // M15-T008: 表单校验——IPv6 合法 / 端口 1-65535 / 昵称与挑战码必填（UI-CON-010/022）
+            // M15-T008: 表单校验——IP（v4/v6 均可，M8-T033）/ 端口 1-65535 /
+            // 昵称与挑战码必填（UI-CON-010/022）
             let ip_empty = self.connect_ipv6.trim().is_empty();
             let ip_ok = self
                 .connect_ipv6
                 .trim()
-                .parse::<std::net::Ipv6Addr>()
+                .parse::<std::net::IpAddr>()
                 .is_ok();
             let port_empty = self.connect_port.trim().is_empty();
             let port_ok = self
@@ -7111,15 +7822,15 @@ impl KirinDeskApp {
             labeled_input(
                 ui,
                 theme,
-                "IPv6 Address:",
+                "IP Address:",
                 &mut self.connect_ipv6,
-                "2001:db8::1",
+                "192.168.1.5 or 2001:db8::1",
                 if ip_empty {
                     Validity::None
                 } else if ip_ok {
                     Validity::Valid
                 } else {
-                    Validity::Invalid("Not a valid IPv6 address")
+                    Validity::Invalid("Not a valid IP address (IPv4 or IPv6)")
                 },
                 None,
                 true,
@@ -7220,13 +7931,19 @@ impl KirinDeskApp {
                 let nick = self.connect_nickname.trim().to_string();
                 let chal = self.connect_challenge.trim().to_string();
                 if ip.is_empty() {
-                    self.connect_status = "Enter an IPv6 address".to_string();
+                    self.connect_status = "Enter an IP address (IPv4 or IPv6)".to_string();
                 } else if port == 0 {
                     self.connect_status = "Enter a valid port".to_string();
                 } else if nick.is_empty() {
                     self.connect_status = "Enter the device nickname".to_string();
                 } else {
-                    let addr = format!("[{}]:{}", ip, port);
+                    // M8-T033: v4 不加方括号（`[192.168.1.5]:port` 非法）；
+                    // v6 保持 `[ip]:port` 规范形式。
+                    let addr = if ip.parse::<std::net::Ipv4Addr>().is_ok() {
+                        format!("{}:{}", ip, port)
+                    } else {
+                        format!("[{}]:{}", ip, port)
+                    };
                     let kind = if do_shell {
                         WindowKind::Shell
                     } else {
@@ -7240,11 +7957,10 @@ impl KirinDeskApp {
                         tracing::info!("[dedup] connect pre-check hit for {}, not spawning", addr);
                     } else {
                         self.connect_status =
-                            format!("Connecting [{}]:{} as '{}'...", ip, port, nick);
+                            format!("Connecting {} as '{}'...", addr, nick);
                         tracing::info!(
-                            "Connect button: target=[{}]:{} nickname={} shell={}",
-                            ip,
-                            port,
+                            "Connect button: target={} nickname={} shell={}",
+                            addr,
                             nick,
                             do_shell
                         );
@@ -7759,165 +8475,214 @@ impl KirinDeskApp {
             );
             ui.add_space(4.0);
         }
-        // M15-T008: 底部连接日志改 LogView（级别着色 + 清空/复制）
-        log_view(
-            ui,
-            theme,
-            &self.gui_log,
-            &LogViewOptions {
-                title: "Connection Log:",
-                empty: "(no connection log yet)",
-                max_height: 150.0,
-                clearable: true,
-                clear: Some(clear_gui_log),
-            },
+        // M8-T036: 连接日志已移至表单右侧（show_connect 双栏右列）。
+    }
+
+    /// M8-T036 (需求 2): Connect 页下方「连接过的设备」列表（与 Devices 页同源
+    /// `self.devices`）——单击自动填入表单并切换 Connect 页，右键菜单
+    /// 连接 / 编辑 / 删除（M10-T004/T005 语义复用，轻量行渲染）。
+    fn show_connect_devices(&mut self, ui: &mut egui::Ui, theme: &Theme) {
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new("连接过的设备:")
+                    .size(theme.small_size)
+                    .color(theme.fg_weak),
+            )
+            .selectable(false),
         );
+        if self.devices.is_empty() {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new("暂无记录 — 连接成功后自动保存")
+                        .size(theme.small_size)
+                        .color(theme.fg_weak),
+                )
+                .selectable(false),
+            );
+            return;
+        }
+        egui::ScrollArea::vertical()
+            .max_height(220.0)
+            .show(ui, |ui| {
+                for i in 0..self.devices.len() {
+                    let d = self.devices[i].clone();
+                    let name = if d.domain.is_empty() {
+                        format!("{}@[{}]:{}", d.nickname, d.ipv6, d.port)
+                    } else {
+                        format!("{}@{}", d.nickname, d.domain)
+                    };
+                    let addr = if d.domain.is_empty() {
+                        None
+                    } else {
+                        Some(format!("[{}]:{}", d.ipv6, d.port))
+                    };
+                    let row = ui.horizontal(|ui| {
+                        status_dot(ui, theme.fg_weak, "saved");
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(&name).strong())
+                                .selectable(true),
+                        );
+                        let (kind, label) = if d.device_type == "server" {
+                            (BadgeKind::Info, "server")
+                        } else {
+                            (BadgeKind::Neutral, "desktop")
+                        };
+                        badge(ui, theme, label, kind);
+                        if let Some(addr) = &addr {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(addr)
+                                        .monospace()
+                                        .size(theme.small_size)
+                                        .color(theme.fg_weak),
+                                )
+                                .selectable(true),
+                            );
+                        }
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(format_last_seen(d.last_seen))
+                                            .size(theme.small_size)
+                                            .color(theme.fg_weak),
+                                    )
+                                    .selectable(false),
+                                );
+                            },
+                        );
+                    })
+                    .response;
+                    if row.clicked() {
+                        self.fill_connect_from_device(&d);
+                    }
+                    row.context_menu(|ui| {
+                        if ui.button("连接").clicked() {
+                            self.fill_connect_from_device(&d);
+                            ui.close_menu();
+                        }
+                        if ui.button("编辑").clicked() {
+                            self.start_edit_device(&d);
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui.button("删除").clicked() {
+                            self.delete_device(&d.id);
+                            ui.close_menu();
+                        }
+                    });
+                }
+            });
+    }
+
+    /// M8-T035 (需求 12): 按 DNS 服务商定义渲染动态表单——字段来自
+    /// `dns_providers` 注册表（label/mono/secret 由定义驱动），值映射到
+    /// App 字段；未映射的字段（未来服务商）暂不渲染，避免 UI 越界。
+    fn dns_provider_fields(
+        &mut self,
+        ui: &mut egui::Ui,
+        theme: &Theme,
+        def: &kirin_desk_utils::dns_providers::DnsProviderDef,
+    ) {
+        for field in def.fields {
+            match (def.id, field.key) {
+                ("godaddy", "domain") => {
+                    labeled_input(
+                        ui,
+                        theme,
+                        field.label,
+                        &mut self.domain,
+                        "example.com",
+                        Validity::None,
+                        None,
+                        field.mono,
+                    );
+                }
+                ("godaddy", "api_key") => {
+                    labeled_input(
+                        ui,
+                        theme,
+                        field.label,
+                        &mut self.api_key,
+                        "required",
+                        Validity::None,
+                        None,
+                        field.mono,
+                    );
+                }
+                // API Secret 密文输入（圆点遮蔽 + 👁 切换，M15-T008）。
+                ("godaddy", "api_secret") => {
+                    labeled_input(
+                        ui,
+                        theme,
+                        field.label,
+                        &mut self.api_secret,
+                        "required",
+                        Validity::None,
+                        Some(&mut self.show_secret_api),
+                        field.mono,
+                    );
+                }
+                _ => {}
+            }
+        }
     }
 
     fn show_settings(&mut self, ui: &mut egui::Ui, theme: &Theme) {
         ui.heading("Settings");
         ui.separator();
         egui::ScrollArea::vertical().show(ui, |ui| {
-            // M15-T008: 6 个可折叠分组（GoDaddy API / 服务端 / 日志 / 身份 / 白名单 / 关于）
-            // + 外观组（主题切换）。
+            // M15-T008: 可折叠分组（DNS / Tunnel / Unattended / Identity / Whitelist /
+            // Logging / Appearance / Update / About）+ 底部统一 Save。
+            // M8-T035 (需求 4): 「Server」组已移除（Listen Port → Dashboard 服务端
+            // 设置；音频总开关/高危警告 → Dashboard Server 卡；模式按钮 Dashboard 已有）。
 
-            egui::CollapsingHeader::new("GoDaddy API")
+            // M8-T035 (需求 10-12): 「GoDaddy API」组改名「DNS」——首行为域名
+            // 服务商 ComboBox（数据源 = `dns_providers` 注册表，当前仅 GoDaddy）；
+            // 表单按所选服务商的 fields 定义动态渲染，未来新服务商由注册表驱动。
+            egui::CollapsingHeader::new("DNS")
                 .default_open(true)
                 .show(ui, |ui| {
-                    labeled_input(
-                        ui,
-                        theme,
-                        "Domain:",
-                        &mut self.domain,
-                        "example.com",
-                        Validity::None,
-                        None,
-                        true,
-                    );
-                    labeled_input(
-                        ui,
-                        theme,
-                        "API Key:",
-                        &mut self.api_key,
-                        "required",
-                        Validity::None,
-                        None,
-                        false,
-                    );
-                    // M15-T008: API Secret 密文输入（圆点遮蔽 + 👁 切换）
-                    labeled_input(
-                        ui,
-                        theme,
-                        "API Secret:",
-                        &mut self.api_secret,
-                        "required",
-                        Validity::None,
-                        Some(&mut self.show_secret_api),
-                        false,
-                    );
-                });
-
-            egui::CollapsingHeader::new("Server").show(ui, |ui| {
-                labeled_input(
-                    ui,
-                    theme,
-                    "Listen Port:",
-                    &mut self.listen_port,
-                    "3389",
-                    Validity::None,
-                    None,
-                    true,
-                );
-                ui.add_space(4.0);
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new("Connection Mode:")
-                            .size(theme.small_size)
-                            .color(theme.fg_weak),
-                    )
-                    .selectable(false),
-                );
-                let mut mode = if self.ip_mode_allowed { 1 } else { 0 };
-                if segmented_control(
-                    ui,
-                    theme,
-                    &["Domain Mode (strict)", "IP Mode (flexible)"],
-                    &mut mode,
-                ) {
-                    self.ip_mode_allowed = mode == 1;
-                }
-                ui.add_space(4.0);
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new("Temp Mode (headless):")
-                            .size(theme.small_size)
-                            .color(theme.fg_weak),
-                    )
-                    .selectable(false),
-                );
-                let mut tm = if self.temp_mode { 1 } else { 0 };
-                if segmented_control(
-                    ui,
-                    theme,
-                    &["Off (whitelist enforced)", "On (bypass whitelist)"],
-                    &mut tm,
-                ) {
-                    self.temp_mode = tm == 1;
-                }
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(
-                            "Temp mode skips whitelist check. Use for Linux headless servers.",
-                        )
-                        .size(theme.small_size)
-                        .color(theme.fg_weak),
-                    )
-                    .selectable(false),
-                );
-                // S-01c (F-1/F-2): 高危配置警告——旁路（IP/Temp mode）开启但
-                // 挑战码为空 → 旁路零凭据连接全部被拒（fail-closed），提示用户
-                // 在 Identity 页配置挑战码（凭据是旁路放行的前提）。
-                if (self.ip_mode_allowed || self.temp_mode)
-                    && self.challenge_code.trim().is_empty()
-                {
-                    ui.add_space(4.0);
                     ui.add(
                         egui::Label::new(
-                            egui::RichText::new(
-                                "⚠ HIGH RISK: whitelist bypass (IP/Temp mode) is ON but \
-                                 Challenge Code is empty — bypass connections carry zero \
-                                 credentials and will be REJECTED (fail-closed, F-1/F-2). \
-                                 Set a challenge code in the Identity section to allow them.",
-                            )
-                            .size(theme.small_size)
-                            .color(theme.danger),
+                            egui::RichText::new("域名服务商:")
+                                .size(theme.small_size)
+                                .color(theme.fg_weak),
                         )
                         .selectable(false),
                     );
-                }
-                // R-04：音频开关（会话级，默认开；取消勾选 = 本次进程内所有
-                // 会话不再传音频，视频/键鼠不受影响）。
-                ui.add_space(4.0);
-                let mut audio_on = audio_enabled_global().load(Ordering::Relaxed);
-                if ui.checkbox(&mut audio_on, "音频传输 (会话级)").changed() {
-                    set_audio_enabled(audio_on);
-                    self.settings_status = if audio_on {
-                        "Audio enabled (takes effect on new sessions)".to_string()
-                    } else {
-                        "Audio disabled (takes effect on new sessions)".to_string()
-                    };
-                }
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(
-                            "System sound of the controlled device is streamed (Opus 48kHz stereo).",
-                        )
-                        .size(theme.small_size)
-                        .color(theme.fg_weak),
-                    )
-                    .selectable(false),
-                );
-            });
+                    let defs = kirin_desk_utils::dns_providers::dns_provider_defs();
+                    let sel_name =
+                        kirin_desk_utils::dns_providers::dns_provider_def(&self.dns_provider)
+                            .map(|p| p.name)
+                            .unwrap_or("GoDaddy");
+                    egui::ComboBox::from_id_source("dns_provider_sel")
+                        .selected_text(sel_name)
+                        .width(220.0)
+                        .show_ui(ui, |ui| {
+                            for def in defs {
+                                ui.selectable_value(
+                                    &mut self.dns_provider,
+                                    def.id.to_string(),
+                                    def.name,
+                                );
+                            }
+                        });
+                    ui.add_space(4.0);
+                    // 动态表单：按所选服务商定义渲染（GoDaddy → Domain / API Key
+                    // / API Secret）。
+                    if let Some(def) =
+                        kirin_desk_utils::dns_providers::dns_provider_def(&self.dns_provider)
+                    {
+                        self.dns_provider_fields(ui, theme, def);
+                    }
+                });
+
+            // M8-T035 (需求 4/5): Settings「Server」组整体移除——Listen Port 迁
+            // Dashboard「服务端设置」、连接模式迁 Dashboard 工作模式按钮（M8-T034）、
+            // 音频总开关与高危警告迁 Dashboard Server 卡（会话级 toggle / 挑战码
+            // 所在页提示闭环）；静态 temp_mode 仅由 CLI/config 管理（GUI 无入口）。
 
             // M8-T026 (TNL-CFG-004): 内网穿透设置——客户端填写 relay 服务器
             // 地址 / token / 代理列表；服务端参数（bind_port/port_range/heartbeat）
@@ -7936,31 +8701,33 @@ impl KirinDeskApp {
                     .selectable(false),
                 );
                 ui.add_space(4.0);
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new("Enabled:")
-                            .size(theme.small_size)
-                            .color(theme.fg_weak),
-                    )
-                    .selectable(false),
-                );
-                let mut te = if self.tunnel_enabled { 1 } else { 0 };
-                if segmented_control(ui, theme, &["Off", "On"], &mut te) {
-                    self.tunnel_enabled = te == 1;
-                }
-                ui.add_space(4.0);
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new("Mode:")
-                            .size(theme.small_size)
-                            .color(theme.fg_weak),
-                    )
-                    .selectable(false),
-                );
-                let mut tm = if self.tunnel_mode == "server" { 1 } else { 0 };
-                if segmented_control(ui, theme, &["Client", "Server"], &mut tm) {
-                    self.tunnel_mode = if tm == 1 { "server" } else { "client" }.to_string();
-                }
+                // M8-T036 (需求 4): 开启按钮 + Mode 两按钮同一行——「开启」为
+                // 颜色切换状态按钮（ON=品牌蓝 / OFF=灰，state_button），
+                // Client/Server 选中态同款高亮（原 segmented 语义不变）。
+                ui.horizontal(|ui| {
+                    let on = self.tunnel_enabled;
+                    let resp = state_button(ui, theme, "开启", on).on_hover_text(if on {
+                        "点击关闭内网穿透（保存后生效）"
+                    } else {
+                        "点击开启内网穿透（保存后生效）"
+                    });
+                    if resp.clicked() {
+                        self.tunnel_enabled = !on;
+                    }
+                    let mut set_mode: Option<String> = None;
+                    for (label, is_sel, mode) in [
+                        ("Client", self.tunnel_mode != "server", "client"),
+                        ("Server", self.tunnel_mode == "server", "server"),
+                    ] {
+                        let r = state_button(ui, theme, label, is_sel);
+                        if r.clicked() {
+                            set_mode = Some(mode.to_string());
+                        }
+                    }
+                    if let Some(m) = set_mode {
+                        self.tunnel_mode = m;
+                    }
+                });
                 ui.add(
                     egui::Label::new(
                         egui::RichText::new(
@@ -8032,38 +8799,36 @@ impl KirinDeskApp {
                     .selectable(false),
                 );
                 ui.add_space(4.0);
-                // 总开关
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new("Unattended mode:")
-                            .size(theme.small_size)
-                            .color(theme.fg_weak),
-                    )
-                    .selectable(false),
-                );
-                let mut ua = if self.unattended_enabled { 1 } else { 0 };
-                if segmented_control(
-                    ui,
-                    theme,
-                    &["Off", "On"],
-                    &mut ua,
-                ) {
-                    self.unattended_enabled = ua == 1;
-                }
-                ui.add_space(4.0);
-                // 开机自动启动（独立于总开关，D6）
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new("Start at OS logon (autostart):")
-                            .size(theme.small_size)
-                            .color(theme.fg_weak),
-                    )
-                    .selectable(false),
-                );
-                let mut asb = if self.unattended_autostart { 1 } else { 0 };
-                if segmented_control(ui, theme, &["Off", "On"], &mut asb) {
-                    self.unattended_autostart = asb == 1;
-                }
+                // M8-T035 (需求 3): 三个开关改为滑块开关横向一排（原 segmented）：
+                // 无人值守模式（master）/ 开机自启 / 启动时自动开启服务端。
+                ui.horizontal(|ui| {
+                    // 总开关
+                    let ua = self.unattended_enabled;
+                    let ua_resp = toggle_switch(ui, theme, "无人值守模式", ua, None).on_hover_text(
+                        "开：开机自启 + 自动开启服务端 + 受信任设备自动接受连接（UA-UI-001）。",
+                    );
+                    if ua_resp.clicked() {
+                        self.unattended_enabled = !ua;
+                    }
+                    // 开机自动启动（独立于总开关，D6）
+                    let asb = self.unattended_autostart;
+                    let asb_resp =
+                        toggle_switch(ui, theme, "开机自启", asb, None).on_hover_text(
+                            "开：注册到系统登录自启（保存时生效，UA-BOOT-001/002）。",
+                        );
+                    if asb_resp.clicked() {
+                        self.unattended_autostart = !asb;
+                    }
+                    // 启动时自动开启服务端
+                    let ass = self.unattended_auto_server;
+                    let ass_resp =
+                        toggle_switch(ui, theme, "启动时自动开启服务端", ass, None).on_hover_text(
+                            "开：程序启动即自动开启服务端监听（无需手动开「允许受控」）。",
+                        );
+                    if ass_resp.clicked() {
+                        self.unattended_auto_server = !ass;
+                    }
+                });
                 // 自启注册状态（以系统实际状态为准，UA-BOOT-002）
                 let installed = kirin_desk_utils::autostart::is_installed();
                 badge(
@@ -8080,20 +8845,6 @@ impl KirinDeskApp {
                         BadgeKind::Neutral
                     },
                 );
-                ui.add_space(4.0);
-                // 启动时自动开启服务端
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new("Auto-start server on launch:")
-                            .size(theme.small_size)
-                            .color(theme.fg_weak),
-                    )
-                    .selectable(false),
-                );
-                let mut ass = if self.unattended_auto_server { 1 } else { 0 };
-                if segmented_control(ui, theme, &["Off", "On"], &mut ass) {
-                    self.unattended_auto_server = ass == 1;
-                }
                 ui.add_space(4.0);
                 // 安全提示（UA-SEC-003 / UA-ACCEPT-002）
                 if self.unattended_enabled {
@@ -8118,37 +8869,21 @@ impl KirinDeskApp {
                     theme,
                     "Device ID:",
                     &mut self.device_id,
-                    "my-pc",
+                    // M8-T031: 留空保存 = 自动（系统盘硬盘 UUID）。
+                    "留空 = 自动（系统硬盘 UUID）",
                     Validity::None,
                     None,
                     true,
                 );
-                labeled_input(
-                    ui,
-                    theme,
-                    "Nickname (server expects this):",
-                    &mut self.nickname,
-                    "required",
-                    Validity::None,
-                    None,
-                    false,
-                );
-                // M15-T008: 验证码密文输入（圆点遮蔽 + 👁 切换）
-                labeled_input(
-                    ui,
-                    theme,
-                    "Challenge Code (server expects this):",
-                    &mut self.challenge_code,
-                    "optional",
-                    Validity::None,
-                    Some(&mut self.show_secret_challenge),
-                    false,
-                );
+                // M8-T035: 昵称/挑战码/端口已迁至 Dashboard「服务端设置」
+                // （下次启动服务端生效；页面内小保存按钮即时落盘）。
                 ui.add(
                     egui::Label::new(
-                        egui::RichText::new("(Incoming clients must send this nickname)")
-                            .size(theme.small_size)
-                            .color(theme.fg_weak),
+                        egui::RichText::new(
+                            "Nickname / Challenge Code / Listen Port 已移至 Dashboard「服务端设置」。",
+                        )
+                        .size(theme.small_size)
+                        .color(theme.fg_weak),
                     )
                     .selectable(false),
                 );
@@ -8507,6 +9242,17 @@ impl KirinDeskApp {
                     cfg.godaddy.api_key = self.api_key.clone();
                     cfg.godaddy.api_secret = self.api_secret.clone();
                     cfg.godaddy.domain = self.domain.clone();
+                    // M8-T035 (需求 12): DNS 服务商持久化（非法 id 防御性回退；
+                    // 仅 GUI 消费，`[godaddy]` 段结构与 CLI 行为零变化）。
+                    cfg.dns.provider = if kirin_desk_utils::dns_providers::dns_provider_def(
+                        &self.dns_provider,
+                    )
+                    .is_some()
+                    {
+                        self.dns_provider.clone()
+                    } else {
+                        "godaddy".to_string()
+                    };
                     if let Ok(p) = self.listen_port.parse::<u16>() {
                         cfg.network.port = p;
                     }

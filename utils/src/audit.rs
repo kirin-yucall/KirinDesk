@@ -128,6 +128,11 @@ pub enum AuditEvent {
     /// M8-T027 (UI-IDWL-004): 设备 ID 白名单条目删除（CLI `remove-id` / GUI
     /// 列表删除）。detail 含设备 ID，如 `device=device-7`。
     WhitelistIdRemoved,
+    /// M8-T031: 身份凭证恢复（从未配发的过期 legacy 文件损坏/不可解密 →
+    /// 备份后重新生成身份；或后端已有身份、忽略损坏旧文件）。
+    /// detail 含路径、label 与处置，如
+    /// `path=...\ed25519.json label=kirindesk.identity.HD-XXXX backup=...\ed25519.json.corrupt.1234`。
+    IdentityRecovered,
 }
 
 impl fmt::Display for AuditEvent {
@@ -172,6 +177,8 @@ impl fmt::Display for AuditEvent {
             // M8-T027 (UI-IDWL-004): 设备 ID 白名单增删事件。
             AuditEvent::WhitelistIdAdded => "whitelist_id_added",
             AuditEvent::WhitelistIdRemoved => "whitelist_id_removed",
+            // M8-T031: 身份凭证恢复事件。
+            AuditEvent::IdentityRecovered => "identity_recovered",
         };
         f.write_str(s)
     }

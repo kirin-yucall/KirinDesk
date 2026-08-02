@@ -1,14 +1,20 @@
-//! Windows WASAPI 环回捕获（P1D §T4.1）。
+//! Windows WASAPI 环回/麦克风捕获（P1D §T4.1 + M8-T032）。
 //!
-//! 经 `IMMDeviceEnumerator` 取默认渲染端点（`eRender`/`eConsole`），用
-//! `IAudioClient` 以 `AUDCLNT_SHAREMODE_SHARED` + `AUDCLNT_STREAMFLAGS_LOOPBACK`
-//! 初始化环回捕获，`IAudioCaptureClient::GetBuffer` 拉 float32 PCM，推到通道。
+//! 两种捕获共用一个骨架（见 [`run_capture_loop_common`]）：
+//! - **环回**（[`WasapiLoopbackCapture`]，系统声音）：取默认渲染端点
+//!   （`eRender`/`eConsole`），`IAudioClient` 以
+//!   `AUDCLNT_SHAREMODE_SHARED` + `AUDCLNT_STREAMFLAGS_LOOPBACK` 初始化环回捕获；
+//! - **麦克风**（[`WasapiMicCapture`]，M8-T032 客户端 talkback）：取默认
+//!   捕获端点（`eCapture`/`eCommunications`，即通话麦克风），**无** loopback
+//!   标志；其余（GetMixFormat → Initialize → GetBuffer 轮询 → 格式适配）共用。
+//!
+//! 两者都经 `IAudioCaptureClient::GetBuffer` 拉 float32 PCM，推到通道。
 //!
 //! # 格式适配
 //!
-//! WASAPI 环回**只能**用 mix format（系统音频引擎格式）。现代 Windows
-//! mix format 通常为 48000Hz/stereo/float32（正合 M12 目标）。若系统设为
-//! 44100Hz/单声道/24-bit 等，本模块在 Rust 侧做：
+//! WASAPI 环回**只能**用 mix format（系统音频引擎格式）；麦克风同理用设备
+//! 默认格式。现代 Windows mix format 通常为 48000Hz/stereo/float32（正合 M12
+//! 目标）。若系统设为 44100Hz/单声道/24-bit 等，本模块在 Rust 侧做：
 //! - float32（IEEE_FLOAT，tag=3）或 extensible 的 KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
 //!   → 直接用；S16/S32 PCM → 转 float32；
 //! - 重采样到 48000Hz（简单线性插值）；
@@ -16,8 +22,8 @@
 //!
 //! # 线程模型
 //!
-//! [`WasapiLoopbackCapture::start`] spawn 一条捕获线程：CoInitializeEx(MTA)
-//! → 建 enumerator → Activate IAudioClient → Initialize(loopback) →
+//! [`AudioCapture::start`] spawn 一条捕获线程：CoInitializeEx(MTA)
+//! → 建 enumerator → Activate IAudioClient → Initialize(loopback 按需) →
 //! GetService(IAudioCaptureClient) → Start → 轮询 GetBuffer（10ms 间隔）→
 //! 推 [`AudioPcm`] → stop 时 Stop+Release+CoUninitialize。
 
@@ -30,9 +36,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use windows::Win32::Media::Audio::{
-    eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator, MMDeviceEnumerator,
-    AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
-    WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
+    eCapture, eCommunications, eConsole, eRender, EDataFlow, ERole, IAudioCaptureClient,
+    IAudioClient, IMMDeviceEnumerator, MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT,
+    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
 };
 use windows::Win32::Media::KernelStreaming::WAVE_FORMAT_EXTENSIBLE;
 use windows::Win32::System::Com::{
@@ -75,7 +81,7 @@ impl WasapiLoopbackCapture {
         // S_OK(0) / S_FALSE(1, 已初始化) 都可继续；失败才报错。
         let co_init_ok = hr.is_ok() || hr == windows::Win32::Foundation::S_FALSE;
         let probe = if co_init_ok {
-            probe_default_endpoint()
+            probe_endpoint(eRender, eConsole)
         } else {
             Err(EncodeError::InitFailed(format!("CoInitializeEx: {hr}")))
         };
@@ -141,37 +147,140 @@ impl Drop for WasapiLoopbackCapture {
     }
 }
 
-/// 探测默认渲染端点（临时 COM 上下文里）。
-fn probe_default_endpoint() -> Result<(), EncodeError> {
+/// WASAPI 麦克风捕获器（M8-T032：客户端 talkback 回传）。
+///
+/// 与 [`WasapiLoopbackCapture`] 同骨架，差别仅在端点（`eCapture`/
+/// `eCommunications`，默认通话麦克风）与初始化标志（**无** loopback）。
+/// 创建时只做轻量校验（能否取到默认捕获端点）；真正的捕获在
+/// [`AudioCapture::start`] spawn 的线程里进行。
+pub struct WasapiMicCapture {
+    /// 捕获线程退出标志。
+    stop_flag: Arc<AtomicBool>,
+    /// 捕获线程句柄（start 后才有）。
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl WasapiMicCapture {
+    /// 创建：探测默认捕获端点是否可达（不启动捕获）。
+    ///
+    /// 无麦克风 / 无默认捕获端点 → `Err(InitFailed)`。
+    pub fn new() -> Result<Self, EncodeError> {
+        let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        let co_init_ok = hr.is_ok() || hr == windows::Win32::Foundation::S_FALSE;
+        let probe = if co_init_ok {
+            probe_endpoint(eCapture, eCommunications)
+        } else {
+            Err(EncodeError::InitFailed(format!("CoInitializeEx: {hr}")))
+        };
+        if hr == windows::Win32::Foundation::S_OK {
+            unsafe { CoUninitialize() };
+        }
+        probe.map(|_| Self {
+            stop_flag: Arc::new(AtomicBool::new(false)),
+            thread: None,
+        })
+    }
+}
+
+impl AudioCapture for WasapiMicCapture {
+    fn start(&mut self, sink: mpsc::Sender<AudioPcm>) -> Result<(), EncodeError> {
+        if self.thread.is_some() {
+            return Ok(()); // 幂等。
+        }
+        // 再次探测默认捕获端点（确认 start 时仍可用）。
+        let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        let co_init_ok = hr.is_ok() || hr == windows::Win32::Foundation::S_FALSE;
+        if hr == windows::Win32::Foundation::S_OK {
+            unsafe { CoUninitialize() };
+        }
+        if !co_init_ok {
+            return Err(EncodeError::InitFailed(format!("CoInitializeEx: {hr}")));
+        }
+
+        self.stop_flag.store(false, Ordering::SeqCst);
+        let stop_flag = self.stop_flag.clone();
+        let handle = thread::Builder::new()
+            .name("kirin-audio-mic".into())
+            .spawn(move || {
+                run_mic_capture_loop(stop_flag, sink);
+            })
+            .map_err(|e| EncodeError::InitFailed(format!("spawn mic capture thread: {e}")))?;
+        self.thread = Some(handle);
+        Ok(())
+    }
+
+    fn stop(&mut self) {
+        self.stop_flag.store(true, Ordering::SeqCst);
+        if let Some(h) = self.thread.take() {
+            // 不阻塞 join 过久：捕获线程在 ≤10ms 轮询间隔内观察标志退出。
+            let _ = h.join();
+        }
+    }
+
+    fn sample_rate(&self) -> u32 {
+        SAMPLE_RATE
+    }
+
+    fn channels(&self) -> u16 {
+        CHANNELS
+    }
+}
+
+impl Drop for WasapiMicCapture {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// 探测默认端点（临时 COM 上下文里；`flow`/`role` 决定环回或麦克风）。
+fn probe_endpoint(flow: EDataFlow, role: ERole) -> Result<(), EncodeError> {
     let enumerator: IMMDeviceEnumerator = unsafe {
         CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
     }
     .map_err(|e| EncodeError::InitFailed(format!("CoCreateInstance(MMDeviceEnumerator): {e}")))?;
-    let dev = unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }
-        .map_err(|e| EncodeError::InitFailed(format!("GetDefaultAudioEndpoint(eRender): {e}")))?;
+    let dev = unsafe { enumerator.GetDefaultAudioEndpoint(flow, role) }
+        .map_err(|e| EncodeError::InitFailed(format!("GetDefaultAudioEndpoint: {e}")))?;
     // 确认能 Activate IAudioClient。
     let _client: IAudioClient = unsafe { dev.Activate::<IAudioClient>(CLSCTX_ALL, None) }
         .map_err(|e| EncodeError::InitFailed(format!("IMMDevice::Activate(IAudioClient): {e}")))?;
     Ok(())
 }
 
-/// 捕获线程主循环：建 COM → enumerator → device → client → initialize(loopback)
-/// → capture client → Start → 轮询 GetBuffer → 适配到 48000/stereo/float32 → 推通道。
+/// 环回捕获线程主循环：端点 `eRender`/`eConsole` + loopback 标志。
 fn run_capture_loop(stop_flag: Arc<AtomicBool>, sink: mpsc::Sender<AudioPcm>) {
+    run_capture_loop_common("loopback", eRender, eConsole, true, stop_flag, sink);
+}
+
+/// 麦克风捕获线程主循环：端点 `eCapture`/`eCommunications`、无 loopback。
+fn run_mic_capture_loop(stop_flag: Arc<AtomicBool>, sink: mpsc::Sender<AudioPcm>) {
+    run_capture_loop_common("mic", eCapture, eCommunications, false, stop_flag, sink);
+}
+
+/// 捕获线程主循环（环回/麦克风共用骨架）：建 COM → enumerator → device →
+/// client → initialize（loopback 按需）→ capture client → Start → 轮询
+/// GetBuffer → 适配到 48000/stereo/float32 → 推通道。
+fn run_capture_loop_common(
+    label: &'static str,
+    flow: EDataFlow,
+    role: ERole,
+    loopback: bool,
+    stop_flag: Arc<AtomicBool>,
+    sink: mpsc::Sender<AudioPcm>,
+) {
     // 线程私有 COM 上下文（MTA）。
     let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
     let co_inited = hr == windows::Win32::Foundation::S_OK;
     // S_FALSE（已初始化）也可用，但本线程是新线程，正常应为 S_OK。
     if !hr.is_ok() && hr != windows::Win32::Foundation::S_FALSE {
-        tracing::warn!("WASAPI capture: CoInitializeEx failed: {hr}");
+        tracing::warn!("WASAPI capture({label}): CoInitializeEx failed: {hr}");
         return;
     }
 
     // 任何提前 return 都要 CoUninitialize。
     let _guard = CoUninitGuard { inited: co_inited };
 
-    if let Err(e) = run_capture_inner(&stop_flag, &sink) {
-        tracing::warn!("WASAPI capture thread exiting: {e}");
+    if let Err(e) = run_capture_inner(label, flow, role, loopback, &stop_flag, &sink) {
+        tracing::warn!("WASAPI capture({label}) thread exiting: {e}");
     }
     // 通道 drop（sink 离开作用域）→ 接收端 next_packets 收到 Disconnected。
 }
@@ -188,21 +297,25 @@ impl Drop for CoUninitGuard {
 }
 
 fn run_capture_inner(
+    label: &'static str,
+    flow: EDataFlow,
+    role: ERole,
+    loopback: bool,
     stop_flag: &Arc<AtomicBool>,
     sink: &mpsc::Sender<AudioPcm>,
 ) -> Result<(), EncodeError> {
-    // 1. enumerator + default render endpoint。
+    // 1. enumerator + default endpoint（环回 = eRender/eConsole；mic = eCapture/eCommunications）。
     let enumerator: IMMDeviceEnumerator =
         unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }
             .map_err(|e| EncodeError::InitFailed(format!("CoCreateInstance: {e}")))?;
-    let dev = unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }
+    let dev = unsafe { enumerator.GetDefaultAudioEndpoint(flow, role) }
         .map_err(|e| EncodeError::InitFailed(format!("GetDefaultAudioEndpoint: {e}")))?;
 
     // 2. Activate IAudioClient。
     let client: IAudioClient = unsafe { dev.Activate::<IAudioClient>(CLSCTX_ALL, None) }
         .map_err(|e| EncodeError::InitFailed(format!("Activate(IAudioClient): {e}")))?;
 
-    // 3. GetMixFormat（环回只能用 mix format）。
+    // 3. GetMixFormat（环回只能用 mix format；麦克风取设备默认格式）。
     let mix_ptr: *mut WAVEFORMATEX = unsafe { client.GetMixFormat() }
         .map_err(|e| EncodeError::InitFailed(format!("GetMixFormat: {e}")))?;
     if mix_ptr.is_null() {
@@ -211,23 +324,21 @@ fn run_capture_inner(
     // 解析格式（borrow mix_ptr 期间不释放）。
     let fmt_desc = parse_format(mix_ptr);
 
-    // 4. Initialize（环回 + 共享 + 20ms 帧对齐缓冲）。
+    // 4. Initialize（共享 + 20ms 帧对齐缓冲；环回加 loopback 标志）。
     // hnsBufferDuration = 20ms = 200000 (100ns 单位)；hnsPeriodicity = 0（共享必须 0）。
     let hns_buffer: i64 = (FRAME_MS as i64) * 10_000; // 20ms in 100ns units
+    let flags = if loopback {
+        AUDCLNT_STREAMFLAGS_LOOPBACK
+    } else {
+        0 // 麦克风捕获无 loopback（AUDCLNT_STREAMFLAGS_NONE）。
+    };
     let init_res = unsafe {
-        client.Initialize(
-            AUDCLNT_SHAREMODE_SHARED,
-            AUDCLNT_STREAMFLAGS_LOOPBACK,
-            hns_buffer,
-            0,
-            mix_ptr,
-            None,
-        )
+        client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, hns_buffer, 0, mix_ptr, None)
     };
     // mix_ptr 不再需要，释放（GetMixFormat 分配的需 CoTaskMemFree）。
     unsafe { CoTaskMemFree(Some(mix_ptr as *const _)) };
     init_res
-        .map_err(|e| EncodeError::InitFailed(format!("IAudioClient::Initialize(loopback): {e}")))?;
+        .map_err(|e| EncodeError::InitFailed(format!("IAudioClient::Initialize: {e}")))?;
 
     // 5. GetService IAudioCaptureClient + Start。
     let capture: IAudioCaptureClient = unsafe { client.GetService::<IAudioCaptureClient>() }
@@ -236,7 +347,7 @@ fn run_capture_inner(
         .map_err(|e| EncodeError::InitFailed(format!("IAudioClient::Start: {e}")))?;
 
     tracing::info!(
-        "WASAPI loopback capture started: mix={}Hz/{}ch/{}bit float={} -> convert to {}Hz/stereo",
+        "WASAPI {label} capture started: mix={}Hz/{}ch/{}bit float={} -> convert to {}Hz/stereo",
         fmt_desc.sample_rate,
         fmt_desc.channels,
         fmt_desc.bits_per_sample,
@@ -532,5 +643,16 @@ mod tests {
             (dst_frames as i64 - 480).abs() <= 1,
             "dst_frames={dst_frames}"
         );
+    }
+
+    /// M8-T032：麦克风捕获器创建/析构冒烟（eCapture 端点探测；无麦克风
+    /// 设备 → Err(InitFailed)，不 panic、不泄漏 COM 上下文）。
+    #[test]
+    fn test_mic_capture_create_drop() {
+        let mic = WasapiMicCapture::new();
+        // 有/无麦克风都允许：有 → 可创建（不 start）；无 → InitFailed。
+        if let Ok(mut mic) = mic {
+            mic.stop(); // 析构前 stop（幂等），验证 Drop 不 panic。
+        }
     }
 }

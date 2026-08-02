@@ -3,6 +3,10 @@
 pub mod audit;
 pub mod autostart;
 pub mod config;
+// M8-T035: DNS 域名维护服务商注册表（Settings → DNS 组动态表单的事实源）。
+pub mod dns_providers;
+// M8-T031: 系统设备 ID 派生（空配置 → 硬盘 UUID / machine-id / 平台 UUID）。
+pub mod device;
 pub mod logging;
 pub mod error;
 pub mod devices;

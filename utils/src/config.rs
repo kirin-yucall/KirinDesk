@@ -86,6 +86,10 @@ pub struct Config {
     /// GoDaddy DNS API settings
     pub godaddy: GoDaddyConfig,
 
+    /// M8-T035: DNS 域名维护服务商选择（`[dns]` 段，默认 "godaddy"）。
+    #[serde(default)]
+    pub dns: DnsConfig,
+
     /// Network settings
     pub network: NetworkConfig,
 
@@ -549,6 +553,29 @@ fn default_api_url() -> String {
     "https://api.godaddy.com".to_string()
 }
 
+/// M8-T035: DNS 域名维护服务商选择（`[dns]` 段）。
+///
+/// 仅 GUI 消费（Settings → DNS 组服务商列表）；值 = `dns_providers::dns_provider_defs()`
+/// 中已实现服务商 id（默认 "godaddy"）。旧配置无本段 → serde 默认回退，兼容。
+/// `[godaddy]` 段结构原样保留（CLI setup/register/discover/heartbeat 直接读写）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsConfig {
+    #[serde(default = "default_dns_provider")]
+    pub provider: String,
+}
+
+impl Default for DnsConfig {
+    fn default() -> Self {
+        Self {
+            provider: default_dns_provider(),
+        }
+    }
+}
+
+fn default_dns_provider() -> String {
+    "godaddy".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkConfig {
     /// Listening port for remote desktop
@@ -726,7 +753,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             device: DeviceConfig {
-                id: "default-device".to_string(),
+                // M8-T031: 留空 = 自动（系统硬盘 UUID / machine-id / 平台 UUID）。
+                id: String::new(),
                 name: "My Device".to_string(),
                 nickname: String::new(),
                 challenge_code: String::new(),
@@ -737,6 +765,7 @@ impl Default for Config {
                 domain: "example.com".to_string(),
                 api_url: default_api_url(),
             },
+            dns: DnsConfig::default(),
             network: NetworkConfig {
                 port: default_port(),
                 heartbeat_interval: default_heartbeat_interval(),
@@ -1225,7 +1254,8 @@ mod tests {
     #[test]
     fn test_config_default() {
         let config = Config::default();
-        assert_eq!(config.device.id, "default-device");
+        // M8-T031: 默认留空 = 自动（系统硬盘 UUID）。
+        assert!(config.device.id.is_empty());
         assert_eq!(config.network.port, 3389);
         assert_eq!(config.godaddy.api_url, "https://api.godaddy.com");
     }

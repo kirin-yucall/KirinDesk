@@ -23,6 +23,9 @@ subtle = "2"
 zeroize = { version = "1", features = ["zeroize_derive"] }
 tracing.workspace = true
 get-if-addrs = { version = "0.5", package = "get_if_addrs" }
+# M8-T033: 双栈监听需在 bind 前设置 IPV6_V6ONLY（tokio TcpSocket 无 set_only_v6，
+# 与 media transport 的 QUIC 双栈 bind 同用 socket2）
+socket2 = "0.6"
 dirs-next = "2.0"
 libloading = "0.8"   # M12-MAC MAC-T006：macOS Keychain 经 dlopen Security/CoreFoundation
 kirin-desk-dns = { path = "../dns" }

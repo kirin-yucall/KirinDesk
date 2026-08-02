@@ -1,5 +1,8 @@
 [device]
-id = "default-device"
+# M8-T031: 留空 = 自动（系统盘硬盘 UUID，Windows 卷序列号 `HD-XXXXXXXX`；
+# Linux machine-id / macOS IOPlatformUUID；全部失败兜底主机名）。
+# 旧占位 `default-device` 视为未填写（同样自动生成）。
+id = ""
 name = "My Device"
 nickname = ""
 # S-01 (F-1): 挑战码 —— **必填（安全）**，服务端核心凭据。为空（默认）时
@@ -19,6 +22,12 @@ api_key = ""
 api_secret = ""
 domain = "example.com"
 api_url = "https://api.godaddy.com"
+
+# M8-T035: DNS 域名维护服务商（Settings → DNS 组 ComboBox 写入；
+# 值 = utils dns_providers 注册表中已实现服务商 id，未知值自动回退 "godaddy"）。
+# `[godaddy]` 段为 GoDaddy 客户端实际使用的字段，结构不变（CLI 直接读写）。
+[dns]
+provider = "godaddy"
 
 [network]
 port = 3389

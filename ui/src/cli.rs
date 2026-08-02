@@ -2031,17 +2031,16 @@ fn load_identity(
     cfg: &Config,
 ) -> Result<kirin_desk_core::crypto::ed25519::IdentityManager, Box<dyn std::error::Error>> {
     use kirin_desk_core::crypto::ed25519::IdentityManager;
-    let device_id = if cfg.device.id.is_empty() {
-        "default"
-    } else {
-        &cfg.device.id
-    };
+    // M8-T031: 与 GUI 同一解析语义（空/旧占位 → 自动硬盘 UUID）——否则 CLI 与
+    // GUI 同机身份 label 分裂（`kirindesk.identity.default` vs `HD-XXXX`），
+    // 导致 `[tunnel] device_id` 指纹派生（ID-001）不一致、隧道注册分裂。
+    let device_id = kirin_desk_utils::device::effective_device_id(&cfg.device.id);
     let path = dirs_next::home_dir()
         .unwrap_or_default()
         .join(".kirin_desk")
         .join("identity")
         .join("ed25519.json");
-    IdentityManager::load_or_generate(path, device_id).map_err(|e| e.into())
+    IdentityManager::load_or_generate(path, &device_id).map_err(|e| e.into())
 }
 
 /// M8-T017: temp-mode 剩余秒数（无激活时 0）。

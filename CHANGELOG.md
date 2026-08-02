@@ -59,6 +59,30 @@
   为 www.gyan.dev）。nvenc open 失败路径堆损坏崩溃（驱动不满足时）既有隐患对更老
   驱动仍适用，登记观察
 
+### Fixed
+
+- **视频无画面（阻断，修复计划 2026-08-03 P0）**：服务端捕获循环把编码窗口
+  （`EncodedWindow`，4K 下 ~125KB）经 `SecureChannelSender::send_packets` 发送，
+  超过 `MAX_PACKET_PAYLOAD`（≈1151B）小分片上限 → `payload too large` → 捕获循环
+  退出 → 客户端画面空白。改为 `send_big_packet` 大帧路径（16MiB 上限，线格式
+  `PacketHeader + payload` 一致，客户端 parse_frame 零改动，新旧互通）——
+  与 M13-T006 文件传输同路径（`ui/src/lib.rs`）
+- **opus 编码器不可用（修复计划 2026-08-03 P1）**：`avcodec_find_encoder
+  (AV_CODEC_ID_OPUS)` 返回 libopus（支持 s16 / packed f32），代码却强制
+  `sample_fmt=fltp`（libopus **不支持** planar f32）→ `avcodec_open2` EINVAL →
+  麦克风/环回音频全不可用（原错误文案误判"构建缺 libopus"）。改为显式
+  `avcodec_find_encoder_by_name("libopus")` + 帧格式 `AV_SAMPLE_FMT_FLT`，
+  单平面整块拷贝（顺带去掉 deinterleave 循环），注释/文档同步修正
+  （`media/src/encoder/audio/mod.rs`）；media lib 374 项测试全绿
+- **音频发送路径防御性加固（修复计划 2026-08-03 P2）**：音频发送原走
+  `send_packets` 小分片路径，超限（如未来音频码率自适应/配置化提码率至
+  opus 上限 510kbps → 单帧 1275B > 1151B）即 `break` 整条音频静音，且与
+  "音频可丢、低优先级"（R-04）语义不符。新增 `send_audio_packets`：≤1151B
+  走小分片路径（保持 QUIC 迁移语义），超限走 `send_big_packet`，失败仅丢批
+  不中断循环；服务端环回 + 客户端麦克风两处调用点同步替换
+  （`ui/src/lib.rs`）。注：当前码率硬常量 64kbps（M12），20ms 帧 ≈160B，
+  现路径不会超限，此为防御性加固
+
 ## [v0.1.0] - 2026-07-31
 
 ### Added
