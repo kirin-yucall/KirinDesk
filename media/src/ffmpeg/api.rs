@@ -235,7 +235,7 @@ pub fn av_opt_set_pixel_fmt(obj: *mut c_void, name: &str, val: i32) -> Result<()
 
 // ── AVCodecContext 字段直写（opaque 约束放宽） ────────────────
 //
-// FFmpeg 8.1.2 共享构建（GyanD/BtbN full shared）的 AVCodecContext AVOption 表
+// FFmpeg 8.1.2 共享构建（GyanD full shared）的 AVCodecContext AVOption 表
 // 缺少 width/height/pix_fmt/time_base 条目（pix_fmt 完全不在表里）—— av_opt_set*
 // 返回 AVERROR_OPTION_NOT_FOUND，AVDictionary 也不被 open2 消费。libx264/h264_qsv
 // 在 open2 时强制要求这些字段已设，故需结构体字段直写。

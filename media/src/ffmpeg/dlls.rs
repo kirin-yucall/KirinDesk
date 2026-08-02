@@ -8,7 +8,7 @@
 //! Function pointers are resolved via the platform-agnostic `libloading`
 //! crate.
 //!
-//! # DLL Versions (FFmpeg 8.1.2 full build / BtbN shared builds)
+//! # DLL Versions (FFmpeg 8.1.x full build / GyanD shared builds)
 //!
 //! | Library | DLL name       | Purpose                     |
 //! |---------|----------------|-----------------------------|
@@ -75,7 +75,7 @@ pub const SWSCALE_LIB: &str = "libswscale.9.dylib";
 /// 字段偏移快照对应的 **libavcodec 库主版本**（R-22；R-06 修正语义）。
 ///
 /// `api.rs::avctx_offset` 与 `AVFRAME_CH_LAYOUT_OFFSET` 的偏移按 FFmpeg 8.1.2
-/// （GyanD/BtbN full shared）实测确认；加载完成后断言 `avcodec_version()` 的
+/// （GyanD full shared）实测确认；加载完成后断言 `avcodec_version()` 的
 /// major 与此一致，不符**直接加载失败报错**——绝不带着错偏移静默运行。
 /// 升级流程见 `api.rs` 升级核对清单与 `Readme.md`「FFmpeg 升级步骤」。
 ///

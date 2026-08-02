@@ -822,11 +822,13 @@ impl VideoEncoder for FfmpegHwEncoder {
     /// **ZM-01 S2 实测结论（2026-08-02，Intel UHD 770 开发机）**：
     /// - `h264_qsv`：连续 3 窗口各编码 1 帧 + `avcodec_flush_buffers` 边界
     ///   flush，无错误无崩溃 → **保持现状**（QSV 支持该调用）。
-    /// - `h264_nvenc`：本机不可测——FFmpeg 8.1.2 要求 nvenc API 13.1 /
-    ///   NVIDIA 驱动 ≥610.00，本机驱动不满足（仅 Intel iGPU）。
+    /// - `h264_nvenc`：8.1.2 构建要求 nvenc API 13.1 / 驱动 ≥610.00，本机 591.86
+    ///   不满足（open2 拒绝，无 flush 语义可测）。2026-08-02 换 GyanD 8.1.1 构建
+    ///   （ffnvcodec 13.0 头，libavcodec 62.28.101）后本机 h264/hevc_nvenc 实测
+    ///   出码流 ✓（决策记录见 task_docs/共享层/M8-T030 §5.2）。
     ///   注意：nvenc open 失败路径本身会堆损坏崩溃（0xc0000005/0xc0000374），
-    ///   为既有隐患；生产路径（软编优先 factory + qsv 兜底）在本机不触达，
-    ///   不在本批次修复范围，登记观察。
+    ///   为既有隐患（更老驱动仍适用）；生产路径（软编优先 factory + qsv 兜底）
+    ///   在本机不触达，不在本批次修复范围，登记观察。
     /// - 软编（libx264）同问题已修复（见 `ffmpeg_sw.rs::flush_buffers`，改
     ///   send-null + drain）。
     fn flush_buffers(&mut self) {

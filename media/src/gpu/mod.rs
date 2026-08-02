@@ -278,7 +278,7 @@ pub fn select_adapter<'a>(
 
 /// FFmpeg 设备串候选（**实测定案：十进制适配器索引**）。
 ///
-/// FFmpeg 8.1.2（BtbN full shared，开发机 2026-08-02 实测）的
+/// FFmpeg 8.1.2（GyanD full shared，开发机 2026-08-02 实测）的
 /// `hwcontext_d3d11va.c::d3d11va_device_parse` 对 device 串仅做 `atoi` 解析
 /// ——**只接受十进制适配器索引**（枚举序，0 = 第一个）；LUID 十六进制
 /// （`0x{high}-{low}` 等）会被静默解析为 0 → 恒选中第一个适配器，无效。

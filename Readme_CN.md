@@ -97,7 +97,8 @@ sudo apt install build-essential libssl-dev pkg-config \
 
 git clone <repo>
 cd KirinDesk
-cargo build --release -p kirin-desk-ui
+# --jobs 8: 线程数上限(硬性约束),禁止满线程打包——大小核设备线程过多会死机
+cargo build --release -p kirin-desk-ui --jobs 8
 
 # 配置与服务端
 ./target/release/kirin-desk-ui --cli setup
@@ -123,7 +124,7 @@ cd ../..
 
 **2. FFmpeg 二进制** —— `ffmpeg/ffmpeg-8.1.2-full_build-shared/` 同样不入库:
 
-下载 [ffmpeg-8.1.2-full_build-shared.zip](https://github.com/GyanD/codexffmpeg/releases/download/8.1.2/ffmpeg-8.1.2-full_build-shared.zip),解压到 `ffmpeg/ffmpeg-8.1.2-full_build-shared/`。若要直接运行发布版 `release/KirinDesk.exe`,还需把其中的 DLL(`avcodec-62.dll`、`avutil-60.dll`、`swscale-9.dll` 等)复制到 `release/ffmpeg/bin/`。
+下载 [ffmpeg-8.1.1-full_build-shared.zip](https://github.com/GyanD/codexffmpeg/releases/download/8.1.1/ffmpeg-8.1.1-full_build-shared.zip),解压后**改名为** `ffmpeg/ffmpeg-8.1.2-full_build-shared/`(加载器搜索路径沿用此目录名,见 `media/src/ffmpeg/dlls.rs`)。**为何用 8.1.1 而非 8.1.2**:8.1.2 构建捆绑 ffnvcodec 13.1 头,`h264_nvenc` 要求 NVIDIA 驱动 ≥610.00;8.1.1 捆绑 13.0 头,兼容 591 系主流驱动(本机 591.86 实测出码流 ✓,2026-08-02)。两者均为 libavcodec 62,硬编码偏移快照兼容——决策记录见 `task_docs/共享层/M8-T030_单GPU硬件加速与虚拟设备过滤_需求设计.md` §5.2。若要直接运行发布版 `release/KirinDesk.exe`,还需把其中的 DLL(`avcodec-62.dll`、`avutil-60.dll`、`swscale-9.dll` 等)复制到 `release/ffmpeg/bin/`。
 
 **FFmpeg 升级步骤**(R-22):编解码路径对 `AVCodecContext`/`AVFrame` 结构体字段按**硬编码字节偏移**直写,偏移基于 FFmpeg **8.1.2**(avcodec-62/avutil-60)实测验证。升级主版本时:
 
@@ -135,8 +136,13 @@ cd ../..
 **3. 编译** —— `target/` 由 cargo 生成,不入库:
 
 ```bash
-cargo build --release -p kirin-desk-ui
+cargo build --release -p kirin-desk-ui --jobs 8
 ```
+
+> ⚠️ **线程限制(硬性约束):** 打包机为大小核(big.LITTLE)架构设计,可能有 bug,
+> **编译/打包线程过多会死机**——所有构建、打包、测试命令必须限制并行度
+> (`--jobs 8` 或 `CARGO_BUILD_JOBS=8`),**禁止满线程**,详见
+> `task_docs/共享层/M14_发布与打包.md` 硬性约束章节。
 
 ### 客户端连接
 

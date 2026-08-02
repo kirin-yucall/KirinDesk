@@ -3,6 +3,12 @@
 # 同时消除 "LF will be replaced by CRLF / CRLF will be replaced by LF" 警告。
 * text=auto eol=lf
 
+# --- Windows 批处理例外（必须 CRLF）---
+# cmd.exe 对 LF-only 批处理解析异常：多行 if (...) 块会被拆断，脚本挂起、
+# 双击只剩黑框无响应（2026-08-02 实测 package.bat 复现）。仓库内仍以 LF
+# 存储，检出时自动转 CRLF，不产生 git 警告。
+*.bat text eol=crlf
+
 # --- 二进制文件：禁止任何换行符转换 ---
 *.dll binary
 *.exe binary

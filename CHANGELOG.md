@@ -48,6 +48,17 @@
   - 自动更新：Settings Update 面板（检查 / 下载进度 / 安装重启）+ 每周后台检查（updater 按平台选 asset）
   - 版本发布脚本 `release/publish.sh`（tag + changelog + gh release create）
 
+### Changed
+
+- FFmpeg 捆绑构建 8.1.2 → **GyanD 8.1.1**（决策记录与实测见
+  `task_docs/共享层/M8-T030_单GPU硬件加速与虚拟设备过滤_需求设计.md` §5.2；
+  Readme 下载链接已更新；**捆绑目录已替换并回归通过**）：8.1.2 构建捆绑 ffnvcodec 13.1 头，
+  `h264_nvenc` 要求 NVIDIA 驱动 ≥610.00；8.1.1 捆绑 ffnvcodec 13.0 头，兼容 591 系
+  主流驱动（libavcodec 同为 62，偏移快照兼容；本机 591.86 实测 h264/hevc_nvenc
+  出码流 ✓）。顺带修正文档/注释中构建来源标注（BtbN → GyanD，实测 `ffmpeg -version`
+  为 www.gyan.dev）。nvenc open 失败路径堆损坏崩溃（驱动不满足时）既有隐患对更老
+  驱动仍适用，登记观察
+
 ## [v0.1.0] - 2026-07-31
 
 ### Added

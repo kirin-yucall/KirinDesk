@@ -20,7 +20,7 @@
 //! `use crate::ffmpeg;` + `ffmpeg::AVCodecContext` / `ffmpeg::ensure_loaded` /
 //! `ffmpeg::AvError` references keep working unchanged.
 //!
-//! # DLL Versions (FFmpeg 8.1.2 full build / BtbN shared builds)
+//! # DLL Versions (FFmpeg 8.1.x full build / GyanD shared builds)
 //!
 //! | Library    | DLL name       | Purpose                     |
 //! |------------|----------------|-----------------------------|

@@ -7,6 +7,7 @@ ui/frontend/dist/
 
 # FFmpeg 二进制发行包(可由 ffmpeg/bin/download.ps1 重新下载)
 ffmpeg/ffmpeg-8.1.2-full_build-shared/
+ffmpeg/ffmpeg-8.1.2-full_build-shared.old-8.1.2/
 release/ffmpeg/
 
 # 编译产物与发布临时文件
