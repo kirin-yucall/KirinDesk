@@ -9,7 +9,7 @@ ffmpeg/ffmpeg-8.1.2-full_build-shared/
 release/ffmpeg/
 
 # 编译产物与发布临时文件
-release/*.exe
+# 注意:release/KirinDesk.exe 是发布用的正式二进制,需要入库跟踪
 release/*.exe.bak-*
 release/bench_results*.json
 
