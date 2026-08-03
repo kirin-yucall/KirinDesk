@@ -5150,8 +5150,9 @@ async fn cmd_self_test() {
                 tokio::time::sleep(Duration::from_millis(300)).await;
                 println!("  device registered: '{}'", device_id);
 
-                // 3. 控制器（Alice）凭 ID 解析 → 三级路径（无直连候选 →
-                //    中继兜底）→ 握手。
+                // 3. 控制器（Alice）凭 ID 解析 → 三级路径（无直连候选 → 打洞
+                //    未配置 rendezvous（生产默认）跳过 → 中继兜底）→ 握手。
+                //    R-18b 打洞路径由下方独立段覆盖（配置 rendezvous + 对端响应）。
                 let connector = IdConnector::new(
                     IdModeConfig::try_new(
                         // S-24 (F-29)：relay 绑 127.0.0.1 → 客户端也走 IPv4 回环。
@@ -5239,6 +5240,152 @@ async fn cmd_self_test() {
                 sc.send(test_msg).await.unwrap();
                 println!("  encrypted send over relay OK ({} bytes)", test_msg.len());
                 println!("  ID mode e2e: relay path handshake + encrypted send PASSED");
+
+                // ── R-18b: id_mode 打洞路径（直连失败 → 打洞 → 中继，真三级）──
+                //   子用例 A：直连失败 → 打洞尝试发起（经独立 rendezvous 登记
+                //   候选）→ 无对端响应 → 降中继（path=relay）；
+                //   子用例 B：设备侧打洞会话同 session 响应 → 打洞成功
+                //   （punch-tcp，PUNCH-SEC-001 内建 Ed25519 握手）→ 不再走中继。
+                println!();
+                println!("=== R-18b id_mode punch path (direct fail -> punch -> relay/punch-tcp) ===");
+                {
+                    use kirin_desk_core::connection::punch::{
+                        PunchConfig, PunchModes, PunchResult, PunchSession,
+                    };
+                    use kirin_desk_core::crypto::ed25519::IdentityManager;
+                    use kirin_desk_core::crypto::handshake::PinExpectation;
+                    use kirin_desk_relay::audit::{AuditSink, TunnelAuditEvent};
+                    use kirin_desk_relay::rendezvous::RendezvousServer;
+                    use std::sync::Mutex as StdMutex;
+
+                    // 1. 独立 rendezvous（R-08b 部署形态：--rendezvous-port 独立
+                    //    监听）+ 审计收集（打洞候选登记/互转证据，PUNCH-PROTO-001/003）。
+                    #[derive(Debug, Default)]
+                    struct CollectPunch(StdMutex<Vec<TunnelAuditEvent>>);
+                    impl AuditSink for CollectPunch {
+                        fn record(&self, event: TunnelAuditEvent) {
+                            self.0.lock().unwrap().push(event);
+                        }
+                    }
+                    let punch_audit = Arc::new(CollectPunch::default());
+                    let rv_server = Arc::new(
+                        RendezvousServer::bind(0)
+                            .await
+                            .unwrap()
+                            .with_audit(Arc::clone(&punch_audit) as Arc<dyn AuditSink>),
+                    );
+                    let mut rv_addr = rv_server.local_addr();
+                    if rv_addr.ip().is_unspecified() {
+                        rv_addr = std::net::SocketAddr::from((
+                            std::net::Ipv6Addr::LOCALHOST,
+                            rv_addr.port(),
+                        ));
+                    }
+                    let rv_arc = Arc::clone(&rv_server);
+                    let rv_task = tokio::spawn(async move {
+                        let _ = rv_arc.serve(tokio::sync::watch::channel(false).1).await;
+                    });
+
+                    // 2. 控制器打洞身份（独立临时身份；与设备侧互相 pin）。
+                    let ctrl_ident = Arc::new(
+                        IdentityManager::generate(tmp.join("kirindesk_self_test_idpunch_ctrl"))
+                            .unwrap(),
+                    );
+                    let punch_connector = IdConnector::new(IdModeConfig {
+                        // S-24 (F-29)：relay 绑 127.0.0.1 → 客户端也走 IPv4 回环。
+                        connect_timeout: Duration::from_secs(2),
+                        identity: Some(Arc::clone(&ctrl_ident)),
+                        punch_rendezvous_addr: Some(rv_addr),
+                        ..IdModeConfig::try_new(
+                            &format!("127.0.0.1:{}", relay_port),
+                            "self-test-token",
+                            &server_pubkey_b64,
+                        )
+                        .unwrap()
+                    });
+
+                    // 3. 子用例 A：resolve（真实候选：本机接口 + 服务器观察地址）
+                    //    → 直连失败 → 打洞发起（rendezvous 候选登记，无对端响应）
+                    //    → 降中继兜底（真三级第 ③ 级）。
+                    let info_a = punch_connector.resolve(device_id).await.unwrap();
+                    let (path_a, _stream_a) = punch_connector
+                        .connect_stream(&info_a, "alice-device")
+                        .await
+                        .expect("punch 失败后必须中继兜底");
+                    assert_eq!(path_a, PathKind::Relay, "无打洞对端响应 → 降中继");
+                    {
+                        let events = punch_audit.0.lock().unwrap();
+                        assert!(
+                            events.iter().any(|e| matches!(
+                                e,
+                                TunnelAuditEvent::PunchCandidateRegistered { .. }
+                            )),
+                            "打洞尝试必须发起（rendezvous 候选登记审计，不再 punch_skipped）"
+                        );
+                    }
+                    println!(
+                        "  sub-case A: direct fail -> punch attempt (candidates registered) -> relay (path={})",
+                        path_a
+                    );
+
+                    // 4. 子用例 B：设备侧打洞会话（同一 session_id，PUNCH-SEC-003
+                    //    发起方 pin + 经控制面告知对端）并发 → 打洞成功
+                    //    （punch-tcp；Ed25519 双向握手在打洞内完成）。
+                    let sid = [0x18u8; 16];
+                    let mut dev_punch_cfg = PunchConfig::loopback(device_id);
+                    dev_punch_cfg.rendezvous_addr = rv_addr;
+                    dev_punch_cfg.handshake.peer_device_id = "alice-device".into();
+                    dev_punch_cfg.handshake.peer_pin = PinExpectation::exact_from_base64(
+                        &ctrl_ident.public_key_base64(),
+                    )
+                    .expect("ctrl pubkey");
+                    dev_punch_cfg.modes = PunchModes { udp: false, tcp: true };
+                    let mut dev_punch = PunchSession::with_session_id(
+                        dev_punch_cfg,
+                        Arc::clone(&dev_arc),
+                        sid,
+                    );
+                    let (ctrl_res, dev_res) = tokio::join!(
+                        punch_connector.try_punch_with_session(
+                            &info_a,
+                            "alice-device",
+                            Some(sid),
+                        ),
+                        dev_punch.establish(),
+                    );
+                    let (path_b, stream_b) =
+                        ctrl_res.expect("打洞（TCP 同时打开）必须建立（PUNCH-002）");
+                    assert_eq!(
+                        path_b,
+                        PathKind::PunchTcp,
+                        "直连失败 → 打洞成功走 punch-tcp（不再直接降中继）"
+                    );
+                    assert!(stream_b.peer_addr().is_ok(), "打洞流必须已连接");
+                    let dev_channel = match dev_res {
+                        PunchResult::TcpEstablished { channel } => channel,
+                        other => panic!("设备侧打洞必须 TcpEstablished，got {other:?}"),
+                    };
+                    assert_eq!(
+                        dev_channel.peer_id, "alice-device",
+                        "打洞内 Ed25519 双向握手身份（PUNCH-SEC-001）"
+                    );
+                    {
+                        let events = punch_audit.0.lock().unwrap();
+                        assert!(
+                            events.iter().any(|e| matches!(
+                                e,
+                                TunnelAuditEvent::PunchForwarded { .. }
+                            )),
+                            "双端登记后必须互转候选（PUNCH-PROTO-003）"
+                        );
+                    }
+                    println!(
+                        "  sub-case B: punch candidates paired via rendezvous, path={} (peer '{}')",
+                        path_b, dev_channel.peer_id
+                    );
+                    println!("  id_mode punch path PASSED (direct fail -> punch, PUNCH-001/002/SEC-001)");
+                    rv_task.abort();
+                }
                 dev_client.stop();
                 let _ = tokio::time::timeout(Duration::from_secs(2), dev_task).await;
                 srv_task.abort();

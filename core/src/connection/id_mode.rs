@@ -6,14 +6,16 @@
 //! - ID-SEC-001 验签：`DeviceInfo` 必须由服务器 Ed25519 私钥签名
 //!   （`[tunnel] server_pubkey` 预置公钥验签），伪造/篡改 → 拒绝；
 //! - ID-011 三级路径编排（叠加语义，对齐 P1）：
-//!   ① 直连候选（IPv6/IPv4 TCP 并行尝试）→ ② 打洞（**P1 并行开发**：
-//!   [`super::punch::PunchSession`] 已落地，接入点见
-//!   `task_docs/共享层/M8-T026_P2_与P1并行开发交互文档.md`，本阶段留 hook，
-//!   路径选择由调用方审计 `TunnelPathSelected=punch_skipped`）
+//!   ① 直连候选（IPv6/IPv4 TCP 并行尝试）→ ② 打洞（P1 hook 已接入，
+//!   R-18b：`[`Self::try_punch`]` 经 rendezvous 交换候选 + UDP 探测 /
+//!   TCP 同时打开，成功路径 `PathKind::PunchUdp/PunchTcp`，接入点见
+//!   `task_docs/共享层/M8-T026_P2_与P1并行开发交互文档.md`）
 //!   → ③ 设备级中继兜底（`TunnelConn`，§8.1，随会话建立保证连通）；
-//! - ID-013 握手不变：任何路径返回的流上由调用方执行 Ed25519 双向握手
+//! - ID-013 握手不变：直连/中继路径返回的流上由调用方执行 Ed25519 双向握手
 //!   （`client_handshake_with_confirm_generic` 等现有逻辑零改动复用），
-//!   白名单/挑战码/临时码校验保持生效；
+//!   白名单/挑战码/临时码校验保持生效；打洞 TCP 路径（`PathKind::PunchTcp`）
+//!   的 Ed25519 双向握手已在打洞内完成（PUNCH-SEC-001，公钥 pin 强制比对），
+//!   返回流不再重复握手；
 //! - ID-012 公钥 pin：`ed25519_pub` 与 known_hosts / DNS TXT 的一致性检查
 //!   由调用方完成（CLI `cli_resolve_trust` 三态判定，首次指纹确认）。
 //!
@@ -21,13 +23,20 @@
 
 // 路径枚举复用 P1 `path_manager::PathKind`（PATH-001，本 crate 不重复定义）。
 pub use crate::connection::path_manager::PathKind;
+use crate::connection::punch::{PunchConfig, PunchHandshake, PunchModes, PunchResult, PunchSession};
+use crate::crypto::ed25519::IdentityManager;
+use crate::crypto::handshake::PinExpectation;
 use ed25519_dalek::VerifyingKey;
 use kirin_desk_relay::id_client;
-use kirin_desk_relay::protocol::{CandidateKind, DeviceInfo};
+use kirin_desk_relay::id_client::collect_local_candidates;
+use kirin_desk_relay::protocol::{Candidate, CandidateKind, DeviceInfo};
 use kirin_desk_relay::registry::Registry;
-use std::net::{IpAddr, SocketAddr};
+use kirin_desk_utils::audit::AuditLogger;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpStream;
+use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 /// 默认拨号/响应超时（对齐 relay `DEFAULT_CONNECT_TIMEOUT`，5s）。
@@ -44,8 +53,17 @@ pub struct IdModeConfig {
     pub token: String,
     /// 服务器 Ed25519 公钥（ID-SEC-001 验签；`[tunnel] server_pubkey` 预置）。
     pub server_pubkey: VerifyingKey,
-    /// 拨号/响应超时。
+    /// 拨号/响应超时（打洞阶段整体预算亦复用此值，PUNCH-PROTO-007）。
     pub connect_timeout: Duration,
+    /// 打洞握手身份（ID-011 ② / PUNCH-SEC-001：打洞 TCP 路径内建 Ed25519
+    /// 双向握手所需签名身份）。`None` = `try_punch` 时懒加载默认身份
+    /// （`~/.kirin_desk/identity/ed25519.json`，与 GUI/CLI 同路径语义）。
+    pub identity: Option<Arc<IdentityManager>>,
+    /// 打洞 rendezvous 地址（R-08b：relay-server `--rendezvous-port` 独立
+    /// 监听；候选登记/互转/结果透传不经隧道主端口）。`None` = 未配置
+    /// rendezvous —— 打洞阶段跳过（debug 日志注明，路径选择如实落中继，
+    /// 不再产生 `punch_skipped` 审计）。
+    pub punch_rendezvous_addr: Option<SocketAddr>,
 }
 
 impl IdModeConfig {
@@ -69,7 +87,23 @@ impl IdModeConfig {
             token: token.to_string(),
             server_pubkey,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            identity: None,
+            punch_rendezvous_addr: None,
         })
+    }
+
+    /// 注入打洞握手身份（测试/复用既有身份；`None` 时 `try_punch` 懒加载
+    /// 默认身份 `~/.kirin_desk/identity/ed25519.json`）。
+    pub fn with_identity(mut self, identity: Arc<IdentityManager>) -> Self {
+        self.identity = Some(identity);
+        self
+    }
+
+    /// 注入打洞 rendezvous 地址（R-08b 部署形态：relay-server
+    /// `--rendezvous-port` 独立监听，与隧道主端口并存）。
+    pub fn with_punch_rendezvous(mut self, addr: SocketAddr) -> Self {
+        self.punch_rendezvous_addr = Some(addr);
+        self
     }
 }
 
@@ -213,13 +247,237 @@ impl IdConnector {
         Ok(stream)
     }
 
-    /// ID-011：三级路径编排（叠加语义，对齐 P1）——
-    /// ① 直连（并行候选）→ ② 打洞（**P1 hook**：`try_punch` 接口由 P1 并行
-    /// 开发按 `M8-T026_P2_与P1并行开发交互文档.md` 接入，本阶段跳过并审计
-    /// `TunnelPathSelected=punch_skipped`）→ ③ 中继兜底（保证首字节即通）。
+    /// ID-011 ②：打洞路径（P1 hook 接入，R-18b，PUNCH-001~006）——
+    /// 直连失败后经 rendezvous（R-08b：relay-server `--rendezvous-port`
+    /// 独立监听）交换候选并发起 UDP 探测 / TCP 同时打开：
+    /// - 候选来源：`DeviceInfo.payload.candidates`（UDP 条目即打洞候选；
+    ///   服务器观察地址 OBSERVED_CANDIDATE_PRIORITY=200 的 TCP 条目为
+    ///   NAT 后可达地址，PUNCH-PROTO-001）；
+    /// - 会话：复用 `punch::PunchSession::establish()`（本端生成 128 位随机
+    ///   `session_id` 并 pin，PUNCH-SEC-003 —— 对端（设备侧）经打洞会话参与，
+    ///   见 [`Self::try_punch_with_session`]）；
+    /// - 结果映射：TCP 同时打开成功（`PathKind::PunchTcp`，PUNCH-SEC-001
+    ///   双向握手已在打洞内完成）→ 返回已握手通道的底层流（调用方不再重复
+    ///   握手）；UDP 成功（`PathKind::PunchUdp`）→ socket 属媒体层 QUIC
+    ///   升级路径（`M8-T026_接口交互协调.md` §3.6 PunchUpgradeEvent），初始
+    ///   编排无法以 `TcpStream` 交付，记成功审计后返回 `None`（让位中继）；
+    ///   失败/无候选/未配置 rendezvous → `None`。
     ///
-    /// 返回 `(PathKind, TcpStream)`：调用方在该流上执行 Ed25519 双向握手
-    /// （ID-013，访问控制零降级）。
+    /// `None` 仅表示打洞阶段未交付可用的 TCP 流——调用方（[`Self::connect_stream`]）
+    /// 据此降级③中继兜底；审计由调用方以 `TunnelPathSelected` 如实记录最终
+    /// 路径（不再出现 `punch_skipped`）。
+    pub async fn try_punch(&self, info: &DeviceInfo, from_peer: &str) -> Option<(PathKind, TcpStream)> {
+        self.try_punch_with_session(info, from_peer, None).await
+    }
+
+    /// 同 [`Self::try_punch`]，但由调用方固定打洞会话（PUNCH-SEC-003：
+    /// 发起方生成 `session_id` 后经现有控制连接告知对端；对端以
+    /// `punch::PunchSession::with_session_id` 复用同一会话 —— 设备侧响应器
+    /// 与 self-test 双端配对经此入口）。`session_id = None` = 本端生成
+    /// 随机会话（独立尝试）。
+    pub async fn try_punch_with_session(
+        &self,
+        info: &DeviceInfo,
+        from_peer: &str,
+        session_id: Option<[u8; 16]>,
+    ) -> Option<(PathKind, TcpStream)> {
+        let cfg = self.build_punch_config(info, from_peer).await?;
+        let identity = self.punch_identity(from_peer)?;
+        info!(
+            "id mode: punch attempt for '{}' via rendezvous {}",
+            info.payload.device_id, cfg.rendezvous_addr
+        );
+        // 打洞会话（发起方 pin；PUNCH-SEC-003）。
+        let mut session = match session_id {
+            Some(sid) => PunchSession::with_session_id(cfg, identity, sid),
+            None => {
+                let mut s = PunchSession::new(cfg, identity);
+                s.pin_session();
+                s
+            }
+        };
+        // PUNCH-SEC-004：成功/失败审计（默认审计文件；不可用时跳过落盘）。
+        if let Ok(logger) = AuditLogger::open_default() {
+            session.set_audit(Arc::new(Mutex::new(logger)));
+        }
+        // 整体预算 = connect_timeout（PUNCH-PROTO-007 快速失败，让位中继）。
+        let result = match timeout(self.cfg.connect_timeout, session.establish()).await {
+            Ok(r) => r,
+            Err(_) => {
+                debug!(
+                    "id mode: punch timed out after {:?}",
+                    self.cfg.connect_timeout
+                );
+                return None;
+            }
+        };
+        match result {
+            PunchResult::TcpEstablished { channel } => {
+                info!("id mode: punch tcp established (peer '{}')", channel.peer_id);
+                Some((PathKind::PunchTcp, channel.stream))
+            }
+            PunchResult::UdpEstablished { socket, peer_addr } => {
+                // UDP 打洞成功：socket 属媒体层 QUIC 升级路径（§3.6），初始
+                // 编排（TcpStream 语义）无法交付 —— 记录后让位中继。
+                info!("id mode: punch udp established with {peer_addr} (media upgrade path)");
+                drop(socket);
+                None
+            }
+            PunchResult::Failed { reason } => {
+                debug!("id mode: punch failed: {reason}");
+                None
+            }
+        }
+    }
+
+    /// 打洞配置构造（候选/rendezvous/公钥 pin/本地地址族选择，PUNCH-PROTO-001）。
+    async fn build_punch_config(&self, info: &DeviceInfo, from_peer: &str) -> Option<PunchConfig> {
+        // 1) 打洞候选（跳过通配地址；UDP 条目 = UDP 探测目标；TCP 条目
+        //    （含服务器观察地址）= TCP 同时打开目标）。
+        let cands: Vec<Candidate> = info
+            .payload
+            .candidates
+            .iter()
+            .filter(|c| !c.addr.ip().is_unspecified())
+            .cloned()
+            .collect();
+        if cands.is_empty() {
+            debug!("id mode: punch skipped — no candidates");
+            return None;
+        }
+        let has_udp = cands.iter().any(|c| c.kind == CandidateKind::Udp);
+        let has_tcp = cands.iter().any(|c| c.kind == CandidateKind::Tcp);
+
+        // 2) rendezvous（R-08b：独立监听；未配置 → 打洞无路由目标，跳过 ——
+        //    路径选择如实落中继，不再产生 punch_skipped）。
+        let rendezvous_addr = match self.cfg.punch_rendezvous_addr {
+            Some(a) => a,
+            None => {
+                debug!(
+                    "id mode: punch skipped — no rendezvous configured \
+                     (set [tunnel] rendezvous_addr / --rendezvous-port)"
+                );
+                return None;
+            }
+        };
+
+        // 3) 对端公钥 pin（PUNCH-SEC-001：打洞 TCP 握手与直连同强度身份校验）。
+        let peer_pin = match PinExpectation::exact_from_base64(&info.payload.ed25519_pub) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("id mode: punch peer pin invalid: {e}");
+                return None;
+            }
+        };
+
+        // 4) 本端打洞地址：候选含回环（同机/self-test）→ 回环地址；否则取本机
+        //    接口地址（relay::id_client::collect_local_candidates 复用，族与
+        //    对端最高优先级候选一致 —— R-17）；都不可得 → 通配地址。
+        let best_v6 = cands
+            .iter()
+            .max_by_key(|c| c.priority)
+            .map(|c| match c.addr.ip() {
+                // v4-mapped（双栈监听下服务器视角的 v4 地址，::ffff:a.b.c.d）
+                // 按 v4 处理（`is_ipv4_mapped` 暂不稳定，手动判断）。
+                IpAddr::V6(v6) => {
+                    let o = v6.octets();
+                    !(o[..10].iter().all(|&b| b == 0) && o[10] == 0xFF && o[11] == 0xFF)
+                }
+                IpAddr::V4(_) => false,
+            })
+            .unwrap_or(false);
+        let local_ip = self.pick_local_ip(&cands, best_v6).await;
+
+        Some(PunchConfig {
+            rendezvous_addr,
+            device_id: from_peer.to_string(),
+            local_ip,
+            // 快速失败预算：id_mode 打洞是首连阶段的加速路径，整体受
+            // connect_timeout 约束（外层 timeout），单段参数取较紧值。
+            probe_interval: Duration::from_millis(200),
+            max_probes: 5,
+            tcp_open_timeout: self.cfg.connect_timeout.min(Duration::from_secs(5)),
+            peer_timeout: self
+                .cfg
+                .connect_timeout
+                .min(crate::connection::punch::PEER_CANDIDATES_TIMEOUT),
+            max_repunch_attempts: 0,
+            modes: PunchModes {
+                udp: has_udp,
+                tcp: has_tcp,
+            },
+            handshake: PunchHandshake {
+                // ID 模式无域名（ID-013：访问控制由调用方握手/挑战码承担；
+                // 打洞内握手以 device_id + 公钥 pin 校验身份，PUNCH-SEC-001）。
+                domain: String::new(),
+                device_type: "desktop".to_string(),
+                peer_device_id: info.payload.device_id.clone(),
+                peer_pin,
+                challenge: String::new(),
+            },
+        })
+    }
+
+    /// 本端打洞绑定地址选择（R-17：与对端地址族匹配，避免 bind/connect 族错误）。
+    async fn pick_local_ip(&self, cands: &[Candidate], want_v6: bool) -> IpAddr {
+        // 同机场景（候选含回环地址）→ 回环地址（self-test / 同机直连验证）。
+        if cands.iter().any(|c| c.addr.ip().is_loopback()) {
+            return if want_v6 {
+                IpAddr::V6(Ipv6Addr::LOCALHOST)
+            } else {
+                IpAddr::V4(Ipv4Addr::LOCALHOST)
+            };
+        }
+        // 生产：本机非回环接口地址（打洞候选必须可被对端寻址，0.0.0.0 不可达；
+        // 复用 relay::id_client::collect_local_candidates，族优先）。
+        let local = collect_local_candidates(&[]).await;
+        let preferred = local
+            .iter()
+            .find(|c| c.addr.ip().is_ipv6() == want_v6 && !c.addr.ip().is_unspecified());
+        if let Some(c) = preferred.or_else(|| local.first()) {
+            if !c.addr.ip().is_unspecified() {
+                return c.addr.ip();
+            }
+        }
+        // 兜底：通配地址（对端探测通常不可达 → 打洞失败 → 中继兜底）。
+        if want_v6 {
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+        } else {
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        }
+    }
+
+    /// 打洞握手身份（PUNCH-SEC-001）：注入身份优先，否则懒加载默认身份。
+    fn punch_identity(&self, from_peer: &str) -> Option<Arc<IdentityManager>> {
+        if let Some(id) = &self.cfg.identity {
+            return Some(Arc::clone(id));
+        }
+        let path = match IdentityManager::default_path() {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("id mode: punch identity path unavailable: {e}");
+                return None;
+            }
+        };
+        match IdentityManager::load_or_generate(path, from_peer) {
+            Ok(id) => Some(Arc::new(id)),
+            Err(e) => {
+                warn!("id mode: punch identity unavailable: {e}");
+                None
+            }
+        }
+    }
+
+    /// ID-011：三级路径编排（叠加语义，对齐 P1）——
+    /// ① 直连（并行候选）→ ② 打洞（P1 hook 接入，R-18b：经 rendezvous 交换
+    /// 候选 + UDP 探测 / TCP 同时打开，PUNCH-001~006）→ ③ 中继兜底
+    /// （保证首字节即通）。
+    ///
+    /// 返回 `(PathKind, TcpStream)`：
+    /// - 直连/中继路径：调用方在该流上执行 Ed25519 双向握手（ID-013，
+    ///   访问控制零降级）；
+    /// - 打洞 TCP 路径（`PathKind::PunchTcp`）：Ed25519 双向握手已在打洞内
+    ///   完成（PUNCH-SEC-001，公钥 pin 强制比对），返回流**不再重复握手**。
     pub async fn connect_stream(
         &self,
         info: &DeviceInfo,
@@ -230,11 +488,12 @@ impl IdConnector {
             info!("id mode: path selected = {kind} (direct)");
             return Ok((kind, stream));
         }
-        // ② 打洞 —— P1 并行开发接入点（PUNCH-001~006）：
-        //    接口约定：`try_punch(&self, info, from_peer) -> Option<(PathKind, TcpStream)>`，
-        //    复用 relay `PeerCandidates` / `PunchProbe`（协议消息已定义）；
-        //    本阶段跳过（审计 `TunnelPathSelected=punch_skipped (P1 pending)`）。
-        warn!("id mode: punch path skipped (P1 in progress) — falling back to relay");
+        // ② 打洞（P1 hook 接入，R-18b；成功走 PunchUdp/PunchTcp，审计
+        //    如实记录；无候选/未配置 rendezvous/失败 → None → ③ 中继兜底）。
+        if let Some((kind, stream)) = self.try_punch(info, from_peer).await {
+            info!("id mode: path selected = {kind} (punch)");
+            return Ok((kind, stream));
+        }
         // ③ 中继兜底（§8.1）。
         let stream = self.open_relay(&info.payload.device_id, from_peer).await?;
         info!(
@@ -254,6 +513,7 @@ pub fn verify_device_info(verify_key: &VerifyingKey, info: &DeviceInfo) -> bool 
 mod tests {
     use super::*;
     use kirin_desk_relay::protocol::{Candidate, DeviceInfoPayload};
+    use kirin_desk_relay::rendezvous::RendezvousServer;
 
     fn test_config() -> IdModeConfig {
         // 从 seed 派生合法 ed25519 密钥对（VerifyingKey::from_bytes 对任意
@@ -264,6 +524,8 @@ mod tests {
             token: "t".to_string(),
             server_pubkey: sk.verifying_key(),
             connect_timeout: Duration::from_secs(1),
+            identity: None,
+            punch_rendezvous_addr: None,
         }
     }
 
@@ -360,5 +622,153 @@ mod tests {
         // 长度不对 → 拒绝。
         let b64_short = base64::engine::general_purpose::STANDARD.encode([0u8; 16]);
         assert!(IdModeConfig::try_new("a:1", "t", &b64_short).is_err());
+    }
+
+    /// 进程内 rendezvous（R-08b 形态：独立监听）+ 双端临时身份
+    /// （对齐 punch.rs 测试基底；临时目录按 pid+序号隔离）。
+    async fn punch_harness(
+        ctrl_id: &str,
+        dev_id: &str,
+    ) -> (
+        Arc<RendezvousServer>,
+        SocketAddr,
+        Arc<IdentityManager>,
+        Arc<IdentityManager>,
+    ) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+        let server = Arc::new(RendezvousServer::bind(0).await.unwrap());
+        let mut addr = server.local_addr();
+        if addr.ip().is_unspecified() {
+            addr = SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, addr.port()));
+        }
+        let srv = Arc::clone(&server);
+        tokio::spawn(async move {
+            let _ = srv.serve(tokio::sync::watch::channel(false).1).await;
+        });
+
+        let n = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "kirin_desk_idmode_punch_{}_{}",
+            std::process::id(),
+            n
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctrl = Arc::new(IdentityManager::generate(dir.join(ctrl_id)).unwrap());
+        let dev = Arc::new(IdentityManager::generate(dir.join(dev_id)).unwrap());
+        (server, addr, ctrl, dev)
+    }
+
+    #[tokio::test]
+    async fn test_try_punch_no_candidates() {
+        // 无打洞候选 → 打洞阶段不可发起 → None（中继兜底）。
+        let connector = IdConnector::new(
+            test_config().with_punch_rendezvous("127.0.0.1:1".parse().unwrap()),
+        );
+        let mut info = sample_info(true);
+        info.payload.candidates.clear();
+        assert!(connector.try_punch(&info, "ctrl-a").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_try_punch_skips_without_rendezvous() {
+        // 未配置 rendezvous（生产默认形态）→ 打洞阶段跳过（None）——
+        // 路径选择如实落中继，不再出现 punch_skipped。
+        let connector = IdConnector::new(test_config());
+        assert!(
+            connector
+                .try_punch(&sample_info(true), "ctrl-a")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_try_punch_tcp_establishes() {
+        // R-18b：直连失败 → 打洞（TCP 同时打开 + 内建 Ed25519 双向握手，
+        // PUNCH-002 / PUNCH-SEC-001）→ PunchTcp 路径交付。
+        let (_rv, rv_addr, ctrl_ident, dev_ident) = punch_harness("ctrl-a", "dev-b").await;
+        let sid = [0x42u8; 16];
+        // 设备侧打洞会话（同一会话，PUNCH-SEC-003；对端 pin = 控制器公钥）。
+        let mut dev_cfg = PunchConfig::loopback("dev-b");
+        dev_cfg.rendezvous_addr = rv_addr;
+        dev_cfg.handshake.peer_device_id = "ctrl-a".into();
+        dev_cfg.handshake.peer_pin =
+            PinExpectation::exact_from_base64(&ctrl_ident.public_key_base64()).unwrap();
+        dev_cfg.modes = PunchModes { udp: false, tcp: true };
+        let mut dev_punch = PunchSession::with_session_id(dev_cfg, Arc::clone(&dev_ident), sid);
+
+        // 控制器：DeviceInfo 含回环 TCP 候选（本端绑定 127.0.0.1；
+        // 打洞实际目标来自 rendezvous 候选交换）。
+        let info = DeviceInfo {
+            payload: DeviceInfoPayload {
+                device_id: "dev-b".to_string(),
+                candidates: vec![Candidate {
+                    addr: "127.0.0.1:1".parse().unwrap(),
+                    kind: CandidateKind::Tcp,
+                    priority: 100,
+                }],
+                ed25519_pub: dev_ident.public_key_base64(),
+                online: true,
+                ts: 1_752_000_000,
+            },
+            signature: vec![],
+        };
+        let connector = IdConnector::new(
+            IdModeConfig {
+                connect_timeout: Duration::from_secs(3),
+                ..test_config()
+            }
+            .with_identity(Arc::clone(&ctrl_ident))
+            .with_punch_rendezvous(rv_addr),
+        );
+        let (ctrl_res, dev_res) = tokio::join!(
+            connector.try_punch_with_session(&info, "ctrl-a", Some(sid)),
+            dev_punch.establish(),
+        );
+        let (kind, stream) = ctrl_res.expect("punch-tcp must establish");
+        assert_eq!(kind, PathKind::PunchTcp);
+        assert!(stream.peer_addr().is_ok(), "punch stream must be connected");
+        match dev_res {
+            PunchResult::TcpEstablished { channel } => {
+                assert_eq!(channel.peer_id, "ctrl-a", "PUNCH-SEC-001 内建握手身份");
+            }
+            other => panic!("device side expected TcpEstablished, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_try_punch_fails_without_peer() {
+        // 打洞尝试发起但无对端响应 → 快速失败（受 connect_timeout 约束）→
+        // None（调用方降级中继兜底）。
+        let (_rv, rv_addr, ctrl_ident, dev_ident) = punch_harness("ctrl-a", "dev-b").await;
+        let info = DeviceInfo {
+            payload: DeviceInfoPayload {
+                device_id: "dev-b".to_string(),
+                candidates: vec![Candidate {
+                    addr: "127.0.0.1:1".parse().unwrap(),
+                    kind: CandidateKind::Tcp,
+                    priority: 100,
+                }],
+                ed25519_pub: dev_ident.public_key_base64(),
+                online: true,
+                ts: 1_752_000_000,
+            },
+            signature: vec![],
+        };
+        let connector = IdConnector::new(
+            test_config()
+                .with_identity(Arc::clone(&ctrl_ident))
+                .with_punch_rendezvous(rv_addr),
+        );
+        let started = std::time::Instant::now();
+        let r = connector.try_punch(&info, "ctrl-a").await;
+        assert!(r.is_none(), "无对端响应 → 打洞失败 → 中继兜底");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "打洞失败判定需快速（connect_timeout 约束）"
+        );
     }
 }
