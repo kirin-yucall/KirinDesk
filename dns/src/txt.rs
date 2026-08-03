@@ -1,4 +1,4 @@
-use crate::godaddy::{GoDaddyClient, GoDaddyError, Record};
+use crate::provider::{Provider, ProviderError, Record, RecordData, RecordType};
 use crate::validate::{self, MAX_PUBLIC_KEY_LEN, MAX_RECORD_DATA_LEN};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, trace};
@@ -93,14 +93,16 @@ pub fn is_valid_ed25519_pubkey_b64(public_key_base64: &str) -> bool {
 ///
 /// Each device gets its own subdomain (`{device_id}.{domain}`).
 /// The TXT record at the subdomain root stores device metadata (public key).
+///
+/// M9-DNS000：多服务商化——只依赖 `&dyn Provider`，不感知厂商差异。
 pub struct TxtManager<'a> {
-    client: &'a GoDaddyClient,
+    provider: &'a dyn Provider,
     domain: &'a str,
 }
 
 impl<'a> TxtManager<'a> {
-    pub fn new(client: &'a GoDaddyClient, domain: &'a str) -> Self {
-        Self { client, domain }
+    pub fn new(provider: &'a dyn Provider, domain: &'a str) -> Self {
+        Self { provider, domain }
     }
 
     /// Register or update the device metadata TXT record.
@@ -113,25 +115,27 @@ impl<'a> TxtManager<'a> {
         device_id: &str,
         meta: &DeviceMeta,
         ttl: u32,
-    ) -> Result<(), GoDaddyError> {
+    ) -> Result<(), ProviderError> {
         validate_device_and_key(device_id, meta)?;
-        debug!("TXT register: device={}, device_type={}, ttl={}", device_id, meta.device_type, ttl);
+        debug!(
+            "TXT register: device={}, device_type={}, ttl={}",
+            device_id, meta.device_type, ttl
+        );
         trace!("TXT register: device={}, full_key={}", device_id, meta.key);
-        let records = vec![Record {
-            data: meta.to_txt(),
+        let rec = Record {
+            name: device_id.to_string(),
+            rtype: RecordType::TXT,
             ttl,
-        }];
-
-        self.client
-            .put_records(self.domain, "TXT", device_id, &records)
-            .await
+            data: RecordData::Plain(meta.to_txt()),
+        };
+        self.provider.upsert_record(self.domain, &rec).await
     }
 
     /// Query the device metadata from its subdomain TXT record.
-    pub async fn query(&self, device_id: &str) -> Result<DeviceMeta, GoDaddyError> {
+    pub async fn query(&self, device_id: &str) -> Result<DeviceMeta, ProviderError> {
         if !validate::validate_device_id(device_id) {
-            return Err(GoDaddyError::InvalidParameters {
-                body: format!(
+            return Err(ProviderError::InvalidParameter {
+                detail: format!(
                     "invalid device_id '{}' (charset [a-zA-Z0-9:_-], len 1..=128, no '.' allowed)",
                     device_id
                 ),
@@ -139,23 +143,33 @@ impl<'a> TxtManager<'a> {
         }
         debug!("TXT query: device={}", device_id);
         let records = self
-            .client
-            .get_records(self.domain, "TXT", device_id)
+            .provider
+            .query_records(self.domain, Some(device_id), Some(RecordType::TXT))
             .await?;
 
-        let record = records.first().ok_or_else(|| GoDaddyError::NotFound {
-            name: device_id.to_string(),
-            record_type: "TXT".to_string(),
+        let record = records.first().ok_or_else(|| ProviderError::NotFound {
+            what: format!("TXT {}.{}", device_id, self.domain),
         })?;
 
-        let meta = DeviceMeta::from_txt(&record.data).ok_or_else(|| GoDaddyError::InvalidParameters {
-            body: format!("Failed to parse device metadata from TXT: {}", record.data),
+        let data = match &record.data {
+            RecordData::Plain(data) => data.clone(),
+            other => {
+                return Err(ProviderError::InvalidParameter {
+                    detail: format!(
+                        "Failed to parse device metadata from TXT: unexpected data shape '{}'",
+                        other.to_display_string()
+                    ),
+                })
+            }
+        };
+        let meta = DeviceMeta::from_txt(&data).ok_or_else(|| ProviderError::InvalidParameter {
+            detail: format!("Failed to parse device metadata from TXT: {}", data),
         })?;
 
         // S-14c / F-19: 读侧公钥长度上限（防脏数据撑爆后续握手）。
         if meta.raw_public_key().map_or(true, |k| k.len() > MAX_PUBLIC_KEY_LEN) {
-            return Err(GoDaddyError::InvalidParameters {
-                body: format!(
+            return Err(ProviderError::InvalidParameter {
+                detail: format!(
                     "public key exceeds {} chars (got {})",
                     MAX_PUBLIC_KEY_LEN,
                     meta.raw_public_key().map_or(0, |k| k.len())
@@ -165,8 +179,8 @@ impl<'a> TxtManager<'a> {
         // S-27 (F-32): 读侧公钥 base64 **恰为 32 字节**（Ed25519）——DNS 数据
         // 可被外部写入任意长度/畸形字符串，长度不符直接拒绝。
         if meta.raw_public_key().map_or(true, |k| !is_valid_ed25519_pubkey_b64(k)) {
-            return Err(GoDaddyError::InvalidParameters {
-                body: format!(
+            return Err(ProviderError::InvalidParameter {
+                detail: format!(
                     "public key is not a valid Ed25519 key (base64 must decode to 32 bytes, got '{}')",
                     meta.raw_public_key().unwrap_or("")
                 ),
@@ -176,39 +190,39 @@ impl<'a> TxtManager<'a> {
     }
 
     /// Delete the device metadata TXT record (device offline).
-    pub async fn remove(&self, device_id: &str) -> Result<(), GoDaddyError> {
+    pub async fn remove(&self, device_id: &str) -> Result<(), ProviderError> {
         if !validate::validate_device_id(device_id) {
-            return Err(GoDaddyError::InvalidParameters {
-                body: format!(
+            return Err(ProviderError::InvalidParameter {
+                detail: format!(
                     "invalid device_id '{}' (charset [a-zA-Z0-9:_-], len 1..=128, no '.' allowed)",
                     device_id
                 ),
             });
         }
-        self.client
-            .delete_record(self.domain, "TXT", device_id)
+        self.provider
+            .delete_record(self.domain, device_id, RecordType::TXT)
             .await
     }
 }
 
 /// device_id + 公钥长度校验（TXT 写侧；S-14b/F-18 + S-14c/F-19）。
-fn validate_device_and_key(device_id: &str, meta: &DeviceMeta) -> Result<(), GoDaddyError> {
+fn validate_device_and_key(device_id: &str, meta: &DeviceMeta) -> Result<(), ProviderError> {
     if !validate::validate_device_id(device_id) {
-        return Err(GoDaddyError::InvalidParameters {
-            body: format!(
+        return Err(ProviderError::InvalidParameter {
+            detail: format!(
                 "invalid device_id '{}' (charset [a-zA-Z0-9:_-], len 1..=128, no '.' allowed)",
                 device_id
             ),
         });
     }
     if meta.raw_public_key().map_or(true, |k| k.len() > MAX_PUBLIC_KEY_LEN) {
-        return Err(GoDaddyError::InvalidParameters {
-            body: format!("public key exceeds {} chars (got {})", MAX_PUBLIC_KEY_LEN, meta.key.len()),
+        return Err(ProviderError::InvalidParameter {
+            detail: format!("public key exceeds {} chars (got {})", MAX_PUBLIC_KEY_LEN, meta.key.len()),
         });
     }
     if meta.to_txt().len() > MAX_RECORD_DATA_LEN {
-        return Err(GoDaddyError::InvalidParameters {
-            body: format!("TXT record data exceeds {} bytes", MAX_RECORD_DATA_LEN),
+        return Err(ProviderError::InvalidParameter {
+            detail: format!("TXT record data exceeds {} bytes", MAX_RECORD_DATA_LEN),
         });
     }
     Ok(())
@@ -217,6 +231,13 @@ fn validate_device_and_key(device_id: &str, meta: &DeviceMeta) -> Result<(), GoD
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::mock::MockProvider;
+
+    /// S-27 (F-32)：32 字节 Ed25519 公钥的标准 base64（44 字符）。
+    fn valid_key() -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode([7u8; 32])
+    }
 
     #[test]
     fn test_device_meta_roundtrip() {
@@ -290,5 +311,87 @@ mod tests {
         let meta = DeviceMeta::new(&valid);
         assert_eq!(meta.raw_public_key(), Some(valid.as_str()));
         assert!(is_valid_ed25519_pubkey_b64(meta.raw_public_key().unwrap()));
+    }
+
+    // ---- MockProvider 往返（M9-DNS000 抽象层语义） ----
+
+    #[tokio::test]
+    async fn test_register_and_query_roundtrip() {
+        let provider = MockProvider::new("mock");
+        let mgr = TxtManager::new(&provider, "example.com");
+
+        let meta = DeviceMeta::new(&valid_key());
+        mgr.register("my-pc", &meta, 600).await.unwrap();
+
+        let parsed = mgr.query("my-pc").await.unwrap();
+        assert_eq!(parsed.key, meta.key);
+        assert_eq!(parsed.proto, "ip6desk");
+        assert_eq!(parsed.ver, "1");
+        assert_eq!(parsed.device_type, "desktop");
+
+        // 存储形态：TXT 记录 data = JSON 字符串（RecordData::Plain）。
+        let stored = provider.records_of("example.com", RecordType::TXT, "my-pc");
+        assert_eq!(stored.len(), 1);
+        assert!(matches!(&stored[0].data, RecordData::Plain(d) if d == &meta.to_txt()));
+
+        mgr.remove("my-pc").await.unwrap();
+        assert!(
+            provider
+                .records_of("example.com", RecordType::TXT, "my-pc")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_query_not_found() {
+        let provider = MockProvider::new("mock");
+        let mgr = TxtManager::new(&provider, "example.com");
+        let err = mgr.query("ghost").await.unwrap_err();
+        assert!(matches!(err, ProviderError::NotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_query_parses_invalid_json_as_error() {
+        let provider = MockProvider::new("mock");
+        provider.seed_record(
+            "example.com",
+            Record {
+                name: "bad-meta".to_string(),
+                rtype: RecordType::TXT,
+                ttl: 600,
+                data: RecordData::Plain("not-json{{{".to_string()),
+            },
+        );
+        let mgr = TxtManager::new(&provider, "example.com");
+        let err = mgr.query("bad-meta").await.unwrap_err();
+        assert!(matches!(err, ProviderError::InvalidParameter { .. }));
+    }
+
+    /// S-27（F-32）：读侧拒绝畸形公钥 —— 非 32 字节 base64 的 TXT 直接拒绝。
+    #[tokio::test]
+    async fn test_query_rejects_malformed_pubkey() {
+        let provider = MockProvider::new("mock");
+        // "shortkey" 非 32 字节 Ed25519 公钥。
+        let bad = DeviceMeta::new("shortkey").to_txt();
+        provider.seed_record(
+            "example.com",
+            Record {
+                name: "bad-key".to_string(),
+                rtype: RecordType::TXT,
+                ttl: 600,
+                data: RecordData::Plain(bad),
+            },
+        );
+        let mgr = TxtManager::new(&provider, "example.com");
+        let err = mgr.query("bad-key").await.unwrap_err();
+        assert!(matches!(err, ProviderError::InvalidParameter { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_query_rejects_invalid_device_id() {
+        let provider = MockProvider::new("mock");
+        let mgr = TxtManager::new(&provider, "example.com");
+        let err = mgr.query("a.b.c").await.unwrap_err();
+        assert!(matches!(err, ProviderError::InvalidParameter { .. }));
     }
 }

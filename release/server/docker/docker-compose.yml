@@ -37,3 +37,6 @@ volumes:
 #     - "9000:9000/tcp"
 #     - "50000-50099:50000-50099/tcp"
 #   command: ["--bind-port", "9000", "--port-range", "50000-50099"]
+# 显式多监听示例（IPv4+IPv6 双监听，v6 一律 v6-only；IPv6 端口映射
+# 需 docker 启用 IPv6，一般公网 v4 场景用默认即可）：
+#   command: ["--bind-addrs", "0.0.0.0,::", "--bind-port", "9000", "--port-range", "50000-50099"]

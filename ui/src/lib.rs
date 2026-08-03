@@ -59,7 +59,6 @@ use widgets::{
 
 // M10: 设备列表持久化 + DNS 发现连接。
 use kirin_desk_dns::discovery::DiscoveryService;
-use kirin_desk_dns::godaddy::GoDaddyClient;
 use kirin_desk_utils::devices::{DeviceStore, SavedDevice};
 // M15 (CLI-KH): 已知主机指纹验证。
 use kirin_desk_utils::known_hosts::{
@@ -90,6 +89,18 @@ fn gui_log_buffer() -> Arc<LogBuffer> {
 /// M15-T008: LogView「Clear」按钮回调——清空共享日志缓冲（`fn()` 无借用冲突）。
 pub(crate) fn clear_gui_log() {
     gui_log_buffer().clear();
+}
+
+/// 当前激活 DNS 服务商是否已配置可用凭据（注册表已注册 + `[dns.providers.*]`
+/// 对应条目非空）。M9-DNS022 (UI-DNS-004) 泛化：不再限定 GoDaddy——Connect 页
+/// 域名模式前置校验 / 状态栏 DNS 徽标统一走本判定（配合 App 内存
+/// `dns_configured`，避免每帧读配置）。
+fn dns_provider_configured(cfg: &kirin_desk_utils::config::Config) -> bool {
+    !cfg.dns.provider.is_empty()
+        && kirin_desk_dns::provider_registry().has(&cfg.dns.provider)
+        && cfg
+            .dns_provider_credentials(&cfg.dns.provider)
+            .map_or(false, |m| !m.is_empty())
 }
 
 /// S-02 (F-5): 服务端并发连接处理上限（含 60s 审批等待）——accept 循环每连接
@@ -3838,6 +3849,10 @@ struct KirinDeskApp {
     /// GoDaddy API base URL（未保存时回退生产环境）。
     api_url: String,
     domain: String,
+    /// M9-DNS022 (UI-DNS-004): DNS 服务商是否已配置凭据（Connect 页域名模式 /
+    /// 状态栏徽标判定；`load_config` 与 Domain 页保存后刷新——`api_key` 等
+    /// 字段仅 godaddy 兼容填充，非 godaddy 服务商不能以它们判定）。
+    dns_configured: bool,
     device_id: String,
     nickname: String,
     challenge_code: String,
@@ -4510,11 +4525,11 @@ impl eframe::App for KirinDeskApp {
                 ui.separator();
                 // M15-T008: API 状态改语义 Badge
                 // M9-DNS000 (UI-DNS-004): 文案泛化——不再出现 GoDaddy 字样，
-                // 未配置时引导至 Settings → DNS（服务商设置）。
-                if self.api_key.is_empty() {
-                    badge(ui, &theme, t!("session.statusbar.dns_na"), BadgeKind::Warning);
-                } else {
+                // 判定走 `dns_configured`（任意已注册服务商，非 godaddy 专属）。
+                if self.dns_configured {
                     badge(ui, &theme, t!("session.statusbar.dns_ready"), BadgeKind::Success);
+                } else {
+                    badge(ui, &theme, t!("session.statusbar.dns_na"), BadgeKind::Warning);
                 }
                 ui.separator();
                 // M15-T008: StatusDot——监听=绿 / 停止=灰
@@ -5326,6 +5341,10 @@ impl eframe::App for KirinDeskApp {
                                 }
                             }
                             // 2. 渲染 + 尺寸变化 → ShellResize（终端尺寸变更通知）。
+                            // R-27：终端画布固定经典深色——明亮主题下视频底已浅色化
+                            // （theme.video_bg），终端保持 M11-T002 经典深色 ANSI
+                            // 调色板可读性（深色主题下与 video_bg=纯黑 视觉一致）。
+                            ui.painter().rect_filled(ui.max_rect(), 0.0, egui::Color32::BLACK);
                             let (cols, rows, resized) = term.lock().unwrap().ui(ui);
                             if resized {
                                 if let Some(tx) = win.shell_tx.as_ref() {
@@ -5733,10 +5752,21 @@ impl KirinDeskApp {
         self.listen_port = "3389".to_string();
         self.ip_mode_allowed = true;
         if let Ok(cfg) = kirin_desk_utils::config::Config::load() {
-            self.api_key = cfg.godaddy.api_key;
-            self.api_secret = cfg.godaddy.api_secret;
-            self.api_url = cfg.godaddy.api_url.clone();
-            self.domain = cfg.godaddy.domain;
+            // M9-DNS022 (UI-DNS-004): App 内存 godaddy 凭据字段仅作 godaddy
+            // 兼容——激活服务商非 godaddy 时清空（Connect 页/状态栏判定走
+            // `dns_configured`，不依赖这些字段）。
+            if cfg.dns.provider == "godaddy" {
+                self.api_key = cfg.godaddy.api_key.clone();
+                self.api_secret = cfg.godaddy.api_secret.clone();
+                self.api_url = cfg.godaddy.api_url.clone();
+                self.domain = cfg.godaddy.domain.clone();
+            } else {
+                self.api_key.clear();
+                self.api_secret.clear();
+                self.api_url.clear();
+                self.domain.clear();
+            }
+            self.dns_configured = dns_provider_configured(&cfg);
             // M9-DNS022: DNS 服务商选择迁至 Domain 页（domain_panel 内部
             // 自配置读取并回填表单），App 不再持有该字段。
             // M8-T031: 配置留空 / 旧占位 `default-device` → 自动派生
@@ -6446,12 +6476,21 @@ impl KirinDeskApp {
         let saved = domain_panel::show_domain_page(ui, theme, &mut self.domain_panel);
         if saved {
             // Domain 页保存凭据 → 同步 App 内存值（Connect 页 DNS 发现与
-            // 状态栏徽标即时生效，无需重启）。
+            // 状态栏徽标即时生效，无需重启）。godaddy 兼容字段仅激活服务商为
+            // godaddy 时填充，否则清空（UI-DNS-004 泛化）。
             if let Ok(cfg) = kirin_desk_utils::config::Config::load() {
-                self.api_key = cfg.godaddy.api_key;
-                self.api_secret = cfg.godaddy.api_secret;
-                self.api_url = cfg.godaddy.api_url;
-                self.domain = cfg.godaddy.domain;
+                if cfg.dns.provider == "godaddy" {
+                    self.api_key = cfg.godaddy.api_key.clone();
+                    self.api_secret = cfg.godaddy.api_secret.clone();
+                    self.api_url = cfg.godaddy.api_url.clone();
+                    self.domain = cfg.godaddy.domain.clone();
+                } else {
+                    self.api_key.clear();
+                    self.api_secret.clear();
+                    self.api_url.clear();
+                    self.domain.clear();
+                }
+                self.dns_configured = dns_provider_configured(&cfg);
             }
         }
     }
@@ -7960,16 +7999,15 @@ impl KirinDeskApp {
     }
 
     /// M10-T004: 设备 → 自动填入 Connect 页并切换标签页。
-    /// 有域名且 API 已配置 → Domain 模式（DNS 发现）；否则 IP 模式直连。
+    /// 有域名且 DNS 服务商已配置 → Domain 模式（DNS 发现）；否则 IP 模式直连。
     /// M8-T037: 设备保存的挑战码非空时预填连接表单（表单必填校验不变；
     /// 设备无挑战码 → 不预填，由用户输入）。
     fn fill_connect_from_device(&mut self, d: &SavedDevice) {
         self.connect_nickname = d.nickname.clone();
         self.connect_challenge = d.challenge.clone();
-        if !d.domain.is_empty()
-            && !self.api_key.trim().is_empty()
-            && !self.api_secret.trim().is_empty()
-        {
+        // M9-DNS022 (UI-DNS-004): 判定泛化——任意已注册服务商凭据即可
+        // （不再限定 GoDaddy api_key/api_secret）。
+        if !d.domain.is_empty() && self.dns_configured {
             self.connect_domain = d.domain.clone();
             self.ip_mode_allowed = false; // 切换 Domain 模式界面（仅内存，不写回配置）
             self.connect_status =
@@ -8464,25 +8502,26 @@ impl KirinDeskApp {
                 .selectable(false),
             );
         } else {
-            // M10-T002: 无 GoDaddy API 配置 → 友好提示 + 直接跳转 Settings。
-            if self.api_key.trim().is_empty() || self.api_secret.trim().is_empty() {
+            // M10-T002: 无 DNS 服务商配置 → 友好提示 + 直接跳转 Domain 页。
+            // M9-DNS022 (UI-DNS-004): 泛化——任意服务商，不再出现 GoDaddy 字样。
+            if !self.dns_configured {
                 ui.add(
                     egui::Label::new(
-                        egui::RichText::new(t!("connect.godaddy.unconfigured"))
+                        egui::RichText::new(t!("domain.error.not_configured"))
                             .color(theme.danger),
                     )
                     .selectable(false),
                 );
                 ui.add(
                     egui::Label::new(
-                        egui::RichText::new(t!("connect.godaddy.guide"))
+                        egui::RichText::new(t!("domain.provider.connect_guide"))
                             .size(theme.small_size)
                             .color(theme.fg_weak),
                     )
                     .selectable(false),
                 );
-                if ui.button(t!("connect.button.goto_settings")).clicked() {
-                    self.current_tab = Tab::Settings;
+                if ui.button(t!("domain.provider.goto_domain")).clicked() {
+                    self.current_tab = Tab::Domain;
                 }
                 ui.separator();
             }
@@ -8546,7 +8585,9 @@ impl KirinDeskApp {
                 None
             };
             let busy = matches!(step, Some(0) | Some(1) | Some(2));
-            let api_ok = !self.api_key.trim().is_empty() && !self.api_secret.trim().is_empty();
+            // M9-DNS022 (UI-DNS-004): 域名模式前置校验泛化——任意已注册服务商
+            // 凭据即可（不再限定 GoDaddy）。
+            let api_ok = self.dns_configured;
             let can_connect = domain_ok && nick_ok && chal_ok && api_ok;
             let state = if busy {
                 ButtonState::Busy
@@ -8565,31 +8606,52 @@ impl KirinDeskApp {
                     self.connect_status = t!("connect.error.domain_empty").to_string();
                 } else if nick.is_empty() {
                     self.connect_status = t!("connect.error.nickname_empty").to_string();
-                } else if self.api_key.trim().is_empty() || self.api_secret.trim().is_empty() {
-                    // M10-T002: 无 GoDaddy API → 拒绝执行（页面上方已有引导提示）。
-                    self.connect_status = t!("connect.error.godaddy_missing").to_string();
+                } else if !self.dns_configured {
+                    // M10-T002: 无 DNS 服务商配置 → 拒绝执行（页面上方已有引导提示）。
+                    self.connect_status = t!("domain.error.not_configured").to_string();
                 } else {
                     // M10-T001 + M15: Domain 模式 — DNS 发现（SRV 端口 + TXT 公钥 +
                     // AAAA IPv6）→ 信任解析（known_hosts 优先于 TXT；未命中首次指纹
                     // 确认）→ TCP 连接 → 完整握手（TXT 公钥强制验证）→ 自动保存设备。
                     // M8-T038 (P1): 进度快照类 connect_status 写入已删除（弹出页状态条承载）。
                     tracing::info!("Connect button: domain={} device={}", domain, nick);
-                    let api_key = self.api_key.trim().to_string();
-                    let api_secret = self.api_secret.trim().to_string();
-                    let api_url = if self.api_url.is_empty() {
-                        "https://api.godaddy.com".to_string()
-                    } else {
-                        self.api_url.clone()
-                    };
                     let ctx = ui.ctx().clone();
                     std::thread::spawn(move || {
                         let rt = tokio::runtime::Runtime::new().expect("connect rt");
                         rt.block_on(async {
-                            // 1. 发现中：GoDaddy API 并行查询 SRV/TXT/AAAA。
+                            // 1. 发现中：当前激活服务商（配置层凭据）并行查询
+                            //    SRV/TXT/AAAA（M9-DNS022 provider 化）。
+                            let cfg = kirin_desk_utils::config::Config::load()
+                                .unwrap_or_default();
+                            // 目标域名：godaddy 兼容读 `[godaddy] domain`
+                            // （设备注册域）；其余服务商取表单输入。
+                            let target_domain = if cfg.dns.provider == "godaddy"
+                                && !cfg.godaddy.domain.trim().is_empty()
+                            {
+                                cfg.godaddy.domain.trim().to_string()
+                            } else {
+                                domain.clone()
+                            };
                             let device_id = nick.clone();
                             let discovery_res = {
-                                let client = GoDaddyClient::new(&api_key, &api_secret, &api_url);
-                                let discovery = DiscoveryService::new(&client, &domain);
+                                let provider = match kirin_desk_dns::default_provider(
+                                    &cfg.dns.provider,
+                                    &cfg.dns.providers,
+                                ) {
+                                    Ok(p) => p,
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "DNS provider init failed: {}",
+                                            e
+                                        );
+                                        if let Ok(mut s) = connection_status().lock() {
+                                            *s = format!("DNS 服务商初始化失败: {}", e);
+                                        }
+                                        return;
+                                    }
+                                };
+                                let discovery =
+                                    DiscoveryService::new(&*provider, &target_domain);
                                 discovery.discover(&device_id).await
                             };
                             match discovery_res {
@@ -8697,8 +8759,13 @@ impl KirinDeskApp {
                                                 api_key: cfg.godaddy.api_key.clone(),
                                                 api_secret: cfg.godaddy.api_secret.clone(),
                                                 api_url: cfg.godaddy.api_url.clone(),
-                                                domain: domain.clone(),
+                                                domain: target_domain.clone(),
                                                 ip_family: family,
+                                                // M9-DNS023: provider 化——重连
+                                                // 发现经 default_provider（配置层
+                                                // 凭据表为事实源）。
+                                                provider: cfg.dns.provider.clone(),
+                                                credentials: cfg.dns.providers.clone(),
                                             }),
                                             domain.clone(),
                                         )

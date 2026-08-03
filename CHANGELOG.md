@@ -7,6 +7,32 @@
 ## [Unreleased]
 
 ### Added
+- M9-DNS000 多服务商 DNS 域名维护客户端（M9-DNS001~024，20 家服务商全量落地）：
+  - Provider 抽象层（`dns/src/provider/`）：`Provider` trait（test_connection /
+    list_domains / query_records / upsert_record / delete_record / capabilities）、
+    统一 `Record`/`RecordData`（Plain/Mx/Srv）与 `RecordType`、统一 `ProviderError`
+    （Auth/InvalidParameter/NotFound/RateLimited/Server/Network/Json/Unsupported/
+    Other）、`ProviderRegistry` + `Credential` 枚举（20 变体）、`MockProvider`
+    契约测试基建
+  - 20 家服务商适配（`dns/src/providers/`，M9-DNS001~020）：GoDaddy（旧模块迁移+
+    trait 化）、Cloudflare、阿里云云解析、腾讯云 DNSPod（TC3）、AWS Route 53
+    （SigV4+XML）、Azure DNS（OAuth2）、Google Cloud DNS（RS256 JWT）、华为云 DNS、
+    Namecheap（XML）、DigitalOcean、Vultr、Linode、Hetzner DNS、OVH（三要素签名）、
+    Porkbun、百度智能云（BCE）、火山引擎云解析、京东云解析（JDCLOUD2）、西部数码
+    （MD5 token，SRV/NS 能力降级）、新网（SRV 能力降级）；每服务商自包含 mock
+    契约测试（≥5 用例/家）
+  - 服务层多服务商化（M9-DNS021）：srv/aaaa/a/txt/discovery/heartbeat 全部改为
+    `&dyn Provider` / `Arc<dyn Provider>`，`DiscoveryError` 新增 `Provider` 变体，
+    `discover_device(provider, domain, device_id)`；旧 `dns/src/godaddy/` 模块删除
+  - 配置结构（§四）：`[dns] provider` + `[dns.providers.*]` 每服务商凭据表；
+    旧 `[godaddy]` 表加载时自动迁移并写回；`utils::dns_providers` 注册表全量
+    20 家（UI 下拉框数据源）
+  - UI（M9-DNS022）：Domain 页「服务商」卡下拉框列出全部 20 家（注册表驱动）、
+    凭据表单按服务商动态渲染（secret 👁）、测试连接、域名列表、记录 CRUD、
+    SRV/NS 能力降级提示（西部数码/新网）、文案泛化（GoDaddy → DNS 服务商）
+  - CLI（M9-DNS023）：`dns` 子命令组（list-providers / set-provider / test /
+    domains / records / add / update / delete / register / unregister）；
+    `register`/`discover`/`connect` 链路走当前激活 provider，旧用法零破坏
 - M8-T039 Tunnel 内网穿透独立页 + Server 多监听 + Token ✏️📋 + 通用工具化：
   - 独立页（P3）：`Tab::Tunnel`（🚇 标签，Connect 与 Settings 之间）；Settings
     页「Tunnel (内网穿透)」分组与保存分支整体移除（`settings.tunnel.*` 10 键随删，
@@ -46,6 +72,13 @@
     语义零变化）
   - 门禁：`cargo check --workspace --all-targets` 全绿；utils 118 + relay 91（含
     新增 4）+ ui 110（含 i18n 重复键断言）全过；`--cli self-test` 回归通过
+  - 跨平台补齐（P16b，08-03）：独立服务端 `relay-server` 新增 `--bind-addrs`
+    参数（多监听地址，逗号分隔、仅本机 IP，v6 一律 v6-only）——Linux/macOS
+    无 GUI 部署主路径（Docker/systemd/裸机）获得与 Windows GUI Server 区块
+    相同的多监听能力；空 = 默认双栈回退（行为零变化）、非法值 fail-closed
+    拒绝启动、`--help`/启动横幅展示实际监听地址；`Config::parse` 新增单测；
+    发布文档同步（`release/server/README.md` 参数表 + `BUILD_LINUX.md` /
+    `relay-server.service` / docker compose & Dockerfile 示例）
 - M8-T038 连接状态迁移 + 语言选项与文案统一：
   - 连接状态迁移（P1）：Connect 页移除顶部状态点行与表单内 3 处 Stepper 渲染
     （保留 step/busy 推导驱动按钮禁用/⏳）、删除 3 处进度快照类表单反馈写入；
@@ -146,6 +179,20 @@
   不中断循环；服务端环回 + 客户端麦克风两处调用点同步替换
   （`ui/src/lib.rs`）。注：当前码率硬常量 64kbps（M12），20ms 帧 ≈160B，
   现路径不会超限，此为防御性加固
+- **明亮主题视频画布深字压深底（R-27）**：`theme.video_bg` 明亮值由深色
+  `#0D1117` 改为浅色 `#F6F8FA`（与 `theme.bg` 同色）——断线/重连覆盖层
+  （fg 1.20:1 → 14.84:1）、"等待视频流"占位（4.16 → 4.27:1 同既有例外）、
+  状态点 danger（3.53 → 5.03:1）在明亮主题下恢复可读；深色主题恒 `#000000`
+  零变化。远程 Shell 终端画布改为显式纯黑填充（M11-T002 经典深色 ANSI
+  调色板与主题解耦的落地，深色主题视觉不变）。新增
+  `test_video_bg_theme_alignment` 锁定"明亮=浅底/深色=深底"+ 画布文字对比度，
+  `test_palette_contrast` 底色矩阵纳入 `video_bg`
+  （`ui/src/theme.rs`、`ui/src/lib.rs`；设计文档
+  `task_docs/修复任务/U_R-27_明亮主题画布浅色化与域名页徽标移除.md`）
+- **域名页服务商名 Info 徽标移除（R-27）**：`domain_panel.rs` 服务商卡不再以
+  Info 语义（品牌蓝 `#0969DA`）徽标渲染服务商名（如 "GoDaddy"，观感误认品牌
+  logo）；服务商名保留于 ComboBox 选中文本，配置状态徽标（已配置/未配置）
+  不受影响（`ui/src/domain_panel.rs`）
 
 ## [v0.1.0] - 2026-07-31
 

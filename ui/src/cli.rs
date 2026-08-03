@@ -1,13 +1,15 @@
 use kirin_desk_core::connection::temp_mode::TempModeManager;
 use kirin_desk_core::network::ipv6::get_global_ipv6;
 use kirin_desk_core::network::tcp::TcpServer;
+use kirin_desk_dns::a::AManager;
 use kirin_desk_dns::aaaa::AaaaManager;
-use kirin_desk_dns::godaddy::GoDaddyClient;
 use kirin_desk_dns::srv::SrvManager;
 use kirin_desk_dns::txt::{DeviceMeta, TxtManager};
-use kirin_desk_dns::{DiscoveryService, IpFamily};
+use kirin_desk_dns::{default_provider, provider_registry, DiscoveryService, IpFamily};
+use kirin_desk_dns::{Provider, ProviderError, Record, RecordData, RecordType};
 use kirin_desk_media::transport::TransportMode;
 use kirin_desk_utils::config::Config;
+use kirin_desk_utils::dns_providers::dns_provider_defs;
 use std::net::Ipv6Addr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -264,6 +266,8 @@ pub(crate) enum CliCommand {
     Tunnel,
     Status,
     SelfTest,
+    /// M9-DNS023: DNS 域名维护子命令组（`dns list-providers` 等，见 §六）。
+    Dns,
     /// 未识别命令（保留原文供报错/help；无子命令时为空串）。
     Unknown(String),
 }
@@ -289,6 +293,7 @@ pub(crate) fn parse_cli_command(args: &[String]) -> CliCommand {
         Some("tunnel") => CliCommand::Tunnel,
         Some("status") => CliCommand::Status,
         Some("self-test") => CliCommand::SelfTest,
+        Some("dns") => CliCommand::Dns,
         Some(other) => CliCommand::Unknown(other.to_string()),
         None => CliCommand::Unknown(String::new()),
     }
@@ -417,6 +422,8 @@ pub async fn run_cli() {
         CliCommand::Tunnel => cmd_tunnel(args).await,
         CliCommand::Status => cmd_status(),
         CliCommand::SelfTest => cmd_self_test().await,
+        // M9-DNS023: `dns <subcommand>` 子命令组（§六）。
+        CliCommand::Dns => cmd_dns(args).await,
         CliCommand::Unknown(cmd) => {
             println!("Unknown command: {}", cmd);
             print_help();
@@ -433,8 +440,15 @@ fn print_help() {
     println!("COMMANDS:");
     println!("  setup                Interactive configuration wizard");
     println!("  config               Show current configuration");
-    println!("  register [id] [p]    Register device with GoDaddy DNS");
-    println!("  discover <id>        Discover a remote device");
+    println!("  register [id] [p]    Register device with DNS (current provider)");
+    println!("  discover <id>        Discover a remote device (current DNS provider)");
+    println!("  dns <subcommand>     DNS domain maintenance (M9-DNS023)");
+    println!("                       subcommands: list-providers | set-provider <name> |");
+    println!("                       test [provider] | domains | records <domain> [type] |");
+    println!("                       add|update <domain> <type> <name> <data> [--ttl N]");
+    println!("                       [--priority N --weight N --port N] |");
+    println!("                       delete <domain> <type> <name> |");
+    println!("                       register <device-id> <port> | unregister <device-id>");
     println!("  connect <t> [p] [n] Connect to device — domain: DNS discovery + TXT key");
     println!("                                     binding; IPv6: known_hosts / first-use confirm");
     println!("                                     challenge: interactive prompt (TTY, hidden input)");
@@ -738,7 +752,16 @@ fn cmd_config() {
             println!("Nickname:      {}", c.device.nickname);
             println!("Domain:        {}", c.godaddy.domain);
             println!("Port:          {}", c.network.port);
-            println!("API Key:       {}", mask(&c.godaddy.api_key));
+            // M9-DNS023：只显示 provider 名 + 凭据状态，不显示任何密钥。
+            println!(
+                "DNS Provider:  {} ({})",
+                c.dns.provider,
+                if c.active_dns_provider_credentials().is_some() {
+                    "已配置凭据"
+                } else {
+                    "未配置凭据"
+                }
+            );
             let wl = if c.network.allowed_domains.is_empty() {
                 "any".to_string()
             } else {
@@ -768,46 +791,93 @@ fn cmd_config() {
     }
 }
 
-async fn cmd_register(device_id: &str, port: u16) {
-    let cfg = match Config::load() {
-        Ok(c) => c,
-        Err(e) => {
-            println!("Config error: {}. Run setup first.", e);
-            return;
-        }
-    };
-    if cfg.godaddy.api_key.is_empty() {
-        println!("API key not set. Run setup.");
-        return;
+/// M9-DNS023: 按名称构建 Provider（凭据缺失 → 「未配置 [dns.providers.{name}]
+/// 凭据」；构建失败 → 归一化错误文案）。
+fn provider_by_name(cfg: &Config, name: &str) -> Result<Box<dyn Provider>, String> {
+    if cfg.dns_provider_credentials(name).is_none() {
+        return Err(format!("未配置 [dns.providers.{name}] 凭据"));
     }
-    let client = GoDaddyClient::new(
-        &cfg.godaddy.api_key,
-        &cfg.godaddy.api_secret,
-        &cfg.godaddy.api_url,
-    );
-    println!("Registering '{}' on {}...", device_id, cfg.godaddy.domain);
+    default_provider(name, &cfg.dns.providers)
+        .map_err(|e| format!("服务商「{name}」初始化失败: {}", provider_error_label(&e)))
+}
 
-    let target = format!("{}.{}.", device_id, cfg.godaddy.domain);
-    match SrvManager::new(&client, &cfg.godaddy.domain)
-        .register(device_id, port, &target, cfg.network.dns_ttl)
-        .await
-    {
-        Ok(()) => println!("  SRV: OK"),
-        Err(e) => println!("  SRV: {}", e),
+/// M9-DNS023: 当前激活服务商（`[dns] provider`）。
+fn active_provider(cfg: &Config) -> Result<Box<dyn Provider>, String> {
+    provider_by_name(cfg, &cfg.dns.provider)
+}
+
+/// M9-DNS023: ProviderError → 统一分类文案（认证/限流/网络/未找到/服务端等）。
+/// 厂商原始错误串只允许进日志，不进 CLI 输出（M9-DNS000 §九验收）。
+fn provider_error_label(e: &ProviderError) -> String {
+    match e {
+        ProviderError::Auth { detail } => format!("认证失败：{detail}"),
+        ProviderError::InvalidParameter { detail } => format!("参数错误：{detail}"),
+        ProviderError::NotFound { what } => format!("未找到：{what}"),
+        ProviderError::RateLimited { retry_after } => {
+            format!("限流：请等待 {} 秒后重试", retry_after.unwrap_or(0))
+        }
+        ProviderError::Server { status, body } => format!("服务端错误：HTTP {status} {body}"),
+        ProviderError::Network(_) => format!("网络错误：{e}"),
+        ProviderError::Json(_) => format!("数据解析错误：{e}"),
+        ProviderError::Unsupported(cap) => format!("服务商不支持该能力：{cap}"),
+        ProviderError::Other(d) => format!("其他：{d}"),
+    }
+}
+
+/// M9-DNS023: 解析 `--flag <T>`（缺失 → Ok(None)；非法值 → Err 明确文案）。
+fn flag_parse<T: std::str::FromStr>(args: &[String], flag: &str) -> Result<Option<T>, String>
+where
+    T::Err: std::fmt::Display,
+{
+    match flag_value(args, flag) {
+        Some(v) => v
+            .parse::<T>()
+            .map(Some)
+            .map_err(|e| format!("ERROR: {flag} '{v}' 无效（{e}）")),
+        None => Ok(None),
+    }
+}
+
+/// 设备域名（`[godaddy] domain`，设备级；空 → `None`，调用方提示需设置）。
+fn device_domain(cfg: &Config) -> Option<&str> {
+    let d = cfg.godaddy.domain.trim();
+    if d.is_empty() {
+        None
+    } else {
+        Some(d)
+    }
+}
+
+/// M9-DNS023: 设备 DNS 注册三件套（Srv / Aaaa / Txt）——复用现有 `register`
+/// 语义（SRV-DNS-006：TXT 注册**真实身份公钥**，走 `load_identity`）。
+/// 服务商不支持 SRV 时降级为 A/AAAA+TXT（DNS-MNT-013），A/AAAA/TXT 照常。
+async fn register_device_dns(cfg: &Config, provider: &dyn Provider, device_id: &str, port: u16) {
+    let domain = device_domain(cfg).unwrap_or("");
+    let target = format!("{device_id}.{domain}.");
+    if provider.capabilities().srv {
+        match SrvManager::new(provider, domain)
+            .register(device_id, port, &target, cfg.network.dns_ttl)
+            .await
+        {
+            Ok(()) => println!("  SRV: OK"),
+            Err(e) => println!("  SRV: {}", provider_error_label(&e)),
+        }
+    } else {
+        println!("  ⚠ 该服务商不支持 SRV，降级为 A/AAAA+TXT（跳过 SRV 记录）");
     }
     match get_global_ipv6() {
-        Ok(ip) => match AaaaManager::new(&client, &cfg.godaddy.domain)
+        Ok(ip) => match AaaaManager::new(provider, domain)
             .register(device_id, ip, cfg.network.dns_ttl)
             .await
         {
             Ok(()) => println!("  AAAA: {} OK", ip),
-            Err(e) => println!("  AAAA: {}", e),
+            Err(e) => println!("  AAAA: {}", provider_error_label(&e)),
         },
         Err(e) => println!("  IPv6: {}", e),
     }
     // SRV-DNS-006：TXT 注册**真实身份公钥**（供对端握手 pin / DNS TXT 比对，
     // 修复旧 PLACEHOLDER_KEY —— 占位公钥会让所有基于 TXT 的公钥校验失效）。
-    let identity = match load_identity(&cfg) {
+    let identity = match load_identity(cfg) {
         Ok(id) => id,
         Err(e) => {
             println!(
@@ -823,16 +893,47 @@ async fn cmd_register(device_id: &str, port: u16) {
         "  TXT key: {}...",
         &pubkey[..std::cmp::min(20, pubkey.len())]
     );
-    match TxtManager::new(&client, &cfg.godaddy.domain)
+    match TxtManager::new(provider, domain)
         .register(device_id, &meta, cfg.network.dns_ttl)
         .await
     {
         Ok(()) => println!("  TXT: OK (real identity key)"),
-        Err(e) => println!("  TXT: {}", e),
+        Err(e) => println!("  TXT: {}", provider_error_label(&e)),
     }
+}
+
+/// M9-DNS023: 设备注册（`register [id] [p]`）——走当前激活 provider。
+async fn cmd_register(device_id: &str, port: u16) {
+    let cfg = match Config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            println!("Config error: {}. Run setup first.", e);
+            return;
+        }
+    };
+    let domain = match device_domain(&cfg) {
+        Some(d) => d.to_string(),
+        None => {
+            println!("ERROR: 未设置设备域名（[godaddy] domain）。请先配置。");
+            return;
+        }
+    };
+    let provider = match active_provider(&cfg) {
+        Ok(p) => p,
+        Err(msg) => {
+            println!("{}", msg);
+            return;
+        }
+    };
+    println!(
+        "Registering '{}' on {} (provider: {})...",
+        device_id, domain, cfg.dns.provider
+    );
+    register_device_dns(&cfg, &*provider, device_id, port).await;
     println!("Done.");
 }
 
+/// M9-DNS023: 设备发现（`discover <id>`）——走当前激活 provider。
 async fn cmd_discover(device_id: &str) {
     let cfg = match Config::load() {
         Ok(c) => c,
@@ -841,12 +942,21 @@ async fn cmd_discover(device_id: &str) {
             return;
         }
     };
-    let client = GoDaddyClient::new(
-        &cfg.godaddy.api_key,
-        &cfg.godaddy.api_secret,
-        &cfg.godaddy.api_url,
-    );
-    let discovery = DiscoveryService::new(&client, &cfg.godaddy.domain);
+    let domain = match device_domain(&cfg) {
+        Some(d) => d.to_string(),
+        None => {
+            println!("ERROR: 未设置设备域名（[godaddy] domain）。请先配置。");
+            return;
+        }
+    };
+    let provider = match active_provider(&cfg) {
+        Ok(p) => p,
+        Err(msg) => {
+            println!("{}", msg);
+            return;
+        }
+    };
+    let discovery = DiscoveryService::new(&*provider, &domain);
     match discovery.discover(device_id).await {
         Ok(info) => {
             println!("Device:    {}", info.device_id);
@@ -878,6 +988,370 @@ async fn cmd_discover(device_id: &str) {
         }
         Err(e) => println!("Discovery failed: {}", e),
     }
+}
+
+/// M9-DNS023: `dns <subcommand>` 子命令组（总体需求 §六）。
+///
+/// 命令：list-providers / set-provider / test / domains / records / add /
+/// update / delete / register / unregister。所有记录操作与设备注册走当前
+/// 激活 provider（`[dns] provider` + `[dns.providers.*]`）。
+async fn cmd_dns(args: Vec<String>) {
+    let mut cfg = match Config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            println!("Config error: {}. Run setup first.", e);
+            return;
+        }
+    };
+    let sub = args.get(2).map(|s| s.as_str()).unwrap_or("");
+    match sub {
+        "list-providers" => {
+            println!("DNS 服务商（共 {} 家）：", dns_provider_defs().len());
+            for def in dns_provider_defs() {
+                let marker = if def.id == cfg.dns.provider { "*" } else { " " };
+                let cred = if cfg.dns_provider_credentials(def.id).is_some() {
+                    "已配置凭据 ✓"
+                } else {
+                    "未配置"
+                };
+                let client = if provider_registry().has(def.id) {
+                    "客户端已集成"
+                } else {
+                    "客户端未集成"
+                };
+                println!(
+                    "  {} {:<14} {:<18} {:<12} {}",
+                    marker, def.id, def.name, cred, client
+                );
+            }
+            println!("  * = 当前激活（[dns] provider = {}）", cfg.dns.provider);
+        }
+        "set-provider" => {
+            let name = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            if name.is_empty() {
+                println!("Usage: kirin_desk dns set-provider <name>  （列表见 'dns list-providers'）");
+                return;
+            }
+            let Some(def) = dns_provider_defs().iter().find(|d| d.id == name) else {
+                println!("ERROR: 未知服务商 '{name}'（列表见 'dns list-providers'）");
+                return;
+            };
+            cfg.dns.provider = name.to_string();
+            match cfg.save() {
+                Ok(()) => {
+                    println!("已切换 DNS 服务商为「{}」（{}）", def.name, def.id);
+                    if !provider_registry().has(def.id) {
+                        println!("  ⚠ 该服务商客户端尚未集成，'dns test' / 设备注册将失败");
+                    }
+                    if cfg.dns_provider_credentials(def.id).is_none() {
+                        println!(
+                            "  提示：尚未配置 [dns.providers.{0}] 凭据——旧 [godaddy] 配置会在加载时自动迁移到 [dns.providers.godaddy]，其余服务商请在 setup / UI Domain 页配置。",
+                            def.id
+                        );
+                    }
+                }
+                Err(e) => println!("保存失败: {}", e),
+            }
+        }
+        "test" => {
+            let name = args
+                .get(3)
+                .map(|s| s.as_str())
+                .unwrap_or(&cfg.dns.provider)
+                .to_string();
+            let provider = match provider_by_name(&cfg, &name) {
+                Ok(p) => p,
+                Err(msg) => {
+                    println!("{}", msg);
+                    return;
+                }
+            };
+            println!("Testing connection to DNS provider '{}'...", name);
+            match provider.test_connection().await {
+                Ok(()) => println!("OK — 服务商「{name}」连接正常"),
+                Err(e) => println!("FAILED — {}", provider_error_label(&e)),
+            }
+        }
+        "domains" => {
+            let provider = match active_provider(&cfg) {
+                Ok(p) => p,
+                Err(msg) => {
+                    println!("{}", msg);
+                    return;
+                }
+            };
+            match provider.list_domains().await {
+                Ok(list) => {
+                    if list.is_empty() {
+                        println!("（无域名）");
+                        return;
+                    }
+                    for d in &list {
+                        println!("  {}", d);
+                    }
+                }
+                Err(e) => println!("FAILED — {}", provider_error_label(&e)),
+            }
+        }
+        "records" => {
+            let domain = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            if domain.is_empty() {
+                print_dns_usage();
+                return;
+            }
+            let rtype = match args.get(4) {
+                None => None,
+                Some(s) => match s.parse::<RecordType>() {
+                    Ok(t) => Some(t),
+                    Err(_) => {
+                        println!("ERROR: 未知记录类型 '{s}'（A/AAAA/CNAME/MX/TXT/SRV/NS）");
+                        return;
+                    }
+                },
+            };
+            let provider = match active_provider(&cfg) {
+                Ok(p) => p,
+                Err(msg) => {
+                    println!("{}", msg);
+                    return;
+                }
+            };
+            match provider.query_records(domain, None, rtype).await {
+                Ok(records) => {
+                    if records.is_empty() {
+                        println!("（无记录）");
+                        return;
+                    }
+                    println!("{:<6} {:<32} {:<44} {}", "类型", "名称", "数据", "TTL");
+                    for r in &records {
+                        println!(
+                            "{:<6} {:<32} {:<44} {}",
+                            r.rtype,
+                            r.name,
+                            r.data.to_display_string(),
+                            r.ttl
+                        );
+                    }
+                }
+                Err(e) => println!("FAILED — {}", provider_error_label(&e)),
+            }
+        }
+        "add" | "update" => {
+            let verb = if sub == "add" { "添加" } else { "更新" };
+            let (domain, rtype_str, name, data) = (
+                args.get(3).map(|s| s.as_str()).unwrap_or(""),
+                args.get(4).map(|s| s.as_str()).unwrap_or(""),
+                args.get(5).map(|s| s.as_str()).unwrap_or(""),
+                args.get(6).map(|s| s.as_str()).unwrap_or(""),
+            );
+            if domain.is_empty() || rtype_str.is_empty() || name.is_empty() || data.is_empty() {
+                print_dns_usage();
+                return;
+            }
+            let rtype: RecordType = match rtype_str.parse() {
+                Ok(t) => t,
+                Err(_) => {
+                    println!("ERROR: 未知记录类型 '{rtype_str}'（A/AAAA/CNAME/MX/TXT/SRV/NS）");
+                    return;
+                }
+            };
+            let ttl: u32 = match flag_parse(&args, "--ttl") {
+                Ok(v) => v.unwrap_or(0),
+                Err(msg) => {
+                    println!("{}", msg);
+                    return;
+                }
+            };
+            let priority: u16 = match flag_parse(&args, "--priority") {
+                Ok(v) => v.unwrap_or(0),
+                Err(msg) => {
+                    println!("{}", msg);
+                    return;
+                }
+            };
+            let weight: u16 = match flag_parse(&args, "--weight") {
+                Ok(v) => v.unwrap_or(1),
+                Err(msg) => {
+                    println!("{}", msg);
+                    return;
+                }
+            };
+            let port: Option<u16> = match flag_parse(&args, "--port") {
+                Ok(v) => v,
+                Err(msg) => {
+                    println!("{}", msg);
+                    return;
+                }
+            };
+            let rec_data = match rtype {
+                RecordType::SRV => {
+                    let Some(port) = port else {
+                        println!("ERROR: SRV 记录需要 --port <端口>（--priority N --weight N --port N）");
+                        return;
+                    };
+                    RecordData::Srv {
+                        priority,
+                        weight,
+                        port,
+                        target: data.to_string(),
+                    }
+                }
+                // MX：data 为 "prio exchange" 两 token 且首 token 是 u16 → 结构化；
+                // 否则按普通文本记录处理。
+                RecordType::MX => {
+                    let parts: Vec<&str> = data.split_whitespace().collect();
+                    if parts.len() == 2 {
+                        if let Ok(mx_priority) = parts[0].parse::<u16>() {
+                            RecordData::Mx {
+                                priority: mx_priority,
+                                exchange: parts[1].to_string(),
+                            }
+                        } else {
+                            RecordData::Plain(data.to_string())
+                        }
+                    } else {
+                        RecordData::Plain(data.to_string())
+                    }
+                }
+                _ => RecordData::Plain(data.to_string()),
+            };
+            let provider = match active_provider(&cfg) {
+                Ok(p) => p,
+                Err(msg) => {
+                    println!("{}", msg);
+                    return;
+                }
+            };
+            let rec = Record {
+                name: name.to_string(),
+                rtype,
+                ttl,
+                data: rec_data,
+            };
+            println!(
+                "{}记录 '{}'（{}）到 {}（TTL={}）...",
+                verb,
+                name,
+                rtype,
+                domain,
+                if ttl == 0 {
+                    "default".to_string()
+                } else {
+                    ttl.to_string()
+                }
+            );
+            match provider.upsert_record(domain, &rec).await {
+                Ok(()) => println!("OK — {rtype} 记录 '{}' 已写入 {}", name, domain),
+                Err(e) => println!("FAILED — {}", provider_error_label(&e)),
+            }
+        }
+        "delete" => {
+            let (domain, rtype_str, name) = (
+                args.get(3).map(|s| s.as_str()).unwrap_or(""),
+                args.get(4).map(|s| s.as_str()).unwrap_or(""),
+                args.get(5).map(|s| s.as_str()).unwrap_or(""),
+            );
+            if domain.is_empty() || rtype_str.is_empty() || name.is_empty() {
+                print_dns_usage();
+                return;
+            }
+            let rtype: RecordType = match rtype_str.parse() {
+                Ok(t) => t,
+                Err(_) => {
+                    println!("ERROR: 未知记录类型 '{rtype_str}'（A/AAAA/CNAME/MX/TXT/SRV/NS）");
+                    return;
+                }
+            };
+            let provider = match active_provider(&cfg) {
+                Ok(p) => p,
+                Err(msg) => {
+                    println!("{}", msg);
+                    return;
+                }
+            };
+            match provider.delete_record(domain, name, rtype).await {
+                Ok(()) => println!("OK — 已删除 {rtype} 记录 '{}'（{}）", name, domain),
+                Err(e) => println!("FAILED — {}", provider_error_label(&e)),
+            }
+        }
+        "register" => {
+            let device_id = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            if device_id.is_empty() {
+                print_dns_usage();
+                return;
+            }
+            let port: u16 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(3389);
+            if device_domain(&cfg).is_none() {
+                println!("ERROR: 未设置设备域名（[godaddy] domain）。请先配置。");
+                return;
+            }
+            let provider = match active_provider(&cfg) {
+                Ok(p) => p,
+                Err(msg) => {
+                    println!("{}", msg);
+                    return;
+                }
+            };
+            println!(
+                "Registering '{}' on {} (provider: {})...",
+                device_id, cfg.godaddy.domain, cfg.dns.provider
+            );
+            register_device_dns(&cfg, &*provider, device_id, port).await;
+            println!("Done.");
+        }
+        "unregister" => {
+            let device_id = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            if device_id.is_empty() {
+                print_dns_usage();
+                return;
+            }
+            let Some(domain) = device_domain(&cfg) else {
+                println!("ERROR: 未设置设备域名（[godaddy] domain）。请先配置。");
+                return;
+            };
+            let provider = match active_provider(&cfg) {
+                Ok(p) => p,
+                Err(msg) => {
+                    println!("{}", msg);
+                    return;
+                }
+            };
+            println!("Unregistering '{}' on {}...", device_id, domain);
+            match SrvManager::new(&*provider, domain).remove(device_id).await {
+                Ok(()) => println!("  SRV: removed"),
+                Err(e) => println!("  SRV: {}", provider_error_label(&e)),
+            }
+            match AaaaManager::new(&*provider, domain).remove(device_id).await {
+                Ok(()) => println!("  AAAA: removed"),
+                Err(e) => println!("  AAAA: {}", provider_error_label(&e)),
+            }
+            match TxtManager::new(&*provider, domain).remove(device_id).await {
+                Ok(()) => println!("  TXT: removed"),
+                Err(e) => println!("  TXT: {}", provider_error_label(&e)),
+            }
+            match AManager::new(&*provider, domain).remove(device_id).await {
+                Ok(()) => println!("  A: removed"),
+                Err(e) => println!("  A: {}", provider_error_label(&e)),
+            }
+            println!("Done.");
+        }
+        _ => print_dns_usage(),
+    }
+}
+
+/// M9-DNS023: `dns` 子命令组用法。
+fn print_dns_usage() {
+    println!("Usage: kirin_desk dns <subcommand> [args]");
+    println!("  list-providers                       列出全部服务商 + 凭据状态 + 当前激活");
+    println!("  set-provider <name>                  切换激活服务商（[dns] provider）");
+    println!("  test [provider]                      测试连接（默认当前激活服务商）");
+    println!("  domains                              列出域名");
+    println!("  records <domain> [type]              查询记录（type: A/AAAA/CNAME/MX/TXT/SRV/NS）");
+    println!("  add <domain> <type> <name> <data> [--ttl N] [--priority N --weight N --port N]");
+    println!("  update <domain> <type> <name> <data> [同 add 扩展参数]");
+    println!("  delete <domain> <type> <name>        删除记录（按 name+type）");
+    println!("  register <device-id> <port>          设备注册三件套（SRV/AAAA/TXT，走当前 provider）");
+    println!("  unregister <device-id>               注销设备记录（SRV/AAAA/TXT/A）");
 }
 
 /// M13-T005 (UA-CLI-001): 无人值守模式开关与状态 — `unattended <on|off|status>`。
@@ -1278,8 +1752,13 @@ async fn cmd_connect(args: Vec<String>) {
     let dns = if is_ip {
         None
     } else {
-        if cfg.godaddy.api_key.is_empty() {
-            println!("GoDaddy API not configured. Run 'kirin_desk setup' first.");
+        // M9-DNS023：provider 凭据检查（旧 GoDaddy api_key 检查删除；切换
+        // 服务商后自动走新 provider，无需改代码）。
+        if cfg.active_dns_provider_credentials().is_none() {
+            println!(
+                "DNS 服务商未配置（[dns.providers.{}] 无凭据）。Run 'kirin_desk setup' / 配置凭据后重试。",
+                cfg.dns.provider
+            );
             return;
         }
         Some(DnsConfig {
@@ -1288,6 +1767,8 @@ async fn cmd_connect(args: Vec<String>) {
             api_url: cfg.godaddy.api_url.clone(),
             domain: cfg.godaddy.domain.clone(),
             ip_family,
+            provider: cfg.dns.provider.clone(),
+            credentials: cfg.dns.providers.clone(),
         })
     };
     // 确认回调共享槽（IP 模式：确认放行的公钥供握手成功后写入 known_hosts，CLI-KH-002）。
@@ -1342,7 +1823,7 @@ async fn cmd_connect(args: Vec<String>) {
             Err(e) => {
                 // CLI-DNS-005: 设备未注册 / DNS 无响应 → 明确错误中止。
                 println!("{}", e);
-                println!("  (device not registered, or DNS/GoDaddy API unavailable)");
+                println!("  (device not registered, or DNS provider unavailable)");
                 return;
             }
         };
@@ -1754,10 +2235,11 @@ async fn cmd_shell_client(target: &str, port: u16, nickname: &str) {
         format!("{}:{}", target, port)
     };
     if !is_ip {
-        if cfg.godaddy.api_key.is_empty() {
+        // M9-DNS023：provider 凭据检查（旧 GoDaddy api_key 检查删除）。
+        if cfg.active_dns_provider_credentials().is_none() {
             println!(
-                "GoDaddy API not configured — cannot discover '{}'. Run setup.",
-                target
+                "DNS 服务商未配置（[dns.providers.{}] 无凭据）— cannot discover '{}'. Run setup.",
+                cfg.dns.provider, target
             );
             return;
         }
@@ -1765,12 +2247,14 @@ async fn cmd_shell_client(target: &str, port: u16, nickname: &str) {
             .trim_end_matches(&format!(".{}", cfg.godaddy.domain))
             .to_string();
         println!("Discovering '{}' on {}...", device_id, cfg.godaddy.domain);
-        let client = GoDaddyClient::new(
-            &cfg.godaddy.api_key,
-            &cfg.godaddy.api_secret,
-            &cfg.godaddy.api_url,
-        );
-        let discovery = DiscoveryService::new(&client, &cfg.godaddy.domain);
+        let provider = match default_provider(&cfg.dns.provider, &cfg.dns.providers) {
+            Ok(p) => p,
+            Err(e) => {
+                println!("Discovery FAILED: {}", provider_error_label(&e));
+                return;
+            }
+        };
+        let discovery = DiscoveryService::new(&*provider, &cfg.godaddy.domain);
         let info = match discovery.discover(&device_id).await {
             Ok(info) => info,
             Err(e) => {
@@ -2103,10 +2587,11 @@ async fn cli_file_connect(
         format!("{}:{}", target, port)
     };
     if !is_ip {
-        if cfg.godaddy.api_key.is_empty() {
+        // M9-DNS023：provider 凭据检查（旧 GoDaddy api_key 检查删除）。
+        if cfg.active_dns_provider_credentials().is_none() {
             println!(
-                "GoDaddy API not configured — cannot discover '{}'. Run setup.",
-                target
+                "DNS 服务商未配置（[dns.providers.{}] 无凭据）— cannot discover '{}'. Run setup.",
+                cfg.dns.provider, target
             );
             return None;
         }
@@ -2114,12 +2599,14 @@ async fn cli_file_connect(
             .trim_end_matches(&format!(".{}", cfg.godaddy.domain))
             .to_string();
         println!("Discovering '{}' on {}...", device_id, cfg.godaddy.domain);
-        let client = GoDaddyClient::new(
-            &cfg.godaddy.api_key,
-            &cfg.godaddy.api_secret,
-            &cfg.godaddy.api_url,
-        );
-        let discovery = DiscoveryService::new(&client, &cfg.godaddy.domain);
+        let provider = match default_provider(&cfg.dns.provider, &cfg.dns.providers) {
+            Ok(p) => p,
+            Err(e) => {
+                println!("Discovery FAILED: {}", provider_error_label(&e));
+                return None;
+            }
+        };
+        let discovery = DiscoveryService::new(&*provider, &cfg.godaddy.domain);
         let info = match discovery.discover(&device_id).await {
             Ok(info) => info,
             Err(e) => {
@@ -3298,12 +3785,14 @@ fn cmd_status() {
             println!("Config:        Loaded");
             println!("Device ID:     {}", cfg.device.id);
             println!("Domain:        {}", cfg.godaddy.domain);
+            // M9-DNS023：显示当前 provider 名 + 凭据状态（不显示密钥）。
             println!(
-                "API:           {}",
-                if cfg.godaddy.api_key.is_empty() {
-                    "Not set"
-                } else {
+                "DNS Provider:  {} ({})",
+                cfg.dns.provider,
+                if cfg.active_dns_provider_credentials().is_some() {
                     "Configured"
+                } else {
+                    "Not configured"
                 }
             );
             let wl = if cfg.network.allowed_domains.is_empty() {

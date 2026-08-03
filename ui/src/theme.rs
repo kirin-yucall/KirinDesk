@@ -134,7 +134,9 @@ impl Theme {
         border: c(0xD0D7DE),
         selection: c(0xB6D4FE),
         on_primary: Color32::WHITE,
-        video_bg: c(0x0D1117),
+        // R-27：明亮主题画布浅色（与 bg 同色）——叠印文字（断线覆盖层/视频占位）
+        // 取 fg/fg_weak/danger 深色系，浅底上对比度达标（深字压深底问题修复）。
+        video_bg: c(0xF6F8FA),
         body_size: 20.0,
         button_size: 18.0,
         heading_size: 26.0,
@@ -462,7 +464,8 @@ mod tests {
 
     /// 正文/弱色正文在所有面板底色上对比度 ≥ 4.5:1。
     /// 注：GitHub 官方色板中 light `fg_weak` 位于 `bg`(#F6F8FA)/`bg_strong` 上为
-    /// 4.27/3.95（品牌色板锁定，UI-BTY-018 按"用色板自查"原则记录例外）。
+    /// 4.27/3.95（品牌色板锁定，UI-BTY-018 按"用色板自查"原则记录例外）；
+    /// R-27：`video_bg` 明亮值 = `bg` 同色（4.27:1，同一例外）。
     #[test]
     fn test_palette_contrast() {
         for theme in [Theme::LIGHT, Theme::DARK] {
@@ -472,10 +475,13 @@ mod tests {
                     (theme.bg, "bg"),
                     (theme.bg_panel, "bg_panel"),
                     (theme.bg_strong, "bg_strong"),
+                    (theme.video_bg, "video_bg"),
                 ] {
                     let c = contrast(fg, bg);
                     let pass = if !theme.dark && fname == "fg_weak" {
-                        // light 主题弱色正文只保证面板（白）背景达标
+                        // light 主题弱色正文只保证面板（白）背景达标；其余底色为
+                        // 例外（品牌色板锁定，≥3.0 由下一断言兜底）。
+                        // R-27：video_bg 明亮=bg 同色（4.27:1），同属例外。
                         bname == "bg_panel"
                     } else {
                         true
@@ -492,6 +498,28 @@ mod tests {
             assert!(contrast(theme.on_primary, theme.success) >= 4.5);
             assert!(contrast(theme.on_primary, theme.danger) >= 4.5);
         }
+    }
+
+    /// R-27：画布底色随主题对齐——明亮=浅底（深色文字可读）、深色=深底；
+    /// 画布叠印文字（断线/重连覆盖层、视频占位）的语义色对比度锁定。
+    #[test]
+    fn test_video_bg_theme_alignment() {
+        // 明亮主题画布必须为浅色（修复前 #0D1117 深底导致深字压深底不可读）。
+        assert!(
+            luminance(Theme::LIGHT.video_bg) > 0.8,
+            "light theme video_bg must be light"
+        );
+        // 深色主题画布保持近黑（视频 letterbox 惯例）。
+        assert!(
+            luminance(Theme::DARK.video_bg) < 0.05,
+            "dark theme video_bg must stay dark"
+        );
+        // 画布叠印文字对比度（明亮：深色字/浅底；深色：浅色字/深底）。
+        assert!(contrast(Theme::LIGHT.fg, Theme::LIGHT.video_bg) >= 4.5);
+        assert!(contrast(Theme::LIGHT.fg_weak, Theme::LIGHT.video_bg) >= 3.0);
+        assert!(contrast(Theme::LIGHT.danger, Theme::LIGHT.video_bg) >= 4.5);
+        assert!(contrast(Theme::DARK.fg, Theme::DARK.video_bg) >= 4.5);
+        assert!(contrast(Theme::DARK.fg_weak, Theme::DARK.video_bg) >= 4.5);
     }
 
     #[test]

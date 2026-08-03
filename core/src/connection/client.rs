@@ -16,24 +16,36 @@ use crate::crypto::ed25519::IdentityManager;
 use crate::crypto::handshake::{
     client_handshake_with_confirm, CoreReason, HandshakeError, PinExpectation, SecureChannel,
 };
-use kirin_desk_dns::godaddy::GoDaddyClient;
-use kirin_desk_dns::{DeviceInfo, DiscoveryService, IpFamily};
+use kirin_desk_dns::{default_provider, DeviceInfo, DiscoveryService, IpFamily};
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 
 /// DNS 发现配置（domain 模式；`ConnectionOptions::dns = None` = IP 直连）。
+///
+/// M9-DNS023：provider 化——发现经 [`kirin_desk_dns::default_provider`] 构建
+/// 当前激活服务商（`provider` + `credentials` 为事实源）；`api_key` /
+/// `api_secret` / `api_url` 为旧 `[godaddy]` 兼容字段，provider 化后不再参与
+/// 发现，保留仅为不破坏既有构造方。
 #[derive(Debug, Clone)]
 pub struct DnsConfig {
-    /// GoDaddy API key（`[godaddy] api_key`）。
+    /// 旧 GoDaddy API key（`[godaddy] api_key`；兼容字段，不再使用）。
     pub api_key: String,
-    /// GoDaddy API secret（`[godaddy] api_secret`）。
+    /// 旧 GoDaddy API secret（`[godaddy] api_secret`；兼容字段，不再使用）。
     pub api_secret: String,
-    /// GoDaddy API 地址（`[godaddy] api_url`）。
+    /// 旧 GoDaddy API 地址（`[godaddy] api_url`；兼容字段，不再使用）。
     pub api_url: String,
-    /// 托管域名（`[godaddy] domain`）。
+    /// 托管域名（`[godaddy] domain`，设备级域名）。
     pub domain: String,
     /// 地址族选择策略（`--ip-family` / `[transport] ip_family`）。
     pub ip_family: IpFamily,
+    /// M9-DNS023：当前激活服务商注册表键名（`[dns] provider`，默认
+    /// "godaddy"；`dns set-provider` 切换）。
+    pub provider: String,
+    /// M9-DNS023：各服务商凭据表（`[dns.providers.*]`，原始字符串；
+    /// `dns.provider` 对应条目传给 `default_provider`）。纯内存结构，
+    /// 不参与序列化。
+    pub credentials: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 /// 客户端信任策略（R03-S1：确认策略以回调注入，CLI 自动 / GUI 弹窗复用）。
@@ -98,7 +110,7 @@ pub struct ResolvedPeer {
     /// 设备 id（domain 模式 = 发现返回；IP 模式 = server_id）。
     pub device_id: String,
     pub device_type: String,
-    /// GoDaddy 域名（IP 模式空串）。
+    /// DNS 托管域名（IP 模式空串）。
     pub domain: String,
     /// domain 模式发现详情（CLI 展示用）。
     pub discovered: Option<DeviceInfo>,
@@ -118,7 +130,7 @@ pub struct ConnectOutcome {
     /// 本次握手生效的公钥（domain 模式 = 解析出的 pin；Confirm 回调路径由
     /// 调用方自持槽位读取，见 CLI-KH-002）。
     pub trusted_key: Option<String>,
-    /// GoDaddy 域名（IP 模式空串）。
+    /// DNS 托管域名（IP 模式空串）。
     pub domain: String,
     /// domain 模式发现详情（IP 模式 None）。
     pub discovered: Option<DeviceInfo>,
@@ -127,10 +139,15 @@ pub struct ConnectOutcome {
 /// 建连错误（各阶段可读原因；R03-S5 不可重连分类见 [`ConnectError::refusal_reason`]）。
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectError {
-    #[error("GoDaddy API not configured. Run 'kirin_desk setup' first.")]
+    /// M9-DNS023：DNS 服务商凭据缺失（`[dns.providers.*]` 无当前激活条目）。
+    /// 文案不泄漏厂商细节。
+    #[error("DNS 服务商未配置（[dns.providers.*] 无凭据）。Run 'kirin_desk setup' first.")]
     DnsNotConfigured,
     #[error("Discovery FAILED: {0}")]
     Discovery(String),
+    /// M9-DNS023：服务商构建失败（未注册 / 凭据字段不完整 / 凭据错误）。
+    #[error("DNS provider error: {0}")]
+    Provider(kirin_desk_dns::ProviderError),
     #[error("ERROR: device TXT record has NO public key — connection refused.")]
     NoTxtKey,
     #[error("ERROR: 设备无可用 IPv4/IPv6 地址（ip_family={0}）")]
@@ -197,6 +214,7 @@ impl ConnectError {
             ConnectError::NoTxtKey | ConnectError::TrustRejected(_) => RefusalReason::TrustChanged,
             ConnectError::DnsNotConfigured
             | ConnectError::Discovery(_)
+            | ConnectError::Provider(_)
             | ConnectError::NoConnectAddr(_)
             | ConnectError::Tcp(_) => RefusalReason::ServerUnreachable,
             ConnectError::NoReconnectContext => RefusalReason::Other,
@@ -229,8 +247,11 @@ pub async fn resolve_peer(opts: &ConnectionOptions) -> Result<ResolvedPeer, Conn
             .target
             .trim_end_matches(&format!(".{}", dns.domain))
             .to_string();
-        let client = GoDaddyClient::new(&dns.api_key, &dns.api_secret, &dns.api_url);
-        let discovery = DiscoveryService::new(&client, &dns.domain);
+        // M9-DNS023：按 `[dns] provider` + `[dns.providers.*]` 构建当前激活
+        // 服务商（旧 GoDaddyClient 直连逻辑删除，发现走 `dyn Provider`）。
+        let provider = default_provider(&dns.provider, &dns.credentials)
+            .map_err(ConnectError::Provider)?;
+        let discovery = DiscoveryService::new(&*provider, &dns.domain);
         let info = discovery
             .discover(&device_id)
             .await

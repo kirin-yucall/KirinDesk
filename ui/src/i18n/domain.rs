@@ -3,6 +3,9 @@
 //!
 //! zh 为基线语言包；en 全量翻译（不得留空串）。
 //! 动态文案模板使用 `{0}`/`{1}` 位置参数，zh/en 占位符一一对应。
+//!
+//! M9-DNS022（UI-DNS-004）：文案全面泛化——不再出现 GoDaddy 字样，
+//! 未配置引导指向 Domain 页「服务商」卡。
 
 pub static TABLE: &[(&str, &str, &str)] = &[
     // ── 页面 / 卡标题 ──
@@ -11,35 +14,36 @@ pub static TABLE: &[(&str, &str, &str)] = &[
     ("domain.list.title", "域名列表", "Domain list"),
     ("domain.record.title", "解析记录", "DNS records"),
 
-    // ── 错误（client_from_config / fmt_godaddy_error）──
+    // ── 错误（provider_from_config / fmt_provider_error）──
     ("domain.error.config_load", "配置读取失败: {0}", "Failed to read config: {0}"),
     ("domain.error.provider_unsupported",
-     "服务商「{0}」的客户端适配尚在开发中（M9-DNS001~020 分批），当前可维护服务商：GoDaddy",
-     "Client adapter for provider \"{0}\" is still under development (M9-DNS001~020, in batches); currently maintained provider: GoDaddy"),
+     "服务商「{0}」的客户端适配尚未实现，暂无法在此维护域名",
+     "Client adapter for provider \"{0}\" is not implemented yet; domain maintenance is unavailable"),
     ("domain.error.not_configured",
-     "DNS 服务商未配置 — 请到 Settings → DNS 填写凭据后保存",
-     "DNS provider not configured — fill in the credentials in Settings → DNS and save"),
-    ("domain.error.client_init", "客户端初始化失败: {0}", "Client initialization failed: {0}"),
+     "DNS 服务商未配置 — 请到 Domain 页「服务商」卡填写凭据后保存",
+     "DNS provider not configured — fill in the credentials in the Provider card on the Domain tab and save"),
+    ("domain.error.client_init", "服务商初始化失败: {0}", "Provider initialization failed: {0}"),
     ("domain.error.rate_limited", "限流：请求过于频繁，请稍后重试", "Rate limited: too many requests, please retry later"),
     ("domain.error.invalid_params", "参数错误: {0}", "Invalid parameters: {0}"),
-    ("domain.error.auth_failed", "认证失败（HTTP {0}）：API Key/Secret 无效或无权限", "Authentication failed (HTTP {0}): API Key/Secret invalid or unauthorized"),
-    ("domain.error.client_error", "客户端错误（HTTP {0}）: {1}", "Client error (HTTP {0}): {1}"),
+    ("domain.error.auth_failed", "认证失败：API 凭据无效或无权限", "Authentication failed: API credentials invalid or unauthorized"),
     ("domain.error.server_error", "服务商服务异常（HTTP {0}），请稍后重试", "Provider service error (HTTP {0}), please retry later"),
     ("domain.error.network", "网络错误：无法连接服务商 API（超时/连接失败）", "Network error: cannot reach the provider API (timeout/connection failed)"),
     ("domain.error.config", "配置错误: {0}", "Configuration error: {0}"),
-    ("domain.error.response_too_large", "响应体超过安全上限，已拒绝", "Response body exceeded the safety limit — rejected"),
     ("domain.error.json", "服务商返回数据格式异常", "Provider returned malformed data"),
     ("domain.error.not_found", "未找到（域名不可管理或记录不存在）", "Not found (domain not manageable or record does not exist)"),
+    ("domain.error.unsupported_type",
+     "该服务商不支持此记录类型 {0}",
+     "This provider does not support record type {0}"),
 
-    // ── 凭据（UI-DNS-002）──
-    ("domain.cred.key_empty", "API Key / API Secret 不能为空", "API Key / API Secret must not be empty"),
+    // ── 凭据（UI-DNS-002，动态字段表单）──
+    ("domain.cred.required_field", "{0} 必填", "{0} is required"),
     ("domain.cred.domain_invalid", "Domain 格式无效（需为 RFC 1123 主机名，如 example.com）", "Invalid domain (must be an RFC 1123 hostname, e.g. example.com)"),
     ("domain.cred.config_load_failed", "配置读取失败", "Failed to read config"),
     ("domain.cred.saved", "已保存（服务商与凭据即时生效）", "Saved (provider and credentials take effect immediately)"),
     ("domain.cred.save_failed", "保存失败: {0}", "Save failed: {0}"),
 
     // ── 测试连接（DNS-MNT-003）──
-    ("domain.test.ok", "连接成功 — 当前账号可管理 {0} 个域名", "Connected — this account can manage {0} domain(s)"),
+    ("domain.test.ok", "连接成功 — 服务商 API 可用", "Connected — provider API is reachable"),
     ("domain.test.failed", "测试失败: {0}", "Test failed: {0}"),
     ("domain.test.testing", "测试连接中…", "Testing connection…"),
 
@@ -64,10 +68,25 @@ pub static TABLE: &[(&str, &str, &str)] = &[
      "已切换服务商 — 填写凭据后点「保存凭据」（该服务商未适配时提示开发中）",
      "Provider switched — fill in the credentials and click \"Save credentials\" (an unadapted provider shows an under-development notice)"),
     ("domain.provider.unsupported",
-     "该服务商的客户端适配尚在开发中（M9-DNS001~020 分批）— 当前可维护服务商：GoDaddy。",
-     "Client adapter for this provider is still under development (M9-DNS001~020, in batches) — currently maintained provider: GoDaddy."),
+     "该服务商的客户端适配尚未实现 — 暂不支持域名维护，可先行保存凭据备后续版本。",
+     "Client adapter for this provider is not implemented yet — domain maintenance is unavailable for now; you may still save the credentials for a later version."),
     ("domain.provider.save_credentials", "保存凭据", "Save credentials"),
     ("domain.provider.test_connection", "测试连接", "Test connection"),
+    // UI-DNS-009：能力降级警示（记录卡顶部 / 编辑弹窗）。
+    ("domain.provider.caps_srv_warning",
+     "该服务商不支持 SRV 记录——设备注册将降级为 A/AAAA+TXT",
+     "This provider does not support SRV records — device registration will degrade to A/AAAA+TXT"),
+    ("domain.provider.caps_ns_warning",
+     "该服务商不支持 NS 记录",
+     "This provider does not support NS records"),
+    ("domain.provider.srv_degraded",
+     "SRV 记录已禁用 — 设备注册将降级为 A/AAAA+TXT",
+     "SRV records are disabled — device registration will degrade to A/AAAA+TXT"),
+    // Connect 页域名模式未配置引导（UI-DNS-004 泛化，不再出现 GoDaddy 字样）。
+    ("domain.provider.connect_guide",
+     "请先到 Domain 页「服务商」卡配置 DNS 服务商与凭据，再使用域名发现连接。",
+     "Configure the DNS provider and credentials in the Provider card on the Domain tab first, then use domain discovery to connect."),
+    ("domain.provider.goto_domain", "前往 Domain 页配置", "Go to the Domain tab to configure"),
 
     // ── 域名列表卡 ──
     ("domain.list.refresh", "刷新域名", "Refresh domains"),
@@ -96,7 +115,7 @@ pub static TABLE: &[(&str, &str, &str)] = &[
     ("domain.record.table.name", "名称", "Name"),
     ("domain.record.table.data", "数据", "Data"),
     ("domain.record.table.actions", "操作", "Actions"),
-    ("domain.record.ttl_hint", "TTL 秒（GoDaddy 最低 600）", "TTL seconds (GoDaddy minimum 600)"),
+    ("domain.record.ttl_hint", "TTL 秒（最低 600）", "TTL seconds (minimum 600)"),
 
     // ── 编辑弹窗（UI-DNS-007）──
     ("domain.edit.domain_label", "域名: {0}", "Domain: {0}"),

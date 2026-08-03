@@ -14,13 +14,20 @@ frps 等价的独立服务端二进制（M8-T026），部署在**公网服务器
 relay-server.exe --bind-port 7000 --token <高熵token≥32字节> --port-range 60000-60099
 ```
 
+显式 IPv4+IPv6 双监听（多地址，可选）：
+
+```bat
+relay-server.exe --bind-addrs 0.0.0.0,:: --bind-port 7000 --token <高熵token≥32字节> --port-range 60000-60099
+```
+
 启动后控制台会打印服务器 Ed25519 公钥（**客户端 ID 模式须预置
-`[tunnel] server_pubkey`**）与监听端口。`Ctrl+C` 优雅退出。
+`[tunnel] server_pubkey`**）与监听地址。`Ctrl+C` 优雅退出。
 
 ## 参数
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
+| `--bind-addrs <IP,IP,…>` | 空（默认双栈） | 监听地址列表（逗号分隔，可多个，仅本机 IP，IPv4/IPv6 均可；**v6 地址一律 v6-only**——`::` 只收 IPv6、`0.0.0.0` 只收 IPv4，两者并存互不冲突）；留空 = 默认双栈回退（`[::]` 优先 + `0.0.0.0` 回退，行为同旧版）；非法值拒绝启动 |
 | `--bind-port <PORT>` | `7000` | 控制端口；`[::]` 优先（显式关闭 `IPV6_V6ONLY` 双栈）、`0.0.0.0` 回退 |
 | `--token <TOKEN>` | 空（告警） | 客户端认证 token；也可经环境变量 `KIRIN_RELAY_TOKEN` 提供（推荐，避免进程列表泄露） |
 | `--port-range <S-E>` | 无 | 自动分配端口范围（客户端 `remote_port=0` 请求用），如 `60000-60099` |

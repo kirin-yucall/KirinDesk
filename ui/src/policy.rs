@@ -2,7 +2,8 @@
 //! 与 GUI 服务器共用的握手策略：
 //!
 //! 1. **客户端公钥解析**（[`resolve_expected_client_key`]）：known_hosts 优先 →
-//!    DNS TXT 兜底（需 GoDaddy 配置，未配置则跳过）→ 未知走白名单/审批；
+//!    DNS TXT 兜底（当前激活 DNS 服务商；设备域为 `[godaddy] domain`，未配置
+//!    则跳过）→ 未知走白名单/审批；
 //! 2. **完整两阶段握手**（[`server_accept_handshake`]）：预读 init → 公钥解析与
 //!    pin → 白名单（temp 可绕过）→ 校验 → 应答，服务端**不再信任网络上来的
 //!    自报公钥**（对称于客户端 known_hosts/DNS-TXT 绑定）。
@@ -14,7 +15,6 @@ use kirin_desk_core::crypto::handshake::{
     server_read_init, verify_server_init_with_temp, HandshakeError, SecureChannel,
     VerifiedDecision,
 };
-use kirin_desk_dns::godaddy::GoDaddyClient;
 use kirin_desk_dns::txt::TxtManager;
 use kirin_desk_utils::config::Config;
 use kirin_desk_utils::known_hosts::KnownClientsStore;
@@ -37,7 +37,8 @@ pub enum ClientKeyResolution {
 /// - `known_hosts` 命中 → 直接返回记录公钥（调用方用 [`verify_server_init`] pin，
 ///   不一致即拒绝）；
 /// - 未命中 → DNS TXT 兜底（`{client_id}.{domain}` TXT 记录的 Ed25519 公钥，
-///   需 GoDaddy API 配置，未配置或查询失败则跳过）；
+///   经当前激活 DNS 服务商查询；设备域为 `[godaddy] domain`，未配置或查询
+///   失败则跳过）；
 /// - 都未命中 → `None`，由白名单/审批流程决定。
 pub async fn resolve_expected_client_key(
     known: &KnownClientsStore,
@@ -51,15 +52,18 @@ pub async fn resolve_expected_client_key(
         );
     }
 
-    if cfg.godaddy.api_key.is_empty() || cfg.godaddy.domain.is_empty() {
+    // M9-DNS022 (UI-DNS-004): DNS TXT 兜底走当前激活服务商（provider 化，
+    // `default_provider` 从 `[dns] provider` + `[dns.providers.*]` 构建）。
+    // 设备域仅 godaddy 兼容字段（`[godaddy] domain`）可用；其他服务商无独立
+    // 设备域字段 → 跳过 TXT 兜底（与未配置同语义，不影响握手主路径）。
+    if cfg.dns.provider != "godaddy" || cfg.godaddy.domain.trim().is_empty() {
         return (None, ClientKeyResolution::Unknown);
     }
-    let client = GoDaddyClient::new(
-        &cfg.godaddy.api_key,
-        &cfg.godaddy.api_secret,
-        &cfg.godaddy.api_url,
-    );
-    match TxtManager::new(&client, &cfg.godaddy.domain)
+    let Ok(provider) = kirin_desk_dns::default_provider(&cfg.dns.provider, &cfg.dns.providers)
+    else {
+        return (None, ClientKeyResolution::Unknown);
+    };
+    match TxtManager::new(&*provider, cfg.godaddy.domain.trim())
         .query(client_id)
         .await
     {

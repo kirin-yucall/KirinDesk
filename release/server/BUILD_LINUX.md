@@ -86,6 +86,8 @@ echo "KIRIN_RELAY_TOKEN=$TOKEN"   # 保存，分发给客户端
 
 # 前台试运行（公钥首次启动自动生成并打印）
 relay-server --bind-port 7000 --port-range 60000-60099
+# 显式 IPv4+IPv6 双监听（可选；v6 一律 v6-only，留空 = 默认双栈回退）：
+# relay-server --bind-addrs 0.0.0.0,:: --bind-port 7000 --port-range 60000-60099
 ```
 
 ## systemd 守护（推荐）
@@ -103,6 +105,8 @@ Wants=network-online.target
 Type=simple
 Environment=KIRIN_RELAY_TOKEN=<你的高熵token>
 ExecStart=/usr/local/bin/relay-server --bind-port 7000 --port-range 60000-60099
+# 如需显式多监听（IPv4+IPv6 双监听，v6 一律 v6-only）：
+# ExecStart=/usr/local/bin/relay-server --bind-addrs 0.0.0.0,:: --bind-port 7000 --port-range 60000-60099
 Restart=on-failure
 RestartSec=3
 # 密钥持久化在 /root/.kirin_desk/relay_server_key.pem（首次启动自动生成）

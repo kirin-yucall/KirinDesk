@@ -18,6 +18,8 @@ Type=simple
 Environment=KIRIN_RELAY_TOKEN=REPLACE_WITH_HIGH_ENTROPY_TOKEN
 # 控制端口 7000 + 自动分配端口范围 60000-60099
 ExecStart=/usr/local/bin/relay-server --bind-port 7000 --port-range 60000-60099
+# 如需显式多监听（IPv4+IPv6 双监听，v6 一律 v6-only；留空 = 默认双栈回退）：
+# ExecStart=/usr/local/bin/relay-server --bind-addrs 0.0.0.0,:: --bind-port 7000 --port-range 60000-60099
 Restart=on-failure
 RestartSec=3
 # 服务器 Ed25519 密钥持久化路径：/root/.kirin_desk/relay_server_key.pem

@@ -1,8 +1,8 @@
 //! M8-T026: 内网穿透服务端主程序（frps 等价，独立部署用）。
 //!
 //! 薄壳包装 [`kirin_desk_relay::server::TunnelServer`]：
-//! - CLI 参数：`--bind-port` / `--token` / `--port-range` / `--server-key` /
-//!   `--max-proxies` / `--max-work-conns`；
+//! - CLI 参数：`--bind-addrs` / `--bind-port` / `--token` / `--port-range` /
+//!   `--server-key` / `--max-proxies` / `--max-work-conns`；
 //! - 控制台日志（`RUST_LOG`，默认 `info`）+ 审计事件输出（stdout，
 //!   TNL-SEC-003 全部事件 + P1/P2 打洞/设备事件）；
 //! - Ctrl+C / SIGTERM 优雅关闭（TNL-SERVER-006）；
@@ -23,7 +23,9 @@ const DEFAULT_MAX_PROXIES: usize = 32;
 const DEFAULT_MAX_WORK_CONNS: usize = 100;
 
 /// 命令行配置。
+#[derive(Debug)]
 struct Config {
+    bind_addrs: String,
     bind_port: u16,
     token: String,
     port_range: Option<(u16, u16)>,
@@ -38,6 +40,10 @@ fn print_usage() {
     println!("USAGE: relay-server [OPTIONS]");
     println!();
     println!("OPTIONS:");
+    println!("  --bind-addrs <IP,IP,…> 监听地址列表（逗号分隔，可多个，仅本机 IP，");
+    println!("                        IPv4/IPv6 均可；v6 一律 v6-only——`::` 只收 IPv6、");
+    println!("                        `0.0.0.0` 只收 IPv4，两者并存互不冲突；");
+    println!("                        留空 = 默认双栈回退（[::] 优先 + 0.0.0.0 回退））");
     println!("  --bind-port <PORT>    控制端口（默认 {DEFAULT_BIND_PORT}；[::] 优先、0.0.0.0 回退，双栈）");
     println!("  --token <TOKEN>       客户端认证 token（建议高熵 ≥32 字节；");
     println!("                        也可经环境变量 KIRIN_RELAY_TOKEN 提供）");
@@ -76,6 +82,7 @@ fn parse_port_range(s: &str) -> Result<(u16, u16), String> {
 impl Config {
     fn parse(mut args: impl Iterator<Item = String>) -> Result<Self, String> {
         let mut cfg = Config {
+            bind_addrs: String::new(),
             bind_port: DEFAULT_BIND_PORT,
             token: std::env::var("KIRIN_RELAY_TOKEN").unwrap_or_default(),
             port_range: None,
@@ -96,6 +103,9 @@ impl Config {
                 "--version" => {
                     println!("relay-server v{VERSION}");
                     std::process::exit(0);
+                }
+                "--bind-addrs" => {
+                    cfg.bind_addrs = next_value(&mut args, &inline, "--bind-addrs")?;
                 }
                 "--bind-port" => {
                     let v = next_value(&mut args, &inline, "--bind-port")?;
@@ -130,6 +140,15 @@ impl Config {
             }
         }
         Ok(cfg)
+    }
+
+    /// M8-T039 P16b: 解析 `--bind-addrs` 为监听地址列表（复用
+    /// `utils::config::parse_bind_addr_list`，GUI/CLI 同一校验口径）。
+    /// 空/纯空白 → 空列表（relay 回退默认双栈）；非法值（域名/空段）→ Err，
+    /// 由调用方 fail-closed 拒绝启动（对齐 cmd_tunnel_serve 语义）。
+    fn parse_bind_addrs(&self) -> Result<Vec<std::net::SocketAddr>, String> {
+        kirin_desk_utils::config::parse_bind_addr_list(&self.bind_addrs, self.bind_port)
+            .map_err(|e| format!("invalid --bind-addrs: {e}"))
     }
 }
 
@@ -260,6 +279,61 @@ mod console_audit_escape_tests {
     }
 }
 
+// M8-T039 P16b: Config::parse 参数解析单测（--bind-addrs 两种写法、缺值、
+// 默认空、parse_bind_addrs 合法/非法值 fail-closed）。
+#[cfg(test)]
+mod config_parse_tests {
+    use super::Config;
+
+    fn parse(args: &[&str]) -> Result<Config, String> {
+        Config::parse(args.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn test_bind_addrs_default_empty() {
+        // 不传 --bind-addrs → 空串（relay 默认双栈回退，行为与旧版一致）。
+        let cfg = parse(&[]).unwrap();
+        assert_eq!(cfg.bind_addrs, "");
+        assert_eq!(cfg.parse_bind_addrs().unwrap(), vec![]);
+    }
+
+    #[test]
+    fn test_bind_addrs_space_and_equals_forms() {
+        // `--key value` 与 `--key=value` 两种写法等价。
+        let cfg = parse(&["--bind-addrs", "0.0.0.0,::"]).unwrap();
+        assert_eq!(cfg.bind_addrs, "0.0.0.0,::");
+        let cfg = parse(&["--bind-addrs=127.0.0.1,::1"]).unwrap();
+        assert_eq!(cfg.bind_addrs, "127.0.0.1,::1");
+    }
+
+    #[test]
+    fn test_bind_addrs_missing_value() {
+        let err = parse(&["--bind-addrs"]).unwrap_err();
+        assert!(err.contains("missing value for --bind-addrs"), "{err}");
+    }
+
+    #[test]
+    fn test_parse_bind_addrs_valid_list() {
+        // 合法双地址 → 两个 SocketAddr（端口 = bind_port）。
+        let cfg = parse(&["--bind-addrs", "0.0.0.0,::", "--bind-port", "7000"]).unwrap();
+        let v = cfg.parse_bind_addrs().unwrap();
+        assert_eq!(v.len(), 2);
+        assert!(v.contains(&"0.0.0.0:7000".parse().unwrap()));
+        assert!(v.contains(&"[::]:7000".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_parse_bind_addrs_invalid_fail_closed() {
+        // 域名拒绝（监听地址必须是本机 IP）→ Err（调用方 exit(2)）。
+        let cfg = parse(&["--bind-addrs", "example.com"]).unwrap();
+        let err = cfg.parse_bind_addrs().unwrap_err();
+        assert!(err.contains("invalid --bind-addrs"), "{err}");
+        // 空段拒绝。
+        let cfg = parse(&["--bind-addrs", "0.0.0.0,,::"]).unwrap();
+        assert!(cfg.parse_bind_addrs().is_err());
+    }
+}
+
 /// 等待关闭信号：Ctrl+C（全平台）+ SIGTERM（Unix，systemd 停止用）。
 async fn wait_shutdown_signal() {
     #[cfg(unix)]
@@ -315,8 +389,20 @@ async fn main() {
         .server_key
         .clone()
         .unwrap_or_else(kirin_desk_relay::registry::default_key_path);
+    // M8-T039 P16b: 可选显式多监听地址。空 → relay 默认双栈回退（[::] 优先 +
+    // 0.0.0.0 回退，行为零变化）；非法值 fail-closed 拒绝启动（exit 2，对齐
+    // 参数解析错误路径）。
+    let bind_addrs = match cfg.parse_bind_addrs() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: {e}");
+            print_usage();
+            std::process::exit(2);
+        }
+    };
     let srv_cfg = TunnelServerConfig {
         bind_port: cfg.bind_port,
+        bind_addrs,
         token: cfg.token.clone(),
         port_range: cfg.port_range,
         max_proxies: cfg.max_proxies,
@@ -336,7 +422,17 @@ async fn main() {
     };
 
     println!("=== relay-server v{VERSION} ===");
-    println!("  Control port:  {} (all interfaces, dual-stack)", server.port());
+    // 多监听场景 server.port() 只报首个 listener（对齐 relay port() 语义），
+    // 实际监听地址由 Bind addrs 行展示（空 = 默认双栈回退，对齐 cli.rs 显示）。
+    println!("  Control port:  {}", server.port());
+    println!(
+        "  Bind addrs:    {}",
+        if cfg.bind_addrs.trim().is_empty() {
+            "(default dual-stack)".to_string()
+        } else {
+            cfg.bind_addrs.trim().to_string()
+        }
+    );
     println!(
         "  Port range:    {}",
         cfg.port_range

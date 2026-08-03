@@ -1,6 +1,6 @@
 use crate::a::AManager;
 use crate::aaaa::AaaaManager;
-use crate::godaddy::GoDaddyClient;
+use crate::provider::Provider;
 use crate::srv::SrvManager;
 use crate::txt::{DeviceMeta, TxtManager};
 use crate::validate;
@@ -11,8 +11,8 @@ use tokio::sync::watch;
 use tracing::{error, info, warn};
 
 const DEFAULT_INTERVAL_SECS: u64 = 30;
-/// S-27（F-32）：心跳间隔**下限 10s**——过短间隔会放大对 GoDaddy API 的
-/// 调用（配额/滥用风险），配置值低于下限一律收敛到下限。
+/// S-27（F-32）：心跳间隔**下限 10s**——过短间隔会放大对 DNS 服务商的
+/// API 调用（配额/滥用风险），配置值低于下限一律收敛到下限。
 const MIN_INTERVAL_SECS: u64 = 10;
 
 /// Heartbeat service — keeps device DNS records alive.
@@ -22,8 +22,11 @@ const MIN_INTERVAL_SECS: u64 = 10;
 /// 2. Monitors IPv6 address changes, updates AAAA
 /// 3. Monitors IPv4 address changes, updates A (change → register; cleared → remove)
 /// 4. Cleans up DNS records on shutdown
+///
+/// M9-DNS000：多服务商化——持 `Arc<dyn Provider>`（可跨任务共享），
+/// 不感知厂商差异。
 pub struct HeartbeatService {
-    client: Arc<GoDaddyClient>,
+    provider: Arc<dyn Provider>,
     domain: String,
     device_id: String,
     port: u16,
@@ -34,7 +37,7 @@ pub struct HeartbeatService {
 
 impl HeartbeatService {
     pub fn new(
-        client: Arc<GoDaddyClient>,
+        provider: Arc<dyn Provider>,
         device_id: impl Into<String>,
         domain: impl Into<String>,
         port: u16,
@@ -43,7 +46,7 @@ impl HeartbeatService {
     ) -> Self {
         let (shutdown_tx, _) = watch::channel(false);
         Self {
-            client,
+            provider,
             domain: domain.into(),
             device_id: device_id.into(),
             port,
@@ -103,19 +106,19 @@ impl HeartbeatService {
     // ---- internal ----
 
     fn srv_mgr(&self) -> SrvManager<'_> {
-        SrvManager::new(&self.client, &self.domain)
+        SrvManager::new(self.provider.as_ref(), &self.domain)
     }
 
     fn txt_mgr(&self) -> TxtManager<'_> {
-        TxtManager::new(&self.client, &self.domain)
+        TxtManager::new(self.provider.as_ref(), &self.domain)
     }
 
     fn aaaa_mgr(&self) -> AaaaManager<'_> {
-        AaaaManager::new(&self.client, &self.domain)
+        AaaaManager::new(self.provider.as_ref(), &self.domain)
     }
 
     fn a_mgr(&self) -> AManager<'_> {
-        AManager::new(&self.client, &self.domain)
+        AManager::new(self.provider.as_ref(), &self.domain)
     }
 
     async fn register_all(&self, pubkey: &str) {
@@ -353,12 +356,22 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::MockDns;
+    use crate::provider::mock::MockProvider;
+    use crate::provider::RecordType;
+
+    /// 读取 A 记录 data（显示形态）——MockProvider 内存态断言用。
+    fn a_records(provider: &MockProvider) -> Vec<String> {
+        provider
+            .records_of("example.com", RecordType::A, "my-pc")
+            .iter()
+            .map(|r| r.data.to_display_string())
+            .collect()
+    }
 
     #[test]
     fn test_heartbeat_config() {
-        let client = Arc::new(GoDaddyClient::new("k", "s", "https://api.godaddy.com"));
-        let hb = HeartbeatService::new(client, "my-pc", "example.com", 3389, 30, 600);
+        let provider = Arc::new(MockProvider::new("mock"));
+        let hb = HeartbeatService::new(provider, "my-pc", "example.com", 3389, 30, 600);
         assert_eq!(hb.device_id, "my-pc");
         assert_eq!(hb.port, 3389);
         assert_eq!(hb.interval, Duration::from_secs(30));
@@ -367,31 +380,42 @@ mod tests {
     /// S-27（F-32）：心跳间隔下限 —— 配置低于 10s → 收敛到 10s；0/负 → 默认 30s。
     #[test]
     fn test_heartbeat_interval_floor() {
-        let client = Arc::new(GoDaddyClient::new("k", "s", "https://api.godaddy.com"));
-        let hb = HeartbeatService::new(client.clone(), "pc", "example.com", 3389, 5, 600);
+        let provider = Arc::new(MockProvider::new("mock"));
+        let hb = HeartbeatService::new(provider.clone(), "pc", "example.com", 3389, 5, 600);
         assert_eq!(
             hb.interval,
             Duration::from_secs(MIN_INTERVAL_SECS),
             "interval below floor must clamp to 10s (S-27)"
         );
-        let hb = HeartbeatService::new(client.clone(), "pc", "example.com", 3389, 10, 600);
+        let hb = HeartbeatService::new(provider.clone(), "pc", "example.com", 3389, 10, 600);
         assert_eq!(hb.interval, Duration::from_secs(10));
-        let hb = HeartbeatService::new(client.clone(), "pc", "example.com", 3389, 120, 600);
+        let hb = HeartbeatService::new(provider.clone(), "pc", "example.com", 3389, 120, 600);
         assert_eq!(hb.interval, Duration::from_secs(120), "above floor unchanged");
-        let hb = HeartbeatService::new(client, "pc", "example.com", 3389, 0, 600);
+        let hb = HeartbeatService::new(provider, "pc", "example.com", 3389, 0, 600);
         assert_eq!(hb.interval, Duration::from_secs(DEFAULT_INTERVAL_SECS));
     }
 
     // S-14b / F-18: 非法 device_id 早退，不产生任何 API 调用
     #[tokio::test]
     async fn test_heartbeat_skips_invalid_device_id() {
-        let mock = MockDns::start().await;
-        let client = Arc::new(GoDaddyClient::new("k", "s", mock.base_url()));
-        let hb = HeartbeatService::new(client, "bad id!", "example.com", 3389, 30, 600);
+        let provider = Arc::new(MockProvider::new("mock"));
+        let hb = HeartbeatService::new(provider.clone(), "bad id!", "example.com", 3389, 30, 600);
         hb.register_all("testpubkey").await;
-        assert!(mock.records_of("SRV", "_remote._tcp.bad id!").is_empty());
-        assert!(mock.records_of("TXT", "bad id!").is_empty());
-        assert!(mock.records_of("A", "bad id!").is_empty());
+        assert!(
+            provider
+                .records_of("example.com", RecordType::SRV, "_remote._tcp.bad id!")
+                .is_empty()
+        );
+        assert!(
+            provider
+                .records_of("example.com", RecordType::TXT, "bad id!")
+                .is_empty()
+        );
+        assert!(
+            provider
+                .records_of("example.com", RecordType::A, "bad id!")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -447,38 +471,49 @@ mod tests {
 
     #[tokio::test]
     async fn test_heartbeat_register_and_update() {
-        let mock = MockDns::start().await;
-        let client = Arc::new(GoDaddyClient::new("k", "s", mock.base_url()));
-        let hb = HeartbeatService::new(client, "my-pc", "example.com", 3389, 30, 600);
+        let provider = Arc::new(MockProvider::new("mock"));
+        let hb = HeartbeatService::new(provider.clone(), "my-pc", "example.com", 3389, 30, 600);
 
         // 初始注册: A 记录与真实检测结果自洽（无 IPv4 环境则不应有 A 记录）
         hb.register_all("testpubkey").await;
         let detected = detect_global_ipv4();
         match detected {
-            Some(ip) => assert_eq!(mock.records_of("A", "my-pc"), vec![ip.to_string()]),
-            None => assert!(mock.records_of("A", "my-pc").is_empty()),
+            Some(ip) => assert_eq!(a_records(&provider), vec![ip.to_string()]),
+            None => assert!(a_records(&provider).is_empty()),
         }
 
-        // 地址变化 → A::register 更新（192.0.2.0/24 为 TEST-NET-1，测试专用）
+        // 地址变化 → A::register 更新（192.0.2.0/24 为 TEST-NET-1，测试专用）。
+        // MockProvider 语义：同 name+rtype 不同 data 并存（DNS 多值记录），
+        // 断言新 IP 一定写入；此前检测到的 IP 若存在则保留。
         let mut last = detected;
         let new_ip: Ipv4Addr = "192.0.2.77".parse().unwrap();
         hb.sync_ipv4(Some(new_ip), &mut last).await;
         assert_eq!(last, Some(new_ip));
-        assert_eq!(mock.records_of("A", "my-pc"), vec![new_ip.to_string()]);
+        let recs = a_records(&provider);
+        assert!(
+            recs.contains(&new_ip.to_string()),
+            "A records should contain the new IP, got {recs:?}"
+        );
+        if let Some(ip) = detected {
+            assert!(
+                recs.contains(&ip.to_string()),
+                "previous detected IP should be retained, got {recs:?}"
+            );
+        }
 
-        // 清空 → A::remove
+        // 清空 → A::remove（删除整个 name+rtype 组，含多值记录）
         hb.sync_ipv4(None, &mut last).await;
         assert_eq!(last, None);
-        assert!(mock.records_of("A", "my-pc").is_empty());
-        assert_eq!(mock.delete_count("A", "my-pc"), 1);
+        assert!(a_records(&provider).is_empty());
+        assert_eq!(provider.delete_count(), 1);
 
         // 未变化 → 无操作
-        let delete_before = mock.delete_count("A", "my-pc");
+        let delete_before = provider.delete_count();
         hb.sync_ipv4(None, &mut last).await;
-        assert_eq!(mock.delete_count("A", "my-pc"), delete_before);
+        assert_eq!(provider.delete_count(), delete_before);
 
-        // cleanup 对称移除
+        // cleanup 对称移除（SRV + TXT + AAAA + A 四条）
         hb.cleanup().await;
-        assert_eq!(mock.delete_count("A", "my-pc"), delete_before + 1);
+        assert_eq!(provider.delete_count(), delete_before + 4);
     }
 }

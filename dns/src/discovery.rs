@@ -1,6 +1,6 @@
 use crate::a::AManager;
 use crate::aaaa::AaaaManager;
-use crate::godaddy::{GoDaddyClient, GoDaddyError};
+use crate::provider::{Provider, ProviderError};
 use crate::srv::SrvManager;
 use crate::txt::TxtManager;
 use std::collections::HashMap;
@@ -73,10 +73,13 @@ impl DeviceInfo {
 }
 
 /// Discovery errors.
+///
+/// M9-DNS000（§八）：`GoDaddyError` 不再向上传播——统一错误经 `ProviderError`
+/// 收敛为 `Provider` 变体；各服务商原始错误串只允许进日志。
 #[derive(Debug, thiserror::Error)]
 pub enum DiscoveryError {
-    #[error("GoDaddy API error: {0}")]
-    GoDaddy(#[from] GoDaddyError),
+    #[error("Provider error: {0}")]
+    Provider(#[from] ProviderError),
 
     #[error("Device '{0}' has no TXT metadata record")]
     TxtNotFound(String),
@@ -108,23 +111,19 @@ struct CacheEntry {
 /// 2. **TXT** `{device_id}` → Ed25519 public key (JSON)
 /// 3. **AAAA** `{device_id}` → IPv6 address (optional)
 /// 4. **A** `{device_id}` → IPv4 address (optional)
+///
+/// M9-DNS000：多服务商化——只依赖 `&dyn Provider`，不感知厂商差异。
 pub struct DiscoveryService<'a> {
-    srv_mgr: SrvManager<'a>,
-    txt_mgr: TxtManager<'a>,
-    aaaa_mgr: AaaaManager<'a>,
-    a_mgr: AManager<'a>,
+    provider: &'a dyn Provider,
     domain: &'a str,
     cache: Mutex<HashMap<String, CacheEntry>>,
     cache_ttl: u64,
 }
 
 impl<'a> DiscoveryService<'a> {
-    pub fn new(client: &'a GoDaddyClient, domain: &'a str) -> Self {
+    pub fn new(provider: &'a dyn Provider, domain: &'a str) -> Self {
         Self {
-            srv_mgr: SrvManager::new(client, domain),
-            txt_mgr: TxtManager::new(client, domain),
-            aaaa_mgr: AaaaManager::new(client, domain),
-            a_mgr: AManager::new(client, domain),
+            provider,
             domain,
             cache: Mutex::new(HashMap::new()),
             cache_ttl: 50,
@@ -163,11 +162,16 @@ impl<'a> DiscoveryService<'a> {
         );
 
         // 4-way parallel: SRV (port) + TXT (key) + AAAA (IPv6) + A (IPv4)
+        // 经四 manager 走 provider（每轮从 provider 构造，语义与缓存无关）。
+        let srv_mgr = SrvManager::new(self.provider, self.domain);
+        let txt_mgr = TxtManager::new(self.provider, self.domain);
+        let aaaa_mgr = AaaaManager::new(self.provider, self.domain);
+        let a_mgr = AManager::new(self.provider, self.domain);
         let (srv_res, txt_res, aaaa_res, a_res) = tokio::join!(
-            self.srv_mgr.query(device_id),
-            self.txt_mgr.query(device_id),
-            self.aaaa_mgr.query(device_id),
-            self.a_mgr.query(device_id),
+            srv_mgr.query(device_id),
+            txt_mgr.query(device_id),
+            aaaa_mgr.query(device_id),
+            a_mgr.query(device_id),
         );
 
         // Log each result individually for debugging which one fails
@@ -284,22 +288,22 @@ impl<'a> DiscoveryService<'a> {
     }
 }
 
-/// Convenience: one-shot discovery.
+/// Convenience: one-shot discovery（M9-DNS000 §八 —— 多服务商化签名，
+/// 由调用方按配置构建 `&dyn Provider`）。
 pub async fn discover_device(
-    api_key: &str,
-    api_secret: &str,
+    provider: &dyn Provider,
     domain: &str,
     device_id: &str,
 ) -> Result<DeviceInfo, DiscoveryError> {
-    let client = GoDaddyClient::new(api_key, api_secret, "https://api.godaddy.com");
-    let discovery = DiscoveryService::new(&client, domain);
+    let discovery = DiscoveryService::new(provider, domain);
     discovery.discover(device_id).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::MockDns;
+    use crate::provider::mock::MockProvider;
+    use crate::provider::{Record, RecordData, RecordType};
     use crate::txt::DeviceMeta;
 
     /// S-27 (F-32)：32 字节 Ed25519 公钥的标准 base64（44 字符）——
@@ -307,23 +311,59 @@ mod tests {
     const TEST_PUBKEY_B64: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=";
 
     /// Seed SRV + TXT (always required) plus optional AAAA/A records.
-    fn seed_device(mock: &MockDns, device_id: &str, with_v6: bool, with_v4: bool) {
-        let srv = format!("0 1 3389 {}.example.com.", device_id);
-        mock.set_records("SRV", &format!("_remote._tcp.{}", device_id), &[&srv], 600);
+    fn seed_device(provider: &MockProvider, device_id: &str, with_v6: bool, with_v4: bool) {
+        provider.seed_record(
+            "example.com",
+            Record {
+                name: format!("_remote._tcp.{}", device_id),
+                rtype: RecordType::SRV,
+                ttl: 600,
+                data: RecordData::Srv {
+                    priority: 0,
+                    weight: 1,
+                    port: 3389,
+                    target: format!("{}.example.com.", device_id),
+                },
+            },
+        );
         let txt = DeviceMeta::new(TEST_PUBKEY_B64).to_txt();
-        mock.set_records("TXT", device_id, &[&txt], 600);
+        provider.seed_record(
+            "example.com",
+            Record {
+                name: device_id.to_string(),
+                rtype: RecordType::TXT,
+                ttl: 600,
+                data: RecordData::Plain(txt),
+            },
+        );
         if with_v6 {
-            mock.set_records("AAAA", device_id, &["2001:db8::1"], 600);
+            provider.seed_record(
+                "example.com",
+                Record {
+                    name: device_id.to_string(),
+                    rtype: RecordType::AAAA,
+                    ttl: 600,
+                    data: RecordData::Plain("2001:db8::1".to_string()),
+                },
+            );
         }
         if with_v4 {
-            mock.set_records("A", device_id, &["203.0.113.7"], 600);
+            provider.seed_record(
+                "example.com",
+                Record {
+                    name: device_id.to_string(),
+                    rtype: RecordType::A,
+                    ttl: 600,
+                    data: RecordData::Plain("203.0.113.7".to_string()),
+                },
+            );
         }
     }
 
     #[test]
     fn test_cache_ttl_config() {
-        let client = GoDaddyClient::new("k", "s", "https://api.godaddy.com");
-        let svc = DiscoveryService::new(&client, "example.com").with_cache_ttl(30);
+        let provider = MockProvider::new("mock");
+        let svc = DiscoveryService::new(&provider, "example.com").with_cache_ttl(30);
         assert_eq!(svc.cache_ttl, 30);
     }
 
@@ -345,10 +385,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_discover_ipv4_only() {
-        let mock = MockDns::start().await;
-        seed_device(&mock, "v4only", false, true);
-        let client = GoDaddyClient::new("k", "s", mock.base_url());
-        let svc = DiscoveryService::new(&client, "example.com");
+        let provider = MockProvider::new("mock");
+        seed_device(&provider, "v4only", false, true);
+        let svc = DiscoveryService::new(&provider, "example.com");
 
         let info = svc.discover("v4only").await.unwrap();
         // 哨兵: 无 AAAA → ipv6_addr == UNSPECIFIED
@@ -362,10 +401,9 @@ mod tests {
     #[tokio::test]
     async fn test_discover_ipv6_only() {
         // 回归现状: IPv6-only 设备行为与实现前完全一致
-        let mock = MockDns::start().await;
-        seed_device(&mock, "v6only", true, false);
-        let client = GoDaddyClient::new("k", "s", mock.base_url());
-        let svc = DiscoveryService::new(&client, "example.com");
+        let provider = MockProvider::new("mock");
+        seed_device(&provider, "v6only", true, false);
+        let svc = DiscoveryService::new(&provider, "example.com");
 
         let info = svc.discover("v6only").await.unwrap();
         assert_eq!(info.ipv6_addr, "2001:db8::1".parse::<Ipv6Addr>().unwrap());
@@ -375,10 +413,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_discover_dual_stack() {
-        let mock = MockDns::start().await;
-        seed_device(&mock, "dual", true, true);
-        let client = GoDaddyClient::new("k", "s", mock.base_url());
-        let svc = DiscoveryService::new(&client, "example.com");
+        let provider = MockProvider::new("mock");
+        seed_device(&provider, "dual", true, true);
+        let svc = DiscoveryService::new(&provider, "example.com");
 
         let info = svc.discover("dual").await.unwrap();
         assert_eq!(info.ipv6_addr, "2001:db8::1".parse::<Ipv6Addr>().unwrap());
@@ -388,13 +425,48 @@ mod tests {
     #[tokio::test]
     async fn test_discover_no_address() {
         // AAAA + A 均缺 → NoAddress（不再报 AaaaNotFound）
-        let mock = MockDns::start().await;
-        seed_device(&mock, "noaddr", false, false);
-        let client = GoDaddyClient::new("k", "s", mock.base_url());
-        let svc = DiscoveryService::new(&client, "example.com");
+        let provider = MockProvider::new("mock");
+        seed_device(&provider, "noaddr", false, false);
+        let svc = DiscoveryService::new(&provider, "example.com");
 
         let err = svc.discover("noaddr").await.unwrap_err();
         assert!(matches!(err, DiscoveryError::NoAddress(_)));
+    }
+
+    #[tokio::test]
+    async fn test_discover_missing_txt_is_txt_not_found() {
+        // SRV + A 存在、TXT 缺失 → TxtNotFound（错误映射收敛为发现级错误）。
+        let provider = MockProvider::new("mock");
+        seed_device(&provider, "notxt", true, false);
+        // 覆盖 TXT 为无（重播种同名 TXT 不产生；此处直接把 TXT 记录删除）。
+        provider.delete_record("example.com", "notxt", RecordType::TXT).await.unwrap();
+        let svc = DiscoveryService::new(&provider, "example.com");
+
+        let err = svc.discover("notxt").await.unwrap_err();
+        assert!(matches!(err, DiscoveryError::TxtNotFound(_)));
+    }
+
+    /// M9-DNS000 §八：`ProviderError` 经 `#[from]` 收敛为 `Provider` 变体
+    /// （GoDaddyError 不再向上传播）。
+    #[test]
+    fn test_discovery_error_provider_variant() {
+        let err: DiscoveryError = ProviderError::NotFound {
+            what: "TXT ghost.example.com".to_string(),
+        }
+        .into();
+        assert!(matches!(err, DiscoveryError::Provider(_)));
+        assert!(err.to_string().contains("ghost.example.com"));
+    }
+
+    /// M9-DNS000 §八：`discover_device` 自由函数新签名（`&dyn Provider`）。
+    #[tokio::test]
+    async fn test_discover_device_free_function() {
+        let provider = MockProvider::new("mock");
+        seed_device(&provider, "v4only", false, true);
+
+        let info = discover_device(&provider, "example.com", "v4only").await.unwrap();
+        assert_eq!(info.ipv4_addr, Some("203.0.113.7".parse().unwrap()));
+        assert_eq!(info.port, 3389);
     }
 
     // ---- select_connect_addr 纯函数（并行契约） ----

@@ -1,24 +1,31 @@
-//! M9-DNS000 (UI-DNS-001~009): 域名维护客户端页面（Dashboard 右侧「Domain」标签页）
+//! M9-DNS000 / M9-DNS022 (UI-DNS-001~011): 域名维护客户端页面（Dashboard 右侧
+//! 「Domain」标签页）——全面支持 20 家服务商。
 //!
-//! 按 `M9-DNS000_DNS域名维护客户端_总体需求.md` 实现的功能子集（服务商适配
-//! M9-DNS001~020 分批开发中，当前唯一已实现客户端为 GoDaddy）：
-//! - DNS-MNT-003 测试连接：`list_domains()` 最小查询，区分认证/限流/网络/未找到
-//! - DNS-MNT-004 域名列表：拉取当前账号可管理域名 + 「添加域名」（本地缓存，
-//!   域名注册/购买属注册局业务，Out of scope）
-//! - DNS-MNT-005 记录查询：按域名 + 可选类型筛选（`get_all_records`）
-//! - DNS-MNT-006/007 记录增删改：A/AAAA/CNAME/MX/TXT/SRV/NS 全类型；GoDaddy
-//!   PUT 整组替换语义由适配层统一为「幂等写入目标状态」（读取现组 → 合并 → PUT）
-//! - UI-DNS-004 文案泛化：未配置提示不再出现 GoDaddy 字样
-//! - UI-DNS-006 记录表格：类型/名称/数据/TTL 列 + 按类型筛选
-//! - UI-DNS-007 记录编辑弹窗：类型切换动态渲染字段（SRV 渲染 priority/weight/
-//!   port/target）
+//! 按 `M9-DNS000_DNS域名维护客户端_总体需求.md` 实现的功能子集：
+//! - UI-DNS-001 服务商下拉：由 `dns_provider_defs()` 注册表驱动，选中显示
+//!   def.name；
+//! - UI-DNS-002 凭据动态表单：字段由服务商定义 `fields` 驱动（label/secret/
+//!   mono），值映射到 `cred_values`，密文 👁 切换记入 `show_secret`；
+//! - UI-DNS-003 测试连接：`test_connection()`；
+//! - UI-DNS-004 文案泛化：不出现任何厂商字样（GoDaddy 仅保留配置层兼容）；
+//! - UI-DNS-005 域名列表：`list_domains()` + 本地手动添加；
+//! - UI-DNS-006/007 记录查询与编辑：`query_records` / `upsert_record` /
+//!   `delete_record`，SRV/MX 结构化（RecordData）；
+//! - UI-DNS-009 能力降级：`caps.srv`/`caps.ns` 为 false 时记录卡顶部警示 +
+//!   编辑弹窗类型下拉禁用对应项；
+//! - UI-DNS-010 未适配服务商：注册表未注册 → 凭据表单不渲染，显示指引；
+//! - UI-DNS-011 配置签名回填：签名 = (provider, 凭据表序列化) + godaddy
+//!   旧字段，签名变化才回填表单，避免覆盖正在编辑的输入。
 //!
 //! 状态机约定：`KirinDeskApp` 持有本页状态；所有 API 调用在后台线程执行
 //! （`std::thread::spawn` + tokio runtime，与 Connect 页同模式），结果经
 //! 共享槽回填，GUI 每帧 `poll()` 一次——不阻塞 UI 线程。
 
 use eframe::egui;
-use kirin_desk_dns::godaddy::{GoDaddyClient, GoDaddyError, ManagedRecord, Record, SrvData};
+use kirin_desk_dns::provider_registry;
+use kirin_desk_dns::{Provider, ProviderCapabilities, ProviderError};
+use kirin_desk_dns::{Record, RecordData, RecordType};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -41,48 +48,46 @@ fn filter_items() -> [&'static str; 8] {
 // 后台任务协议
 // ════════════════════════════════════════════════════════════════
 
-/// 一条后台任务：携带构造客户端所需的全部凭据（凭据只存在于配置层，
-/// M9-DNS000 §七.3；由 worker 线程自行 `Config::load()`）。
+/// 一条后台任务：worker 线程自行 `Config::load()` 并构建当前激活服务商
+/// （凭据只存在于配置层，M9-DNS000 §七.3）。
 enum DomainOp {
-    /// DNS-MNT-003 测试连接（最小查询：域名列表）。
+    /// DNS-MNT-003 测试连接（最小查询）。
     TestConnection,
     /// DNS-MNT-004 拉取域名列表。
     ListDomains,
-    /// DNS-MNT-005 拉取指定域名记录（filter="" = 全部）。
+    /// DNS-MNT-005 拉取指定域名全部记录（类型筛选在客户端侧 `visible_records`）。
     LoadRecords {
         domain: String,
-        filter: String,
     },
-    /// DNS-MNT-006/007 新增或更新记录（`old_data` = 更新时定位原记录的 data；
-    /// None = 新增）。GoDaddy PUT 整组替换 → 读取现组合并后写回。
+    /// DNS-MNT-006/007 新增或更新记录（统一模型按 name+rtype 幂等 upsert；
+    /// `old_name`/`old_rtype` = 更新模式定位原记录，名称/类型变化时清理旧记录）。
     SaveRecord {
         domain: String,
-        rtype: String,
+        rtype: RecordType,
         name: String,
-        data: String,
+        data: RecordData,
         ttl: u32,
-        old_data: Option<String>,
+        old_name: Option<String>,
+        old_rtype: Option<RecordType>,
     },
-    /// DNS-MNT-006 删除单条记录：读取现组 → 剔除目标 → 余组非空 PUT 写回，
-    /// 余组为空走 DELETE（整组删除，GoDaddy 语义）。
+    /// DNS-MNT-006 删除该 name+rtype 下的全部记录（统一模型语义）。
     DeleteRecord {
         domain: String,
-        rtype: String,
+        rtype: RecordType,
         name: String,
-        data: String,
     },
 }
 
 /// 后台任务结果。
 enum DomainOpResult {
-    /// 测试连接：Ok = 可管理域名数。
-    Test(Result<usize, String>),
+    /// 测试连接。
+    Test(Result<(), String>),
     /// 域名列表。
     Domains(Result<Vec<String>, String>),
     /// 记录列表。
     Records {
         domain: String,
-        result: Result<Vec<ManagedRecord>, String>,
+        result: Result<Vec<Record>, String>,
     },
     /// 写操作（新增/更新/删除）。
     Write(Result<(), String>),
@@ -100,58 +105,48 @@ fn worker_busy() -> &'static AtomicBool {
     &B
 }
 
-/// 从配置构造 GoDaddy 客户端；返回 (provider 名称, 客户端或错误)。
+/// 从配置构建当前激活服务商（worker 线程内调用）。
 ///
-/// 凭据来自 `Config::load()`（Settings → DNS 保存后生效，UI-DNS-004 泛化
-/// 文案在此统一：不再出现 GoDaddy 字样）。provider 非 godaddy 时返回明确提示
-/// （M9-DNS001~020 服务商适配分批开发中，当前仅 GoDaddy 有客户端实现）。
-fn client_from_config() -> Result<(String, GoDaddyClient), String> {
+/// 顺序判定（UI-DNS-010 / UI-DNS-004）：注册表未注册 → 明确「适配尚未实现」
+/// 指引；已注册但无凭据 → 「DNS 服务商未配置」（引导 Domain 页「服务商」卡）。
+fn provider_from_config() -> Result<Box<dyn Provider>, String> {
     let cfg = kirin_desk_utils::config::Config::load()
         .map_err(|e| tf!("domain.error.config_load", e))?;
     let provider = cfg.dns.provider.clone();
     let provider_name = kirin_desk_utils::dns_providers::dns_provider_def(&provider)
         .map(|p| p.name.to_string())
         .unwrap_or_else(|| provider.clone());
-    if provider != "godaddy" {
+    if !provider_registry().has(&provider) {
         return Err(tf!(
             "domain.error.provider_unsupported",
             provider_name
         ));
     }
-    if cfg.godaddy.api_key.trim().is_empty() || cfg.godaddy.api_secret.trim().is_empty() {
+    if cfg
+        .dns_provider_credentials(&provider)
+        .map_or(true, |m| m.is_empty())
+    {
         return Err(t!("domain.error.not_configured").to_string());
     }
-    let client = GoDaddyClient::try_new(
-        cfg.godaddy.api_key.trim(),
-        cfg.godaddy.api_secret.trim(),
-        cfg.godaddy.api_url.trim(),
-    )
-    .map_err(|e| tf!("domain.error.client_init", e))?;
-    Ok((provider_name, client))
+    kirin_desk_dns::default_provider(&provider, &cfg.dns.providers)
+        .map_err(|e| tf!("domain.error.client_init", e))
 }
 
-/// 统一错误文案（DNS-MNT-011：上层不感知厂商原始细节，分类到限流/认证/
-/// 未找到/参数/网络/服务端）。
-fn fmt_godaddy_error(e: &GoDaddyError) -> String {
+/// 统一错误文案（DNS-MNT-011：上层不感知厂商原始细节，分类到认证/参数/
+/// 未找到/限流/服务端/网络/不支持；原始串只进日志）。
+fn fmt_provider_error(e: &ProviderError) -> String {
     match e {
-        GoDaddyError::RateLimited { .. } => t!("domain.error.rate_limited").to_string(),
-        GoDaddyError::InvalidParameters { body } => {
-            tf!("domain.error.invalid_params", truncate(body))
+        ProviderError::Auth { .. } => t!("domain.error.auth_failed").to_string(),
+        ProviderError::InvalidParameter { detail } => {
+            tf!("domain.error.invalid_params", truncate(detail))
         }
-        GoDaddyError::ClientError { status, body } if *status == 401 || *status == 403 => {
-            tf!("domain.error.auth_failed", status)
-        }
-        GoDaddyError::ClientError { status, body } => {
-            tf!("domain.error.client_error", status, truncate(body))
-        }
-        GoDaddyError::ServerError { status, .. } => {
-            tf!("domain.error.server_error", status)
-        }
-        GoDaddyError::Network(_) => t!("domain.error.network").to_string(),
-        GoDaddyError::Configuration(msg) => tf!("domain.error.config", msg),
-        GoDaddyError::ResponseTooLarge { .. } => t!("domain.error.response_too_large").to_string(),
-        GoDaddyError::Json(_) => t!("domain.error.json").to_string(),
-        GoDaddyError::NotFound { .. } => t!("domain.error.not_found").to_string(),
+        ProviderError::NotFound { .. } => t!("domain.error.not_found").to_string(),
+        ProviderError::RateLimited { .. } => t!("domain.error.rate_limited").to_string(),
+        ProviderError::Server { status, .. } => tf!("domain.error.server_error", status),
+        ProviderError::Network(_) => t!("domain.error.network").to_string(),
+        ProviderError::Json(_) => t!("domain.error.json").to_string(),
+        ProviderError::Unsupported(what) => tf!("domain.error.unsupported_type", what),
+        ProviderError::Other(msg) => tf!("domain.error.config", truncate(msg)),
     }
 }
 
@@ -182,14 +177,14 @@ fn launch_worker(op: DomainOp) -> bool {
 fn run_op(op: DomainOp) -> DomainOpResult {
     let rt = tokio::runtime::Runtime::new().expect("domain panel runtime");
     rt.block_on(async move {
-        // 客户端构造失败（未配置/未知服务商）→ 直接回错误。
-        let (_, client) = match client_from_config() {
-            Ok(c) => c,
+        // 服务商构建失败（未配置/未注册/凭据不完整）→ 直接回错误。
+        let provider = match provider_from_config() {
+            Ok(p) => p,
             Err(e) => {
                 return match op {
                     DomainOp::TestConnection => DomainOpResult::Test(Err(e)),
                     DomainOp::ListDomains => DomainOpResult::Domains(Err(e)),
-                    DomainOp::LoadRecords { domain, .. } => {
+                    DomainOp::LoadRecords { domain } => {
                         DomainOpResult::Records { domain, result: Err(e) }
                     }
                     _ => DomainOpResult::Write(Err(e)),
@@ -197,24 +192,23 @@ fn run_op(op: DomainOp) -> DomainOpResult {
             }
         };
         match op {
-            DomainOp::TestConnection => match client.list_domains().await {
-                Ok(domains) => DomainOpResult::Test(Ok(domains.len())),
-                Err(e) => DomainOpResult::Test(Err(fmt_godaddy_error(&e))),
+            DomainOp::TestConnection => match provider.test_connection().await {
+                Ok(()) => DomainOpResult::Test(Ok(())),
+                Err(e) => DomainOpResult::Test(Err(fmt_provider_error(&e))),
             },
-            DomainOp::ListDomains => match client.list_domains().await {
+            DomainOp::ListDomains => match provider.list_domains().await {
                 Ok(domains) => DomainOpResult::Domains(Ok(domains)),
-                Err(e) => DomainOpResult::Domains(Err(fmt_godaddy_error(&e))),
+                Err(e) => DomainOpResult::Domains(Err(fmt_provider_error(&e))),
             },
-            DomainOp::LoadRecords { domain, filter } => {
-                let filter = if filter.is_empty() { None } else { Some(filter) };
-                match client.get_all_records(&domain, filter.as_deref()).await {
+            DomainOp::LoadRecords { domain } => {
+                match provider.query_records(&domain, None, None).await {
                     Ok(records) => DomainOpResult::Records {
                         domain,
                         result: Ok(records),
                     },
                     Err(e) => DomainOpResult::Records {
                         domain,
-                        result: Err(fmt_godaddy_error(&e)),
+                        result: Err(fmt_provider_error(&e)),
                     },
                 }
             }
@@ -224,94 +218,68 @@ fn run_op(op: DomainOp) -> DomainOpResult {
                 name,
                 data,
                 ttl,
-                old_data,
+                old_name,
+                old_rtype,
             } => {
-                let result = save_record(&client, &domain, &rtype, &name, &data, ttl, old_data)
-                    .await;
+                let result = save_record(
+                    &*provider,
+                    &domain,
+                    rtype,
+                    &name,
+                    data,
+                    ttl,
+                    old_name.as_deref(),
+                    old_rtype,
+                )
+                .await;
                 DomainOpResult::Write(result)
             }
             DomainOp::DeleteRecord {
                 domain,
                 rtype,
                 name,
-                data,
             } => {
-                let result = delete_record(&client, &domain, &rtype, &name, &data).await;
+                let result = provider
+                    .delete_record(&domain, &name, rtype)
+                    .await
+                    .map_err(|e| fmt_provider_error(&e));
                 DomainOpResult::Write(result)
             }
         }
     })
 }
 
-/// DNS-MNT-006/007：幂等写入目标状态——读取 (type, name) 现组 → 合并新记录
-/// （或替换 `old_data` 定位的原记录）→ PUT 整组写回。
+/// DNS-MNT-006/007：统一模型写入——幂等 upsert（存在则更新、不存在则创建，
+/// 适配层消化厂商语义）；更新且名称/类型变化时清理旧 name+rtype 记录。
 async fn save_record(
-    client: &GoDaddyClient,
+    provider: &dyn Provider,
     domain: &str,
-    rtype: &str,
+    rtype: RecordType,
     name: &str,
-    data: &str,
+    data: RecordData,
     ttl: u32,
-    old_data: Option<String>,
+    old_name: Option<&str>,
+    old_rtype: Option<RecordType>,
 ) -> Result<(), String> {
-    let mut group = match client.get_records(domain, rtype, name).await {
-        Ok(g) => g,
-        // GoDaddy 对无记录的 (type, name) 返回 404——视为空组。
-        Err(GoDaddyError::NotFound { .. }) => Vec::new(),
-        Err(e) => return Err(fmt_godaddy_error(&e)),
-    };
-    let new_record = Record {
-        data: data.to_string(),
+    let rec = Record {
+        name: name.to_string(),
+        rtype,
         ttl,
+        data,
     };
-    match old_data {
-        // 更新：替换 data 与目标相同的原记录（找不到则追加，幂等）。
-        Some(old) => {
-            if let Some(pos) = group.iter().position(|r| r.data == old) {
-                group[pos] = new_record;
-            } else {
-                group.push(new_record);
-            }
-        }
-        // 新增：同 (type, name) 已存在相同 data → 跳过（幂等去重）。
-        None => {
-            if !group.iter().any(|r| r.data == data) {
-                group.push(new_record);
-            }
-        }
-    }
-    client
-        .put_records(domain, rtype, name, &group)
+    provider
+        .upsert_record(domain, &rec)
         .await
-        .map_err(|e| fmt_godaddy_error(&e))
-}
-
-/// DNS-MNT-006：删除单条记录——现组剔除目标；余组非空 PUT 写回，空组走
-/// DELETE（GoDaddy 整组删除语义）。
-async fn delete_record(
-    client: &GoDaddyClient,
-    domain: &str,
-    rtype: &str,
-    name: &str,
-    data: &str,
-) -> Result<(), String> {
-    let mut group = match client.get_records(domain, rtype, name).await {
-        Ok(g) => g,
-        Err(GoDaddyError::NotFound { .. }) => return Ok(()),
-        Err(e) => return Err(fmt_godaddy_error(&e)),
-    };
-    group.retain(|r| r.data != data);
-    if group.is_empty() {
-        client
-            .delete_record(domain, rtype, name)
-            .await
-            .map_err(|e| fmt_godaddy_error(&e))
-    } else {
-        client
-            .put_records(domain, rtype, name, &group)
-            .await
-            .map_err(|e| fmt_godaddy_error(&e))
+        .map_err(|e| fmt_provider_error(&e))?;
+    if let (Some(old_name), Some(old_rtype)) = (old_name, old_rtype) {
+        if old_name != name || old_rtype != rtype {
+            provider
+                .delete_record(domain, old_name, old_rtype)
+                .await
+                .map_err(|e| fmt_provider_error(&e))?;
+        }
     }
+    Ok(())
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -322,9 +290,10 @@ async fn delete_record(
 #[derive(Default, Clone)]
 pub struct RecordEditState {
     pub domain: String,
-    /// true = 新增；false = 更新（`old_data` 定位原记录）。
+    /// true = 新增；false = 更新（`old_name`/`old_rtype` 定位原记录）。
     pub is_new: bool,
-    pub old_data: String,
+    pub old_name: Option<String>,
+    pub old_rtype: Option<RecordType>,
     pub rtype: String,
     pub name: String,
     pub data: String,
@@ -336,6 +305,31 @@ pub struct RecordEditState {
     pub srv_target: String,
 }
 
+/// 配置签名（UI-DNS-011）：(provider, 凭据表序列化, godaddy 兼容 api_key,
+/// api_secret, domain)——任一变化才回填表单，避免覆盖正在编辑的输入。
+type CredSig = (String, String, String, String, String);
+
+/// 计算配置签名（`sync_provider` 与 `save_credentials` 共用同一口径）。
+fn cred_sig_of(cfg: &kirin_desk_utils::config::Config) -> CredSig {
+    let provider = cfg.dns.provider.clone();
+    let legacy = if provider == "godaddy" {
+        (
+            cfg.godaddy.api_key.clone(),
+            cfg.godaddy.api_secret.clone(),
+            cfg.godaddy.domain.clone(),
+        )
+    } else {
+        (String::new(), String::new(), String::new())
+    };
+    (
+        provider,
+        serde_json::to_string(&cfg.dns.providers.get(&cfg.dns.provider)).unwrap_or_default(),
+        legacy.0,
+        legacy.1,
+        legacy.2,
+    )
+}
+
 /// 域名维护页面状态（KirinDeskApp 持有；GUI 帧内 `poll()` 回填后台结果）。
 #[derive(Default)]
 pub struct DomainPanelState {
@@ -343,23 +337,23 @@ pub struct DomainPanelState {
     pub provider_id: String,
     /// 服务商展示名。
     pub provider_name: String,
-    /// 凭据是否已配置。
+    /// 凭据是否已配置（注册表已注册 + 凭据表非空）。
     pub configured: bool,
 
     // —— 服务商选择与凭据（UI-DNS-001/002；M9-DNS022 迁自 Settings → DNS 组）——
     /// ComboBox 当前选中服务商 id。
     pub provider: String,
-    /// 凭据表单字段（GoDaddy：Domain / API Key / API Secret 密文）。
-    pub api_key: String,
-    pub api_secret: String,
-    pub domain: String,
-    pub show_secret_api: bool,
+    /// 凭据表单值（key = 服务商定义字段 key，UI-DNS-002 动态渲染）。
+    pub cred_values: HashMap<String, String>,
+    /// 已点 👁 的 secret 字段 key（明文展示）。
+    pub show_secret: HashSet<String>,
     /// 保存凭据结果反馈。
     pub cred_status: String,
     pub cred_ok: bool,
-    /// 上次回填的配置签名（(provider, api_key, api_secret, domain)）——配置
-    /// 变化才回填表单，避免每帧覆盖正在编辑的输入。
-    cred_sig: Option<(String, String, String, String)>,
+    /// 能力声明（UI-DNS-009：provider 构建时读取；构建失败用全开默认）。
+    pub caps: ProviderCapabilities,
+    /// 上次回填的配置签名（变化才回填表单）。
+    cred_sig: Option<CredSig>,
 
     // —— 测试连接（DNS-MNT-003）——
     pub test_busy: bool,
@@ -375,7 +369,7 @@ pub struct DomainPanelState {
     pub add_input: String,
 
     // —— 记录（DNS-MNT-005/006，UI-DNS-006/007）——
-    pub records: Vec<ManagedRecord>,
+    pub records: Vec<Record>,
     pub records_busy: bool,
     pub filter: String,
 
@@ -391,18 +385,31 @@ impl DomainPanelState {
     /// 进入页面/切换服务商时刷新展示信息（不触发网络请求）。
     pub fn sync_provider(&mut self) {
         let cfg = kirin_desk_utils::config::Config::load().unwrap_or_default();
-        // 凭据/服务商仅在配置签名变化时回填表单（防覆盖正在编辑的输入）。
-        let sig = (
-            cfg.dns.provider.clone(),
-            cfg.godaddy.api_key.clone(),
-            cfg.godaddy.api_secret.clone(),
-            cfg.godaddy.domain.clone(),
-        );
+        let sig = cred_sig_of(&cfg);
         if self.cred_sig.as_ref() != Some(&sig) {
-            self.provider = cfg.dns.provider.clone();
-            self.api_key = cfg.godaddy.api_key.clone();
-            self.api_secret = cfg.godaddy.api_secret.clone();
-            self.domain = cfg.godaddy.domain.clone();
+            let provider = cfg.dns.provider.clone();
+            self.provider = provider.clone();
+            // 回填表单值（仅回填该服务商定义中的字段 key）。
+            self.cred_values.clear();
+            if let Some(def) =
+                kirin_desk_utils::dns_providers::dns_provider_def(&provider)
+            {
+                for field in def.fields {
+                    let v = cfg
+                        .dns_provider_credentials(&provider)
+                        .and_then(|m| m.get(field.key))
+                        .cloned()
+                        .unwrap_or_default();
+                    self.cred_values.insert(field.key.to_string(), v);
+                }
+            }
+            self.show_secret.clear();
+            self.cred_ok = false;
+            self.cred_status.clear();
+            // UI-DNS-009：能力声明——provider 构建时读取（构建失败 → 全开默认）。
+            self.caps = kirin_desk_dns::default_provider(&provider, &cfg.dns.providers)
+                .map(|p| p.capabilities())
+                .unwrap_or_else(|_| ProviderCapabilities::all());
             self.cred_sig = Some(sig);
         }
         self.provider_id = cfg.dns.provider.clone();
@@ -414,8 +421,10 @@ impl DomainPanelState {
                 self.provider_id.clone()
             }
         });
-        self.configured = !cfg.godaddy.api_key.trim().is_empty()
-            && !cfg.godaddy.api_secret.trim().is_empty();
+        self.configured = provider_registry().has(&self.provider_id)
+            && cfg
+                .dns_provider_credentials(&self.provider_id)
+                .map_or(false, |m| !m.is_empty());
     }
 
     /// UI-DNS-002: 保存服务商选择 + 凭据到配置（即时落盘，模式同 Dashboard
@@ -430,32 +439,88 @@ impl DomainPanelState {
         } else {
             "godaddy".to_string()
         };
-        let api_key = self.api_key.trim().to_string();
-        let api_secret = self.api_secret.trim().to_string();
-        let domain = self.domain.trim().to_string();
-        if api_key.is_empty() || api_secret.is_empty() {
+        let Some(def) = kirin_desk_utils::dns_providers::dns_provider_def(&provider) else {
             self.cred_ok = false;
-            self.cred_status = t!("domain.cred.key_empty").to_string();
+            self.cred_status = tf!("domain.error.provider_unsupported", provider).to_string();
             return false;
-        }
-        if !domain.is_empty() && !kirin_desk_dns::validate::validate_hostname(&domain) {
-            self.cred_ok = false;
-            self.cred_status = t!("domain.cred.domain_invalid").to_string();
-            return false;
+        };
+        // 按服务商定义字段校验：全部非空（secret 字段只展示 label，不打印值）。
+        for field in def.fields {
+            let v = self
+                .cred_values
+                .get(field.key)
+                .map(String::as_str)
+                .unwrap_or("");
+            if v.trim().is_empty() {
+                self.cred_ok = false;
+                self.cred_status = tf!("domain.cred.required_field", field.label);
+                return false;
+            }
+            // domain 字段（godaddy 设备域）保持主机名校验。
+            if field.key == "domain"
+                && !kirin_desk_dns::validate::validate_hostname(v.trim())
+            {
+                self.cred_ok = false;
+                self.cred_status = t!("domain.cred.domain_invalid").to_string();
+                return false;
+            }
         }
         let Ok(mut cfg) = kirin_desk_utils::config::Config::load() else {
             self.cred_ok = false;
             self.cred_status = t!("domain.cred.config_load_failed").to_string();
             return false;
         };
+        // 写入 `[dns] provider` + `[dns.providers.{provider}]`（仅已渲染的字段 key）。
+        let mut fields: BTreeMap<String, String> = BTreeMap::new();
+        for field in def.fields {
+            let v = self
+                .cred_values
+                .get(field.key)
+                .map(String::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            fields.insert(field.key.to_string(), v);
+        }
         cfg.dns.provider = provider.clone();
-        cfg.godaddy.api_key = api_key.clone();
-        cfg.godaddy.api_secret = api_secret.clone();
-        cfg.godaddy.domain = domain.clone();
+        cfg.dns.providers.insert(provider.clone(), fields);
+        // godaddy 兼容：同步写 `[godaddy]`（api_url 默认生产地址；表单含
+        // domain 字段时同步设备域，供 CLI / Connect 页旧路径读取）。
+        if provider == "godaddy" {
+            cfg.godaddy.api_key = self
+                .cred_values
+                .get("api_key")
+                .cloned()
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            cfg.godaddy.api_secret = self
+                .cred_values
+                .get("api_secret")
+                .cloned()
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            cfg.godaddy.api_url = self
+                .cred_values
+                .get("api_url")
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "https://api.godaddy.com".to_string());
+            if def.fields.iter().any(|f| f.key == "domain") {
+                cfg.godaddy.domain = self
+                    .cred_values
+                    .get("domain")
+                    .cloned()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+            }
+        }
         match cfg.save() {
             Ok(()) => {
                 // 签名同步为刚保存值，避免下一帧 sync_provider 覆盖。
-                self.cred_sig = Some((provider.clone(), api_key, api_secret, domain));
+                self.cred_sig = Some(cred_sig_of(&cfg));
                 self.provider_id = provider;
                 self.configured = true;
                 self.cred_ok = true;
@@ -475,9 +540,9 @@ impl DomainPanelState {
         let result = worker_slot().lock().unwrap().take();
         let Some(result) = result else { return };
         match result {
-            DomainOpResult::Test(Ok(n)) => {
+            DomainOpResult::Test(Ok(())) => {
                 self.test_ok = Some(true);
-                self.test_status = tf!("domain.test.ok", n);
+                self.test_status = t!("domain.test.ok").to_string();
             }
             DomainOpResult::Test(Err(e)) => {
                 self.test_ok = Some(false);
@@ -509,9 +574,18 @@ impl DomainPanelState {
                 if domain == self.selected {
                     match result {
                         Ok(mut records) => {
-                            // 稳定排序：类型 → 名称 → 数据。
+                            // 稳定排序：类型 → 名称 → 数据（展示形态）。
                             records.sort_by(|a, b| {
-                                (&a.rtype, &a.name, &a.data).cmp(&(&b.rtype, &b.name, &b.data))
+                                (
+                                    &a.rtype,
+                                    &a.name,
+                                    a.data.to_display_string(),
+                                )
+                                    .cmp(&(
+                                        &b.rtype,
+                                        &b.name,
+                                        b.data.to_display_string(),
+                                    ))
                             });
                             self.records = records;
                             self.status_ok = true;
@@ -562,7 +636,7 @@ impl DomainPanelState {
         launch_worker(DomainOp::ListDomains);
     }
 
-    /// DNS-MNT-005 加载当前选中域名记录（filter 沿用面板筛选）。
+    /// DNS-MNT-005 加载当前选中域名全部记录（类型筛选在客户端侧过滤）。
     pub fn trigger_load_records(&mut self) {
         if self.selected.is_empty() || self.records_busy || worker_busy().load(Ordering::SeqCst) {
             return;
@@ -572,7 +646,6 @@ impl DomainPanelState {
         self.status_ok = true;
         launch_worker(DomainOp::LoadRecords {
             domain: self.selected.clone(),
-            filter: self.filter.clone(),
         });
     }
 
@@ -610,35 +683,44 @@ impl DomainPanelState {
         });
     }
 
-    /// 打开编辑弹窗（SRV 自动拆分字段）。
-    pub fn open_edit_record(&mut self, rec: &ManagedRecord) {
+    /// 打开编辑弹窗（SRV/MX 从结构化 RecordData 拆分）。
+    pub fn open_edit_record(&mut self, rec: &Record) {
         let mut state = RecordEditState {
             domain: self.selected.clone(),
             is_new: false,
-            old_data: rec.data.clone(),
-            rtype: rec.rtype.clone(),
-            name: rec.name.clone(),
+            old_name: Some(rec.name.clone()),
+            old_rtype: Some(rec.rtype),
+            rtype: rec.rtype.as_str().to_string(),
+            name: if rec.name.is_empty() {
+                "@".to_string()
+            } else {
+                rec.name.clone()
+            },
             ttl: rec.ttl.to_string(),
             ..Default::default()
         };
-        if rec.rtype == "SRV" {
-            if let Some(srv) = SrvData::from_string(&rec.data) {
-                state.srv_priority = srv.priority.to_string();
-                state.srv_weight = srv.weight.to_string();
-                state.srv_port = srv.port.to_string();
-                state.srv_target = srv.target;
-            } else {
-                // 无法拆分的 SRV 原文 → 退化为自由文本。
-                state.data = rec.data.clone();
+        match &rec.data {
+            RecordData::Srv {
+                priority,
+                weight,
+                port,
+                target,
+            } => {
+                state.srv_priority = priority.to_string();
+                state.srv_weight = weight.to_string();
+                state.srv_port = port.to_string();
+                state.srv_target = target.clone();
             }
-        } else {
-            state.data = rec.data.clone();
+            RecordData::Mx { priority, exchange } => {
+                state.data = format!("{priority} {exchange}");
+            }
+            RecordData::Plain(s) => state.data = s.clone(),
         }
         self.editing = Some(state);
     }
 
-    /// 删除单条记录。
-    pub fn trigger_delete_record(&mut self, rec: &ManagedRecord) {
+    /// 删除单条记录（统一模型：删除该 name+rtype 下全部记录）。
+    pub fn trigger_delete_record(&mut self, rec: &Record) {
         if self.records_busy || worker_busy().load(Ordering::SeqCst) {
             return;
         }
@@ -647,23 +729,32 @@ impl DomainPanelState {
         self.status = tf!("domain.status.deleting", rec.rtype, rec.name);
         launch_worker(DomainOp::DeleteRecord {
             domain: self.selected.clone(),
-            rtype: rec.rtype.clone(),
+            rtype: rec.rtype,
             name: rec.name.clone(),
-            data: rec.data.clone(),
         });
     }
 
-    /// 弹窗「保存」：校验 → 组装（SRV 拼 priority/weight/port/target）→ 后台写。
+    /// 弹窗「保存」：校验 → 组装 RecordData（SRV 拆分字段 / MX 结构化，
+    /// 失败回退 Plain）→ 后台写。
     pub fn save_edit(&mut self) -> bool {
         let Some(edit) = self.editing.take() else {
             return false;
         };
         // —— 校验 ——
-        let rtype = edit.rtype.clone();
-        let name = edit.name.trim().to_string();
-        let root = name == "@" || name == "*";
-        let valid_name = root
-            || (!name.is_empty() && kirin_desk_dns::validate::validate_record_name(&name));
+        let rtype: RecordType = match edit.rtype.parse() {
+            Ok(t) => t,
+            Err(_) => {
+                self.status_ok = false;
+                self.status = t!("domain.edit.data_empty").to_string();
+                return false;
+            }
+        };
+        let raw_name = edit.name.trim().to_string();
+        // 统一模型相对名："" = 根；UI 用 "@" 表达根。
+        let name = if raw_name == "@" { String::new() } else { raw_name.clone() };
+        let valid_name = name.is_empty()
+            || name == "*"
+            || kirin_desk_dns::validate::validate_record_name(&name);
         if !valid_name {
             self.status_ok = false;
             self.status = t!("domain.edit.name_invalid").to_string();
@@ -677,7 +768,7 @@ impl DomainPanelState {
                 return false;
             }
         };
-        let data = if rtype == "SRV" {
+        let data = if rtype == RecordType::SRV {
             let priority: u16 = match edit.srv_priority.trim().parse() {
                 Ok(v) => v,
                 Err(_) => {
@@ -708,13 +799,24 @@ impl DomainPanelState {
                 self.status = t!("domain.edit.srv_target_invalid").to_string();
                 return false;
             }
-            SrvData {
+            RecordData::Srv {
                 priority,
                 weight,
                 port,
                 target,
             }
-            .to_string()
+        } else if rtype == RecordType::MX {
+            // MX：尝试结构化解析 "u16 exchange" → Mx；失败回退 Plain。
+            let text = edit.data.trim().to_string();
+            if text.is_empty() {
+                self.status_ok = false;
+                self.status = t!("domain.edit.data_empty").to_string();
+                return false;
+            }
+            match parse_mx_data(&text) {
+                Some((priority, exchange)) => RecordData::Mx { priority, exchange },
+                None => RecordData::Plain(text),
+            }
         } else {
             let data = edit.data.trim().to_string();
             if data.is_empty() {
@@ -722,7 +824,7 @@ impl DomainPanelState {
                 self.status = t!("domain.edit.data_empty").to_string();
                 return false;
             }
-            data
+            RecordData::Plain(data)
         };
         if worker_busy().load(Ordering::SeqCst) {
             self.status_ok = false;
@@ -742,19 +844,32 @@ impl DomainPanelState {
             name,
             data,
             ttl,
-            old_data: if edit.is_new { None } else { Some(edit.old_data.clone()) },
+            old_name: if edit.is_new { None } else { edit.old_name },
+            old_rtype: if edit.is_new { None } else { edit.old_rtype },
         });
         true
     }
 
     /// 按筛选/类型过滤后的记录视图（返回自有副本——渲染闭包内需可变借用
     /// `state` 触发操作，不能持有对 `self.records` 的借用）。
-    pub fn visible_records(&self) -> Vec<ManagedRecord> {
+    pub fn visible_records(&self) -> Vec<Record> {
         self.records
             .iter()
-            .filter(|r| self.filter.is_empty() || r.rtype == self.filter)
+            .filter(|r| self.filter.is_empty() || r.rtype.as_str() == self.filter)
             .cloned()
             .collect()
+    }
+}
+
+/// 解析 MX 记录数据 "u16 exchange"（失败 → None，调用方回退 Plain）。
+fn parse_mx_data(s: &str) -> Option<(u16, String)> {
+    let mut parts = s.split_whitespace();
+    let priority: u16 = parts.next()?.parse().ok()?;
+    let exchange: String = parts.collect::<Vec<_>>().join(" ");
+    if exchange.is_empty() {
+        None
+    } else {
+        Some((priority, exchange))
     }
 }
 
@@ -797,9 +912,8 @@ pub fn show_domain_page(ui: &mut egui::Ui, theme: &Theme, state: &mut DomainPane
 }
 
 /// UI-DNS-002: 凭据动态表单——字段来自 `dns_providers` 注册表定义
-/// （label/mono/secret 由定义驱动），值映射到面板状态；未映射的字段
-/// （未来服务商）暂不渲染，避免 UI 越界。GoDaddy → Domain / API Key /
-/// API Secret（密文 + 👁，M15-T008 模式）。
+/// （label/secret/mono 由定义驱动），值映射到 `cred_values`（key = 字段 key）。
+/// secret 字段密文输入 + 👁 切换（M15-T008 模式），切换状态记入 `show_secret`。
 fn render_cred_fields(
     ui: &mut egui::Ui,
     theme: &Theme,
@@ -807,44 +921,26 @@ fn render_cred_fields(
     def: &kirin_desk_utils::dns_providers::DnsProviderDef,
 ) {
     for field in def.fields {
-        match (def.id, field.key) {
-            ("godaddy", "domain") => {
-                labeled_input(
-                    ui,
-                    theme,
-                    field.label,
-                    &mut state.domain,
-                    "example.com",
-                    Validity::None,
-                    None,
-                    field.mono,
-                );
+        let value = state.cred_values.entry(field.key.to_string()).or_default();
+        let mut show = state.show_secret.contains(field.key);
+        // placeholder = label 去冒号（如 "API Key:" → "API Key"）。
+        let placeholder = field.label.trim_end_matches(':');
+        labeled_input(
+            ui,
+            theme,
+            field.label,
+            value,
+            placeholder,
+            Validity::None,
+            if field.secret { Some(&mut show) } else { None },
+            field.mono,
+        );
+        if field.secret {
+            if show {
+                state.show_secret.insert(field.key.to_string());
+            } else {
+                state.show_secret.remove(field.key);
             }
-            ("godaddy", "api_key") => {
-                labeled_input(
-                    ui,
-                    theme,
-                    field.label,
-                    &mut state.api_key,
-                    "required",
-                    Validity::None,
-                    None,
-                    field.mono,
-                );
-            }
-            ("godaddy", "api_secret") => {
-                labeled_input(
-                    ui,
-                    theme,
-                    field.label,
-                    &mut state.api_secret,
-                    "required",
-                    Validity::None,
-                    Some(&mut state.show_secret_api),
-                    field.mono,
-                );
-            }
-            _ => {}
         }
     }
 }
@@ -857,7 +953,8 @@ fn show_provider_card(ui: &mut egui::Ui, theme: &Theme, state: &mut DomainPanelS
     let mut saved = false;
     crate::widgets::card(ui, theme, t!("domain.provider.title"), |ui| {
         ui.horizontal(|ui| {
-            badge(ui, theme, &state.provider_name, BadgeKind::Info);
+            // R-27：移除服务商名 Info 徽标（品牌蓝观感误认 logo；服务商名已展示于
+            // ComboBox 选中文本与卡片标题，无需徽标强调）。仅保留配置状态徽标。
             if state.configured {
                 badge(ui, theme, t!("domain.provider.configured"), BadgeKind::Success);
             } else {
@@ -873,7 +970,7 @@ fn show_provider_card(ui: &mut egui::Ui, theme: &Theme, state: &mut DomainPanelS
             );
         });
         ui.add_space(4.0);
-        // —— 服务商选择（UI-DNS-001：注册表驱动，当前仅 GoDaddy）——
+        // —— 服务商选择（UI-DNS-001：注册表驱动，20 家全部列出）——
         ui.horizontal(|ui| {
             ui.add(
                 egui::Label::new(
@@ -886,7 +983,7 @@ fn show_provider_card(ui: &mut egui::Ui, theme: &Theme, state: &mut DomainPanelS
             let defs = kirin_desk_utils::dns_providers::dns_provider_defs();
             let sel_name = kirin_desk_utils::dns_providers::dns_provider_def(&state.provider)
                 .map(|p| p.name)
-                .unwrap_or("GoDaddy");
+                .unwrap_or(state.provider.as_str());
             let mut provider = state.provider.clone();
             egui::ComboBox::from_id_source("dns_provider_sel")
                 .selected_text(sel_name)
@@ -897,19 +994,22 @@ fn show_provider_card(ui: &mut egui::Ui, theme: &Theme, state: &mut DomainPanelS
                     }
                 });
             if provider != state.provider {
-                // 切换服务商：清空凭据编辑态（不同服务商凭据字段不同）。
+                // 切换服务商：清空凭据编辑态（不同服务商字段不同；配置签名未变，
+                // sync_provider 不会回填覆盖）。
                 state.provider = provider;
-                state.api_key.clear();
-                state.api_secret.clear();
-                state.domain.clear();
+                state.cred_values.clear();
+                state.show_secret.clear();
                 state.cred_ok = false;
                 state.cred_status = t!("domain.provider.switched").to_string();
             }
         });
         ui.add_space(4.0);
-        // —— 凭据表单（UI-DNS-002：按注册表 fields 动态渲染）——
-        if let Some(def) = kirin_desk_utils::dns_providers::dns_provider_def(&state.provider) {
-            render_cred_fields(ui, theme, state, def);
+        // —— 凭据表单（UI-DNS-002：按注册表 fields 动态渲染；UI-DNS-010：
+        //    注册表未注册 → 不渲染表单，显示指引文案）——
+        if provider_registry().has(&state.provider) {
+            if let Some(def) = kirin_desk_utils::dns_providers::dns_provider_def(&state.provider) {
+                render_cred_fields(ui, theme, state, def);
+            }
         } else {
             ui.add(
                 egui::Label::new(
@@ -1071,6 +1171,27 @@ fn show_domain_card(ui: &mut egui::Ui, theme: &Theme, state: &mut DomainPanelSta
 /// ③ 解析记录卡（DNS-MNT-005/006/007，UI-DNS-006/007）：类型筛选 + 表格 + 操作。
 fn show_records_card(ui: &mut egui::Ui, theme: &Theme, state: &mut DomainPanelState) {
     crate::widgets::card(ui, theme, t!("domain.record.title"), |ui| {
+        // UI-DNS-009：能力降级——记录卡顶部黄色警示（SRV/NS 不支持时）。
+        if !state.caps.srv {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(t!("domain.provider.caps_srv_warning"))
+                        .size(theme.small_size)
+                        .color(theme.warning),
+                )
+                .selectable(false),
+            );
+        }
+        if !state.caps.ns {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(t!("domain.provider.caps_ns_warning"))
+                        .size(theme.small_size)
+                        .color(theme.warning),
+                )
+                .selectable(false),
+            );
+        }
         if state.selected.is_empty() {
             ui.add(
                 egui::Label::new(
@@ -1171,16 +1292,18 @@ fn show_records_card(ui: &mut egui::Ui, theme: &Theme, state: &mut DomainPanelSt
                     for rec in &records {
                         ui.add(
                             egui::Label::new(
-                                egui::RichText::new(&rec.rtype)
+                                egui::RichText::new(rec.rtype.as_str())
                                     .size(theme.small_size)
                                     .strong()
                                     .color(theme.fg),
                             )
                             .selectable(false),
                         );
+                        // 相对名 "" = 根 → 展示 "@"。
+                        let name_disp = if rec.name.is_empty() { "@" } else { rec.name.as_str() };
                         ui.add(
                             egui::Label::new(
-                                egui::RichText::new(&rec.name)
+                                egui::RichText::new(name_disp)
                                     .size(theme.mono_size)
                                     .color(theme.fg),
                             )
@@ -1188,7 +1311,7 @@ fn show_records_card(ui: &mut egui::Ui, theme: &Theme, state: &mut DomainPanelSt
                         );
                         ui.add(
                             egui::Label::new(
-                                egui::RichText::new(&rec.data)
+                                egui::RichText::new(rec.data.to_display_string())
                                     .monospace()
                                     .size(theme.mono_size)
                                     .color(theme.fg),
@@ -1220,6 +1343,9 @@ fn show_records_card(ui: &mut egui::Ui, theme: &Theme, state: &mut DomainPanelSt
 
 /// 记录编辑弹窗（UI-DNS-007）：类型切换动态渲染字段；SRV 拆分
 /// priority/weight/port/target，其余类型自由数据文本。
+///
+/// UI-DNS-009：能力降级——`caps.srv`/`caps.ns` 为 false 时类型下拉禁用
+/// 对应项，并提示设备注册降级。
 ///
 /// 借用说明：弹窗编辑的是 `state.editing` 的**本地副本**——窗口闭包内还需
 /// 可变借用 `state`（`save_edit` 校验/触发任务），不能同时持有 `&mut editing`。
@@ -1255,7 +1381,7 @@ fn show_edit_window(ui: &mut egui::Ui, theme: &Theme, state: &mut DomainPanelSta
             .selectable(true),
         );
         ui.add_space(6.0);
-        // 类型选择。
+        // 类型选择（UI-DNS-009：能力缺失的类型禁用）。
         ui.horizontal(|ui| {
             ui.add(
                 egui::Label::new(
@@ -1271,7 +1397,11 @@ fn show_edit_window(ui: &mut egui::Ui, theme: &Theme, state: &mut DomainPanelSta
                 .width(110.0)
                 .show_ui(ui, |ui| {
                     for t in RECORD_TYPES {
-                        ui.selectable_value(&mut rtype, t.to_string(), t);
+                        let disabled = (t == "SRV" && !state.caps.srv)
+                            || (t == "NS" && !state.caps.ns);
+                        ui.add_enabled_ui(!disabled, |ui| {
+                            ui.selectable_value(&mut rtype, t.to_string(), t);
+                        });
                     }
                 });
             if rtype != edit.rtype {
@@ -1279,6 +1409,16 @@ fn show_edit_window(ui: &mut egui::Ui, theme: &Theme, state: &mut DomainPanelSta
                 edit.rtype = rtype;
             }
         });
+        if !state.caps.srv {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(t!("domain.provider.srv_degraded"))
+                        .size(theme.small_size)
+                        .color(theme.warning),
+                )
+                .selectable(false),
+            );
+        }
         ui.add_space(6.0);
         labeled_input(
             ui,

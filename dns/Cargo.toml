@@ -14,3 +14,15 @@ rand.workspace = true
 get_if_addrs = "0.4"
 # S-27（F-32）：TXT 公钥 base64 解码校验（Ed25519 公钥必须恰为 32 字节）
 base64 = "0.22"
+# M9-DNS000: Provider 抽象层 + 20 家服务商适配
+async-trait = "0.1"
+# 各服务商签名（SigV4 / TC3 / JDCLOUD2 / BCE / 华为 / 火山 / OVH / 西部数码 MD5）
+hex = "0.4"
+sha1 = "0.10"
+md-5 = "0.10"
+chrono.workspace = true
+# M9-DNS007/008：Google 服务账号 RS256 JWT 签名（rsa）、华为云 SDK-HMAC-SHA256 签名（hmac/sha2）
+rsa = "0.9"
+hmac.workspace = true
+# sha2 "oid" 特性：rsa 0.9 的 Pkcs1v15Sign::new 要求摘要实现 AssociatedOid
+sha2 = { workspace = true, features = ["oid"] }

@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// M15-T003: 白名单条目 — 域名模式 + 可选过期时间。
@@ -622,27 +623,78 @@ fn default_api_url() -> String {
     "https://api.godaddy.com".to_string()
 }
 
-/// M8-T035: DNS 域名维护服务商选择（`[dns]` 段）。
+/// M8-T035 + M9-DNS000: DNS 域名维护服务商选择（`[dns]` 段）。
 ///
-/// 仅 GUI 消费（Settings → DNS 组服务商列表）；值 = `dns_providers::dns_provider_defs()`
-/// 中已实现服务商 id（默认 "godaddy"）。旧配置无本段 → serde 默认回退，兼容。
-/// `[godaddy]` 段结构原样保留（CLI setup/register/discover/heartbeat 直接读写）。
+/// - `provider`：当前激活服务商注册表键名（默认 "godaddy"；UI 下拉框 / CLI
+///   `dns list-providers` 的数据源为 `dns_providers::dns_provider_defs()`）。
+/// - `providers`：每服务商独立凭据表（`[dns.providers.*]`，原始字符串，
+///   敏感字段对接 M15-T005 加密，未启用时明文+文件权限告警）。
+///
+/// 迁移：旧 `[godaddy]` 表（api_key/api_secret/api_url）在加载时自动迁入
+/// `[dns.providers.godaddy]` 并写回（见 `Config::load_from`）；`[godaddy]`
+/// 段结构原样保留（CLI setup/register/discover/heartbeat 兼容读）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DnsConfig {
     #[serde(default = "default_dns_provider")]
     pub provider: String,
+
+    /// M9-DNS000: 每服务商凭据表（`[dns.providers.<name>]`）。
+    #[serde(default)]
+    pub providers: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 impl Default for DnsConfig {
     fn default() -> Self {
         Self {
             provider: default_dns_provider(),
+            providers: BTreeMap::new(),
         }
     }
 }
 
 fn default_dns_provider() -> String {
     "godaddy".to_string()
+}
+
+impl Config {
+    /// M9-DNS000 (§4.2): 旧 `[godaddy]` 表 → `[dns.providers.godaddy]` 迁移。
+    ///
+    /// 条件：`[dns.providers]` 尚无 "godaddy" 条目 且 旧段 api_key/api_secret
+    /// 任一非空。迁移仅搬 api_key/api_secret/api_url（Credential::Godaddy
+    /// 字段）；`domain` 留在 `[godaddy]`（设备级域名，CLI 兼容读）。
+    /// 返回 `true` = 本次发生了迁移（调用方应写回）。
+    pub fn migrate_legacy_godaddy(&mut self) -> bool {
+        if self.dns.providers.contains_key("godaddy") {
+            return false;
+        }
+        let legacy_has_creds = !self.godaddy.api_key.trim().is_empty()
+            || !self.godaddy.api_secret.trim().is_empty();
+        if !legacy_has_creds {
+            return false;
+        }
+        let mut fields = BTreeMap::new();
+        fields.insert("api_key".to_string(), self.godaddy.api_key.clone());
+        fields.insert("api_secret".to_string(), self.godaddy.api_secret.clone());
+        fields.insert("api_url".to_string(), self.godaddy.api_url.clone());
+        self.dns.providers.insert("godaddy".to_string(), fields);
+        tracing::info!(
+            "Config: migrated legacy [godaddy] credentials to [dns.providers.godaddy]"
+        );
+        true
+    }
+
+    /// 指定服务商已配置的凭据表（`[dns.providers.<name>]`；无 → `None`）。
+    pub fn dns_provider_credentials(
+        &self,
+        provider: &str,
+    ) -> Option<&BTreeMap<String, String>> {
+        self.dns.providers.get(provider)
+    }
+
+    /// 当前激活服务商的凭据表（`[dns] provider` 对应条目；无 → `None`）。
+    pub fn active_dns_provider_credentials(&self) -> Option<&BTreeMap<String, String>> {
+        self.dns_provider_credentials(&self.dns.provider)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -911,11 +963,18 @@ impl Config {
             path: path.to_path_buf(),
             source: std::io::Error::new(std::io::ErrorKind::InvalidData, e),
         })?;
-        let config: Config = toml::from_str(&content)
+        let mut config: Config = toml::from_str(&content)
             .map_err(|e| ConfigError::ParseError {
                 path: path.to_path_buf(),
                 detail: e.to_string(),
             })?;
+        // M9-DNS000 (§4.2): 旧 `[godaddy]` 表 → `[dns.providers.godaddy]`
+        // 自动迁移（仅当新段缺失且旧段有值时；迁移后写回，用户可见）。
+        if config.migrate_legacy_godaddy() {
+            if let Err(e) = config.save_to(path) {
+                tracing::warn!("Config: legacy [godaddy] migration write-back failed: {e}");
+            }
+        }
         tracing::debug!("Config: successfully parsed from {:?}", path);
         Ok(config)
     }
@@ -1351,6 +1410,62 @@ mod tests {
         let path = std::env::temp_dir().join("kirin_desk_nonexistent.toml");
         let result = Config::load_from(&path);
         assert!(result.is_err());
+    }
+
+    // ---------- M9-DNS000 (§4.2): 旧 [godaddy] 配置迁移 ----------
+
+    #[test]
+    fn test_legacy_godaddy_migration() {
+        let mut cfg = Config::default();
+        cfg.godaddy.api_key = "legacy-key".to_string();
+        cfg.godaddy.api_secret = "legacy-secret".to_string();
+        cfg.godaddy.api_url = "https://api.godaddy.com".to_string();
+        cfg.godaddy.domain = "example.com".to_string();
+        // 迁移到 [dns.providers.godaddy]。
+        assert!(cfg.migrate_legacy_godaddy());
+        let godaddy = cfg.dns.providers.get("godaddy").expect("已迁移");
+        assert_eq!(godaddy.get("api_key").map(String::as_str), Some("legacy-key"));
+        assert_eq!(godaddy.get("api_secret").map(String::as_str), Some("legacy-secret"));
+        assert_eq!(godaddy.get("api_url").map(String::as_str), Some("https://api.godaddy.com"));
+        // domain 留在 [godaddy]（设备级域名，CLI 兼容读）。
+        assert_eq!(cfg.godaddy.domain, "example.com");
+        // 幂等：再次迁移不重复。
+        assert!(!cfg.migrate_legacy_godaddy());
+        // 新段已有 → 不覆盖。
+        let mut cfg2 = Config::default();
+        cfg2.godaddy.api_key = "x".to_string();
+        cfg2.dns.providers.insert(
+            "godaddy".to_string(),
+            [("api_key".to_string(), "new-key".to_string())].into_iter().collect(),
+        );
+        assert!(!cfg2.migrate_legacy_godaddy());
+        assert_eq!(
+            cfg2.dns.providers["godaddy"].get("api_key").map(String::as_str),
+            Some("new-key")
+        );
+        // 旧段无凭据 → 不迁移。
+        let mut cfg3 = Config::default();
+        assert!(!cfg3.migrate_legacy_godaddy());
+    }
+
+    #[test]
+    fn test_dns_provider_credentials_helpers() {
+        let mut cfg = Config::default();
+        assert!(cfg.active_dns_provider_credentials().is_none());
+        cfg.dns.provider = "cloudflare".to_string();
+        cfg.dns.providers.insert(
+            "cloudflare".to_string(),
+            [("api_token".to_string(), "tok".to_string())].into_iter().collect(),
+        );
+        let creds = cfg.dns_provider_credentials("cloudflare").expect("存在");
+        assert_eq!(creds.get("api_token").map(String::as_str), Some("tok"));
+        assert_eq!(
+            cfg.active_dns_provider_credentials()
+                .unwrap()
+                .get("api_token")
+                .map(String::as_str),
+            Some("tok")
+        );
     }
 
     // ---------- M8-T030（R-06）: 单 GPU 配置测试 ----------
