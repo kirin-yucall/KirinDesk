@@ -11,6 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use egui::{RichText, Ui};
 
 use crate::theme::Theme;
+use crate::t;
+use crate::tf;
 use crate::widgets::{action_button, badge, status_dot, BadgeKind, ButtonKind, ButtonState};
 
 // ════════════════════════════════════════════════════════════════
@@ -46,8 +48,8 @@ pub enum FileDirection {
 impl FileDirection {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Upload => "↑ 发送",
-            Self::Download => "↓ 接收",
+            Self::Upload => t!("filepanel.dir.upload"),
+            Self::Download => t!("filepanel.dir.download"),
         }
     }
 }
@@ -236,7 +238,7 @@ pub fn show_file_panel(
     ui.horizontal(|ui| {
         ui.add(
             egui::Label::new(
-                RichText::new("📁 文件传输 — 拖拽文件到窗口即可发送（并发 ≤ 3，其余排队）")
+                RichText::new(t!("filepanel.title"))
                     .size(theme.small_size)
                     .color(theme.fg_weak),
             )
@@ -246,8 +248,8 @@ pub fn show_file_panel(
             badge(
                 ui,
                 theme,
-                &format!(
-                    "{} 活跃 / {} 排队",
+                &tf!(
+                    "filepanel.active_fmt",
                     state.active_count(),
                     state.queued_count()
                 ),
@@ -262,7 +264,7 @@ pub fn show_file_panel(
         ui.centered_and_justified(|ui| {
             ui.add(
                 egui::Label::new(
-                    RichText::new("暂无传输任务\n拖拽文件到此窗口立即发送")
+                    RichText::new(t!("filepanel.empty"))
                         .size(theme.body_size)
                         .color(theme.fg_weak),
                 )
@@ -297,13 +299,13 @@ pub fn show_file_panel(
                             },
                         );
                         let (label, kind) = match &task.status {
-                            FileTaskStatus::Queued => ("排队中", BadgeKind::Neutral),
-                            FileTaskStatus::WaitingAccept => ("等待接受", BadgeKind::Neutral),
-                            FileTaskStatus::Sending => ("传输中", BadgeKind::Info),
-                            FileTaskStatus::Paused => ("已暂停", BadgeKind::Warning),
-                            FileTaskStatus::Completed => ("已完成", BadgeKind::Success),
-                            FileTaskStatus::Failed(_) => ("失败", BadgeKind::Danger),
-                            FileTaskStatus::Cancelled => ("已取消", BadgeKind::Neutral),
+                            FileTaskStatus::Queued => (t!("filepanel.status.queued"), BadgeKind::Neutral),
+                            FileTaskStatus::WaitingAccept => (t!("filepanel.status.waiting"), BadgeKind::Neutral),
+                            FileTaskStatus::Sending => (t!("filepanel.status.sending"), BadgeKind::Info),
+                            FileTaskStatus::Paused => (t!("filepanel.status.paused"), BadgeKind::Warning),
+                            FileTaskStatus::Completed => (t!("filepanel.status.completed"), BadgeKind::Success),
+                            FileTaskStatus::Failed(_) => (t!("filepanel.status.failed"), BadgeKind::Danger),
+                            FileTaskStatus::Cancelled => (t!("filepanel.status.cancelled"), BadgeKind::Neutral),
                         };
                         badge(ui, theme, label, kind);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -314,7 +316,8 @@ pub fn show_file_panel(
                                     if connected {
                                         if ui
                                             .add(egui::Button::new(
-                                                RichText::new("暂停").size(theme.small_size),
+                                                RichText::new(t!("filepanel.btn.pause"))
+                                                    .size(theme.small_size),
                                             ))
                                             .clicked()
                                         {
@@ -327,7 +330,8 @@ pub fn show_file_panel(
                                         && ui
                                             .add(
                                                 egui::Button::new(
-                                                    RichText::new("取消").size(theme.small_size),
+                                                    RichText::new(t!("filepanel.btn.cancel"))
+                                                        .size(theme.small_size),
                                                 )
                                                 .fill(theme.bg_strong),
                                             )
@@ -343,7 +347,8 @@ pub fn show_file_panel(
                                         && ui
                                             .add(
                                                 egui::Button::new(
-                                                    RichText::new("恢复").size(theme.small_size),
+                                                    RichText::new(t!("filepanel.btn.resume"))
+                                                        .size(theme.small_size),
                                                 )
                                                 .fill(theme.bg_strong),
                                             )
@@ -357,7 +362,8 @@ pub fn show_file_panel(
                                         && ui
                                             .add(
                                                 egui::Button::new(
-                                                    RichText::new("取消").size(theme.small_size),
+                                                    RichText::new(t!("filepanel.btn.cancel"))
+                                                        .size(theme.small_size),
                                                 )
                                                 .fill(theme.bg_strong),
                                             )
@@ -373,7 +379,7 @@ pub fn show_file_panel(
                                         && ui
                                             .add(
                                                 egui::Button::new(
-                                                    RichText::new("取消排队")
+                                                    RichText::new(t!("filepanel.btn.cancel_queue"))
                                                         .size(theme.small_size),
                                                 )
                                                 .fill(theme.bg_strong),
@@ -390,8 +396,10 @@ pub fn show_file_panel(
                                         if ui
                                             .add(
                                                 egui::Button::new(
-                                                    RichText::new("在文件夹中显示")
-                                                        .size(theme.small_size),
+                                                    RichText::new(t!(
+                                                        "filepanel.btn.show_in_folder"
+                                                    ))
+                                                    .size(theme.small_size),
                                                 )
                                                 .fill(theme.bg_strong),
                                             )
@@ -403,7 +411,8 @@ pub fn show_file_panel(
                                     if ui
                                         .add(
                                             egui::Button::new(
-                                                RichText::new("清除").size(theme.small_size),
+                                                RichText::new(t!("filepanel.btn.clear"))
+                                                    .size(theme.small_size),
                                             )
                                             .fill(theme.bg_strong),
                                         )
@@ -416,7 +425,8 @@ pub fn show_file_panel(
                                     if ui
                                         .add(
                                             egui::Button::new(
-                                                RichText::new("清除").size(theme.small_size),
+                                                RichText::new(t!("filepanel.btn.clear"))
+                                                    .size(theme.small_size),
                                             )
                                             .fill(theme.bg_strong),
                                         )
@@ -457,7 +467,8 @@ pub fn show_file_panel(
                         } else if let FileTaskStatus::Cancelled = &task.status {
                             ui.add(
                                 egui::Label::new(
-                                    RichText::new("已取消 — 无残留文件").size(theme.small_size),
+                                    RichText::new(t!("filepanel.cancelled_note"))
+                                        .size(theme.small_size),
                                 )
                                 .selectable(false),
                             );

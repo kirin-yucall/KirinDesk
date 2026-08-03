@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 
 /// Supported DNS record types for KirinDesk.
+///
+/// M9-DNS000 (DNS-MNT-006): 域名维护客户端需覆盖 A/AAAA/CNAME/MX/TXT/SRV/NS
+/// 全类型——扩展于原 SRV/A/AAAA/TXT 四型（SRV+AAAA+TXT 仍为设备注册三件套）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum RecordType {
@@ -12,6 +15,12 @@ pub enum RecordType {
     AAAA,
     /// TXT record — arbitrary text data (device public key).
     TXT,
+    /// CNAME record — canonical name alias.
+    CNAME,
+    /// MX record — mail exchanger（GoDaddy data 形如 `10 mail.example.com`）。
+    MX,
+    /// NS record — authoritative name server.
+    NS,
 }
 
 impl std::fmt::Display for RecordType {
@@ -21,8 +30,32 @@ impl std::fmt::Display for RecordType {
             RecordType::A => write!(f, "A"),
             RecordType::AAAA => write!(f, "AAAA"),
             RecordType::TXT => write!(f, "TXT"),
+            RecordType::CNAME => write!(f, "CNAME"),
+            RecordType::MX => write!(f, "MX"),
+            RecordType::NS => write!(f, "NS"),
         }
     }
+}
+
+/// M9-DNS000 (UI-DNS-006): 域名维护视图用完整记录模型——域名下全量记录查询
+/// （`GET /v1/domains/{domain}/records`）返回每条含 类型/名称/数据/TTL 的记录，
+/// 与现有 `{type}/{name}` 端点返回的 `Record{data,ttl}` 互为补充。
+///
+/// GoDaddy API 返回格式：
+/// ```json
+/// { "type": "A", "name": "@", "data": "192.168.1.1", "ttl": 600 }
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagedRecord {
+    /// 记录类型（大写，如 "A" / "SRV" / "TXT"）。
+    #[serde(rename = "type")]
+    pub rtype: String,
+    /// 记录名（相对名，如 `my-pc`；根记录为 `@`）。
+    pub name: String,
+    /// 记录数据（A=IP、SRV=`0 1 3389 target.`、MX=`10 mail.host` 等）。
+    pub data: String,
+    /// 生存时间（秒）。
+    pub ttl: u32,
 }
 
 /// A single DNS record as returned by the GoDaddy API.
@@ -139,6 +172,24 @@ mod tests {
         assert_eq!(RecordType::A.to_string(), "A");
         assert_eq!(RecordType::AAAA.to_string(), "AAAA");
         assert_eq!(RecordType::TXT.to_string(), "TXT");
+        assert_eq!(RecordType::CNAME.to_string(), "CNAME");
+        assert_eq!(RecordType::MX.to_string(), "MX");
+        assert_eq!(RecordType::NS.to_string(), "NS");
+    }
+
+    /// M9-DNS000: ManagedRecord serde 往返（GoDaddy 全量记录端点 JSON 形状）。
+    #[test]
+    fn test_managed_record_serde() {
+        let rec = ManagedRecord {
+            rtype: "A".to_string(),
+            name: "@".to_string(),
+            data: "203.0.113.7".to_string(),
+            ttl: 600,
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        assert_eq!(json, r#"{"type":"A","name":"@","data":"203.0.113.7","ttl":600}"#);
+        let back: ManagedRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, rec);
     }
 
     #[test]

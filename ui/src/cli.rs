@@ -1101,6 +1101,10 @@ fn cli_record_connection(
     let device = SavedDevice {
         id: server_id.to_string(),
         nickname: server_id.to_string(),
+        // M8-T037: 新字段默认值（CLI 自动保存路径不设备注/挑战码/排序）。
+        remark: String::new(),
+        challenge: String::new(),
+        sort_order: 0,
         ipv6,
         port,
         pubkey: pubkey.to_string(),

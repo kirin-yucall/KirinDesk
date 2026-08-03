@@ -1,6 +1,6 @@
 use super::auth::Auth;
 use super::error::GoDaddyError;
-use super::record::Record;
+use super::record::{ManagedRecord, Record};
 use crate::validate::{self, MAX_RECORD_DATA_LEN, MAX_RESPONSE_BYTES};
 use reqwest::header::{HeaderValue, AUTHORIZATION};
 use reqwest::Response;
@@ -312,6 +312,128 @@ impl GoDaddyClient {
         }
     }
 
+    // ────────────────────────────────────────────────────────────────
+    // M9-DNS000 (DNS-MNT-003/004/005): 域名维护客户端端点
+    // 域名列表 / 测试连接最小查询 / 域名下全量记录查询。
+    // ────────────────────────────────────────────────────────────────
+
+    /// GET /v1/domains —— 当前账号可管理的域名列表（DNS-MNT-004）。
+    ///
+    /// 响应形如 `[{"domain":"example.com","status":"ACTIVE",...}, ...]`；
+    /// 仅提取 `domain` 字段。本端点即 DNS-MNT-003 的「最小查询」测试连接载体。
+    pub async fn list_domains(&self) -> Result<Vec<String>, GoDaddyError> {
+        let url = format!("{}/v1/domains", self.base_url);
+        debug!("GoDaddy GET /v1/domains");
+        let response = self
+            .execute_with_retry(|| {
+                let client = self.client.clone();
+                let url = url.clone();
+                async move { client.get(&url).send().await }
+            })
+            .await?;
+        // F-19: Content-Length 预检（响应体读取前）。
+        if let Some(len) = response.content_length() {
+            if len as usize > MAX_RESPONSE_BYTES {
+                return Err(GoDaddyError::ResponseTooLarge {
+                    limit: MAX_RESPONSE_BYTES,
+                    actual: len as usize,
+                });
+            }
+        }
+        let body = response.bytes().await?;
+        if body.len() > MAX_RESPONSE_BYTES {
+            return Err(GoDaddyError::ResponseTooLarge {
+                limit: MAX_RESPONSE_BYTES,
+                actual: body.len(),
+            });
+        }
+        // `DomainItem` 只声明需要的字段，忽略其余（status/expires 等）。
+        #[derive(serde::Deserialize)]
+        struct DomainItem {
+            domain: String,
+        }
+        let items: Vec<DomainItem> = serde_json::from_slice(&body)?;
+        let domains: Vec<String> = items.into_iter().map(|d| d.domain).collect();
+        debug!("GoDaddy GET /v1/domains -> {} domains", domains.len());
+        Ok(domains)
+    }
+
+    /// GET /v1/domains/{domain}/records —— 域名下全量记录（DNS-MNT-005）。
+    ///
+    /// 返回每条含 类型/名称/数据/TTL 的 [`ManagedRecord`]；`record_type` 为
+    /// `Some("A")` 时附加 `?type=A` 服务端筛选。`domain` 经 RFC 1123 校验
+    /// （S-14b / F-18 同 `record_url`）。
+    pub async fn get_all_records(
+        &self,
+        domain: &str,
+        record_type: Option<&str>,
+    ) -> Result<Vec<ManagedRecord>, GoDaddyError> {
+        if !validate::validate_hostname(domain) {
+            return Err(GoDaddyError::InvalidParameters {
+                body: format!(
+                    "invalid domain '{}' (must be an RFC 1123 hostname)",
+                    domain
+                ),
+            });
+        }
+        let mut url = format!("{}/v1/domains/{}/records", self.base_url, domain);
+        if let Some(t) = record_type {
+            if t.is_empty() {
+                return Err(GoDaddyError::InvalidParameters {
+                    body: "record_type filter must not be empty".to_string(),
+                });
+            }
+            url.push_str("?type=");
+            url.push_str(t);
+        }
+        debug!(
+            "GoDaddy GET records for {} (filter={:?})",
+            domain, record_type
+        );
+        let response = self
+            .execute_with_retry(|| {
+                let client = self.client.clone();
+                let url = url.clone();
+                async move { client.get(&url).send().await }
+            })
+            .await?;
+        // F-19: Content-Length 预检 + 实际字节复核。
+        if let Some(len) = response.content_length() {
+            if len as usize > MAX_RESPONSE_BYTES {
+                return Err(GoDaddyError::ResponseTooLarge {
+                    limit: MAX_RESPONSE_BYTES,
+                    actual: len as usize,
+                });
+            }
+        }
+        let body = response.bytes().await?;
+        if body.len() > MAX_RESPONSE_BYTES {
+            return Err(GoDaddyError::ResponseTooLarge {
+                limit: MAX_RESPONSE_BYTES,
+                actual: body.len(),
+            });
+        }
+        let records: Vec<ManagedRecord> = serde_json::from_slice(&body)?;
+        // F-19: 单条 record data 长度上限。
+        for record in &records {
+            if record.data.len() > MAX_RECORD_DATA_LEN {
+                return Err(GoDaddyError::InvalidParameters {
+                    body: format!(
+                        "record data exceeds {} bytes (got {}); refusing oversized record",
+                        MAX_RECORD_DATA_LEN,
+                        record.data.len()
+                    ),
+                });
+            }
+        }
+        debug!(
+            "GoDaddy GET records {} -> {} records",
+            domain,
+            records.len()
+        );
+        Ok(records)
+    }
+
     /// Execute an HTTP request with automatic retry on 429 (rate limit).
     async fn execute_with_retry<F, Fut>(&self, request_fn: F) -> Result<Response, GoDaddyError>
     where
@@ -505,5 +627,69 @@ mod tests {
             "oversized write must be rejected, got {:?}",
             err
         );
+    }
+
+    // ---- M9-DNS000 (DNS-MNT-003/004/005): 域名维护端点 ----
+
+    #[tokio::test]
+    async fn test_list_domains() {
+        let mock = MockDns::start().await;
+        mock.set_domains(&["example.com", "kirin.dev"]);
+        let client = GoDaddyClient::new("k", "s", mock.base_url());
+        let domains = client.list_domains().await.expect("list domains");
+        assert_eq!(domains, vec!["example.com", "kirin.dev"]);
+        // 空账号 → 空列表而非错误。
+        mock.set_domains(&[]);
+        let domains = client.list_domains().await.expect("empty list ok");
+        assert!(domains.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_all_records_flat_and_filtered() {
+        let mock = MockDns::start().await;
+        mock.set_records("A", "@", &["203.0.113.7"], 600);
+        mock.set_records("AAAA", "my-pc", &["2001:db8::1"], 600);
+        mock.set_records("TXT", "my-pc", &["v=ed25519;k=abc"], 300);
+        let client = GoDaddyClient::new("k", "s", mock.base_url());
+
+        // 全量：3 条（A + AAAA + TXT）。
+        let all = client
+            .get_all_records("example.com", None)
+            .await
+            .expect("all records");
+        assert_eq!(all.len(), 3);
+        assert!(all.iter().any(|r| r.rtype == "A" && r.name == "@"));
+        assert!(all.iter().any(|r| r.rtype == "AAAA" && r.data == "2001:db8::1"));
+
+        // 类型筛选：仅 AAAA。
+        let aaaa = client
+            .get_all_records("example.com", Some("AAAA"))
+            .await
+            .expect("filtered records");
+        assert_eq!(aaaa.len(), 1);
+        assert_eq!(aaaa[0].rtype, "AAAA");
+        assert_eq!(aaaa[0].name, "my-pc");
+        assert_eq!(aaaa[0].ttl, 600);
+
+        // 无匹配类型 → 空列表。
+        let none = client
+            .get_all_records("example.com", Some("MX"))
+            .await
+            .expect("no-match ok");
+        assert!(none.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_all_records_rejects_invalid_domain() {
+        let mock = MockDns::start().await;
+        let client = GoDaddyClient::new("k", "s", mock.base_url());
+        assert!(matches!(
+            client.get_all_records("evil.com/x", None).await,
+            Err(GoDaddyError::InvalidParameters { .. })
+        ));
+        assert!(matches!(
+            client.get_all_records("example.com", Some("")).await,
+            Err(GoDaddyError::InvalidParameters { .. })
+        ));
     }
 }

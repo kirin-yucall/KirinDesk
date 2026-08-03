@@ -10,4 +10,4 @@ pub mod record;
 pub use auth::Auth;
 pub use client::GoDaddyClient;
 pub use error::GoDaddyError;
-pub use record::{Record, RecordType, SrvData, TxtKeyData};
+pub use record::{ManagedRecord, Record, RecordType, SrvData, TxtKeyData};

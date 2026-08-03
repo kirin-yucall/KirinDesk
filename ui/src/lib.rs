@@ -1,13 +1,15 @@
 mod cli;
 pub mod clipboard;
+pub mod domain_panel;
 pub mod file_panel;
 mod policy;
 mod privacy;
 pub mod terminal;
 mod theme;
 mod widgets;
-// R-12 (M15-T007): 国际化基础设施（先行；文案抽取 S2~S4 随波次 3，
+// R-12 (M15-T007): 国际化基础设施（先行；文案抽取随 M8-T038 波次 2，
 // 见 task_docs/修复任务/E_安全打磨R-12至R-13.md）。消费方 `use crate::t;`。
+// 注：lib.rs 为 crate 根，`#[macro_export]` 的 t!/tf! 已在本模块宏命名空间直接可用。
 mod i18n;
 
 use file_panel::{FileCommand, FileDirection, FilePanelState, FileTask, FileTaskStatus};
@@ -50,9 +52,9 @@ use terminal::Terminal;
 use theme::{Theme, ThemeMode};
 use widgets::{
     action_button, badge, card, copy_button, labeled_input, log_view, segmented_control,
-    selectable_pill, stat_card, state_button, status_dot, status_dot_char, stepper,
-    toggle_switch, toolbar_button, BadgeKind, ButtonKind, ButtonState, LogViewOptions, StatRow,
-    Validity,
+    selectable_pill, stat_card, stat_card_with_footer, state_button, status_dot, status_dot_char,
+    stepper, toggle_switch, toolbar_button, BadgeKind, ButtonKind, ButtonState, LogViewOptions,
+    StatRow, Validity,
 };
 
 // M10: 设备列表持久化 + DNS 发现连接。
@@ -184,6 +186,72 @@ fn probe_public_ip() -> Option<std::net::IpAddr> {
 fn connection_status() -> &'static Mutex<String> {
     static S: OnceLock<Mutex<String>> = OnceLock::new();
     S.get_or_init(|| Mutex::new(String::new()))
+}
+
+/// M8-T038 (P1): 连接状态 → 语义色（Shell 前缀剥离后判定；与既有 Connect 页
+/// 7868-7877 映射一致：已连接绿 / 发现·解析·连接·握手蓝 / 其余红）。
+fn conn_status_color(theme: &Theme, status: &str) -> egui::Color32 {
+    let s = status.strip_prefix("[shell] ").unwrap_or(status);
+    if s.starts_with("Connected") {
+        theme.success
+    } else if s.starts_with("Discovering")
+        || s.starts_with("Resolving")
+        || s.starts_with("Connecting")
+        || s.starts_with("Handshaking")
+    {
+        theme.info
+    } else {
+        theme.danger
+    }
+}
+
+/// M8-T038 (P1): 连接状态 → Stepper 步数（0=发现/解析 1=连接 2=握手 3=已连接；
+/// 其余 None）。与 Connect 页 step 推导同逻辑，另剥离 `[shell] ` 前缀
+/// （"[shell] Connected to …" → 第 3 步）。
+fn conn_step(status: &str) -> Option<usize> {
+    let s = status.strip_prefix("[shell] ").unwrap_or(status);
+    if s.starts_with("Discovering") || s.starts_with("Resolving") {
+        Some(0)
+    } else if s.starts_with("Connecting") {
+        Some(1)
+    } else if s.starts_with("Handshaking") {
+        Some(2)
+    } else if s.starts_with("Connected") {
+        Some(3)
+    } else {
+        None
+    }
+}
+
+/// M8-T038 (P6): 特殊键按钮文案（input crate 的 `SpecialCombo::label` 为硬编码
+/// 中文——UI 层以 t!() 覆盖，input 层保持平台通用不依赖 ui/i18n；键名同义）。
+fn special_combo_label(c: SpecialCombo) -> &'static str {
+    match c {
+        SpecialCombo::WinE => t!("session.special_key.win_e"),
+        SpecialCombo::WinD => t!("session.special_key.win_d"),
+        SpecialCombo::WinL => t!("session.special_key.win_l"),
+        SpecialCombo::WinR => t!("session.special_key.win_r"),
+        SpecialCombo::AltTab => t!("session.special_key.alt_tab"),
+        SpecialCombo::CtrlShiftEsc => t!("session.special_key.ctrl_shift_esc"),
+        SpecialCombo::AltF4 => t!("session.special_key.alt_f4"),
+        SpecialCombo::CtrlEsc => t!("session.special_key.ctrl_esc"),
+        SpecialCombo::LockScreen => t!("session.special_key.lock_screen"),
+    }
+}
+
+/// M8-T038 (P6): 特殊键按钮 tooltip（同上，覆盖 input crate 的 `hint()`）。
+fn special_combo_hint(c: SpecialCombo) -> &'static str {
+    match c {
+        SpecialCombo::WinE => t!("session.special_key.win_e_hint"),
+        SpecialCombo::WinD => t!("session.special_key.win_d_hint"),
+        SpecialCombo::WinL => t!("session.special_key.win_l_hint"),
+        SpecialCombo::WinR => t!("session.special_key.win_r_hint"),
+        SpecialCombo::AltTab => t!("session.special_key.alt_tab_hint"),
+        SpecialCombo::CtrlShiftEsc => t!("session.special_key.ctrl_shift_esc_hint"),
+        SpecialCombo::AltF4 => t!("session.special_key.alt_f4_hint"),
+        SpecialCombo::CtrlEsc => t!("session.special_key.ctrl_esc_hint"),
+        SpecialCombo::LockScreen => t!("session.special_key.lock_screen_hint"),
+    }
 }
 
 /// R-04：会话级音频开关（Settings 页 / CLI `--no-audio` 共用，进程级生效）。
@@ -821,8 +889,15 @@ fn start_gui(autostart_launched: bool) -> Result<(), String> {
                 .map(|cfg| ThemeMode::from_str(&cfg.ui.theme))
                 .unwrap_or_default();
             theme::install(&cc.egui_ctx, initial_mode);
+            // M8-T038: 语言初始化（Config `[ui] language`，首个 UI 帧前生效；
+            // 缺省 "system" → 跟随系统）。
+            let initial_lang = kirin_desk_utils::config::Config::load()
+                .map(|cfg| cfg.ui.language.clone())
+                .unwrap_or_else(|_| "system".to_string());
+            i18n::set_lang_code(&initial_lang);
             Ok(Box::new(KirinDeskApp {
                 theme_mode: initial_mode,
+                ui_language: initial_lang,
                 // M13-T005: --autostart 标记（驱动最小化启动）
                 autostart_launched,
                 ..Default::default()
@@ -3708,12 +3783,9 @@ struct KirinDeskApp {
     // Settings fields
     api_key: String,
     api_secret: String,
-    /// GoDaddy API base URL（Settings 未保存时回退生产环境）。
+    /// GoDaddy API base URL（未保存时回退生产环境）。
     api_url: String,
     domain: String,
-    /// M8-T035 (需求 10-12): DNS 域名维护服务商 id（Settings DNS 组 ComboBox；
-    /// 值 = `dns_providers` 注册表 id，未知值回退 "godaddy"）。
-    dns_provider: String,
     device_id: String,
     nickname: String,
     challenge_code: String,
@@ -3749,16 +3821,24 @@ struct KirinDeskApp {
     // M10-T005: 设备编辑弹窗状态
     editing_device: Option<String>,
     edit_nickname: String,
-    edit_domain: String,
+    /// M8-T037: 编辑弹窗「地址 (IP/域名)」输入（预填：有域名 → 域名，否则 IPv6）。
+    edit_host: String,
     edit_port: String,
+    /// M8-T037: 编辑弹窗「备注名」「挑战码」（挑战码密文 + 👁）。
+    edit_remark: String,
+    edit_challenge: String,
+    show_secret_edit_challenge: bool,
     // M15-T008: 主题模式（Config `[ui] theme`，默认 Light）+ 密文输入可见开关
     theme_mode: ThemeMode,
+    /// M8-T038: 语言选择（"system" 跟随系统 | "zh" | "en"；Config `[ui] language`）。
+    ui_language: String,
     show_secret_connect: bool,
-    show_secret_api: bool,
+    // M9-DNS022: show_secret_api 随 DNS 组迁至 Domain 页（domain_panel 内部持有）。
     show_secret_challenge: bool,
-    // M13-T005: 无人值守模式（Settings 页状态 + 启动时序）
+    // M13-T005: 无人值守模式（Settings 页状态 + 启动时序；M8-T037 三开关联动）
     unattended_enabled: bool,
     unattended_autostart: bool,
+    /// M8-T037: 显示名「默认受控」——应用启动自动开启服务端（自动监听）。
     unattended_auto_server: bool,
     // M8-T026: 内网穿透设置（Settings 页 Tunnel (内网穿透) 分组）
     tunnel_enabled: bool,
@@ -3782,6 +3862,8 @@ struct KirinDeskApp {
     dashboard_status: String,
     /// M8-T028 (UI-BTY-028): 复制成功浮出提示（(预览文案, 点击时刻)，2s 自动消失）。
     copied_feedback: Option<(String, std::time::Instant)>,
+    /// M9-DNS000: 域名维护页面状态（Domain 标签页，Dashboard 右侧按钮进入）。
+    domain_panel: domain_panel::DomainPanelState,
 }
 
 /// M8-T028 (UI-BTY-028): 状态栏「Copied: …」浮出提示持续时间。
@@ -3790,6 +3872,9 @@ const COPY_TOAST_DURATION: std::time::Duration = std::time::Duration::from_secs(
 #[derive(PartialEq)]
 enum Tab {
     Dashboard,
+    /// M9-DNS000 (UI-DNS-001~009): 域名维护客户端页面（导航按钮位于
+    /// Dashboard 右 / Devices 左）。
+    Domain,
     Devices,
     Connect,
     Settings,
@@ -3805,7 +3890,7 @@ fn format_last_seen(dt: chrono::DateTime<chrono::Utc>) -> String {
     use chrono::Local;
     let local = dt.with_timezone(&Local);
     if local.date_naive() == Local::now().date_naive() {
-        format!("今天 {}", local.format("%H:%M"))
+        tf!("devices.last_seen_today", local.format("%H:%M"))
     } else {
         local.format("%m-%d %H:%M").to_string()
     }
@@ -3846,6 +3931,10 @@ fn save_device_to_store(
     let device = SavedDevice {
         id: server_id.to_string(),
         nickname: server_id.to_string(),
+        // M8-T037: 新字段默认值（GUI 自动保存路径不设备注/挑战码/排序）。
+        remark: String::new(),
+        challenge: String::new(),
+        sort_order: 0,
         ipv6: addr_ipv6(addr),
         port,
         pubkey: pubkey.to_string(),
@@ -3883,17 +3972,14 @@ fn show_panic_dialog(ctx: &egui::Context, theme: &Theme) {
         let log_path = kirin_desk_utils::logging::current_log_path(
             &kirin_desk_utils::logging::default_log_dir(),
         );
-        egui::Window::new("程序异常（panic）")
+        egui::Window::new(t!("dialog.panic.title"))
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.add(
                     egui::Label::new(
-                        egui::RichText::new(
-                            "程序发生未处理异常（panic），可能不稳定。建议尽快重启应用。",
-                        )
-                        .color(theme.fg_weak),
+                        egui::RichText::new(t!("dialog.panic.body")).color(theme.fg_weak),
                     )
                     .selectable(false),
                 );
@@ -3906,8 +3992,10 @@ fn show_panic_dialog(ctx: &egui::Context, theme: &Theme) {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.add(
-                        egui::Label::new(egui::RichText::new("日志文件：").color(theme.fg_weak))
-                            .selectable(false),
+                        egui::Label::new(
+                            egui::RichText::new(t!("dialog.panic.log_label")).color(theme.fg_weak),
+                        )
+                        .selectable(false),
                     );
                     ui.add(
                         egui::Label::new(egui::RichText::new(log_path.display().to_string()))
@@ -3916,7 +4004,7 @@ fn show_panic_dialog(ctx: &egui::Context, theme: &Theme) {
                     copy_button(ui, theme, &log_path.display().to_string());
                 });
                 ui.add_space(4.0);
-                if action_button(ui, theme, ButtonKind::Primary, "关闭", ButtonState::Enabled)
+                if action_button(ui, theme, ButtonKind::Primary, t!("dialog.close"), ButtonState::Enabled)
                     .clicked()
                 {
                     *panic_dialog_msg().lock().unwrap() = None;
@@ -3932,7 +4020,9 @@ impl eframe::App for KirinDeskApp {
             self.config_loaded = true;
             // M13-T005 (UA-SRV-001): 无人值守自动开启服务端——启动即监听，
             // 无需人工点击 Dashboard 启动按钮；失败处理见 start_server 内审计。
-            if self.unattended_enabled && self.unattended_auto_server {
+            // M8-T037: 条件放宽为仅「默认受控」——默认受控独立于无人值守
+            // 总开关生效（无人值守关、默认受控开时同样自动监听）。
+            if self.unattended_auto_server {
                 self.start_server();
             }
             // UA-UI-003 (D4): --autostart 或无人值守启动 → 窗口最小化启动，
@@ -4066,7 +4156,7 @@ impl eframe::App for KirinDeskApp {
             .filter(|p| p.status == PendingStatus::Waiting)
             .collect();
         if let Some(pc) = waiting.first() {
-            egui::Window::new("Incoming Connection")
+            egui::Window::new(t!("dialog.approve.title"))
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -4074,10 +4164,8 @@ impl eframe::App for KirinDeskApp {
                     // M15-T008: 卡片化——设备名加粗 + 类型徽标 + 指纹 Mono + 语义按钮。
                     ui.add(
                         egui::Label::new(
-                            egui::RichText::new(
-                                "A device outside your whitelist is trying to connect:",
-                            )
-                            .color(theme.fg_weak),
+                            egui::RichText::new(t!("dialog.approve.desc"))
+                                .color(theme.fg_weak),
                         )
                         .selectable(false),
                     );
@@ -4095,9 +4183,12 @@ impl eframe::App for KirinDeskApp {
                     ui.horizontal(|ui| {
                         ui.add(
                             egui::Label::new(
-                                egui::RichText::new(format!("Domain: {}", pc.client_domain))
-                                    .monospace()
-                                    .color(theme.fg_weak),
+                                egui::RichText::new(tf!(
+                                    "dialog.approve.domain",
+                                    pc.client_domain
+                                ))
+                                .monospace()
+                                .color(theme.fg_weak),
                             )
                             .selectable(true),
                         );
@@ -4113,7 +4204,7 @@ impl eframe::App for KirinDeskApp {
                     ui.add_space(2.0);
                     ui.add(
                         egui::Label::new(
-                            egui::RichText::new(format!("Fingerprint: {}", client_fp))
+                            egui::RichText::new(tf!("dialog.approve.fingerprint", client_fp))
                                 .monospace()
                                 .size(theme.mono_size)
                                 .color(theme.fg),
@@ -4125,19 +4216,17 @@ impl eframe::App for KirinDeskApp {
                     ui.add_space(2.0);
                     ui.add(
                         egui::Label::new(
-                            egui::RichText::new(
-                                "批准后此公钥写入 known_clients，下次同设备连接自动放行",
-                            )
-                            .size(theme.small_size)
-                            .color(theme.fg_weak),
+                            egui::RichText::new(t!("dialog.approve.known_hint"))
+                                .size(theme.small_size)
+                                .color(theme.fg_weak),
                         )
                         .selectable(false),
                     );
                     ui.add_space(2.0);
                     ui.add(
                         egui::Label::new(
-                            egui::RichText::new(format!(
-                                "Pubkey: {}…",
+                            egui::RichText::new(tf!(
+                                "dialog.pubkey_fmt",
                                 &pc.client_pubkey_base64
                                     [..pc.client_pubkey_base64.len().min(24)]
                             ))
@@ -4153,7 +4242,7 @@ impl eframe::App for KirinDeskApp {
                             ui,
                             &theme,
                             ButtonKind::Success,
-                            "✓ Accept",
+                            t!("dialog.approve.accept"),
                             ButtonState::Enabled,
                         )
                         .clicked()
@@ -4164,7 +4253,7 @@ impl eframe::App for KirinDeskApp {
                             ui,
                             &theme,
                             ButtonKind::Danger,
-                            "✗ Reject",
+                            t!("dialog.approve.reject"),
                             ButtonState::Enabled,
                         )
                         .clicked()
@@ -4185,18 +4274,15 @@ impl eframe::App for KirinDeskApp {
         if let Some(pfp) = pending_fp {
             let mut accepted = false;
             let mut rejected = false;
-            egui::Window::new("首次连接指纹确认")
+            egui::Window::new(t!("dialog.fingerprint.title"))
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
                     ui.add(
                         egui::Label::new(
-                            egui::RichText::new(
-                                "这是第一次连接该设备。请核对远端 Ed25519 公钥指纹，\n\
-                                 与设备持有者提供的指纹一致才可继续（防中间人攻击）。",
-                            )
-                            .color(theme.fg_weak),
+                            egui::RichText::new(t!("dialog.fingerprint.body"))
+                                .color(theme.fg_weak),
                         )
                         .selectable(false),
                     );
@@ -4204,8 +4290,11 @@ impl eframe::App for KirinDeskApp {
                     ui.separator();
                     ui.horizontal(|ui| {
                         ui.add(
-                            egui::Label::new(egui::RichText::new("Device:").color(theme.fg_weak))
-                                .selectable(false),
+                            egui::Label::new(
+                                egui::RichText::new(t!("dialog.fingerprint.device_label"))
+                                    .color(theme.fg_weak),
+                            )
+                            .selectable(false),
                         );
                         ui.add(
                             egui::Label::new(egui::RichText::new(&pfp.device_id).strong())
@@ -4225,7 +4314,7 @@ impl eframe::App for KirinDeskApp {
                     ui.add_space(2.0);
                     ui.add(
                         egui::Label::new(
-                            egui::RichText::new("SHA-256 of the server's Ed25519 public key")
+                            egui::RichText::new(t!("dialog.fingerprint.sha_hint"))
                                 .size(theme.small_size)
                                 .color(theme.fg_weak),
                         )
@@ -4234,8 +4323,8 @@ impl eframe::App for KirinDeskApp {
                     ui.add_space(2.0);
                     ui.add(
                         egui::Label::new(
-                            egui::RichText::new(format!(
-                                "Pubkey: {}…",
+                            egui::RichText::new(tf!(
+                                "dialog.pubkey_fmt",
                                 &pfp.pubkey_base64[..pfp.pubkey_base64.len().min(24)]
                             ))
                             .monospace()
@@ -4250,7 +4339,7 @@ impl eframe::App for KirinDeskApp {
                             ui,
                             &theme,
                             ButtonKind::Success,
-                            "✓ 接受并连接",
+                            t!("dialog.fingerprint.confirm"),
                             ButtonState::Enabled,
                         )
                         .clicked()
@@ -4261,7 +4350,7 @@ impl eframe::App for KirinDeskApp {
                             ui,
                             &theme,
                             ButtonKind::Danger,
-                            "✗ 拒绝",
+                            t!("dialog.fingerprint.reject"),
                             ButtonState::Enabled,
                         )
                         .clicked()
@@ -4306,11 +4395,14 @@ impl eframe::App for KirinDeskApp {
                 );
                 ui.separator();
                 // 图标化标签页（选中态品牌色胶囊）
+                // M9-DNS000: Domain 按钮位于 Dashboard 右侧 / Devices 左侧——
+                // 域名维护客户端页面入口。
                 for (tab, icon, name) in [
-                    (Tab::Dashboard, "🏠", "Dashboard"),
-                    (Tab::Devices, "🖥", "Devices"),
-                    (Tab::Connect, "🔗", "Connect"),
-                    (Tab::Settings, "⚙", "Settings"),
+                    (Tab::Dashboard, "🏠", t!("session.tab.dashboard")),
+                    (Tab::Domain, "🌐", t!("session.tab.domain")),
+                    (Tab::Devices, "🖥", t!("session.tab.devices")),
+                    (Tab::Connect, "🔗", t!("session.tab.connect")),
+                    (Tab::Settings, "⚙", t!("session.tab.settings")),
                 ] {
                     if selectable_pill(
                         ui,
@@ -4329,7 +4421,7 @@ impl eframe::App for KirinDeskApp {
                     badge(
                         ui,
                         &theme,
-                        &format!("⚡ {} pending!", wc),
+                        &tf!("session.pending_fmt", wc),
                         BadgeKind::Danger,
                     );
                 }
@@ -4350,24 +4442,26 @@ impl eframe::App for KirinDeskApp {
                 );
                 ui.separator();
                 // M15-T008: API 状态改语义 Badge
+                // M9-DNS000 (UI-DNS-004): 文案泛化——不再出现 GoDaddy 字样，
+                // 未配置时引导至 Settings → DNS（服务商设置）。
                 if self.api_key.is_empty() {
-                    badge(ui, &theme, "API: Not configured", BadgeKind::Warning);
+                    badge(ui, &theme, t!("session.statusbar.dns_na"), BadgeKind::Warning);
                 } else {
-                    badge(ui, &theme, "API: Ready", BadgeKind::Success);
+                    badge(ui, &theme, t!("session.statusbar.dns_ready"), BadgeKind::Success);
                 }
                 ui.separator();
                 // M15-T008: StatusDot——监听=绿 / 停止=灰
                 if self.server_running {
-                    status_dot(ui, theme.success, "Server: Listening");
+                    status_dot(ui, theme.success, t!("session.statusbar.server_listening"));
                 } else {
-                    status_dot_char(ui, theme.fg_weak, "○", "Server: Stopped");
+                    status_dot_char(ui, theme.fg_weak, "○", t!("session.statusbar.server_stopped"));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // M8-T028 (UI-BTY-028): 复制成功浮出提示（右侧弱色，2s 自动消失）。
                     if let Some((value, _)) = &self.copied_feedback {
                         ui.add(
                             egui::Label::new(
-                                egui::RichText::new(format!("Copied: {value}"))
+                                egui::RichText::new(tf!("session.statusbar.copied", value))
                                     .monospace()
                                     .size(theme.small_size)
                                     .color(theme.fg_weak),
@@ -4390,6 +4484,7 @@ impl eframe::App for KirinDeskApp {
 
         egui::CentralPanel::default().show(ctx, |ui| match self.current_tab {
             Tab::Dashboard => self.show_dashboard(ui, &theme),
+            Tab::Domain => self.show_domain(ui, &theme),
             Tab::Devices => self.show_devices(ui, &theme),
             Tab::Connect => self.show_connect(ui, &theme),
             Tab::Settings => self.show_settings(ui, &theme),
@@ -4402,7 +4497,7 @@ impl eframe::App for KirinDeskApp {
         let mut dismiss = Vec::new();
         for (i, notice) in self.file_notices.iter().enumerate() {
             let mut closed = false;
-            egui::Window::new("📁 文件接收完成")
+            egui::Window::new(t!("dialog.file_received.title"))
                 .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 16.0))
                 .show(ctx, |ui| {
                     ui.add(
@@ -4414,7 +4509,7 @@ impl eframe::App for KirinDeskApp {
                         ui,
                         &theme,
                         ButtonKind::Secondary,
-                        "关闭",
+                        t!("dialog.close"),
                         ButtonState::Enabled,
                     )
                     .clicked()
@@ -4614,10 +4709,8 @@ impl eframe::App for KirinDeskApp {
                             if win.kind == WindowKind::Shell {
                                 ui.add(
                                     egui::Label::new(
-                                        egui::RichText::new(
-                                            "Remote Shell — PTY session (ANSI + scrollback)",
-                                        )
-                                        .color(theme.fg_weak),
+                                        egui::RichText::new(t!("session.statusbar.shell_hint"))
+                                            .color(theme.fg_weak),
                                     )
                                     .selectable(false),
                                 );
@@ -4638,7 +4731,12 @@ impl eframe::App for KirinDeskApp {
                                 );
                                 badge(ui, &theme, &stats.resolution, BadgeKind::Neutral);
                             } else {
-                                badge(ui, &theme, "FPS: --  BW: --  Res: --", BadgeKind::Neutral);
+                                badge(
+                                    ui,
+                                    &theme,
+                                    t!("session.statusbar.fps_placeholder"),
+                                    BadgeKind::Neutral,
+                                );
                             }
                             // M8-T018（CLI-MON-003）：状态栏显示当前屏名称与分辨率。
                             if win.kind == WindowKind::Desktop {
@@ -4646,40 +4744,74 @@ impl eframe::App for KirinDeskApp {
                                     badge(
                                         ui,
                                         &theme,
-                                        &format!(
-                                            "🖥 {} {}×{}{}",
+                                        &tf!(
+                                            "session.statusbar.display",
                                             d.name,
                                             d.width,
                                             d.height,
-                                            if d.is_primary { " [主屏]" } else { "" }
+                                            if d.is_primary {
+                                                t!("session.statusbar.primary_suffix")
+                                            } else {
+                                                ""
+                                            }
                                         ),
                                         BadgeKind::Info,
                                     );
                                 }
                                 // M8-T018（MON-NF-001）：切换被拒 → 错误提示（保持当前屏）。
                                 if let Some(reason) = &win.display_nack {
-                                    badge(ui, &theme, &format!("⛔ {reason}"), BadgeKind::Danger);
+                                    badge(
+                                        ui,
+                                        &theme,
+                                        &tf!("session.statusbar.nack", reason),
+                                        BadgeKind::Danger,
+                                    );
                                 }
                                 // M8-T019 (UI-PRIV-002): 隐私徽标（黑屏 / 锁屏）。
                                 match win.privacy_level {
                                     Some(PrivacyLevel::Black) => {
-                                        badge(ui, &theme, "🛡 黑屏", BadgeKind::Info);
+                                        badge(
+                                            ui,
+                                            &theme,
+                                            t!("session.statusbar.privacy_black"),
+                                            BadgeKind::Info,
+                                        );
                                     }
                                     Some(PrivacyLevel::Lock) => {
-                                        badge(ui, &theme, "🔒 锁屏", BadgeKind::Danger);
+                                        badge(
+                                            ui,
+                                            &theme,
+                                            t!("session.statusbar.privacy_lock"),
+                                            BadgeKind::Danger,
+                                        );
                                     }
                                     None => {}
                                 }
                                 // R-04：音频状态徽标（静音 / 播放中 / 已禁用）。
                                 match win.audio_state {
                                     AudioUiState::Playing => {
-                                        badge(ui, &theme, "🔊 播放中", BadgeKind::Info);
+                                        badge(
+                                            ui,
+                                            &theme,
+                                            t!("session.statusbar.audio_playing"),
+                                            BadgeKind::Info,
+                                        );
                                     }
                                     AudioUiState::Muted => {
-                                        badge(ui, &theme, "🔇 静音", BadgeKind::Neutral);
+                                        badge(
+                                            ui,
+                                            &theme,
+                                            t!("session.statusbar.audio_muted"),
+                                            BadgeKind::Neutral,
+                                        );
                                     }
                                     AudioUiState::Disabled => {
-                                        badge(ui, &theme, "🔇 音频已禁用", BadgeKind::Neutral);
+                                        badge(
+                                            ui,
+                                            &theme,
+                                            t!("session.statusbar.audio_disabled"),
+                                            BadgeKind::Neutral,
+                                        );
                                     }
                                 }
                             }
@@ -4697,7 +4829,7 @@ impl eframe::App for KirinDeskApp {
                                                 "🖥 {}",
                                                 win.current_display()
                                                     .map(|d| d.name.as_str())
-                                                    .unwrap_or("显示器")
+                                                    .unwrap_or_else(|| t!("session.toolbar.display_placeholder"))
                                             );
                                             egui::ComboBox::from_id_source(format!(
                                                 "display_sel_{wid}"
@@ -4711,7 +4843,11 @@ impl eframe::App for KirinDeskApp {
                                                         d.name,
                                                         d.width,
                                                         d.height,
-                                                        if d.is_primary { " [主屏]" } else { "" }
+                                                        if d.is_primary {
+                                                            t!("session.statusbar.primary_suffix")
+                                                        } else {
+                                                            ""
+                                                        }
                                                     );
                                                     ui.selectable_value(
                                                         &mut selected,
@@ -4739,7 +4875,7 @@ impl eframe::App for KirinDeskApp {
                                                 ui,
                                                 &theme,
                                                 "⟳",
-                                                "刷新显示器列表",
+                                                t!("session.toolbar.display_refresh"),
                                             )
                                             .clicked()
                                             {
@@ -4749,8 +4885,13 @@ impl eframe::App for KirinDeskApp {
                                             }
                                         }
                                         // M8-T020 UI-SKEY-001: 特殊键面板（Win/Alt+Tab/任务管理器/锁屏）。
-                                        if toolbar_button(ui, &theme, "🔑", "特殊键 (Win / Alt+Tab / 锁屏)")
-                                            .clicked()
+                                        if toolbar_button(
+                                            ui,
+                                            &theme,
+                                            "🔑",
+                                            t!("session.toolbar.special_keys"),
+                                        )
+                                        .clicked()
                                         {
                                             win.show_special_key_panel = !win.show_special_key_panel;
                                         }
@@ -4763,7 +4904,7 @@ impl eframe::App for KirinDeskApp {
                                                 ui,
                                                 &theme,
                                                 if play { "🔊" } else { "🔇" },
-                                                "播放音频：服务端声音 → 本机（关闭 = 静音）",
+                                                t!("session.toolbar.audio_play"),
                                             )
                                             .clicked()
                                             {
@@ -4785,7 +4926,7 @@ impl eframe::App for KirinDeskApp {
                                                 ui,
                                                 &theme,
                                                 if mic { "🎙️" } else { "🎤" },
-                                                "麦克风：本机麦克风 → 服务端播放（talkback，默认关）",
+                                                t!("session.toolbar.mic"),
                                             )
                                             .clicked()
                                             {
@@ -4793,7 +4934,7 @@ impl eframe::App for KirinDeskApp {
                                                 set_client_mic_enabled(mic);
                                             }
                                         }
-                                        if toolbar_button(ui, &theme, "📁", "文件传输面板 (拖拽发送)")
+                                        if toolbar_button(ui, &theme, "📁", t!("session.toolbar.file"))
                                             .clicked()
                                         {
                                             win.show_file_panel = !win.show_file_panel;
@@ -4802,9 +4943,9 @@ impl eframe::App for KirinDeskApp {
                                         // 黑屏（Level 1）/ 锁屏（Level 2）/ 恢复屏幕。
                                         // 激活时按钮文案显示当前状态（高亮由状态栏徽标承担）。
                                         let privacy_label = match win.privacy_level {
-                                            Some(PrivacyLevel::Black) => "🛡 黑屏",
-                                            Some(PrivacyLevel::Lock) => "🛡 锁屏",
-                                            None => "🛡 隐私",
+                                            Some(PrivacyLevel::Black) => t!("session.privacy.menu_black"),
+                                            Some(PrivacyLevel::Lock) => t!("session.privacy.menu_lock"),
+                                            None => t!("session.privacy.menu_idle"),
                                         };
                                         ui.menu_button(privacy_label, |ui| {
                                             let black_active = win.privacy_level
@@ -4815,11 +4956,11 @@ impl eframe::App for KirinDeskApp {
                                                 .add_enabled(
                                                         !black_active,
                                                         egui::Button::new(
-                                                            "隐藏被控端屏幕（黑屏）",
+                                                            t!("session.privacy.black_action"),
                                                         ),
                                                     )
                                                     .on_hover_text(
-                                                        "被控端屏幕被纯黑覆盖；远程操作与输入注入照常",
+                                                        t!("session.privacy.black_hint"),
                                                     )
                                                     .clicked()
                                                 {
@@ -4841,10 +4982,12 @@ impl eframe::App for KirinDeskApp {
                                                 if ui
                                                     .add_enabled(
                                                         !lock_active,
-                                                        egui::Button::new("锁定被控端"),
+                                                        egui::Button::new(
+                                                            t!("session.privacy.lock_action"),
+                                                        ),
                                                     )
                                                     .on_hover_text(
-                                                        "系统锁屏；锁屏后输入注入暂停，解锁自动恢复",
+                                                        t!("session.privacy.lock_hint"),
                                                     )
                                                     .clicked()
                                                 {
@@ -4866,7 +5009,9 @@ impl eframe::App for KirinDeskApp {
                                                 if ui
                                                     .add_enabled(
                                                         win.privacy_level.is_some(),
-                                                        egui::Button::new("恢复屏幕"),
+                                                        egui::Button::new(
+                                                            t!("session.privacy.restore"),
+                                                        ),
                                                     )
                                                     .clicked()
                                                 {
@@ -4889,7 +5034,7 @@ impl eframe::App for KirinDeskApp {
                                                     ui.add(
                                                         egui::Label::new(
                                                             egui::RichText::new(
-                                                                "被控端已锁定，输入暂停",
+                                                                t!("session.privacy.locked_note"),
                                                             )
                                                             .color(theme.fg_weak),
                                                         )
@@ -4898,14 +5043,17 @@ impl eframe::App for KirinDeskApp {
                                                 }
                                             });
                                     }
-                                    if toolbar_button(ui, &theme, "▣", "Fullscreen (F11)").clicked()
+                                    if toolbar_button(ui, &theme, "▣", t!("session.toolbar.fullscreen"))
+                                        .clicked()
                                     {
                                         win.fullscreen = !win.fullscreen;
                                         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(
                                             win.fullscreen,
                                         ));
                                     }
-                                    if toolbar_button(ui, &theme, "✖", "Disconnect").clicked() {
+                                    if toolbar_button(ui, &theme, "✖", t!("session.toolbar.disconnect"))
+                                        .clicked()
+                                    {
                                         closed.push(wid);
                                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                                     }
@@ -4952,7 +5100,7 @@ impl eframe::App for KirinDeskApp {
                             win.last_special_key.elapsed() < std::time::Duration::from_secs(1);
                         let alt_tab_unsupported = win.remote_platform == RemotePlatform::MacOS;
                         let mut clicked: Option<SpecialCombo> = None;
-                        egui::Window::new("特殊键")
+                        egui::Window::new(t!("session.special_key.title"))
                             .collapsible(false)
                             .resizable(false)
                             .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 44.0))
@@ -4983,16 +5131,16 @@ impl eframe::App for KirinDeskApp {
                                                 ui,
                                                 &theme,
                                                 ButtonKind::Secondary,
-                                                combo.label(),
+                                                special_combo_label(combo),
                                                 state,
                                             );
                                             // UI-SKEY-003: tooltip 提示（Alt+Tab 另附被控端前台要求）。
                                             let hint = if combo == SpecialCombo::AltTab
                                                 && alt_tab_unsupported
                                             {
-                                                "被控端为 macOS：不支持 Alt+Tab（Cmd+Tab 为系统 UI）"
+                                                t!("session.special_key.macos_alt_tab")
                                             } else {
-                                                combo.hint()
+                                                special_combo_hint(combo)
                                             };
                                             let resp = resp.on_hover_text(hint);
                                             if state == ButtonState::Enabled && resp.clicked() {
@@ -5005,11 +5153,9 @@ impl eframe::App for KirinDeskApp {
                                 ui.add_space(4.0);
                                 ui.add(
                                     egui::Label::new(
-                                        egui::RichText::new(
-                                            "Ctrl+Alt+Del 为系统安全序列，普通进程不可注入 — 以「锁屏」代替",
-                                        )
-                                        .size(theme.small_size)
-                                        .color(theme.fg_weak),
+                                        egui::RichText::new(t!("session.special_key.cac_hint"))
+                                            .size(theme.small_size)
+                                            .color(theme.fg_weak),
                                     )
                                     .selectable(false),
                                 );
@@ -5035,7 +5181,7 @@ impl eframe::App for KirinDeskApp {
                         let elapsed = at.elapsed();
                         if elapsed < std::time::Duration::from_secs(5) {
                             let mut dismiss = false;
-                            egui::Window::new("🛡 隐私模式")
+                            egui::Window::new(t!("session.privacy.toast_title"))
                                 .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 44.0))
                                 .collapsible(false)
                                 .resizable(false)
@@ -5051,7 +5197,7 @@ impl eframe::App for KirinDeskApp {
                                         ui,
                                         &theme,
                                         ButtonKind::Secondary,
-                                        "关闭",
+                                        t!("dialog.close"),
                                         ButtonState::Enabled,
                                     )
                                     .clicked()
@@ -5067,6 +5213,32 @@ impl eframe::App for KirinDeskApp {
                         }
                     }
 
+                    // M8-T038 (P1): 连接状态条——工具栏面板（conn_status_{wid}）之下、
+                    // 显示画面（CentralPanel）之前；状态非空才渲染，随弹出页出现/消失
+                    // （零残留）。状态为进程级全局单例，多窗口并存时各窗口显示最近一次
+                    // 写入（主设计 §7-4 已知限制）。本面板由 P1 独占，P6 不得改动。
+                    let status = connection_status().lock().unwrap().clone();
+                    if !status.is_empty() {
+                        egui::TopBottomPanel::top(format!("conn_state_{wid}")).show(ctx, |ui| {
+                            ui.add_space(2.0);
+                            ui.horizontal(|ui| {
+                                let color = conn_status_color(&theme, &status);
+                                status_dot(ui, color, &status);
+                                if let Some(cur) = conn_step(&status) {
+                                    let s = status.strip_prefix("[shell] ").unwrap_or(&status);
+                                    let steps = if s.starts_with("Resolving") {
+                                        &["Resolving", "Connecting", "Handshaking", "Connected"]
+                                    } else {
+                                        &["Discovering", "Connecting", "Handshaking", "Connected"]
+                                    };
+                                    ui.add_space(8.0);
+                                    stepper(ui, &theme, steps, cur);
+                                }
+                            });
+                            ui.add_space(2.0);
+                        });
+                    }
+
                     egui::CentralPanel::default()
                         // M15-T008: letterbox 黑底（视频画布底色令牌）
                         .frame(egui::Frame::none().fill(theme.video_bg))
@@ -5075,7 +5247,7 @@ impl eframe::App for KirinDeskApp {
                         if win.kind == WindowKind::Shell {
                             let (focused, events) = ctx.input(|i| (i.focused, i.events.clone()));
                             let Some(term) = win.terminal.as_ref() else {
-                                ui.label("Shell terminal not initialized.");
+                                ui.label(t!("session.shell_not_initialized"));
                                 return;
                             };
                             // 1. 键盘事件 → 终端字节流（仅窗口聚焦时捕获）。
@@ -5157,12 +5329,12 @@ impl eframe::App for KirinDeskApp {
                                 .cloned();
                             ui.centered_and_justified(|ui| {
                                 ui.vertical(|ui| {
-                                    status_dot(ui, theme.danger, "Connection lost");
+                                    status_dot(ui, theme.danger, t!("session.reconnect.lost"));
                                     ui.add_space(8.0);
                                     match &reconnect_state {
                                         Some(ReconnectUiState::Retrying { attempt, max }) => {
-                                            ui.label(format!(
-                                                "自动重连中（第 {} 次/共 {} 次）",
+                                            ui.label(tf!(
+                                                "session.reconnect.retrying",
                                                 (*attempt).max(1),
                                                 max
                                             ));
@@ -5172,7 +5344,7 @@ impl eframe::App for KirinDeskApp {
                                                 ui,
                                                 &theme,
                                                 ButtonKind::Primary,
-                                                "Reconnect",
+                                                t!("session.reconnect.button"),
                                                 ButtonState::Busy,
                                             );
                                         }
@@ -5184,7 +5356,7 @@ impl eframe::App for KirinDeskApp {
                                                 ui,
                                                 &theme,
                                                 ButtonKind::Primary,
-                                                "Reconnect",
+                                                t!("session.reconnect.button"),
                                                 ButtonState::Enabled,
                                             )
                                             .clicked()
@@ -5196,17 +5368,15 @@ impl eframe::App for KirinDeskApp {
                                             if win.reconnect_ctx.is_none() {
                                                 // R03-S5：无重连上下文的连接（ID 模式等）
                                                 // → 显式原因，不静默失败。
-                                                ui.label(
-                                                    "无法自动重连（该连接方式不支持自动重连，请手动重连）",
-                                                );
+                                                ui.label(t!("session.reconnect.unsupported"));
                                             } else {
-                                                ui.label("Connection lost");
+                                                ui.label(t!("session.reconnect.lost"));
                                                 ui.add_space(8.0);
                                                 if action_button(
                                                     ui,
                                                     &theme,
                                                     ButtonKind::Primary,
-                                                    "Reconnect",
+                                                    t!("session.reconnect.button"),
                                                     ButtonState::Enabled,
                                                 )
                                                 .clicked()
@@ -5396,7 +5566,7 @@ impl eframe::App for KirinDeskApp {
                                 painter.text(
                                     ui.max_rect().center_top() + egui::vec2(0.0, 14.0),
                                     egui::Align2::CENTER_TOP,
-                                    "🔒 被控端已锁定，输入暂停（解锁后自动恢复）",
+                                    t!("session.privacy.input_paused"),
                                     egui::FontId::proportional(16.0),
                                     theme.fg_weak,
                                 );
@@ -5499,11 +5669,8 @@ impl KirinDeskApp {
             self.api_secret = cfg.godaddy.api_secret;
             self.api_url = cfg.godaddy.api_url.clone();
             self.domain = cfg.godaddy.domain;
-            // M8-T035 (需求 11): DNS 服务商加载（非法 id 回退 "godaddy"）。
-            self.dns_provider = cfg.dns.provider.clone();
-            if kirin_desk_utils::dns_providers::dns_provider_def(&self.dns_provider).is_none() {
-                self.dns_provider = "godaddy".to_string();
-            }
+            // M9-DNS022: DNS 服务商选择迁至 Domain 页（domain_panel 内部
+            // 自配置读取并回填表单），App 不再持有该字段。
             // M8-T031: 配置留空 / 旧占位 `default-device` → 自动派生
             // （系统盘硬盘 UUID 等）；显式值原样保留。
             self.device_id = kirin_desk_utils::device::effective_device_id(&cfg.device.id);
@@ -5518,6 +5685,9 @@ impl KirinDeskApp {
             self.listen_port = cfg.network.port.to_string();
             // M15-T008: 主题模式（启动时 install 已用同源值，此处保持一致防漂移）。
             self.theme_mode = ThemeMode::from_str(&cfg.ui.theme);
+            // M8-T038: 语言（启动时已 set_lang_code；此处同源防漂移）。
+            self.ui_language = cfg.ui.language.clone();
+            i18n::set_lang_code(&cfg.ui.language);
             // M13-T005: 无人值守模式状态（Settings 页 + 启动时序共用）。
             self.unattended_enabled = cfg.unattended.enabled;
             self.unattended_autostart = cfg.unattended.auto_start_on_boot;
@@ -5619,7 +5789,7 @@ impl KirinDeskApp {
     }
 
     fn show_dashboard(&mut self, ui: &mut egui::Ui, theme: &Theme) {
-        ui.heading("Dashboard");
+        ui.heading(t!("dashboard.title"));
         ui.separator();
         // M8-T035 (需求 9): Dashboard 整体滚动区（对齐 Settings 页做法；
         // Live Log 内部滚动条保留，双滚动不冲突）。
@@ -5632,101 +5802,101 @@ impl KirinDeskApp {
             // stat_card 返回本帧复制的内容 → 状态栏浮出提示（UI-BTY-028）。
             // M8-T033: 增加 IPv4 行（与 IPv6 并列；无本机 IPv4 时显示 N/A）。
             // M8-T034: 各行 `small: true`——身份卡字号整体调小。
-            if let Some(copied) = stat_card(
+            // M8-T037: 公网检测红/绿点——逐 IP 判定，状态点随行显示在
+            // IPv6/IPv4 值之后（IPv4/IPv6 可能其一通畅）：本地地址为公网段
+            // （is_public_*，含 ULA/CGNAT 剔除）或外部出口探测命中 → 绿点；
+            // 否则红点（无地址 N/A 同样红）。仅两行均非公网时惰性触发一次
+            // 外部出口探测（api.ipify.org，4s 超时）；探测期间卡底提示
+            // 「公网检测中…」，双行均无公网（探测未命中/失败）→ 卡底提示
+            // 「无公网地址建议开启内网穿透或端口转发」。
+            let local_v4 = self.local_ipv4.parse::<std::net::Ipv4Addr>().ok();
+            let local_v6 = self.local_ipv6.parse::<std::net::Ipv6Addr>().ok();
+            let v4_local_public = local_v4
+                .as_ref()
+                .map(|a| kirin_desk_core::network::ipv4::is_public_ipv4(a))
+                .unwrap_or(false);
+            let v6_local_public = local_v6
+                .as_ref()
+                .map(|a| kirin_desk_core::network::ipv6::is_public_ipv6(a))
+                .unwrap_or(false);
+            let mut probing = false;
+            let mut probe_ext: Option<std::net::IpAddr> = None;
+            if !v4_local_public && !v6_local_public {
+                // 本地无公网 → 外部探测兜底（Idle → 触发一次后台探测）。
+                ensure_public_probe();
+                match *public_probe_state().lock().unwrap() {
+                    PublicProbeState::Probing => probing = true,
+                    PublicProbeState::Done(ext) => probe_ext = ext,
+                    PublicProbeState::Idle => {}
+                }
+            }
+            let v4_public = v4_local_public || probe_ext == local_v4.map(std::net::IpAddr::V4);
+            let v6_public = v6_local_public || probe_ext == local_v6.map(std::net::IpAddr::V6);
+            let dot_public = (theme.success, t!("dashboard.identity.dot_public"));
+            let dot_private = (theme.danger, t!("dashboard.identity.dot_private"));
+            let v4_dot = if v4_public { dot_public } else { dot_private };
+            let v6_dot = if v6_public { dot_public } else { dot_private };
+            let footer = if !v4_public && !v6_public {
+                if probing {
+                    Some((theme.fg_weak, t!("dashboard.identity.probing").to_string()))
+                } else {
+                    Some((
+                        theme.danger,
+                        t!("dashboard.identity.no_public").to_string(),
+                    ))
+                }
+            } else {
+                None
+            };
+            if let Some(copied) = stat_card_with_footer(
                 ui,
                 theme,
-                "Identity",
+                t!("dashboard.identity.title"),
                 &[
                     StatRow {
-                        key: "Device ID:",
+                        key: t!("dashboard.identity.device_id"),
                         value: self.device_id.clone(),
                         mono: true,
                         copy: true,
                         small: true,
+                        dot: None,
                     },
                     StatRow {
-                        key: "IPv6:",
+                        key: t!("dashboard.identity.ipv6"),
                         value: self.local_ipv6.clone(),
                         mono: true,
                         copy: true,
                         small: true,
+                        dot: Some(v6_dot),
                     },
                     StatRow {
-                        key: "IPv4:",
+                        key: t!("dashboard.identity.ipv4"),
                         value: self.local_ipv4.clone(),
                         mono: true,
                         copy: true,
                         small: true,
+                        dot: Some(v4_dot),
                     },
                     StatRow {
-                        key: "Domain:",
+                        key: t!("dashboard.identity.domain"),
                         value: self.domain.clone(),
                         mono: true,
                         copy: true,
                         small: true,
+                        dot: None,
                     },
                     StatRow {
-                        key: "Listen Port:",
+                        key: t!("dashboard.identity.listen_port"),
                         value: self.listen_port.clone(),
                         mono: true,
                         copy: false,
                         small: true,
+                        dot: None,
                     },
                 ],
+                footer,
             ) {
                 self.notify_copied(&copied);
-            }
-            // M8-T036: 公网检测行（紧邻身份卡 IP 行）——混合判定：
-            // ① 本地 IPv4/IPv6 任一是公网段（is_public_*，含 ULA/CGNAT 剔除）；
-            // ② 本地全非公网 → 惰性触发一次外部出口探测（api.ipify.org，4s 超时），
-            //    探测 IP 与本机任一地址相同 → 直持公网；否则视为无公网。
-            // 无公网 → 红点提示开启内网穿透（Settings → Tunnel）。
-            {
-                let local_v4 = self.local_ipv4.parse::<std::net::Ipv4Addr>().ok();
-                let local_v6 = self.local_ipv6.parse::<std::net::Ipv6Addr>().ok();
-                let local_public = local_v4
-                    .as_ref()
-                    .map(|a| kirin_desk_core::network::ipv4::is_public_ipv4(a))
-                    .unwrap_or(false)
-                    || local_v6
-                        .as_ref()
-                        .map(|a| kirin_desk_core::network::ipv6::is_public_ipv6(a))
-                        .unwrap_or(false);
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new("公网检测:")
-                                .size(theme.small_size)
-                                .color(theme.fg_weak),
-                        )
-                        .selectable(false),
-                    );
-                    if local_public {
-                        status_dot(ui, theme.success, "具备公网地址");
-                    } else {
-                        // 本地无公网 → 外部探测兜底（Idle → 触发一次后台探测）。
-                        ensure_public_probe();
-                        let probe = *public_probe_state().lock().unwrap();
-                        let ext_matches_local = match probe {
-                            PublicProbeState::Done(Some(ext)) => {
-                                Some(ext) == local_v4.map(std::net::IpAddr::V4)
-                                    || Some(ext) == local_v6.map(std::net::IpAddr::V6)
-                            }
-                            _ => false,
-                        };
-                        if matches!(probe, PublicProbeState::Probing) {
-                            status_dot(ui, theme.fg_weak, "公网检测中…");
-                        } else if ext_matches_local {
-                            status_dot(ui, theme.success, "具备公网地址");
-                        } else {
-                            status_dot(
-                                ui,
-                                theme.danger,
-                                "无公网地址 — 建议开启内网穿透（Settings → Tunnel）",
-                            );
-                        }
-                    }
-                });
             }
             ui.add_space(theme.spacing);
 
@@ -5735,16 +5905,16 @@ impl KirinDeskApp {
             // M8-T035 (需求 6/7): 「允许受控」+「允许麦克风」同一行；停止态不再
             // 显示「已停止 / ○ Stopped」文字（开关位置即状态）；「允许音频」会话级
             // 总开关迁自 Settings Server 组（需求 4）；高危警告同步迁入（需求 4）。
-            card(ui, theme, "Server", |ui| {
+            card(ui, theme, t!("dashboard.server.title"), |ui| {
                 // ── ① 允许受控 + 允许麦克风（同一行，需求 7）──
                 // 允许受控：开关 = 服务端启停；状态文字 = 真实运行态。
                 let runtime_status = {
                     let st = server_runtime_state().lock().unwrap();
                     if st.listening {
-                        Some(format!("监听中 :{}", st.port))
+                        Some(tf!("dashboard.server.listening", st.port))
                     } else if let Some(e) = &st.error {
                         // 截断避免撑破卡片（完整原因在下方 server_status 行 + Live Log）。
-                        let mut s = format!("启动失败: {}", e);
+                        let mut s = tf!("dashboard.server.start_failed", e);
                         const MAX: usize = 56;
                         if s.chars().count() > MAX {
                             let t: String = s.chars().take(MAX - 1).collect();
@@ -5761,20 +5931,17 @@ impl KirinDeskApp {
                     let resp = toggle_switch(
                         ui,
                         theme,
-                        "允许受控",
+                        t!("dashboard.server.allow_controlled"),
                         self.server_running,
                         runtime_status.as_deref(),
                     )
-                    .on_hover_text(
-                        "开：开始监听（下次生效昵称/挑战码/工作模式）；\
-                         关：停止监听。bind 失败时开关自动回位并显示原因。",
-                    );
+                    .on_hover_text(t!("dashboard.server.allow_controlled_hint"));
                     if resp.clicked() {
                         if was_running {
                             // OFF → 停止：stop 信号 + 运行态立即复位（监听线程随后退出）。
                             server_stop_signal().store(true, Ordering::Relaxed);
                             self.server_running = false;
-                            self.server_status = "已停止".to_string();
+                            self.server_status = t!("dashboard.server.stopped").to_string();
                             {
                                 let mut st = server_runtime_state().lock().unwrap();
                                 st.starting = false;
@@ -5788,33 +5955,22 @@ impl KirinDeskApp {
                     }
                     // ── ② 允许麦克风（M8-T032 ①：服务端声音 → 客户端，动态生效）──
                     let mic_on = server_audio_allowed();
-                    let mic_resp =
-                        toggle_switch(ui, theme, "允许麦克风", mic_on, Some("服务端声音 → 客户端"))
-                            .on_hover_text(
-                                "关：服务端不再发送本机声音——运行中会话立即停止，再开即恢复（无需重连）",
-                            );
+                    let mic_resp = toggle_switch(
+                        ui,
+                        theme,
+                        t!("dashboard.server.allow_mic"),
+                        mic_on,
+                        Some(t!("dashboard.server.audio_direction")),
+                    )
+                    .on_hover_text(t!("dashboard.server.allow_mic_hint"));
                     if mic_resp.clicked() {
                         set_server_audio_allowed(!mic_on);
                     }
                 });
-                // ── ③ 允许音频（会话级总开关，迁自 Settings Server 组；关 → 三个
-                // 子开关全部停用——服务端发送 / 客户端播放 / 麦克风回传）──
-                {
-                    let on = audio_enabled_global().load(Ordering::Relaxed);
-                    let resp = toggle_switch(ui, theme, "允许音频 (会话级)", on, None).on_hover_text(
-                        "总开关：关 → 服务端声音、客户端播放、麦克风回传全部停用。\
-                         子开关：① 服务端「允许麦克风」在本卡；②「播放音频」与 ③「麦克风」\
-                         在连接窗口工具栏（会话内动态生效）。",
-                    );
-                    if resp.clicked() {
-                        set_audio_enabled(!on);
-                        self.server_status = if !on {
-                            "Audio enabled (takes effect on new sessions)".to_string()
-                        } else {
-                            "Audio disabled (takes effect on new sessions)".to_string()
-                        };
-                    }
-                }
+                // M8-T037: 「允许音频（会话级）」开关已移除——音频总开关不再
+                // 提供 GUI 写入入口（保持默认开；CLI `--no-audio` 语义不变，
+                // 三个子开关仍可独立控制：服务端「允许麦克风」在本卡、
+                // 「播放音频」/「麦克风」在连接窗口工具栏）。
                 ui.add_space(4.0);
                 if !self.server_status.is_empty() {
                     ui.add(
@@ -5830,15 +5986,15 @@ impl KirinDeskApp {
                 // ── ④ 工作模式：IP ⟷ Domain 单按钮互换（Settings/Connect 页同字段）──
                 ui.horizontal(|ui| {
                     let mode_label = if self.ip_mode_allowed {
-                        "工作模式: IP Mode"
+                        tf!("dashboard.server.mode_label", t!("dashboard.server.mode_ip"))
                     } else {
-                        "工作模式: Domain Mode"
+                        tf!("dashboard.server.mode_label", t!("dashboard.server.mode_domain"))
                     };
                     if action_button(
                         ui,
                         theme,
                         ButtonKind::Secondary,
-                        mode_label,
+                        &mode_label,
                         ButtonState::Enabled,
                     )
                     .clicked()
@@ -5851,7 +6007,7 @@ impl KirinDeskApp {
                     }
                     ui.add(
                         egui::Label::new(
-                            egui::RichText::new("点击互换（下次启动服务端生效；保存后重启保持）")
+                            egui::RichText::new(t!("dashboard.server.mode_hint"))
                                 .size(theme.small_size)
                                 .color(theme.fg_weak),
                         )
@@ -5862,26 +6018,35 @@ impl KirinDeskApp {
                 // ── ⑤ 临时连接开关（替代原开启/关闭按钮；窗口过期自动回位）──
                 if self.unattended_enabled {
                     // UI-TMP-006: 无人值守下禁用（UA-ACCEPT-004）。
-                    toggle_switch(ui, theme, "临时连接", false, Some("无人值守模式下不可用"));
+                    toggle_switch(
+                        ui,
+                        theme,
+                        t!("dashboard.temp.title"),
+                        false,
+                        Some(t!("dashboard.temp.unavailable")),
+                    );
                 } else {
                     let temp_active = crate::policy::temp_mode_window_active();
                     let temp_status = if temp_active {
                         let remaining = TempModeManager::new()
                             .map(|m| m.remaining_secs())
                             .unwrap_or(0);
-                        format!(
-                            "剩余 {:02}:{:02}（窗口期内跳过白名单）",
+                        tf!(
+                            "dashboard.temp.remaining",
                             remaining / 60,
                             remaining % 60
                         )
                     } else {
-                        "窗口期内跳过白名单（默认 5 分钟，过期自动关闭）".to_string()
+                        t!("dashboard.temp.hint").to_string()
                     };
-                    let resp = toggle_switch(ui, theme, "临时连接", temp_active, Some(&temp_status))
-                        .on_hover_text(
-                            "开：生成 10 位临时挑战码并限时跳过域名白名单；\
-                             关：立即恢复白名单验证；过期自动回位（逐连接判定，无需重连）。",
-                        );
+                    let resp = toggle_switch(
+                        ui,
+                        theme,
+                        t!("dashboard.temp.title"),
+                        temp_active,
+                        Some(&temp_status),
+                    )
+                    .on_hover_text(t!("dashboard.temp.toggle_hint"));
                     if resp.clicked() {
                         if temp_active {
                             // OFF（手动）→ 审计 Disabled；清标记避免归零误报 Expired。
@@ -5897,9 +6062,9 @@ impl KirinDeskApp {
                                     kirin_desk_utils::audit::AuditEvent::TempModeDisabled,
                                     "reason=manual_gui",
                                 );
-                                self.temp_status = "临时连接已关闭".to_string();
+                                self.temp_status = t!("dashboard.temp.closed").to_string();
                             } else {
-                                self.temp_status = "临时连接已失效".to_string();
+                                self.temp_status = t!("dashboard.temp.expired").to_string();
                             }
                         } else {
                             // ON → 生成 10 位临时挑战码 + 审计 TempModeEnabled。
@@ -5910,7 +6075,7 @@ impl KirinDeskApp {
                                     Ok(code) => {
                                         self.temp_code = Some(code);
                                         self.temp_status =
-                                            format!("临时连接已开启（{} 分钟）", ttl / 60);
+                                            tf!("dashboard.temp.enabled", ttl / 60);
                                         let mut logger =
                                             kirin_desk_utils::audit::AuditLogger::open_default().ok();
                                         audit_record(
@@ -5923,9 +6088,9 @@ impl KirinDeskApp {
                                             ),
                                         );
                                     }
-                                    Err(e) => self.temp_status = format!("开启失败：{}", e),
+                                    Err(e) => self.temp_status = tf!("dashboard.temp.enable_failed", e),
                                 },
-                                Err(e) => self.temp_status = format!("开启失败：{}", e),
+                                Err(e) => self.temp_status = tf!("dashboard.temp.enable_failed", e),
                             }
                         }
                     }
@@ -5950,25 +6115,22 @@ impl KirinDeskApp {
                                         ui,
                                         theme,
                                         ButtonKind::Secondary,
-                                        "隐藏临时码",
+                                        t!("dashboard.temp.hide_code"),
                                         ButtonState::Enabled,
                                     )
                                     .clicked()
                                     {
                                         self.temp_code = None;
-                                        self.temp_status = "临时码已隐藏（仅展示一次）".to_string();
+                                        self.temp_status = t!("dashboard.temp.hidden").to_string();
                                     }
                                 });
                             }
                             None => {
                                 ui.add(
                                     egui::Label::new(
-                                        egui::RichText::new(
-                                            "临时码已在开启时展示一次，未落盘保存（TMP-SEC-001）；\
-                                             再次查看需重新开启（生成新码）。",
-                                        )
-                                        .size(theme.small_size)
-                                        .color(theme.fg_weak),
+                                        egui::RichText::new(t!("dashboard.temp.not_stored"))
+                                            .size(theme.small_size)
+                                            .color(theme.fg_weak),
                                     )
                                     .selectable(false),
                                 );
@@ -5977,11 +6139,9 @@ impl KirinDeskApp {
                         ui.add_space(4.0);
                         ui.add(
                             egui::Label::new(
-                                egui::RichText::new(
-                                    "窗口期内跳过域名白名单，任何持有此码的客户端均可连接。",
-                                )
-                                .size(theme.small_size)
-                                .color(theme.fg_weak),
+                                egui::RichText::new(t!("dashboard.temp.window_note"))
+                                    .size(theme.small_size)
+                                    .color(theme.fg_weak),
                             )
                             .selectable(false),
                         );
@@ -6001,22 +6161,22 @@ impl KirinDeskApp {
                 // M8-T035 (需求 6): 仅运行时渲染——停止时无「○ Stopped」。
                 if self.server_running {
                     ui.horizontal(|ui| {
-                        status_dot(ui, theme.success, "Listening");
+                        status_dot(ui, theme.success, t!("dashboard.server.status_listening"));
                         if self.temp_mode {
                             badge(
                                 ui,
                                 theme,
-                                "Temp Mode: ON (whitelist bypassed)",
+                                t!("dashboard.temp.badge_on"),
                                 BadgeKind::Warning,
                             );
                         }
                         // M8-T017 (UI-TMP-004): 临时连接窗口激活徽标（状态行）。
                         if crate::policy::temp_mode_window_active() {
-                            badge(ui, theme, "Temp Window: ON", BadgeKind::Warning);
+                            badge(ui, theme, t!("dashboard.temp.window_badge"), BadgeKind::Warning);
                         }
                         // M13-T005 (UA-UI-002): 无人值守模式徽标。
                         if self.unattended_enabled {
-                            badge(ui, theme, "Unattended", BadgeKind::Info);
+                            badge(ui, theme, t!("dashboard.unattended_badge"), BadgeKind::Info);
                         }
                         // 待审批计数 → 红色 Badge
                         let waiting_count = self
@@ -6028,7 +6188,7 @@ impl KirinDeskApp {
                             badge(
                                 ui,
                                 theme,
-                                &format!("{} pending connection(s)", waiting_count),
+                                &tf!("dashboard.pending_fmt", waiting_count),
                                 BadgeKind::Danger,
                             );
                         }
@@ -6043,14 +6203,9 @@ impl KirinDeskApp {
                     ui.add_space(4.0);
                     ui.add(
                         egui::Label::new(
-                            egui::RichText::new(
-                                "⚠ HIGH RISK: whitelist bypass (IP/Temp mode) is ON but \
-                                 Challenge Code is empty — bypass connections carry zero \
-                                 credentials and will be REJECTED (fail-closed, F-1/F-2). \
-                                 Set a challenge code in 服务端设置 below to allow them.",
-                            )
-                            .size(theme.small_size)
-                            .color(theme.danger),
+                            egui::RichText::new(t!("dashboard.risk.high_risk"))
+                                .size(theme.small_size)
+                                .color(theme.danger),
                         )
                         .selectable(false),
                     );
@@ -6062,7 +6217,7 @@ impl KirinDeskApp {
             // 下次启动服务端生效；页面内小保存按钮即时落盘）
             // M8-T035 (需求 1/2): 端口输入迁入（原 Settings Server 组 Listen Port），
             // 三项横向一排——端口定窄宽、昵称/挑战码弹性宽度。
-            card(ui, theme, "服务端设置", |ui| {
+            card(ui, theme, t!("dashboard.server_settings.title"), |ui| {
                 // 整体字号压到 small_size（仅本卡内生效，渲染后还原）。
                 let saved_style: egui::Style = ui.style().as_ref().clone();
                 {
@@ -6075,7 +6230,7 @@ impl KirinDeskApp {
                 // M8-T035: 端口校验（1–65535）——非法红边 + 提示 + 禁用保存。
                 let port_validity = match self.listen_port.parse::<u16>() {
                     Ok(p) if p >= 1 => Validity::None,
-                    _ => Validity::Invalid("端口需为 1–65535"),
+                    _ => Validity::Invalid(t!("dashboard.server_settings.port_invalid")),
                 };
                 ui.horizontal(|ui| {
                     let row_w = ui.available_width();
@@ -6086,7 +6241,7 @@ impl KirinDeskApp {
                         labeled_input(
                             ui,
                             theme,
-                            "Port:",
+                            t!("dashboard.server_settings.port"),
                             &mut self.listen_port,
                             "3389",
                             port_validity,
@@ -6099,9 +6254,9 @@ impl KirinDeskApp {
                         labeled_input(
                             ui,
                             theme,
-                            "Nickname:",
+                            t!("dashboard.server_settings.nickname"),
                             &mut self.nickname,
-                            "required",
+                            t!("dashboard.server_settings.required"),
                             Validity::None,
                             None,
                             false,
@@ -6113,9 +6268,9 @@ impl KirinDeskApp {
                         labeled_input(
                             ui,
                             theme,
-                            "Challenge Code:",
+                            t!("dashboard.server_settings.challenge"),
                             &mut self.challenge_code,
-                            "optional",
+                            t!("dashboard.server_settings.optional"),
                             Validity::None,
                             Some(&mut self.show_secret_challenge),
                             false,
@@ -6125,12 +6280,9 @@ impl KirinDeskApp {
                 *ui.style_mut() = saved_style;
                 ui.add(
                     egui::Label::new(
-                        egui::RichText::new(
-                            "服务端启动时读取本值——下次启动服务端生效（不热改已运行会话）。\
-                             传入客户端必须携带该昵称；挑战码为白名单旁路放行的前提。",
-                        )
-                        .size(theme.small_size)
-                        .color(theme.fg_weak),
+                        egui::RichText::new(t!("dashboard.server_settings.desc"))
+                            .size(theme.small_size)
+                            .color(theme.fg_weak),
                     )
                     .selectable(false),
                 );
@@ -6142,13 +6294,14 @@ impl KirinDeskApp {
                         .map(|p| p >= 1)
                         .unwrap_or(false);
                     if ui
-                        .add_enabled(port_ok, egui::Button::new("保存").small())
+                        .add_enabled(port_ok, egui::Button::new(t!("dashboard.server_settings.save")).small())
                         .clicked()
                     {
                         self.save_dashboard_settings();
                     }
                     if !self.dashboard_status.is_empty() {
-                        let ok = self.dashboard_status.starts_with("已保存");
+                        // M8-T038: 成功判定与同键文案比较（语言无关）。
+                        let ok = self.dashboard_status == t!("dashboard.status.saved");
                         ui.add(
                             egui::Label::new(
                                 egui::RichText::new(&self.dashboard_status)
@@ -6164,16 +6317,14 @@ impl KirinDeskApp {
 
             // M13-T006 (UI-FT-005): 服务端文件传输面板（连接建立后可用；
             // 拖拽文件到主窗口 = 推送（下载方向，服务端主动）。无 GUI 时静默接收）。
-            card(ui, theme, "文件传输（服务端）", |ui| {
+            card(ui, theme, t!("dashboard.file_transfer.title"), |ui| {
                 let connected = server_file_tx().lock().unwrap().is_some();
                 if !connected {
                     ui.add(
                         egui::Label::new(
-                            egui::RichText::new(
-                                "无已连接客户端 — 客户端连接后，可拖拽文件到本窗口推送（服务端 → 客户端）。\n客户端推送的文件将静默接收至下载目录。",
-                            )
-                            .size(theme.small_size)
-                            .color(theme.fg_weak),
+                            egui::RichText::new(t!("dashboard.file_transfer.empty"))
+                                .size(theme.small_size)
+                                .color(theme.fg_weak),
                         )
                         .selectable(false),
                     );
@@ -6203,14 +6354,32 @@ impl KirinDeskApp {
                 theme,
                 &self.gui_log,
                 &LogViewOptions {
-                    title: "Live Log",
-                    empty: "(no log output yet)",
+                    title: t!("dashboard.log.title"),
+                    empty: t!("dashboard.log.empty"),
                     max_height: 280.0,
                     clearable: true,
                     clear: Some(clear_gui_log),
                 },
             );
         });
+    }
+
+    /// M9-DNS000 (UI-DNS-001~009): 域名维护客户端页面（Domain 标签页）。
+    /// 全部逻辑在 `domain_panel` 模块：服务商选择/凭据表单（UI-DNS-001/002，
+    /// 迁自 Settings → DNS）/ 测试连接 / 域名列表+添加 / 记录查询与增删改
+    /// （SRV 动态字段），后台线程执行 API 调用。
+    fn show_domain(&mut self, ui: &mut egui::Ui, theme: &Theme) {
+        let saved = domain_panel::show_domain_page(ui, theme, &mut self.domain_panel);
+        if saved {
+            // Domain 页保存凭据 → 同步 App 内存值（Connect 页 DNS 发现与
+            // 状态栏徽标即时生效，无需重启）。
+            if let Ok(cfg) = kirin_desk_utils::config::Config::load() {
+                self.api_key = cfg.godaddy.api_key;
+                self.api_secret = cfg.godaddy.api_secret;
+                self.api_url = cfg.godaddy.api_url;
+                self.domain = cfg.godaddy.domain;
+            }
+        }
     }
 
     /// M8-T015 P2D: 提取 EncodedWindow 内逐帧 NALU 列表。
@@ -6451,9 +6620,9 @@ impl KirinDeskApp {
         }
         match cfg.save() {
             Ok(()) => {
-                self.dashboard_status = "已保存（下次启动服务端生效）".to_string();
+                self.dashboard_status = t!("dashboard.status.saved").to_string();
             }
-            Err(e) => self.dashboard_status = format!("保存失败: {}", e),
+            Err(e) => self.dashboard_status = tf!("dashboard.status.save_failed", e),
         }
     }
 
@@ -7413,52 +7582,53 @@ impl KirinDeskApp {
     }
 
     fn show_devices(&mut self, ui: &mut egui::Ui, theme: &Theme) {
-        ui.heading("Devices");
+        ui.heading(t!("devices.title"));
         ui.separator();
         if self.devices.is_empty() {
             ui.add(
                 egui::Label::new(
-                    egui::RichText::new(
-                        "No saved devices yet. Connect to a device first — it is saved automatically.",
-                    )
-                    .size(theme.small_size)
-                    .color(theme.fg_weak),
+                    egui::RichText::new(t!("devices.empty"))
+                        .size(theme.small_size)
+                        .color(theme.fg_weak),
                 )
                 .selectable(false),
             );
         } else {
             ui.add(
                 egui::Label::new(
-                    egui::RichText::new(format!(
-                        "{} saved device(s) — 单击自动填入 Connect 页，右键打开菜单",
-                        self.devices.len()
-                    ))
-                    .size(theme.small_size)
-                    .color(theme.fg_weak),
+                    egui::RichText::new(tf!("devices.count", self.devices.len()))
+                        .size(theme.small_size)
+                        .color(theme.fg_weak),
                 )
                 .selectable(false),
             );
             egui::ScrollArea::vertical().show(ui, |ui| {
                 for i in 0..self.devices.len() {
                     let d = self.devices[i].clone();
-                    // M15-T008: 设备卡片——StatusDot + 设备名@IP + 类型徽标 + 上次在线。
-                    // 状态点：SavedDevice 无实时 status 字段 → 中性停止态（fg_weak "saved"，
-                    // 方案 §3.1 停止态映射；实时在线状态待 M9 联调期补充）。
-                    // M8-T028 (UI-BTY-025): 主标题整串（昵称@域名 / 昵称@[IPv6]:端口）与
-                    // 地址行纯连接地址（[IPv6]:端口）各带 📋；行内预留 32px（26 按钮 + 6 间距），
-                    // 按钮在卡片点击层之后注册（同层后注册者优先命中）→ 不改变单击填入/右键菜单。
-                    let name = if d.domain.is_empty() {
-                        format!("{}@[{}]:{}", d.nickname, d.ipv6, d.port)
+                    // M8-T037: 设备卡片——① 昵称（strong）+ 类型徽标 + 上次在线；
+                    // ② 备注名（空 → "—" 弱色）；③ 地址行（[IPv6]:port 或域名，
+                    // mono + 📋）；④ 显式按钮行（连接/编辑/删除/↑上移/↓下移）。
+                    // 状态点：SavedDevice 无实时 status 字段 → 中性停止态
+                    // （fg_weak "saved"）。保留单击卡片填 Connect 页 + 右键菜单；
+                    // 点击交互层仅覆盖 ①~③（按钮行在层外，按钮可正常点击）。
+                    let name = if d.nickname.is_empty() {
+                        d.id.clone()
                     } else {
-                        format!("{}@{}", d.nickname, d.domain)
+                        d.nickname.clone()
                     };
                     let addr = if d.domain.is_empty() {
-                        None
+                        format!("[{}]:{}", d.ipv6, d.port)
                     } else {
-                        Some(format!("[{}]:{}", d.ipv6, d.port))
+                        d.domain.clone()
+                    };
+                    let title_copy = if d.domain.is_empty() {
+                        format!("{}@[{}]:{}", name, d.ipv6, d.port)
+                    } else {
+                        format!("{}@{}", name, d.domain)
                     };
                     let mut title_rect: Option<egui::Rect> = None;
                     let mut addr_rect: Option<egui::Rect> = None;
+                    let mut click_bottom: f32 = f32::MAX;
                     let card = egui::Frame::none()
                         .fill(theme.bg_panel)
                         .stroke(egui::Stroke::new(theme.border_width, theme.border))
@@ -7466,33 +7636,19 @@ impl KirinDeskApp {
                         .inner_margin(egui::Margin::same(theme.card_padding))
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                status_dot(ui, theme.fg_weak, "saved");
+                                status_dot(ui, theme.fg_weak, t!("devices.saved_badge"));
                                 let tr = ui.add(
                                     egui::Label::new(egui::RichText::new(&name).strong())
                                         .selectable(true),
                                 );
                                 title_rect = Some(tr.rect);
                                 ui.add_space(32.0); // 📋 预留
-                                                    // 类型徽标（server=info / desktop=neutral）
                                 let (kind, label) = if d.device_type == "server" {
                                     (BadgeKind::Info, "server")
                                 } else {
                                     (BadgeKind::Neutral, "desktop")
                                 };
                                 badge(ui, theme, label, kind);
-                                if let Some(addr) = &addr {
-                                    let ar = ui.add(
-                                        egui::Label::new(
-                                            egui::RichText::new(addr)
-                                                .monospace()
-                                                .size(theme.small_size)
-                                                .color(theme.fg_weak),
-                                        )
-                                        .selectable(true),
-                                    );
-                                    addr_rect = Some(ar.rect);
-                                    ui.add_space(32.0); // 📋 预留
-                                }
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
@@ -7507,11 +7663,74 @@ impl KirinDeskApp {
                                     },
                                 );
                             });
+                            // ② 备注名行（空 → "—" 弱色占位）。
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(if d.remark.is_empty() {
+                                        t!("devices.remark_empty")
+                                    } else {
+                                        &d.remark
+                                    })
+                                    .size(theme.small_size)
+                                    .color(theme.fg_weak),
+                                )
+                                .selectable(true),
+                            );
+                            // ③ 地址行。
+                            ui.horizontal(|ui| {
+                                let ar = ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(&addr)
+                                            .monospace()
+                                            .size(theme.mono_size)
+                                            .color(theme.fg),
+                                    )
+                                    .selectable(true),
+                                );
+                                addr_rect = Some(ar.rect);
+                                ui.add_space(32.0); // 📋 预留
+                            });
+                            // ④ 按钮行起点 = 点击交互层下界（按钮在层外可点）。
+                            click_bottom = ui.cursor().min.y;
+                            ui.horizontal(|ui| {
+                                if ui.small_button(t!("devices.btn.connect")).clicked() {
+                                    self.fill_connect_from_device(&d);
+                                }
+                                if ui.small_button(t!("devices.btn.edit")).clicked() {
+                                    self.start_edit_device(&d);
+                                }
+                                if ui.small_button(t!("devices.btn.delete")).clicked() {
+                                    self.delete_device(&d.id);
+                                }
+                                ui.separator();
+                                if ui
+                                    .add_enabled(
+                                        i > 0,
+                                        egui::Button::new(t!("devices.btn.up")).small(),
+                                    )
+                                    .clicked()
+                                {
+                                    self.move_device(&d.id, true);
+                                }
+                                if ui
+                                    .add_enabled(
+                                        i + 1 < self.devices.len(),
+                                        egui::Button::new(t!("devices.btn.down")).small(),
+                                    )
+                                    .clicked()
+                                {
+                                    self.move_device(&d.id, false);
+                                }
+                            });
                         });
-                    // M15-T008: Frame 只给 hover 感知 → 叠加点击交互层（单击填入 / 右键菜单）。
-                    let rect = card.response.rect;
+                    // 点击交互层仅覆盖卡片内容区（不含按钮行）——单击填入/右键菜单
+                    // 行为不变；按钮行在层外可正常点击。
+                    let mut click_rect = card.response.rect;
+                    if click_bottom != f32::MAX {
+                        click_rect.max.y = click_bottom;
+                    }
                     let click =
-                        ui.interact(rect, ui.id().with(("dev_card", i)), egui::Sense::click());
+                        ui.interact(click_rect, ui.id().with(("dev_card", i)), egui::Sense::click());
                     // M8-T028: 📋 按钮注册于卡片点击层之后（同层后注册者优先命中）——
                     // 按钮可点，卡片单击填入/右键菜单行为不变。
                     let mut copied: Option<String> = None;
@@ -7530,17 +7749,17 @@ impl KirinDeskApp {
                         }
                     };
                     if let Some(r) = title_rect {
-                        place_btn(ui, r, &name);
+                        place_btn(ui, r, &title_copy);
                     }
-                    if let (Some(r), Some(addr)) = (addr_rect, &addr) {
-                        place_btn(ui, r, addr);
+                    if let Some(r) = addr_rect {
+                        place_btn(ui, r, &addr);
                     }
                     if let Some(v) = copied {
                         self.notify_copied(&v);
                     }
                     if click.hovered() {
                         ui.painter().rect_stroke(
-                            rect,
+                            card.response.rect,
                             egui::Rounding::same(theme.rounding_card),
                             egui::Stroke::new(1.5, theme.primary),
                         );
@@ -7551,16 +7770,16 @@ impl KirinDeskApp {
                     }
                     // M10-T004/T005: 右键菜单 — 连接 / 编辑 / 删除。
                     click.context_menu(|ui| {
-                        if ui.button("连接").clicked() {
+                        if ui.button(t!("devices.menu.connect")).clicked() {
                             self.fill_connect_from_device(&d);
                             ui.close_menu();
                         }
-                        if ui.button("编辑").clicked() {
+                        if ui.button(t!("devices.menu.edit")).clicked() {
                             self.start_edit_device(&d);
                             ui.close_menu();
                         }
                         ui.separator();
-                        if ui.button("删除").clicked() {
+                        if ui.button(t!("devices.menu.delete")).clicked() {
                             self.delete_device(&d.id);
                             ui.close_menu();
                         }
@@ -7572,14 +7791,14 @@ impl KirinDeskApp {
         // M10-T005: 设备编辑弹窗（昵称 / 域名 / 端口）。
         if let Some(id) = self.editing_device.clone() {
             let mut open = true;
-            egui::Window::new("编辑设备")
+            egui::Window::new(t!("devices.edit.title"))
                 .collapsible(false)
                 .resizable(false)
                 .show(ui.ctx(), |ui| {
                     ui.horizontal(|ui| {
                         ui.add(
                             egui::Label::new(
-                                egui::RichText::new(format!("设备 ID: {}", id))
+                                egui::RichText::new(tf!("devices.edit.id_label", id))
                                     .monospace()
                                     .size(theme.mono_size)
                                     .color(theme.fg_weak),
@@ -7593,18 +7812,20 @@ impl KirinDeskApp {
                     labeled_input(
                         ui,
                         theme,
-                        "昵称:",
+                        t!("devices.edit.nickname"),
                         &mut self.edit_nickname,
                         "",
                         Validity::None,
                         None,
                         false,
                     );
+                    // M8-T037: 地址（IP/域名）——update 选择性保存：可解析为 IP →
+                    // 更新 IPv6 清空域名；否则视为域名；空 → 地址保持不变。
                     labeled_input(
                         ui,
                         theme,
-                        "域名:",
-                        &mut self.edit_domain,
+                        t!("devices.edit.host"),
+                        &mut self.edit_host,
                         "",
                         Validity::None,
                         None,
@@ -7613,7 +7834,27 @@ impl KirinDeskApp {
                     labeled_input(
                         ui,
                         theme,
-                        "端口:",
+                        t!("devices.edit.remark"),
+                        &mut self.edit_remark,
+                        t!("devices.edit.optional"),
+                        Validity::None,
+                        None,
+                        false,
+                    );
+                    labeled_input(
+                        ui,
+                        theme,
+                        t!("devices.edit.challenge"),
+                        &mut self.edit_challenge,
+                        t!("devices.edit.optional"),
+                        Validity::None,
+                        Some(&mut self.show_secret_edit_challenge),
+                        false,
+                    );
+                    labeled_input(
+                        ui,
+                        theme,
+                        t!("devices.edit.port"),
                         &mut self.edit_port,
                         "",
                         Validity::None,
@@ -7622,7 +7863,7 @@ impl KirinDeskApp {
                     );
                     ui.separator();
                     ui.horizontal(|ui| {
-                        if ui.button("保存").clicked() {
+                        if ui.button(t!("common.ok")).clicked() {
                             let fallback = self
                                 .devices
                                 .iter()
@@ -7633,7 +7874,7 @@ impl KirinDeskApp {
                             self.commit_device_edit(&id, port);
                             open = false;
                         }
-                        if ui.button("取消").clicked() {
+                        if ui.button(t!("common.cancel")).clicked() {
                             open = false;
                         }
                     });
@@ -7646,8 +7887,11 @@ impl KirinDeskApp {
 
     /// M10-T004: 设备 → 自动填入 Connect 页并切换标签页。
     /// 有域名且 API 已配置 → Domain 模式（DNS 发现）；否则 IP 模式直连。
+    /// M8-T037: 设备保存的挑战码非空时预填连接表单（表单必填校验不变；
+    /// 设备无挑战码 → 不预填，由用户输入）。
     fn fill_connect_from_device(&mut self, d: &SavedDevice) {
         self.connect_nickname = d.nickname.clone();
+        self.connect_challenge = d.challenge.clone();
         if !d.domain.is_empty()
             && !self.api_key.trim().is_empty()
             && !self.api_secret.trim().is_empty()
@@ -7655,12 +7899,12 @@ impl KirinDeskApp {
             self.connect_domain = d.domain.clone();
             self.ip_mode_allowed = false; // 切换 Domain 模式界面（仅内存，不写回配置）
             self.connect_status =
-                format!("Ready: {}@{}（Domain 模式自动发现）", d.nickname, d.domain);
+                tf!("connect.ready_domain", d.nickname, d.domain);
         } else {
             self.connect_ipv6 = d.ipv6.clone();
             self.connect_port = d.port.to_string();
             self.ip_mode_allowed = true;
-            self.connect_status = format!("Ready: {}@[{}]:{}", d.nickname, d.ipv6, d.port);
+            self.connect_status = tf!("connect.ready", d.nickname, d.ipv6, d.port);
         }
         self.current_tab = Tab::Connect;
     }
@@ -7669,21 +7913,29 @@ impl KirinDeskApp {
     fn start_edit_device(&mut self, d: &SavedDevice) {
         self.editing_device = Some(d.id.clone());
         self.edit_nickname = d.nickname.clone();
-        self.edit_domain = d.domain.clone();
+        // M8-T037: 地址预填——有域名 → 域名，否则 IPv6（直连回退值）。
+        self.edit_host = if d.domain.is_empty() {
+            d.ipv6.clone()
+        } else {
+            d.domain.clone()
+        };
         self.edit_port = d.port.to_string();
+        self.edit_remark = d.remark.clone();
+        self.edit_challenge = d.challenge.clone();
     }
 
     /// M10-T005: 提交编辑 → 持久化到 devices.json → 刷新列表。
     fn commit_device_edit(&mut self, id: &str, port: u16) {
         let nickname = self.edit_nickname.trim().to_string();
-        let domain = self.edit_domain.trim().to_string();
-        if nickname.is_empty() {
-            self.editing_device = None;
-            return;
-        }
+        let remark = self.edit_remark.trim().to_string();
+        let challenge = self.edit_challenge.trim().to_string();
+        let host = self.edit_host.trim().to_string();
+        // M8-T037: 取消「昵称必填」限制——空昵称允许保存（卡片展示回退设备 ID）。
         match DeviceStore::load() {
             Ok(mut store) => {
-                if store.update(id, &nickname, &domain, port) {
+                // M8-T037: 备注名/挑战码允许为空（空挑战码 = 无挑战码）；
+                // 地址选择性保存：空 → 原地址不变（update 语义）。
+                if store.update(id, &remark, &host, port, &nickname, &challenge) {
                     if let Err(e) = store.save() {
                         tracing::error!("Edit device save failed: {}", e);
                     }
@@ -7710,6 +7962,28 @@ impl KirinDeskApp {
         }
     }
 
+    /// M8-T037: 上移/下移设备（交换相邻 sort_order）→ 持久化 → 刷新列表。
+    /// 首项上移 / 末项下移 / 未知 id 无效果（按钮已按边界禁用，防御性兜底）。
+    fn move_device(&mut self, id: &str, up: bool) {
+        match DeviceStore::load() {
+            Ok(mut store) => {
+                let moved = if up {
+                    store.move_up(id)
+                } else {
+                    store.move_down(id)
+                };
+                if moved {
+                    if let Err(e) = store.save() {
+                        tracing::error!("Move device save failed: {}", e);
+                    }
+                    self.devices = store.devices().to_vec();
+                    tracing::info!("Device '{}' moved {}", id, if up { "up" } else { "down" });
+                }
+            }
+            Err(e) => tracing::error!("Move device: store load failed: {}", e),
+        }
+    }
+
     /// 从 devices.json 重新加载设备列表（文件不存在 → 空列表）。
     fn reload_devices(&mut self) {
         match DeviceStore::load() {
@@ -7719,27 +7993,11 @@ impl KirinDeskApp {
     }
 
     fn show_connect(&mut self, ui: &mut egui::Ui, theme: &Theme) {
-        ui.heading("Connect to Device");
+        ui.heading(t!("connect.title"));
         ui.separator();
 
-        // Show connection status from background threads
-        // M10-T001: 状态机着色——已连接绿 / 进行中（发现中→连接中→握手）蓝 / 失败红。
-        // M15-T008: StatusDot 化（● + 语义色）。
-        let status = connection_status().lock().unwrap().clone();
-        if !status.is_empty() {
-            let color = if status.starts_with("Connected") {
-                theme.success
-            } else if status.starts_with("Discovering")
-                || status.starts_with("Connecting")
-                || status.starts_with("Handshaking")
-            {
-                theme.info
-            } else {
-                theme.danger
-            };
-            status_dot(ui, color, &status);
-            ui.separator();
-        }
+        // M8-T038 (P1): 连接状态已迁移至弹出页状态条（conn_state_{wid}）——
+        // 本页不再显示顶部状态点行（原「IP Address 上方」位置，M10-T001/M15-T008 块已删）。
 
         // M15-T008: 模式行改 SegmentedControl（IP/Domain，选中项品牌色底）
         // M8-T026-P2 (ID-021): 新增第三段「ID Mode」（relay 设备 ID）。
@@ -7754,9 +8012,9 @@ impl KirinDeskApp {
             ui,
             theme,
             &[
-                "IP Mode (direct IP connection)",
-                "Domain Mode (DNS-based discovery)",
-                "ID Mode (relay device ID)",
+                t!("connect.mode.ip"),
+                t!("connect.mode.domain"),
+                t!("connect.mode.id"),
             ],
             &mut mode,
         ) {
@@ -7779,8 +8037,8 @@ impl KirinDeskApp {
                     theme,
                     &self.gui_log,
                     &LogViewOptions {
-                        title: "Connection Log:",
-                        empty: "(no connection log yet)",
+                        title: t!("connect.log.title"),
+                        empty: t!("connect.log.empty"),
                         max_height: 480.0,
                         clearable: true,
                         clear: Some(clear_gui_log),
@@ -7822,7 +8080,7 @@ impl KirinDeskApp {
             labeled_input(
                 ui,
                 theme,
-                "IP Address:",
+                t!("connect.label.ip"),
                 &mut self.connect_ipv6,
                 "192.168.1.5 or 2001:db8::1",
                 if ip_empty {
@@ -7830,7 +8088,7 @@ impl KirinDeskApp {
                 } else if ip_ok {
                     Validity::Valid
                 } else {
-                    Validity::Invalid("Not a valid IP address (IPv4 or IPv6)")
+                    Validity::Invalid(t!("connect.error.ip_invalid"))
                 },
                 None,
                 true,
@@ -7838,7 +8096,7 @@ impl KirinDeskApp {
             labeled_input(
                 ui,
                 theme,
-                "Port:",
+                t!("connect.label.port"),
                 &mut self.connect_port,
                 "3389",
                 if port_empty {
@@ -7846,7 +8104,7 @@ impl KirinDeskApp {
                 } else if port_ok {
                     Validity::Valid
                 } else {
-                    Validity::Invalid("Port must be 1-65535")
+                    Validity::Invalid(t!("connect.error.port_invalid"))
                 },
                 None,
                 true,
@@ -7854,13 +8112,13 @@ impl KirinDeskApp {
             labeled_input(
                 ui,
                 theme,
-                "Nickname (sent to server):",
+                t!("connect.label.nickname"),
                 &mut self.connect_nickname,
-                "required",
+                t!("connect.placeholder.required"),
                 if nick_ok {
                     Validity::Valid
                 } else {
-                    Validity::Invalid("Nickname is required")
+                    Validity::Invalid(t!("connect.error.nickname_required"))
                 },
                 None,
                 false,
@@ -7868,20 +8126,21 @@ impl KirinDeskApp {
             labeled_input(
                 ui,
                 theme,
-                "Challenge (sent to server):",
+                t!("connect.label.challenge"),
                 &mut self.connect_challenge,
-                "required",
+                t!("connect.placeholder.required"),
                 if chal_ok {
                     Validity::Valid
                 } else {
-                    Validity::Invalid("Challenge is required")
+                    Validity::Invalid(t!("connect.error.challenge_required"))
                 },
                 Some(&mut self.show_secret_connect),
                 false,
             );
             ui.add_space(6.0);
 
-            // M15-T008: 连接中显示 Stepper（先按状态字符串映射：发现→连接→握手→已连接）
+            // M15-T008: 连接状态 Stepper 已迁移至弹出页状态条（M8-T038 P1），
+            // 本页保留 step 推导（busy 驱动按钮禁用/⏳），仅删渲染。
             let step = if status.starts_with("Discovering") {
                 Some(0)
             } else if status.starts_with("Connecting") {
@@ -7893,15 +8152,6 @@ impl KirinDeskApp {
             } else {
                 None
             };
-            if let Some(cur) = step {
-                stepper(
-                    ui,
-                    theme,
-                    &["Discovering", "Connecting", "Handshaking", "Connected"],
-                    cur,
-                );
-                ui.add_space(6.0);
-            }
             // 进行中 → ⏳ 前缀禁用；必填/非法 → 灰化禁用（UI-CON-010 联动按钮）
             let busy = matches!(step, Some(0) | Some(1) | Some(2));
             let can_connect = ip_ok && port_ok && nick_ok && chal_ok;
@@ -7917,10 +8167,19 @@ impl KirinDeskApp {
             let mut do_connect = false;
             let mut do_shell = false;
             ui.horizontal(|ui| {
-                if action_button(ui, theme, ButtonKind::Primary, "Connect", state).clicked() {
+                if action_button(ui, theme, ButtonKind::Primary, t!("connect.button.connect"), state)
+                    .clicked()
+                {
                     do_connect = true;
                 }
-                if action_button(ui, theme, ButtonKind::Secondary, "Connect Shell", state).clicked()
+                if action_button(
+                    ui,
+                    theme,
+                    ButtonKind::Secondary,
+                    t!("connect.button.shell"),
+                    state,
+                )
+                .clicked()
                 {
                     do_shell = true;
                 }
@@ -7931,11 +8190,11 @@ impl KirinDeskApp {
                 let nick = self.connect_nickname.trim().to_string();
                 let chal = self.connect_challenge.trim().to_string();
                 if ip.is_empty() {
-                    self.connect_status = "Enter an IP address (IPv4 or IPv6)".to_string();
+                    self.connect_status = t!("connect.error.ip_empty").to_string();
                 } else if port == 0 {
-                    self.connect_status = "Enter a valid port".to_string();
+                    self.connect_status = t!("connect.error.port_empty").to_string();
                 } else if nick.is_empty() {
-                    self.connect_status = "Enter the device nickname".to_string();
+                    self.connect_status = t!("connect.error.nickname_empty").to_string();
                 } else {
                     // M8-T033: v4 不加方括号（`[192.168.1.5]:port` 非法）；
                     // v6 保持 `[ip]:port` 规范形式。
@@ -7953,11 +8212,11 @@ impl KirinDeskApp {
                     // 提示，不 spawn（session_id 不分配、TCP/握手零浪费；握手期间
                     // 竞态由 drain 去重兜底）。
                     if self.try_dedup_connect(ui.ctx(), &addr, kind) {
-                        self.connect_status = "已有该设备的连接窗口，已聚焦".to_string();
+                        self.connect_status = t!("connect.dedup_hit").to_string();
                         tracing::info!("[dedup] connect pre-check hit for {}, not spawning", addr);
                     } else {
-                        self.connect_status =
-                            format!("Connecting {} as '{}'...", addr, nick);
+                        // M8-T038 (P1): 进度快照类 connect_status 写入已删除
+                        // （进度改由弹出页状态条承载；本行保留 tracing 日志）。
                         tracing::info!(
                             "Connect button: target={} nickname={} shell={}",
                             addr,
@@ -8018,7 +8277,7 @@ impl KirinDeskApp {
             ui.separator();
             ui.add(
                 egui::Label::new(
-                    egui::RichText::new("IP mode: direct TCP, no DNS resolution.")
+                    egui::RichText::new(t!("connect.hint.ip_mode"))
                         .size(theme.small_size)
                         .color(theme.fg_weak),
                 )
@@ -8026,7 +8285,7 @@ impl KirinDeskApp {
             );
             ui.add(
                 egui::Label::new(
-                    egui::RichText::new("Domain whitelist does not apply.")
+                    egui::RichText::new(t!("connect.hint.ip_whitelist_na"))
                         .size(theme.small_size)
                         .color(theme.fg_weak),
                 )
@@ -8049,13 +8308,13 @@ impl KirinDeskApp {
             labeled_input(
                 ui,
                 theme,
-                "Device ID:",
+                t!("connect.label.device_id"),
                 &mut self.connect_device_id,
                 "pc-abc123",
                 if id_ok {
                     Validity::Valid
                 } else {
-                    Validity::Invalid("Device ID is required")
+                    Validity::Invalid(t!("connect.error.device_id_required"))
                 },
                 None,
                 true,
@@ -8063,18 +8322,16 @@ impl KirinDeskApp {
             if !tunnel_ok {
                 ui.add(
                     egui::Label::new(
-                        egui::RichText::new(
-                            "ID 模式需配置 [tunnel] server_addr / token / server_pubkey",
-                        )
-                        .color(theme.danger)
-                        .size(theme.small_size),
+                        egui::RichText::new(t!("connect.id.tunnel_missing"))
+                            .color(theme.danger)
+                            .size(theme.small_size),
                     )
                     .selectable(false),
                 );
             } else {
                 ui.add(
                     egui::Label::new(
-                        egui::RichText::new(format!("via relay {}", tunnel_cfg.server_addr))
+                        egui::RichText::new(tf!("connect.id.via_relay", tunnel_cfg.server_addr))
                             .size(theme.small_size)
                             .color(theme.fg_weak),
                     )
@@ -8082,7 +8339,7 @@ impl KirinDeskApp {
                 );
             }
             ui.add_space(6.0);
-            // 连接中 → Stepper（解析→直连/中继→握手→已连接）
+            // M8-T038 (P1): Stepper 渲染已迁移至弹出页状态条；保留 step/busy 推导。
             let step = if status.starts_with("Resolving") {
                 Some(0)
             } else if status.starts_with("Connecting") {
@@ -8094,15 +8351,6 @@ impl KirinDeskApp {
             } else {
                 None
             };
-            if let Some(cur) = step {
-                stepper(
-                    ui,
-                    theme,
-                    &["Resolving", "Connecting", "Handshaking", "Connected"],
-                    cur,
-                );
-                ui.add_space(6.0);
-            }
             let busy = matches!(step, Some(0) | Some(1) | Some(2));
             let can_connect = id_ok && tunnel_ok;
             let state = if busy {
@@ -8112,17 +8360,18 @@ impl KirinDeskApp {
             } else {
                 ButtonState::Disabled
             };
-            if action_button(ui, theme, ButtonKind::Primary, "Connect", state).clicked() {
+            if action_button(ui, theme, ButtonKind::Primary, t!("connect.button.connect"), state)
+                .clicked()
+            {
                 let device_id = self.connect_device_id.trim().to_string();
                 if device_id.is_empty() {
-                    self.connect_status = "Enter the device ID".to_string();
+                    self.connect_status = t!("connect.error.device_id_empty").to_string();
                 } else if !tunnel_ok {
-                    self.connect_status =
-                        "ID 模式未配置：请在 config 中设置 [tunnel] server_addr/token/server_pubkey".to_string();
+                    self.connect_status = t!("connect.id.error_configure").to_string();
                 } else {
                     // M8-T026-P2: ID 模式连接线程：解析 → 验签 → pin → 三级路径 →
                     // 握手 → 会话（复用 run_client_session_with_stream）。
-                    self.connect_status = format!("Resolving: {} ...", device_id);
+                    // M8-T038 (P1): 进度快照类 connect_status 写入已删除（弹出页状态条承载）。
                     tracing::info!("Connect button (ID mode): device={}", device_id);
                     let ctx = ui.ctx().clone();
                     std::thread::spawn(move || {
@@ -8134,11 +8383,9 @@ impl KirinDeskApp {
             ui.separator();
             ui.add(
                 egui::Label::new(
-                    egui::RichText::new(
-                        "ID mode: relay server resolves the device; direct → punch → relay paths.",
-                    )
-                    .size(theme.small_size)
-                    .color(theme.fg_weak),
+                    egui::RichText::new(t!("connect.hint.id_mode"))
+                        .size(theme.small_size)
+                        .color(theme.fg_weak),
                 )
                 .selectable(false),
             );
@@ -8146,20 +8393,21 @@ impl KirinDeskApp {
             // M10-T002: 无 GoDaddy API 配置 → 友好提示 + 直接跳转 Settings。
             if self.api_key.trim().is_empty() || self.api_secret.trim().is_empty() {
                 ui.add(
-                    egui::Label::new(egui::RichText::new("GoDaddy API 未配置").color(theme.danger))
-                        .selectable(false),
-                );
-                ui.add(
                     egui::Label::new(
-                        egui::RichText::new(
-                            "请先在 Settings 配置 GoDaddy API，才能使用 DNS 域名发现。",
-                        )
-                        .size(theme.small_size)
-                        .color(theme.fg_weak),
+                        egui::RichText::new(t!("connect.godaddy.unconfigured"))
+                            .color(theme.danger),
                     )
                     .selectable(false),
                 );
-                if ui.button("跳转到 Settings").clicked() {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(t!("connect.godaddy.guide"))
+                            .size(theme.small_size)
+                            .color(theme.fg_weak),
+                    )
+                    .selectable(false),
+                );
+                if ui.button(t!("connect.button.goto_settings")).clicked() {
                     self.current_tab = Tab::Settings;
                 }
                 ui.separator();
@@ -8171,13 +8419,13 @@ impl KirinDeskApp {
             labeled_input(
                 ui,
                 theme,
-                "Domain:",
+                t!("connect.label.domain"),
                 &mut self.connect_domain,
                 "example.com",
                 if domain_ok {
                     Validity::Valid
                 } else {
-                    Validity::Invalid("Domain is required")
+                    Validity::Invalid(t!("connect.error.domain_required"))
                 },
                 None,
                 true,
@@ -8185,13 +8433,13 @@ impl KirinDeskApp {
             labeled_input(
                 ui,
                 theme,
-                "Nickname (sent to server):",
+                t!("connect.label.nickname"),
                 &mut self.connect_nickname,
-                "required",
+                t!("connect.placeholder.required"),
                 if nick_ok {
                     Validity::Valid
                 } else {
-                    Validity::Invalid("Nickname is required")
+                    Validity::Invalid(t!("connect.error.nickname_required"))
                 },
                 None,
                 false,
@@ -8199,19 +8447,19 @@ impl KirinDeskApp {
             labeled_input(
                 ui,
                 theme,
-                "Challenge (sent to server):",
+                t!("connect.label.challenge"),
                 &mut self.connect_challenge,
-                "required",
+                t!("connect.placeholder.required"),
                 if chal_ok {
                     Validity::Valid
                 } else {
-                    Validity::Invalid("Challenge is required")
+                    Validity::Invalid(t!("connect.error.challenge_required"))
                 },
                 Some(&mut self.show_secret_connect),
                 false,
             );
             ui.add_space(6.0);
-            // 连接中 → Stepper（Domain 模式含 Discovering 步骤）
+            // M8-T038 (P1): Stepper 渲染已迁移至弹出页状态条；保留 step/busy 推导。
             let step = if status.starts_with("Discovering") {
                 Some(0)
             } else if status.starts_with("Connecting") {
@@ -8223,15 +8471,6 @@ impl KirinDeskApp {
             } else {
                 None
             };
-            if let Some(cur) = step {
-                stepper(
-                    ui,
-                    theme,
-                    &["Discovering", "Connecting", "Handshaking", "Connected"],
-                    cur,
-                );
-                ui.add_space(6.0);
-            }
             let busy = matches!(step, Some(0) | Some(1) | Some(2));
             let api_ok = !self.api_key.trim().is_empty() && !self.api_secret.trim().is_empty();
             let can_connect = domain_ok && nick_ok && chal_ok && api_ok;
@@ -8242,23 +8481,24 @@ impl KirinDeskApp {
             } else {
                 ButtonState::Disabled
             };
-            if action_button(ui, theme, ButtonKind::Primary, "Connect", state).clicked() {
+            if action_button(ui, theme, ButtonKind::Primary, t!("connect.button.connect"), state)
+                .clicked()
+            {
                 let domain = self.connect_domain.trim().to_string();
                 let nick = self.connect_nickname.trim().to_string();
                 let chal = self.connect_challenge.trim().to_string();
                 if domain.is_empty() {
-                    self.connect_status = "Enter the remote domain".to_string();
+                    self.connect_status = t!("connect.error.domain_empty").to_string();
                 } else if nick.is_empty() {
-                    self.connect_status = "Enter the device nickname".to_string();
+                    self.connect_status = t!("connect.error.nickname_empty").to_string();
                 } else if self.api_key.trim().is_empty() || self.api_secret.trim().is_empty() {
                     // M10-T002: 无 GoDaddy API → 拒绝执行（页面上方已有引导提示）。
-                    self.connect_status =
-                        "GoDaddy API not configured — configure it in Settings first".to_string();
+                    self.connect_status = t!("connect.error.godaddy_missing").to_string();
                 } else {
                     // M10-T001 + M15: Domain 模式 — DNS 发现（SRV 端口 + TXT 公钥 +
                     // AAAA IPv6）→ 信任解析（known_hosts 优先于 TXT；未命中首次指纹
                     // 确认）→ TCP 连接 → 完整握手（TXT 公钥强制验证）→ 自动保存设备。
-                    self.connect_status = format!("Discovering: {}@{} ...", nick, domain);
+                    // M8-T038 (P1): 进度快照类 connect_status 写入已删除（弹出页状态条承载）。
                     tracing::info!("Connect button: domain={} device={}", domain, nick);
                     let api_key = self.api_key.trim().to_string();
                     let api_secret = self.api_secret.trim().to_string();
@@ -8434,7 +8674,7 @@ impl KirinDeskApp {
             ui.separator();
             ui.add(
                 egui::Label::new(
-                    egui::RichText::new("Domain whitelist is enforced.")
+                    egui::RichText::new(t!("connect.hint.domain_whitelist"))
                         .size(theme.small_size)
                         .color(theme.fg_weak),
                 )
@@ -8442,7 +8682,7 @@ impl KirinDeskApp {
             );
             ui.add(
                 egui::Label::new(
-                    egui::RichText::new("Only whitelisted domains in Settings are accepted.")
+                    egui::RichText::new(t!("connect.hint.domain_whitelist_only"))
                         .size(theme.small_size)
                         .color(theme.fg_weak),
                 )
@@ -8451,11 +8691,9 @@ impl KirinDeskApp {
             ui.add_space(4.0);
             ui.add(
                 egui::Label::new(
-                    egui::RichText::new(
-                        "Tip: auto-discovers via SRV (port) + TXT (key) + AAAA (IPv6).",
-                    )
-                    .size(theme.small_size)
-                    .color(theme.fg_weak),
+                    egui::RichText::new(t!("connect.hint.domain_tip"))
+                        .size(theme.small_size)
+                        .color(theme.fg_weak),
                 )
                 .selectable(false),
             );
@@ -8484,7 +8722,7 @@ impl KirinDeskApp {
     fn show_connect_devices(&mut self, ui: &mut egui::Ui, theme: &Theme) {
         ui.add(
             egui::Label::new(
-                egui::RichText::new("连接过的设备:")
+                egui::RichText::new(t!("connect.devices.title"))
                     .size(theme.small_size)
                     .color(theme.fg_weak),
             )
@@ -8493,7 +8731,7 @@ impl KirinDeskApp {
         if self.devices.is_empty() {
             ui.add(
                 egui::Label::new(
-                    egui::RichText::new("暂无记录 — 连接成功后自动保存")
+                    egui::RichText::new(t!("connect.devices.empty"))
                         .size(theme.small_size)
                         .color(theme.fg_weak),
                 )
@@ -8517,7 +8755,7 @@ impl KirinDeskApp {
                         Some(format!("[{}]:{}", d.ipv6, d.port))
                     };
                     let row = ui.horizontal(|ui| {
-                        status_dot(ui, theme.fg_weak, "saved");
+                        status_dot(ui, theme.fg_weak, t!("devices.saved_badge"));
                         ui.add(
                             egui::Label::new(egui::RichText::new(&name).strong())
                                 .selectable(true),
@@ -8558,16 +8796,16 @@ impl KirinDeskApp {
                         self.fill_connect_from_device(&d);
                     }
                     row.context_menu(|ui| {
-                        if ui.button("连接").clicked() {
+                        if ui.button(t!("devices.menu.connect")).clicked() {
                             self.fill_connect_from_device(&d);
                             ui.close_menu();
                         }
-                        if ui.button("编辑").clicked() {
+                        if ui.button(t!("devices.menu.edit")).clicked() {
                             self.start_edit_device(&d);
                             ui.close_menu();
                         }
                         ui.separator();
-                        if ui.button("删除").clicked() {
+                        if ui.button(t!("devices.menu.delete")).clicked() {
                             self.delete_device(&d.id);
                             ui.close_menu();
                         }
@@ -8576,108 +8814,33 @@ impl KirinDeskApp {
             });
     }
 
-    /// M8-T035 (需求 12): 按 DNS 服务商定义渲染动态表单——字段来自
-    /// `dns_providers` 注册表（label/mono/secret 由定义驱动），值映射到
-    /// App 字段；未映射的字段（未来服务商）暂不渲染，避免 UI 越界。
-    fn dns_provider_fields(
-        &mut self,
-        ui: &mut egui::Ui,
-        theme: &Theme,
-        def: &kirin_desk_utils::dns_providers::DnsProviderDef,
-    ) {
-        for field in def.fields {
-            match (def.id, field.key) {
-                ("godaddy", "domain") => {
-                    labeled_input(
-                        ui,
-                        theme,
-                        field.label,
-                        &mut self.domain,
-                        "example.com",
-                        Validity::None,
-                        None,
-                        field.mono,
-                    );
-                }
-                ("godaddy", "api_key") => {
-                    labeled_input(
-                        ui,
-                        theme,
-                        field.label,
-                        &mut self.api_key,
-                        "required",
-                        Validity::None,
-                        None,
-                        field.mono,
-                    );
-                }
-                // API Secret 密文输入（圆点遮蔽 + 👁 切换，M15-T008）。
-                ("godaddy", "api_secret") => {
-                    labeled_input(
-                        ui,
-                        theme,
-                        field.label,
-                        &mut self.api_secret,
-                        "required",
-                        Validity::None,
-                        Some(&mut self.show_secret_api),
-                        field.mono,
-                    );
-                }
-                _ => {}
-            }
+    /// M8-T037: 「默认受控」联动 Dashboard「允许受控」——默认受控开启
+    /// （或经无人值守跟随开启）时立即启动服务端监听；已运行则保持。
+    /// bind 失败由每帧运行态同步自动回位开关并显示原因（见 update 帧同步），
+    /// 无需额外处理；「允许受控」手动关闭不回写默认受控（单向联动）。
+    fn apply_default_controlled(&mut self) {
+        if !self.unattended_auto_server {
+            return;
+        }
+        if !self.server_running {
+            self.start_server();
         }
     }
 
     fn show_settings(&mut self, ui: &mut egui::Ui, theme: &Theme) {
-        ui.heading("Settings");
+        ui.heading(t!("settings.title"));
         ui.separator();
         egui::ScrollArea::vertical().show(ui, |ui| {
-            // M15-T008: 可折叠分组（DNS / Tunnel / Unattended / Identity / Whitelist /
+            // M15-T008: 可折叠分组（Tunnel / Unattended / Identity / Whitelist /
             // Logging / Appearance / Update / About）+ 底部统一 Save。
             // M8-T035 (需求 4): 「Server」组已移除（Listen Port → Dashboard 服务端
             // 设置；音频总开关/高危警告 → Dashboard Server 卡；模式按钮 Dashboard 已有）。
+            // M9-DNS022: 「DNS」组移除——服务商选择/凭据表单/测试连接全部迁至
+            // Domain 页「服务商」卡（见 `domain_panel.rs`）；`[dns]`/`[godaddy]`
+            // 配置段不变，CLI 行为零影响。
 
-            // M8-T035 (需求 10-12): 「GoDaddy API」组改名「DNS」——首行为域名
-            // 服务商 ComboBox（数据源 = `dns_providers` 注册表，当前仅 GoDaddy）；
-            // 表单按所选服务商的 fields 定义动态渲染，未来新服务商由注册表驱动。
-            egui::CollapsingHeader::new("DNS")
-                .default_open(true)
-                .show(ui, |ui| {
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new("域名服务商:")
-                                .size(theme.small_size)
-                                .color(theme.fg_weak),
-                        )
-                        .selectable(false),
-                    );
-                    let defs = kirin_desk_utils::dns_providers::dns_provider_defs();
-                    let sel_name =
-                        kirin_desk_utils::dns_providers::dns_provider_def(&self.dns_provider)
-                            .map(|p| p.name)
-                            .unwrap_or("GoDaddy");
-                    egui::ComboBox::from_id_source("dns_provider_sel")
-                        .selected_text(sel_name)
-                        .width(220.0)
-                        .show_ui(ui, |ui| {
-                            for def in defs {
-                                ui.selectable_value(
-                                    &mut self.dns_provider,
-                                    def.id.to_string(),
-                                    def.name,
-                                );
-                            }
-                        });
-                    ui.add_space(4.0);
-                    // 动态表单：按所选服务商定义渲染（GoDaddy → Domain / API Key
-                    // / API Secret）。
-                    if let Some(def) =
-                        kirin_desk_utils::dns_providers::dns_provider_def(&self.dns_provider)
-                    {
-                        self.dns_provider_fields(ui, theme, def);
-                    }
-                });
+            // M9-DNS022: 「DNS」分组已移除——服务商选择/凭据表单/测试连接
+            // 迁至 Domain 页「服务商」卡；此处不再渲染（见 `domain_panel.rs`）。
 
             // M8-T035 (需求 4/5): Settings「Server」组整体移除——Listen Port 迁
             // Dashboard「服务端设置」、连接模式迁 Dashboard 工作模式按钮（M8-T034）、
@@ -8687,16 +8850,12 @@ impl KirinDeskApp {
             // M8-T026 (TNL-CFG-004): 内网穿透设置——客户端填写 relay 服务器
             // 地址 / token / 代理列表；服务端参数（bind_port/port_range/heartbeat）
             // 不占 GUI，在 config/default.toml 配置，穿透服务端走 CLI `tunnel serve`。
-            egui::CollapsingHeader::new("Tunnel (内网穿透)").show(ui, |ui| {
+            egui::CollapsingHeader::new(t!("settings.tunnel.title")).show(ui, |ui| {
                 ui.add(
                     egui::Label::new(
-                        egui::RichText::new(
-                            "内网穿透：被控端主动出站连接公网 relay 服务器，把内网 TCP 服务\
-                             （SSH/RDP/HTTP）映射到公网端口——P2P 直连不可达时的兜底。\
-                             默认关闭，仅在有公网服务器（自建 relay）时启用。",
-                        )
-                        .size(theme.small_size)
-                        .color(theme.fg_weak),
+                        egui::RichText::new(t!("settings.tunnel.desc"))
+                            .size(theme.small_size)
+                            .color(theme.fg_weak),
                     )
                     .selectable(false),
                 );
@@ -8706,11 +8865,12 @@ impl KirinDeskApp {
                 // Client/Server 选中态同款高亮（原 segmented 语义不变）。
                 ui.horizontal(|ui| {
                     let on = self.tunnel_enabled;
-                    let resp = state_button(ui, theme, "开启", on).on_hover_text(if on {
-                        "点击关闭内网穿透（保存后生效）"
-                    } else {
-                        "点击开启内网穿透（保存后生效）"
-                    });
+                    let resp = state_button(ui, theme, t!("settings.tunnel.enable"), on)
+                        .on_hover_text(if on {
+                            t!("settings.tunnel.toggle_off_hint")
+                        } else {
+                            t!("settings.tunnel.toggle_on_hint")
+                        });
                     if resp.clicked() {
                         self.tunnel_enabled = !on;
                     }
@@ -8730,12 +8890,9 @@ impl KirinDeskApp {
                 });
                 ui.add(
                     egui::Label::new(
-                        egui::RichText::new(
-                            "Client = 被控端主动出站（推荐）；Server = 公网 relay 服务端\
-                             （也可用 CLI `tunnel serve`，服务端参数在 default.toml）。",
-                        )
-                        .size(theme.small_size)
-                        .color(theme.fg_weak),
+                        egui::RichText::new(t!("settings.tunnel.mode_hint"))
+                            .size(theme.small_size)
+                            .color(theme.fg_weak),
                     )
                     .selectable(false),
                 );
@@ -8743,7 +8900,7 @@ impl KirinDeskApp {
                 labeled_input(
                     ui,
                     theme,
-                    "Server Address:",
+                    t!("settings.tunnel.server_address"),
                     &mut self.tunnel_server_addr,
                     "relay.example.com:7000",
                     Validity::None,
@@ -8753,7 +8910,7 @@ impl KirinDeskApp {
                 labeled_input(
                     ui,
                     theme,
-                    "Token:",
+                    t!("settings.tunnel.token"),
                     &mut self.tunnel_token,
                     "required",
                     Validity::None,
@@ -8762,7 +8919,7 @@ impl KirinDeskApp {
                 );
                 ui.add(
                     egui::Label::new(
-                        egui::RichText::new("Proxies (one per line):")
+                        egui::RichText::new(t!("settings.tunnel.proxies_label"))
                             .size(theme.small_size)
                             .color(theme.fg_weak),
                     )
@@ -8774,12 +8931,9 @@ impl KirinDeskApp {
                     .show(ui);
                 ui.add(
                     egui::Label::new(
-                        egui::RichText::new(
-                            "Format: name|local_addr:port|remote_port  (remote_port 留空 = 服务端自动分配)\
-                             \ne.g. ssh|127.0.0.1:22|6022",
-                        )
-                        .size(theme.small_size)
-                        .color(theme.fg_weak),
+                        egui::RichText::new(t!("settings.tunnel.format_hint"))
+                            .size(theme.small_size)
+                            .color(theme.fg_weak),
                     )
                     .selectable(false),
                 );
@@ -8787,46 +8941,67 @@ impl KirinDeskApp {
 
             // M13-T005 (UA-UI-001): 无人值守模式卡片——总开关 + 子选项 +
             // 自启注册状态 + 安全提示。保存按钮统一落盘（见下方 Save 分支）。
-            egui::CollapsingHeader::new("Unattended Mode").show(ui, |ui| {
+            egui::CollapsingHeader::new(t!("settings.unattended.title")).show(ui, |ui| {
                 ui.add(
                     egui::Label::new(
-                        egui::RichText::new(
-                            "无人值守：开机自启 + 自动开启服务端 + 受信任设备自动接受连接（远程桌面远控 / 远程 Shell PTY 均可）。",
-                        )
-                        .size(theme.small_size)
-                        .color(theme.fg_weak),
+                        egui::RichText::new(t!("settings.unattended.desc"))
+                            .size(theme.small_size)
+                            .color(theme.fg_weak),
                     )
                     .selectable(false),
                 );
                 ui.add_space(4.0);
-                // M8-T035 (需求 3): 三个开关改为滑块开关横向一排（原 segmented）：
-                // 无人值守模式（master）/ 开机自启 / 启动时自动开启服务端。
+                // M8-T035 (需求 3) + M8-T037: 三个开关滑块横向一排——无人值守
+                // （master）/ 开机自启 / 默认受控。M8-T037 联动：无人值守
+                // 开 → 开机自启、默认受控跟随打开；关 → 跟随关闭（仅改配置，
+                // 不停止运行中监听）；两个子开关均可独立翻转（只改自身）。
+                // 默认受控开启 → 立即联动 Dashboard「允许受控」（启动监听）。
                 ui.horizontal(|ui| {
-                    // 总开关
+                    // 总开关：开 → 子开关跟随开；关 → 子开关跟随关。
                     let ua = self.unattended_enabled;
-                    let ua_resp = toggle_switch(ui, theme, "无人值守模式", ua, None).on_hover_text(
-                        "开：开机自启 + 自动开启服务端 + 受信任设备自动接受连接（UA-UI-001）。",
-                    );
+                    let ua_resp = toggle_switch(
+                        ui,
+                        theme,
+                        t!("settings.unattended.master"),
+                        ua,
+                        None,
+                    )
+                    .on_hover_text(t!("settings.unattended.master_hint"));
                     if ua_resp.clicked() {
                         self.unattended_enabled = !ua;
+                        // M8-T037: 跟随打开/关闭（内存即时；保存时统一落盘）。
+                        self.unattended_autostart = !ua;
+                        self.unattended_auto_server = !ua;
+                        // 子开关跟随开启 → 默认受控立即生效（启动服务端监听）。
+                        if !ua {
+                            self.apply_default_controlled();
+                        }
                     }
-                    // 开机自动启动（独立于总开关，D6）
+                    // 开机自启（可独立翻转，D6；无人值守开/关时不跟随锁定）
                     let asb = self.unattended_autostart;
                     let asb_resp =
-                        toggle_switch(ui, theme, "开机自启", asb, None).on_hover_text(
-                            "开：注册到系统登录自启（保存时生效，UA-BOOT-001/002）。",
-                        );
+                        toggle_switch(ui, theme, t!("settings.unattended.autostart"), asb, None)
+                            .on_hover_text(t!("settings.unattended.autostart_hint"));
                     if asb_resp.clicked() {
                         self.unattended_autostart = !asb;
                     }
-                    // 启动时自动开启服务端
+                    // 默认受控（原「启动时自动开启服务端」，M8-T037 改名）——
+                    // 开启立即联动 Dashboard「允许受控」；关闭仅下次启动不自动监听。
                     let ass = self.unattended_auto_server;
-                    let ass_resp =
-                        toggle_switch(ui, theme, "启动时自动开启服务端", ass, None).on_hover_text(
-                            "开：程序启动即自动开启服务端监听（无需手动开「允许受控」）。",
-                        );
+                    let ass_resp = toggle_switch(
+                        ui,
+                        theme,
+                        t!("settings.unattended.default_controlled"),
+                        ass,
+                        None,
+                    )
+                    .on_hover_text(t!("settings.unattended.default_controlled_hint"));
                     if ass_resp.clicked() {
                         self.unattended_auto_server = !ass;
+                        // 开启 → 立即联动 Dashboard「允许受控」启动监听。
+                        if !ass {
+                            self.apply_default_controlled();
+                        }
                     }
                 });
                 // 自启注册状态（以系统实际状态为准，UA-BOOT-002）
@@ -8835,9 +9010,9 @@ impl KirinDeskApp {
                     ui,
                     theme,
                     if installed {
-                        "registered at OS logon"
+                        t!("settings.unattended.registered")
                     } else {
-                        "not registered"
+                        t!("settings.unattended.not_registered")
                     },
                     if installed {
                         BadgeKind::Success
@@ -8850,27 +9025,23 @@ impl KirinDeskApp {
                 if self.unattended_enabled {
                     ui.add(
                         egui::Label::new(
-                            egui::RichText::new(
-                                "⚠ 无人值守下：known_clients/白名单命中的连接自动放行（远控或 PTY）；\
-                                 未知设备一律拒绝（无审批弹窗）；temp-mode 旁路禁用。\
-                                 建议先在 Whitelist / known-hosts 中配置受信任设备。",
-                            )
-                            .size(theme.small_size)
-                            .color(theme.danger),
+                            egui::RichText::new(t!("settings.unattended.security_hint"))
+                                .size(theme.small_size)
+                                .color(theme.danger),
                         )
                         .selectable(false),
                     );
                 }
             });
 
-            egui::CollapsingHeader::new("Identity").show(ui, |ui| {
+            egui::CollapsingHeader::new(t!("settings.identity.title")).show(ui, |ui| {
                 labeled_input(
                     ui,
                     theme,
-                    "Device ID:",
+                    t!("settings.identity.device_id"),
                     &mut self.device_id,
                     // M8-T031: 留空保存 = 自动（系统盘硬盘 UUID）。
-                    "留空 = 自动（系统硬盘 UUID）",
+                    t!("settings.identity.auto_hint"),
                     Validity::None,
                     None,
                     true,
@@ -8879,20 +9050,18 @@ impl KirinDeskApp {
                 // （下次启动服务端生效；页面内小保存按钮即时落盘）。
                 ui.add(
                     egui::Label::new(
-                        egui::RichText::new(
-                            "Nickname / Challenge Code / Listen Port 已移至 Dashboard「服务端设置」。",
-                        )
-                        .size(theme.small_size)
-                        .color(theme.fg_weak),
+                        egui::RichText::new(t!("settings.identity.moved_hint"))
+                            .size(theme.small_size)
+                            .color(theme.fg_weak),
                     )
                     .selectable(false),
                 );
             });
 
-            egui::CollapsingHeader::new("Whitelist").show(ui, |ui| {
+            egui::CollapsingHeader::new(t!("settings.whitelist.title")).show(ui, |ui| {
                 ui.add(
                     egui::Label::new(
-                        egui::RichText::new("Allowed Domains:")
+                        egui::RichText::new(t!("settings.whitelist.allowed_domains"))
                             .size(theme.small_size)
                             .color(theme.fg_weak),
                     )
@@ -8904,7 +9073,7 @@ impl KirinDeskApp {
                     .show(ui);
                 ui.add(
                     egui::Label::new(
-                        egui::RichText::new("(comma-separated, one or more domains)")
+                        egui::RichText::new(t!("settings.whitelist.domains_hint"))
                             .size(theme.small_size)
                             .color(theme.fg_weak),
                     )
@@ -8913,7 +9082,7 @@ impl KirinDeskApp {
                 ui.add_space(4.0);
                 ui.add(
                     egui::Label::new(
-                        egui::RichText::new("Domain whitelist is more secure.")
+                        egui::RichText::new(t!("settings.whitelist.domain_secure"))
                             .size(theme.small_size)
                             .color(theme.fg_weak),
                     )
@@ -8921,7 +9090,7 @@ impl KirinDeskApp {
                 );
                 ui.add(
                     egui::Label::new(
-                        egui::RichText::new("Non-whitelisted clients trigger an approval dialog.")
+                        egui::RichText::new(t!("settings.whitelist.non_whitelisted_dialog"))
                             .size(theme.small_size)
                             .color(theme.fg_weak),
                     )
@@ -8929,11 +9098,9 @@ impl KirinDeskApp {
                 );
                 ui.add(
                     egui::Label::new(
-                        egui::RichText::new(
-                            "On headless servers, enable Temp Mode or clients are rejected.",
-                        )
-                        .size(theme.small_size)
-                        .color(theme.fg_weak),
+                        egui::RichText::new(t!("settings.whitelist.headless_hint"))
+                            .size(theme.small_size)
+                            .color(theme.fg_weak),
                     )
                     .selectable(false),
                 );
@@ -8943,7 +9110,7 @@ impl KirinDeskApp {
                 ui.add_space(8.0);
                 ui.add(
                     egui::Label::new(
-                        egui::RichText::new("Allowed Device IDs:")
+                        egui::RichText::new(t!("settings.whitelist.allowed_ids"))
                             .size(theme.small_size)
                             .color(theme.fg_weak),
                     )
@@ -8955,12 +9122,9 @@ impl KirinDeskApp {
                     .show(ui);
                 ui.add(
                     egui::Label::new(
-                        egui::RichText::new(
-                            "(comma or newline separated device IDs; exact match, case-sensitive, \
-                             `office-*` = prefix wildcard; takes effect immediately after Save)",
-                        )
-                        .size(theme.small_size)
-                        .color(theme.fg_weak),
+                        egui::RichText::new(t!("settings.whitelist.ids_hint"))
+                            .size(theme.small_size)
+                            .color(theme.fg_weak),
                     )
                     .selectable(false),
                 );
@@ -8969,7 +9133,7 @@ impl KirinDeskApp {
                 ui.add_space(6.0);
                 ui.add(
                     egui::Label::new(
-                        egui::RichText::new("ID whitelist entries:")
+                        egui::RichText::new(t!("settings.whitelist.entries_label"))
                             .size(theme.small_size)
                             .color(theme.fg_weak),
                     )
@@ -8980,15 +9144,15 @@ impl KirinDeskApp {
                 for entry in &self.id_whitelist_entries {
                     let expired = !entry.is_active(idwl_now);
                     let expiry_label = match &entry.expiry {
-                        Some(t) if expired => format!(
-                            "(expired {})",
+                        Some(t) if expired => tf!(
+                            "settings.whitelist.expired_fmt",
                             t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
                         ),
-                        Some(t) => format!(
-                            "(expires {})",
+                        Some(t) => tf!(
+                            "settings.whitelist.expires_fmt",
                             t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
                         ),
-                        None => "(permanent)".to_string(),
+                        None => t!("settings.whitelist.permanent").to_string(),
                     };
                     ui.horizontal(|ui| {
                         ui.label(format!("  {}", entry.device_id));
@@ -9000,7 +9164,7 @@ impl KirinDeskApp {
                             )
                             .selectable(false),
                         );
-                        if ui.small_button("✕ Remove").clicked() {
+                        if ui.small_button(t!("settings.whitelist.remove")).clicked() {
                             pending_remove = Some(entry.device_id.clone());
                         }
                     });
@@ -9010,26 +9174,24 @@ impl KirinDeskApp {
                 }
             });
 
-            egui::CollapsingHeader::new("Logging").show(ui, |ui| {
+            egui::CollapsingHeader::new(t!("settings.logging.title")).show(ui, |ui| {
                 ui.add(
                     egui::Label::new(
-                        egui::RichText::new(
-                            "Log level / format / keep days are configured in config/default.toml.",
-                        )
-                        .size(theme.small_size)
-                        .color(theme.fg_weak),
+                        egui::RichText::new(t!("settings.logging.config_hint"))
+                            .size(theme.small_size)
+                            .color(theme.fg_weak),
                     )
                     .selectable(false),
                 );
             });
 
             // M15-T008: 外观组——明亮/深色/跟随系统，选择即时生效（无需重启）。
-            egui::CollapsingHeader::new("Appearance")
+            egui::CollapsingHeader::new(t!("settings.appearance.title"))
                 .default_open(true)
                 .show(ui, |ui| {
                     ui.add(
                         egui::Label::new(
-                            egui::RichText::new("Theme:")
+                            egui::RichText::new(t!("settings.appearance.theme"))
                                 .size(theme.small_size)
                                 .color(theme.fg_weak),
                         )
@@ -9043,7 +9205,11 @@ impl KirinDeskApp {
                     if segmented_control(
                         ui,
                         theme,
-                        &["Light", "Dark", "System"],
+                        &[
+                            t!("settings.appearance.light"),
+                            t!("settings.appearance.dark"),
+                            t!("settings.appearance.system"),
+                        ],
                         &mut mode,
                     ) {
                         self.theme_mode = match mode {
@@ -9053,11 +9219,40 @@ impl KirinDeskApp {
                         };
                         // 即时生效：update() 帧首 apply_theme 检测明暗变化即全量重设。
                     }
+                    // M8-T038: 语言三段（System / 中文 / English）——选项以自身语言
+                    // 显示（语言选择器惯例）；选中即即时切换（与 Theme 同款交互）。
+                    ui.add_space(6.0);
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(t!("settings.language"))
+                                .size(theme.small_size)
+                                .color(theme.fg_weak),
+                        )
+                        .selectable(false),
+                    );
+                    let mut lang_mode = match self.ui_language.as_str() {
+                        "zh" => 1,
+                        "en" => 2,
+                        _ => 0, // "system" 及未知 → 0
+                    };
+                    if segmented_control(
+                        ui,
+                        theme,
+                        &["System", "中文", "English"],
+                        &mut lang_mode,
+                    ) {
+                        self.ui_language = match lang_mode {
+                            1 => "zh".into(),
+                            2 => "en".into(),
+                            _ => "system".into(),
+                        };
+                        i18n::set_lang_code(&self.ui_language); // 即时生效，无需重启
+                    }
                 });
 
             // M14-T005: 自动更新分组——检查 / 下载进度 / 安装重启。
             // 状态由后台线程写入 `update_state()`，本面板每帧读取。
-            egui::CollapsingHeader::new("Update")
+            egui::CollapsingHeader::new(t!("settings.update.title"))
                 .default_open(true)
                 .show(ui, |ui| {
                     let s = update_state();
@@ -9066,7 +9261,7 @@ impl KirinDeskApp {
                     ui.horizontal(|ui| {
                         ui.add(
                             egui::Label::new(
-                                egui::RichText::new("Current version:")
+                                egui::RichText::new(t!("settings.update.current_version"))
                                     .size(theme.small_size)
                                     .color(theme.fg_weak),
                             )
@@ -9079,7 +9274,7 @@ impl KirinDeskApp {
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
                             ui.spinner();
-                            ui.label("Checking for updates...");
+                            ui.label(t!("settings.update.checking"));
                         });
                     } else {
                         ui.add_space(4.0);
@@ -9087,7 +9282,7 @@ impl KirinDeskApp {
                             ui,
                             theme,
                             ButtonKind::Secondary,
-                            "Check for updates",
+                            t!("settings.update.check_button"),
                             ButtonState::Enabled,
                         )
                         .clicked()
@@ -9105,7 +9300,8 @@ impl KirinDeskApp {
                             ui.horizontal(|ui| {
                                 ui.add(
                                     egui::Label::new(
-                                        egui::RichText::new("New version").strong(),
+                                        egui::RichText::new(t!("settings.update.new_version"))
+                                            .strong(),
                                     )
                                     .selectable(false),
                                 );
@@ -9139,7 +9335,7 @@ impl KirinDeskApp {
                                     ui,
                                     theme,
                                     ButtonKind::Primary,
-                                    "Download update",
+                                    t!("settings.update.download_button"),
                                     ButtonState::Enabled,
                                 )
                                 .clicked()
@@ -9156,7 +9352,7 @@ impl KirinDeskApp {
                                     ui,
                                     theme,
                                     ButtonKind::Primary,
-                                    "Install & Restart",
+                                    t!("settings.update.install_restart"),
                                     ButtonState::Enabled,
                                 )
                                 .clicked()
@@ -9170,8 +9366,8 @@ impl KirinDeskApp {
                                         Ok(InstallOutcome::ManualInstall { artifact, hint }) => {
                                             let mut s2 = s.lock().unwrap();
                                             s2.downloaded = None;
-                                            s2.info = Some(format!(
-                                                "已下载到 {}。{}",
+                                            s2.info = Some(tf!(
+                                                "settings.update.downloaded_fmt",
                                                 artifact.display(),
                                                 hint
                                             ));
@@ -9187,14 +9383,19 @@ impl KirinDeskApp {
                         }
                         Some(UpdateStatus::UpToDate) => {
                             ui.add_space(4.0);
-                            ui.label("You are up to date.");
+                            ui.label(t!("settings.update.up_to_date"));
                         }
                         Some(UpdateStatus::Error(_)) | None => {}
                     }
 
                     if let Some(e) = &guard.error {
                         ui.add_space(4.0);
-                        badge(ui, theme, &format!("Update error: {}", e), BadgeKind::Danger);
+                        badge(
+                            ui,
+                            theme,
+                            &tf!("settings.update.error_fmt", e),
+                            BadgeKind::Danger,
+                        );
                     }
                     if let Some(m) = &guard.info {
                         ui.add_space(4.0);
@@ -9202,7 +9403,7 @@ impl KirinDeskApp {
                     }
                 });
 
-            egui::CollapsingHeader::new("About").show(ui, |ui| {
+            egui::CollapsingHeader::new(t!("settings.about.title")).show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.add(
                         egui::Label::new(egui::RichText::new("🐉 KirinDesk").strong())
@@ -9212,7 +9413,7 @@ impl KirinDeskApp {
                 });
                 ui.add(
                     egui::Label::new(
-                        egui::RichText::new("P2P Remote Desktop — secure direct connections.")
+                        egui::RichText::new(t!("settings.about.tagline"))
                             .size(theme.small_size)
                             .color(theme.fg_weak),
                     )
@@ -9222,7 +9423,7 @@ impl KirinDeskApp {
 
             ui.separator();
             ui.horizontal(|ui| {
-                if action_button(ui, theme, ButtonKind::Primary, "Save", ButtonState::Enabled)
+                if action_button(ui, theme, ButtonKind::Primary, t!("settings.save"), ButtonState::Enabled)
                     .clicked()
                 {
                     // M8-T027 (UI-IDWL-001): 改为基于**现有配置**修改而非重建——
@@ -9239,20 +9440,9 @@ impl KirinDeskApp {
                     cfg.device.id = self.device_id.clone();
                     cfg.device.nickname = self.nickname.clone();
                     cfg.device.challenge_code = self.challenge_code.clone();
-                    cfg.godaddy.api_key = self.api_key.clone();
-                    cfg.godaddy.api_secret = self.api_secret.clone();
-                    cfg.godaddy.domain = self.domain.clone();
-                    // M8-T035 (需求 12): DNS 服务商持久化（非法 id 防御性回退；
-                    // 仅 GUI 消费，`[godaddy]` 段结构与 CLI 行为零变化）。
-                    cfg.dns.provider = if kirin_desk_utils::dns_providers::dns_provider_def(
-                        &self.dns_provider,
-                    )
-                    .is_some()
-                    {
-                        self.dns_provider.clone()
-                    } else {
-                        "godaddy".to_string()
-                    };
+                    // M9-DNS022: `[godaddy]` 凭据与 `[dns] provider` 不再由
+                    // Settings 保存——统一在 Domain 页「服务商」卡维护（即时落盘）；
+                    // 此处不写，避免旧值覆盖 Domain 页已保存的新值。
                     if let Ok(p) = self.listen_port.parse::<u16>() {
                         cfg.network.port = p;
                     }
@@ -9276,6 +9466,8 @@ impl KirinDeskApp {
                     cfg.network.temp_mode = self.temp_mode;
                     // M15-T008: 主题模式持久化（`[ui] theme`，默认 light）
                     cfg.ui.theme = self.theme_mode.as_str().to_string();
+                    // M8-T038: 语言选择持久化（`[ui] language`，默认 system）
+                    cfg.ui.language = self.ui_language.clone();
                     // M13-T005 (UA-CFG-002): 无人值守配置持久化
                     cfg.unattended.enabled = self.unattended_enabled;
                     cfg.unattended.auto_start_server = self.unattended_auto_server;
@@ -9316,7 +9508,7 @@ impl KirinDeskApp {
                                 }
                             }
                             self.id_whitelist_entries = entries;
-                            self.settings_status = "Saved".to_string();
+                            self.settings_status = t!("settings.status.saved").to_string();
                             if let Ok(p) = self.listen_port.parse::<u16>() {
                                 self.connect_port = p.to_string();
                             }
@@ -9325,18 +9517,21 @@ impl KirinDeskApp {
                             if self.unattended_autostart {
                                 if let Err(e) = kirin_desk_utils::autostart::install() {
                                     self.settings_status =
-                                        format!("Saved, but autostart registration failed: {}", e);
+                                        tf!("settings.status.autostart_failed", e);
                                 }
                             } else {
                                 let _ = kirin_desk_utils::autostart::uninstall();
                             }
                         }
-                        Err(e) => self.settings_status = format!("Save failed: {}", e),
+                        Err(e) => {
+                            self.settings_status = tf!("settings.status.save_failed", e)
+                        }
                     }
                 }
                 // M15-T008: 保存反馈改横幅 Badge（success/danger）
                 if !self.settings_status.is_empty() {
-                    let kind = if self.settings_status.starts_with("Saved") {
+                    // M8-T038: 成功文案走 t!()，此处与同键结果比较判定语义色。
+                    let kind = if self.settings_status == t!("settings.status.saved") {
                         BadgeKind::Success
                     } else {
                         BadgeKind::Danger

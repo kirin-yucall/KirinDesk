@@ -478,12 +478,14 @@ pub struct UnattendedConfig {
     pub auto_start_on_boot: bool,
 
     /// 应用启动时自动开启服务端（监听 network.port + DNS 注册/心跳）。
+    /// M8-T037: 显示名「默认受控」，默认改 **false**（三开关默认全关；
+    /// 旧配置文件中显式 true 保持不变——serde default 只作用于缺失字段）。
     #[serde(default = "default_auto_start_server")]
     pub auto_start_server: bool,
 }
 
 fn default_auto_start_server() -> bool {
-    true
+    false
 }
 
 impl Default for UnattendedConfig {
@@ -502,18 +504,26 @@ pub struct UiConfig {
     /// 主题模式: "light"（默认）| "dark" | "system"
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// 语言: "system"（跟随系统，默认）| "zh" | "en"
+    #[serde(default = "default_language")]
+    pub language: String,
 }
 
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
             theme: default_theme(),
+            language: default_language(),
         }
     }
 }
 
 fn default_theme() -> String {
     "light".to_string()
+}
+
+fn default_language() -> String {
+    "system".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1360,10 +1370,11 @@ mod tests {
 
     #[test]
     fn test_unattended_defaults() {
+        // M8-T037: 三开关默认全关（含「默认受控」= auto_start_server）。
         let config = Config::default();
         assert!(!config.unattended.enabled);
         assert!(!config.unattended.auto_start_on_boot);
-        assert!(config.unattended.auto_start_server);
+        assert!(!config.unattended.auto_start_server);
     }
 
     #[test]
@@ -1384,7 +1395,7 @@ mod tests {
         let loaded = Config::load_from(&path).unwrap();
         assert_eq!(loaded.device.id, "old-device");
         assert!(!loaded.unattended.enabled);
-        assert!(loaded.unattended.auto_start_server);
+        assert!(!loaded.unattended.auto_start_server);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1399,7 +1410,8 @@ mod tests {
         let loaded = Config::load_from(&path).unwrap();
         assert!(loaded.unattended.enabled);
         assert!(loaded.unattended.auto_start_on_boot);
-        assert!(loaded.unattended.auto_start_server);
+        // auto_start_server 未显式设置 → 默认 false（三开关默认全关）。
+        assert!(!loaded.unattended.auto_start_server);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1858,6 +1870,52 @@ mod tests {
         let loaded3 = Config::load_from(&dir.join("quota0.toml")).unwrap();
         assert_eq!(loaded3.file_transfer.session_max_bytes, 0);
         assert_eq!(loaded3.file_transfer.session_max_files, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------- M8-T038 (P2): UI 语言配置测试 ----------
+
+    #[test]
+    fn test_ui_language_defaults() {
+        // 默认值："system"（跟随系统）——与 theme 的 "light" 默认互不干扰。
+        let cfg = UiConfig::default();
+        assert_eq!(cfg.language, "system");
+        assert_eq!(cfg.theme, "light");
+    }
+
+    #[test]
+    fn test_ui_language_legacy_toml_missing_field() {
+        // 旧配置无 `[ui].language` → 加载不失败，取默认 "system"（P13）。
+        let dir = std::env::temp_dir().join("kirin_desk_test_ui_lang");
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = dir.join("legacy.toml");
+        std::fs::write(
+            &legacy,
+            "[device]\nid = \"old-device\"\nname = \"Old\"\n\
+             [godaddy]\napi_key = \"\"\napi_secret = \"\"\ndomain = \"example.com\"\n\
+             [ui]\ntheme = \"dark\"\n\
+             [network]\nport = 3389\n\
+             [media]\nencoder = \"auto\"\nframerate = 30\nbitrate = 5000\n\
+             [logging]\nlevel = \"info\"\nformat = \"text\"\n",
+        )
+        .unwrap();
+        let loaded = Config::load_from(&legacy).unwrap();
+        assert_eq!(loaded.ui.language, "system");
+        assert_eq!(loaded.ui.theme, "dark");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_ui_language_roundtrip() {
+        // 显式 `language = "en"` 落盘 → 重新加载保持（P11 持久化基础）。
+        let dir = std::env::temp_dir().join("kirin_desk_test_ui_lang_rt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lang.toml");
+        let mut cfg = Config::default();
+        cfg.ui.language = "en".to_string();
+        cfg.save_to(&path).unwrap();
+        let loaded = Config::load_from(&path).unwrap();
+        assert_eq!(loaded.ui.language, "en");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

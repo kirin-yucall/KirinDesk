@@ -18,6 +18,8 @@ use kirin_desk_dns::godaddy::GoDaddyClient;
 use kirin_desk_dns::txt::TxtManager;
 use kirin_desk_utils::config::Config;
 use kirin_desk_utils::known_hosts::KnownClientsStore;
+// M8-T038 (P6): 连接失败引导提示（用户可见，拼入连接状态与日志）走 t!()。
+use crate::t;
 
 /// 客户端公钥解析来源（供审计/日志区分信任路径）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,16 +229,12 @@ pub fn connect_failure_challenge_hint(challenge: &str) -> Option<String> {
         && challenge
             .chars()
             .all(|c| "ABCDEFGHJKLMNPQRSTUVWXYZ23456789".contains(c));
+    // M8-T038 (P6): 文案走 t!()——zh 模板保持现语义逐字（单测断言
+    // 「固定挑战码错误」「临时连接码格式」等子串），en 补翻译。
     let hint = if temp_like {
-        "提示：此挑战码符合临时连接码格式。连接被拒通常是：\n  \
-         1) 临时窗口已过期或未开启 —— 请服务端执行 `kirin_desk status` 确认（Temp Mode: ACTIVE）；\n  \
-         2) 窗口已过期 —— 请服务端重新执行 `kirin_desk temp-mode` 获取新码；\n  \
-         3) 码输入有误 —— 逐字符核对（临时码不含 0/O/1/I）。"
+        t!("policy.challenge_hint.temp")
     } else {
-        "提示：连接被拒通常是对端挑战码/凭据校验未通过：\n  \
-         1) 固定挑战码错误 —— 与服务端 `challenge_code` 配置核对；\n  \
-         2) 若使用临时连接码 —— 窗口可能已过期，请服务端重新执行 `kirin_desk temp-mode`；\n  \
-         3) 确认服务端未处于无人值守模式（该模式下无临时放行路径）。"
+        t!("policy.challenge_hint.fixed")
     };
     Some(hint.to_string())
 }

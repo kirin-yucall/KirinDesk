@@ -36,6 +36,8 @@ windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Security_Cryptography",
     "Win32_System_Memory",
+    # M8-T038 (P2): 跟随系统语言（GetUserDefaultUILanguage）。
+    "Win32_Globalization",
 ] }
 # M8-T031: 卷序列号取系统盘——dlopen kernel32 GetVolumeInformationW
 # （架构红线：不静态链接系统库；与 macOS 段同版本）。

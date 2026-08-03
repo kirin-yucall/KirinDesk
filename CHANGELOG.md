@@ -7,6 +7,27 @@
 ## [Unreleased]
 
 ### Added
+- M8-T038 连接状态迁移 + 语言选项与文案统一：
+  - 连接状态迁移（P1）：Connect 页移除顶部状态点行与表单内 3 处 Stepper 渲染
+    （保留 step/busy 推导驱动按钮禁用/⏳）、删除 3 处进度快照类表单反馈写入；
+    会话窗口（弹出页）工具栏之下、显示画面之前新增 `conn_state_{wid}` 状态条
+    （状态点 + Stepper，随弹出页出现/消失；Shell 会话 `[shell] ` 前缀剥离后
+    颜色/步数判定一致）；点击 Connect 后进度仅见于右侧连接日志
+  - 语言选项（P3）：Settings → Appearance 新增 Language 三段
+    （System / 中文 / English），镜像 Theme 四件套（App 字段 / 启动应用 /
+    即时切换 / Save 落盘），持久化 `[ui].language`（默认 `"system"` 跟随系统）
+  - 语言基建（P2）：`utils` 新增 `locale::system_language_code()`（Windows
+    `GetUserDefaultUILanguage`，`Win32_Globalization` feature）+ `UiConfig.language`
+    + `i18n::system()` / `set_lang_code()`（env 优先 → 系统 API → zh 基线）；
+    i18n 键值表重构为**按页面分区**的 `ui/src/i18n/{common,settings,connect,
+    dashboard,devices,domain,session,widgets}.rs`（`ALL` 汇总 + 重复键断言单测，
+    并发加键零冲突）；新增 `tf!` 宏（`{0}/{1}` 位置参数模板，`format!` 不支持
+    运行期格式串的替代实现）
+  - GUI 全界面文案统一（P3~P6，约 430 键）：Settings / Connect / Dashboard /
+    Devices / Domain（含 domain_panel.rs）/ 会话窗口（状态栏徽标、工具栏 tooltip、
+    特殊键、隐私菜单、断线重连覆盖层）/ 四类弹窗（panic、审批、指纹确认、文件
+    接收完成）/ 组件默认 tooltip / 文件面板 / 连接失败引导提示全部 `t!()` 化
+    （zh 基线 + en 全量翻译）；CLI 提示语（P1）保持现状
 - R-02 握手 pin 强制加固（安全收尾 P0，审计 P3-17）：
   - `core` 新增强类型 `PinExpectation { None(CoreReason), Exact([u8;32]) }` / `CoreReason { InternalLoopback, UserConfirmRequired }`；`client_handshake_generic` / `client_handshake_with_confirm_generic` / `client_handshake` / `client_handshake_with_confirm` 的 pin 参数全部强类型化——**删除"空串 = 跳过 pin 比对"的旧版兼容路径**（`None(UserConfirmRequired)` 无确认回调即拒绝，杜绝信任网络公钥）
   - loopback 自签兜底：`None(InternalLoopback)` 以客户端自身公钥强制比对（服务端 = 自身），`PunchConfig::loopback` / `PunchHandshake.peer_pin` 不再有空串形态；`PinExpectation::resolve_base64` 供服务端角色（punch）解析
@@ -50,6 +71,10 @@
 
 ### Changed
 
+- M8-T038 行为变更：点击 Connect 后 Connect 页不再显示连接进度（顶部状态点 /
+  表单 Stepper / 底部进度快照已移除），进度可见于弹出页状态条与右侧连接日志；
+  首次使用可能短暂无进度反馈，属预期（用户主动要求，见
+  `task_docs/UI/M8-T038_UI改动需求设计_2026-08-03.md` §7-5）
 - FFmpeg 捆绑构建 8.1.2 → **GyanD 8.1.1**（决策记录与实测见
   `task_docs/共享层/M8-T030_单GPU硬件加速与虚拟设备过滤_需求设计.md` §5.2；
   Readme 下载链接已更新；**捆绑目录已替换并回归通过**）：8.1.2 构建捆绑 ffnvcodec 13.1 头，

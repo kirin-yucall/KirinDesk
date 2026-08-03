@@ -8,6 +8,8 @@ use eframe::egui;
 use egui::{Color32, RichText, Stroke, Ui};
 
 use crate::theme::Theme;
+// M8-T038 (P6): 组件默认 tooltip 文案走 t!()（i18n/widgets.rs 分区表）。
+use crate::t;
 
 // ════════════════════════════════════════════════════════════════
 // 徽标 / 状态点
@@ -231,7 +233,7 @@ pub fn copy_button(ui: &mut Ui, theme: &Theme, text: &str) -> (egui::Response, b
             !text.is_empty(),
             egui::Button::new(RichText::new(icon).size(12.0)).min_size(egui::vec2(26.0, 20.0)),
         )
-        .on_hover_text("Copy");
+        .on_hover_text(t!("widgets.copy"));
     let mut copied = false;
     if resp.clicked() {
         ui.output_mut(|o| o.copied_text = text.to_owned());
@@ -452,7 +454,11 @@ pub fn labeled_input(
                             [32.0, 28.0],
                             egui::Button::new(RichText::new("👁").size(theme.small_size)),
                         )
-                        .on_hover_text(if *show { "Hide" } else { "Show" });
+                        .on_hover_text(if *show {
+                            t!("widgets.secret.hide")
+                        } else {
+                            t!("widgets.secret.show")
+                        });
                     if eye.clicked() {
                         *show = !*show;
                     }
@@ -479,19 +485,45 @@ pub fn labeled_input(
 // 卡片 / 步骤条 / 日志
 // ════════════════════════════════════════════════════════════════
 
-/// StatCard 一行：键（弱色 Small）+ 值（Body/Mono）+ 可选复制按钮。
+/// StatCard 一行：键（弱色 Small）+ 值（Body/Mono）+ 可选行尾状态点 + 可选复制按钮。
 /// `small`（M8-T034）：值改用 `theme.small_size`（身份卡整体小字号）。
+/// `dot`（M8-T037）：`Some((color, tooltip))` → 值后渲染彩色「●」状态点
+/// （无文字，行内紧凑；如公网检测红/绿点），`None` 不渲染（既有调用点零影响）。
 pub struct StatRow<'a> {
     pub key: &'a str,
     pub value: String,
     pub mono: bool,
     pub copy: bool,
     pub small: bool,
+    pub dot: Option<(Color32, &'static str)>,
 }
 
 /// 信息卡片（§4 StatCard）：标题栏（Small 弱色）+ 分隔线 + 键值行。
 /// 返回本帧被复制的内容（`None` = 未复制；M8-T028 状态栏浮出提示用）。
 pub fn stat_card(ui: &mut Ui, theme: &Theme, title: &str, rows: &[StatRow<'_>]) -> Option<String> {
+    stat_card_impl(ui, theme, title, rows, None)
+}
+
+/// 信息卡片 + 底部提示行（M8-T037：公网检测建议「无公网地址建议开启内网穿透
+/// 或端口转发」等随卡展示的提示）。`footer = Some((color, text))` → 卡底渲染
+/// 一行小字号彩色提示（无圆点）；`None` → 与 `stat_card` 完全一致。
+pub fn stat_card_with_footer(
+    ui: &mut Ui,
+    theme: &Theme,
+    title: &str,
+    rows: &[StatRow<'_>],
+    footer: Option<(Color32, String)>,
+) -> Option<String> {
+    stat_card_impl(ui, theme, title, rows, footer)
+}
+
+fn stat_card_impl(
+    ui: &mut Ui,
+    theme: &Theme,
+    title: &str,
+    rows: &[StatRow<'_>],
+    footer: Option<(Color32, String)>,
+) -> Option<String> {
     let mut copied: Option<String> = None;
     egui::Frame::none()
         .fill(theme.bg_panel)
@@ -535,6 +567,22 @@ pub fn stat_card(ui: &mut Ui, theme: &Theme, title: &str, rows: &[StatRow<'_>]) 
                         theme.body_size
                     });
                     ui.add(egui::Label::new(rt).selectable(true));
+                    // M8-T037: 行尾状态点（值后、复制按钮前；如公网检测红/绿点）。
+                    if let Some((color, tip)) = row.dot {
+                        let dot = ui.add(
+                            egui::Label::new(
+                                RichText::new("●")
+                                    .size(if row.small {
+                                        theme.small_size
+                                    } else {
+                                        theme.body_size
+                                    })
+                                    .color(color),
+                            )
+                            .selectable(false),
+                        );
+                        dot.on_hover_text(tip);
+                    }
                     if row.copy {
                         let (_, was_copied) = copy_button(ui, theme, &row.value);
                         if was_copied {
@@ -542,6 +590,18 @@ pub fn stat_card(ui: &mut Ui, theme: &Theme, title: &str, rows: &[StatRow<'_>]) 
                         }
                     }
                 });
+            }
+            // M8-T037: 卡底提示行（公网检测建议等）。
+            if let Some((color, text)) = footer {
+                ui.add_space(2.0);
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(text)
+                            .size(theme.small_size)
+                            .color(color),
+                    )
+                    .selectable(false),
+                );
             }
         });
     copied
@@ -751,6 +811,15 @@ mod tests {
                                 mono: true,
                                 copy: true,
                                 small: true,
+                                dot: None,
+                            },
+                            StatRow {
+                                key: "IPv6:",
+                                value: "2001:db8::1".to_owned(),
+                                mono: true,
+                                copy: true,
+                                small: true,
+                                dot: Some((t.success, "公网地址，可直连")),
                             },
                             StatRow {
                                 key: "API:",
@@ -758,6 +827,7 @@ mod tests {
                                 mono: false,
                                 copy: false,
                                 small: false,
+                                dot: None,
                             },
                         ],
                     );

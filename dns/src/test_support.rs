@@ -11,7 +11,7 @@
 //! - `DELETE` → idempotent, 200 (real GoDaddy 404s on missing records, which
 //!   callers ignore anyway)
 
-use crate::godaddy::Record;
+use crate::godaddy::record::{ManagedRecord, Record};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -20,9 +20,11 @@ use tokio::net::{TcpListener, TcpStream};
 
 #[derive(Debug, Default)]
 struct MockState {
-    /// (record_type, name) → records.
+    /// 当前账号可管理的域名（GET /v1/domains）。
+    domains: Vec<String>,
+    /// (record_type, name) → records。
     records: HashMap<(String, String), Vec<Record>>,
-    /// Logged DELETE calls: (record_type, name).
+    /// Logged DELETE calls: (record_type, name)。
     deletes: Vec<(String, String)>,
 }
 
@@ -68,6 +70,18 @@ impl MockDns {
     /// Base URL to point `GoDaddyClient` at this mock.
     pub fn base_url(&self) -> String {
         format!("http://{}", self.addr)
+    }
+
+    /// M9-DNS000: 设置 GET /v1/domains 返回的域名列表（覆盖式）。
+    pub fn set_domains(&self, domains: &[&str]) {
+        let mut state = self.state.lock().unwrap();
+        state.domains = domains.iter().map(|d| d.to_string()).collect();
+    }
+
+    /// M9-DNS000: 当前 mock 保存的域名列表。
+    pub fn domains(&self) -> Vec<String> {
+        let state = self.state.lock().unwrap();
+        state.domains.clone()
     }
 
     /// Seed records (overwrites any existing for the key).
@@ -153,9 +167,52 @@ async fn handle_connection(
 
 /// `(status_line, body)`.
 fn route(method: &str, path: &str, body: &str, state: &Arc<Mutex<MockState>>) -> (String, String) {
-    // /v1/domains/{domain}/records/{type}/{name}
+    // 查询串剥离：`/v1/domains/{domain}/records?type=A` → `/v1/domains/{domain}/records`
+    let (path, query) = path.split_once('?').unwrap_or((path, ""));
     let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    if segs.len() != 6 || segs[0] != "v1" || segs[1] != "domains" || segs[3] != "records" {
+    if segs.len() < 2 || segs[0] != "v1" || segs[1] != "domains" {
+        return (String::from("404 Not Found"), String::new());
+    }
+    // M9-DNS000: GET /v1/domains —— 域名列表（segments: v1/domains）。
+    if segs.len() == 2 && method == "GET" {
+        let state = state.lock().unwrap();
+        let json = serde_json::to_string(
+            &state
+                .domains
+                .iter()
+                .map(|d| serde_json::json!({ "domain": d }))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap_or_default();
+        return (String::from("200 OK"), json);
+    }
+    // M9-DNS000: GET /v1/domains/{domain}/records[?type=X] —— 域名下全量记录
+    // （segments: v1/domains/{domain}/records）。
+    if segs.len() == 4 && segs[3] == "records" && method == "GET" {
+        let state = state.lock().unwrap();
+        let filter = query
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("type="))
+            .unwrap_or("");
+        let mut out: Vec<ManagedRecord> = Vec::new();
+        for ((record_type, name), records) in &state.records {
+            if !filter.is_empty() && record_type != filter {
+                continue;
+            }
+            for rec in records {
+                out.push(ManagedRecord {
+                    rtype: record_type.clone(),
+                    name: name.clone(),
+                    data: rec.data.clone(),
+                    ttl: rec.ttl,
+                });
+            }
+        }
+        let json = serde_json::to_string(&out).unwrap_or_default();
+        return (String::from("200 OK"), json);
+    }
+    // /v1/domains/{domain}/records/{type}/{name}
+    if segs.len() != 6 || segs[3] != "records" {
         return (String::from("404 Not Found"), String::new());
     }
     let record_type = segs[4].to_string();
