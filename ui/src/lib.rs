@@ -34,8 +34,9 @@ use kirin_desk_core::connection::temp_mode::TempModeManager;
 use kirin_desk_core::crypto::ed25519::IdentityManager;
 // M15 (SRV-SEC-KH-001): 服务端两阶段握手（预读 init → pin → 应答）。
 use kirin_desk_core::crypto::handshake::{
-    domain_matches_whitelist, id_matches_whitelist, server_handshake_respond_generic,
-    server_read_init, verify_server_init_with_temp, SecureChannel,
+    domain_matches_whitelist, id_matches_whitelist, negotiate_codec_by_server_priority,
+    server_handshake_respond_generic, server_read_init, verify_server_init_with_temp,
+    SecureChannel,
 };
 use kirin_desk_media::capture::CaptureError;
 // M15 (SRV-SEC-RL-001/002): 服务端连接速率限制。
