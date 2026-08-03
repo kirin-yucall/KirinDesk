@@ -4990,7 +4990,8 @@ fn cmd_tunnel_status() {
 }
 
 /// 解析 `"start-end"` 端口区间（TNL-CFG-001 `[tunnel].port_range`）。
-fn parse_tunnel_port_range(s: &str) -> Option<(u16, u16)> {
+/// M8-T039 (P4)：提升为 `pub(crate)` 供 lib.rs（Tunnel 页端口范围校验/组装）复用。
+pub(crate) fn parse_tunnel_port_range(s: &str) -> Option<(u16, u16)> {
     let (a, b) = s.trim().split_once('-')?;
     let start: u16 = a.trim().parse().ok()?;
     let end: u16 = b.trim().parse().ok()?;

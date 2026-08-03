@@ -130,6 +130,58 @@ fn server_runtime_state() -> &'static Mutex<ServerRuntimeState> {
     S.get_or_init(|| Mutex::new(ServerRuntimeState::default()))
 }
 
+/// M8-T039 §3.4.3: 隧道真实运行态（后台线程写 → GUI 每帧读；仿 ServerRuntimeState）。
+#[derive(Debug, Clone, Default)]
+struct TunnelRuntimeState {
+    /// 启动进行中（GUI 点击后置位，后台线程确认后复位）。
+    starting: bool,
+    /// 隧道运行中（client 控制连接在 / server 在监听）。
+    running: bool,
+    /// 实际监听端口（server 模式 bind 成功后写回；0 = 未知）。
+    port: u16,
+    /// 实际监听地址列表（server 模式；空 = 默认双栈回退）。
+    addrs: String,
+    /// 启动/运行错误（None = 无错误；Some → 状态行展示原因）。
+    error: Option<String>,
+}
+
+/// 隧道运行态共享槽（GUI 每帧读，后台线程写）。
+fn tunnel_runtime_state() -> &'static Mutex<TunnelRuntimeState> {
+    static S: OnceLock<Mutex<TunnelRuntimeState>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(TunnelRuntimeState::default()))
+}
+
+/// 隧道运行句柄槽（停止时优雅关闭；client 持 `Arc<TunnelClient>`，
+/// server 持 `TunnelServerHandle`；运行结束由后台线程清空）。
+fn tunnel_run_handles() -> &'static Mutex<Option<TunnelRunHandles>> {
+    static S: OnceLock<Mutex<Option<TunnelRunHandles>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(None))
+}
+
+/// 隧道运行句柄（停止路径用；优雅关闭优于 runtime drop abort，TNL-SERVER-006）。
+#[derive(Default)]
+struct TunnelRunHandles {
+    client: Option<std::sync::Arc<kirin_desk_relay::client::TunnelClient>>,
+    server: Option<kirin_desk_relay::server::TunnelServerHandle>,
+}
+
+/// M8-T039: 隧道状态行文案（运行中 ● / 已停止 ○ / 启动失败: 原因（配置保持启用…））。
+fn tunnel_status_text(st: &TunnelRuntimeState, mode: &str) -> String {
+    if let Some(e) = &st.error {
+        return tf!("tunnel.run.failed", e); // 「启动失败: {0}（配置保持启用，下次启动将自动重试）」
+    }
+    if st.running {
+        if mode == "server" {
+            if !st.addrs.is_empty() {
+                return tf!("tunnel.run.running", st.port, &st.addrs); // 「● 运行中 :{0} ({1})」
+            }
+            return tf!("tunnel.run.running", st.port, t!("tunnel.run.default_addrs"));
+        }
+        return t!("tunnel.run.running_client").to_string(); // 「● 运行中（client）」
+    }
+    t!("tunnel.run.stopped").to_string() // 「○ 已停止」
+}
+
 /// M8-T036: 公网出口探测状态（Dashboard「公网检测」混合判定的一部分）。
 /// 仅当本地地址全部非公网时触发一次：后台线程向 `api.ipify.org` 查询公网出口
 /// IP（4s 超时）；探测结果与本地任一地址相同 → 本机直持公网地址。
@@ -4032,6 +4084,12 @@ impl eframe::App for KirinDeskApp {
             // 总开关生效（无人值守关、默认受控开时同样自动监听）。
             if self.unattended_auto_server {
                 self.start_server();
+            }
+            // M8-T039 §3.4.3: 隧道最后运行状态恢复——auto_start=true →
+            // 按上次模式自动启动；失败 → 状态行显示原因且 auto_start 保持
+            // true（下次启动继续尝试，与启动失败同语义）。
+            if self.tunnel_auto_start {
+                self.tunnel_start();
             }
             // UA-UI-003 (D4): --autostart 或无人值守启动 → 窗口最小化启动，
             // 不打断用户前台工作（托盘常驻列为后续增强）。
@@ -9549,18 +9607,103 @@ impl KirinDeskApp {
                     .selectable(false),
                 );
             } else {
-                // Server 区块（结构占位，P4 认领）：
+                // Server 区块（M8-T039 P4：配置输入 + 校验；Token 行含 ✏️📋）。
                 ui.heading(t!("tunnel.server.title"));
-                // ══ [P4 认领] Server 区块配置输入与校验（监听地址 / 端口 /
-                //    端口范围 / Token 行含 ✏️📋）══
+                let addrs_ok = self.tunnel_addrs_valid();
+                let port_ok = self.tunnel_port_valid();
+                let range_ok = self.tunnel_range_valid();
+                labeled_input(
+                    ui,
+                    theme,
+                    t!("tunnel.server.bind_addrs"),
+                    &mut self.tunnel_bind_addrs,
+                    "0.0.0.0,::",
+                    if addrs_ok {
+                        Validity::None
+                    } else {
+                        Validity::Invalid(t!("tunnel.server.bind_addrs_invalid"))
+                    },
+                    None,
+                    true,
+                );
                 ui.add(
                     egui::Label::new(
-                        egui::RichText::new(t!("tunnel.server.placeholder"))
+                        egui::RichText::new(t!("tunnel.server.bind_addrs_hint"))
                             .size(theme.small_size)
                             .color(theme.fg_weak),
                     )
                     .selectable(false),
                 );
+                // §3.2.2：只配 `::` 单地址 → 仅收 IPv6，弱色提示补 0.0.0.0。
+                if self.tunnel_bind_addrs.contains("::")
+                    && !self.tunnel_bind_addrs.contains("0.0.0.0")
+                {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(t!("tunnel.server.v6_only_hint"))
+                                .size(theme.small_size)
+                                .color(theme.fg_weak),
+                        )
+                        .selectable(false),
+                    );
+                }
+                labeled_input(
+                    ui,
+                    theme,
+                    t!("tunnel.server.bind_port"),
+                    &mut self.tunnel_bind_port,
+                    "7000",
+                    if port_ok {
+                        Validity::None
+                    } else {
+                        Validity::Invalid(t!("tunnel.server.port_invalid"))
+                    },
+                    None,
+                    true,
+                );
+                labeled_input(
+                    ui,
+                    theme,
+                    t!("tunnel.server.port_range"),
+                    &mut self.tunnel_port_range,
+                    "60000-61000",
+                    if range_ok {
+                        Validity::None
+                    } else {
+                        Validity::Invalid(t!("tunnel.server.port_range_invalid"))
+                    },
+                    None,
+                    true,
+                );
+                // ── Token 行（Server 专属：👁 + ✏️ + 📋）──
+                // labeled_input 为 vertical 布局（标签上置 + 👁 同行），✏️📋
+                // 与输入行同行排布（horizontal 包裹，尺寸对齐 copy_button）。
+                ui.horizontal(|ui| {
+                    labeled_input(
+                        ui,
+                        theme,
+                        t!("tunnel.token"),
+                        &mut self.tunnel_token,
+                        "required",
+                        Validity::None,
+                        Some(&mut self.show_secret_tunnel_token),
+                        false,
+                    );
+                    ui.vertical(|ui| {
+                        if ui
+                            .add(
+                                egui::Button::new("✏️")
+                                    .min_size(egui::vec2(26.0, 20.0)),
+                            )
+                            .on_hover_text(t!("tunnel.server.gen_token_hint"))
+                            .clicked()
+                        {
+                            self.tunnel_gen_token();
+                        }
+                        // 📋 复用 copy_button（空 token 内建禁用；✓ 瞬态反馈）。
+                        let _ = copy_button(ui, theme, &self.tunnel_token);
+                    });
+                });
             }
             ui.separator();
             // ── 保存（独立于 Settings 全局 Save）──
@@ -9587,7 +9730,50 @@ impl KirinDeskApp {
                     .selectable(false),
                 );
             }
-            // ══ [P5 认领] 运行控制区（▶ 启动 / ■ 停止 + 状态行）══
+            // ── 运行控制区（M8-T039 P5：▶ 启动 / ■ 停止 + 状态行）──
+            // 按钮文案随实际运行态切换（starting 期间也显示「■ 停止」——可点即停止）。
+            ui.horizontal(|ui| {
+                // 先取运行态快照（守卫立即释放——stop/start 内部再锁同一互斥量，
+                // std Mutex 不可重入，跨调用持锁即死锁）。
+                let (running, status, has_error) = {
+                    let st = tunnel_runtime_state().lock().unwrap();
+                    let status = tunnel_status_text(&st, &self.tunnel_mode);
+                    // 状态行跨帧常驻（TunnelRuntimeState 静态槽，非一次性 toast）；
+                    // 失败原因截断对齐 Dashboard start_failed 先例（lib.rs:5933-5938）。
+                    let status = if status.chars().count() > 56 {
+                        let t: String = status.chars().take(55).collect();
+                        format!("{t}…")
+                    } else {
+                        status
+                    };
+                    (st.running || st.starting, status, st.error.is_some())
+                };
+                let label = if running {
+                    t!("tunnel.run.stop")
+                } else {
+                    t!("tunnel.run.start")
+                };
+                let kind = if running {
+                    ButtonKind::Danger
+                } else {
+                    ButtonKind::Primary
+                };
+                if action_button(ui, theme, kind, label, ButtonState::Enabled).clicked() {
+                    if running {
+                        self.tunnel_stop();
+                    } else {
+                        self.tunnel_start();
+                    }
+                }
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(status)
+                            .size(theme.small_size)
+                            .color(if has_error { theme.danger } else { theme.fg_weak }),
+                    )
+                    .selectable(false),
+                );
+            });
         });
     }
 
@@ -9609,10 +9795,235 @@ impl KirinDeskApp {
         }
     }
 
-    /// M8-T039：保存允许判定（P3 占位恒 true；P4 认领实现——挂
-    /// Server 区块输入校验结果，非法值禁用保存）。
+    /// M8-T039 P4：保存允许判定——Server 模式且 Server 区块输入非法 → 禁用保存。
+    /// 校验不阻断保存路径之外的行为（模式切换 / 表单编辑 / ✏️ / 📋 始终可用）。
     fn tunnel_save_allowed(&self) -> bool {
-        true
+        self.tunnel_server_form_valid()
+    }
+
+    /// M8-T039 P4：Server 区块表单整体合法（渲染红边与保存允许判定同源，
+    /// 防双写漂移；Client 模式无 Server 区块校验）。
+    fn tunnel_server_form_valid(&self) -> bool {
+        if self.tunnel_mode != "server" {
+            return true;
+        }
+        self.tunnel_addrs_valid() && self.tunnel_port_valid() && self.tunnel_range_valid()
+    }
+
+    /// M8-T039 P4：监听地址合法——空（含纯空白）= 合法（落盘空串 → relay
+    /// 回退默认双栈，P7）；非空 → `parse_bind_addr_list` 各分支失败（非 IP /
+    /// 空段 / 域名）→ 非法。端口不参与地址段校验（由 `tunnel_port_valid` 独立提示）。
+    fn tunnel_addrs_valid(&self) -> bool {
+        let s = self.tunnel_bind_addrs.trim();
+        if s.is_empty() {
+            return true;
+        }
+        kirin_desk_utils::config::parse_bind_addr_list(s, 7000).is_ok()
+    }
+
+    /// M8-T039 P4：端口合法（1-65535，对齐 Dashboard 端口校验先例）。
+    fn tunnel_port_valid(&self) -> bool {
+        self.tunnel_bind_port
+            .trim()
+            .parse::<u16>()
+            .map(|p| (1..=65535).contains(&p))
+            .unwrap_or(false)
+    }
+
+    /// M8-T039 P4：端口范围合法（"start-end"，复用 cli.rs
+    /// `parse_tunnel_port_range`；空串合法 = remote_port 显式必填语义）。
+    fn tunnel_range_valid(&self) -> bool {
+        let s = self.tunnel_port_range.trim();
+        s.is_empty() || crate::cli::parse_tunnel_port_range(s).is_some()
+    }
+
+    /// M8-T039 §3.3：✏️ 生成随机高熵 Token（32 字节 → 64 hex）并**立即落盘**
+    /// （覆盖旧 token，生成即生效；落盘失败仅提示，输入框值不回滚）。
+    fn tunnel_gen_token(&mut self) {
+        let token = kirin_desk_utils::config::generate_random_token();
+        self.tunnel_token = token.clone();
+        if let Ok(mut cfg) = kirin_desk_utils::config::Config::load() {
+            cfg.tunnel.token = token;
+            match cfg.save() {
+                Ok(()) => self.tunnel_notice = t!("tunnel.server.token_saved").to_string(),
+                Err(e) => self.tunnel_notice = tf!("tunnel.save_failed", e),
+            }
+        } else {
+            self.tunnel_notice = t!("tunnel.server.token_save_failed").to_string();
+        }
+    }
+
+    /// M8-T039 §3.4.3: 启动隧道（GUI 唯一运行控制入口）。
+    /// 校验（fail-closed）→ 自动落盘当前表单 → auto_start=true 落盘 → 后台运行。
+    fn tunnel_start(&mut self) {
+        // ── 1. 校验（对齐 cli.rs cmd_tunnel_serve 4860-4871 / cmd_tunnel_start）──
+        let server_mode = self.tunnel_mode == "server";
+        if server_mode {
+            if self.tunnel_token.trim().is_empty() {
+                // TNL-SEC-008 fail-closed：空 token 拒绝启动。
+                self.tunnel_set_error(t!("tunnel.run.err_token_empty"));
+                return;
+            }
+            if self.tunnel_token.trim().len() < 16 {
+                // TNL-SEC-009：短 token 警告（不阻断，提示后继续）。
+                tracing::warn!(
+                    "tunnel: short token ({}) — use >=32 bytes high-entropy",
+                    self.tunnel_token.trim().len()
+                );
+            }
+        } else if self.tunnel_server_addr.trim().is_empty() {
+            self.tunnel_set_error(t!("tunnel.run.err_server_addr_empty"));
+            return;
+        }
+        // ── 2. 自动落盘当前表单（校验失败已拦截——避免启动用旧配置）──
+        self.tunnel_save(); // P3 方法（不写 enabled / auto_start）
+        // ── 3. auto_start = true 落盘（启动失败不回位，§3.4.3；失败仅影响
+        //    持久化，运行照常）──
+        if let Ok(mut cfg) = kirin_desk_utils::config::Config::load() {
+            cfg.tunnel.auto_start = true;
+            let _ = cfg.save();
+        }
+        self.tunnel_auto_start = true;
+        // ── 4. 状态置 starting ──
+        {
+            let mut st = tunnel_runtime_state().lock().unwrap();
+            st.starting = true;
+            st.running = false;
+            st.error = None;
+        }
+        // ── 5. 组装 + 后台运行（std::thread + 自建 tokio runtime，对齐
+        //    start_server 先例 lib.rs:6546-6548）──
+        let mode = self.tunnel_mode.clone();
+        let token = self.tunnel_token.clone();
+        let server_addr = self.tunnel_server_addr.clone();
+        let proxies = self.tunnel_proxies.clone();
+        let bind_addrs = self.tunnel_bind_addrs.clone();
+        let bind_port = self.tunnel_bind_port.trim().parse().unwrap_or(7000);
+        let port_range = self.tunnel_port_range.clone();
+        let hostname = kirin_desk_utils::config::Config::load()
+            .map(|c| c.device.id.clone())
+            .unwrap_or_else(|_| "kirindesk".to_string());
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().expect("tunnel runtime");
+            let result: Result<(), String> = rt.block_on(async {
+                if mode == "server" {
+                    let mut srv_cfg = kirin_desk_relay::server::TunnelServerConfig {
+                        bind_port,
+                        token: token.clone(),
+                        port_range: crate::cli::parse_tunnel_port_range(&port_range),
+                        // 心跳/连接池等走 relay 默认值（对齐 cmd_tunnel_serve）。
+                        ..Default::default()
+                    };
+                    if !bind_addrs.trim().is_empty() {
+                        // P4 表单已校验，此处仍 fail-closed：解析失败即启动失败。
+                        srv_cfg.bind_addrs = kirin_desk_utils::config::parse_bind_addr_list(
+                            &bind_addrs,
+                            bind_port,
+                        )?;
+                    }
+                    let server = kirin_desk_relay::server::TunnelServer::bind(srv_cfg)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let port = server.port();
+                    let addrs = bind_addrs.trim().to_string();
+                    {
+                        let mut st = tunnel_runtime_state().lock().unwrap();
+                        st.running = true;
+                        st.starting = false;
+                        st.port = port;
+                        st.addrs = addrs;
+                    }
+                    let handle = server.shutdown_handle();
+                    *tunnel_run_handles().lock().unwrap() = Some(TunnelRunHandles {
+                        client: None,
+                        server: Some(handle),
+                    });
+                    server.run().await.map_err(|e| e.to_string())
+                } else {
+                    // client 组装对齐 cli.rs cmd_tunnel_start（4805-4832）：
+                    // TunnelClientConfig + parse_proxy_lines + server_addr/token。
+                    let proxies: Vec<kirin_desk_relay::client::ProxySpec> =
+                        kirin_desk_utils::config::TunnelConfig::parse_proxy_lines(&proxies)
+                            .into_iter()
+                            .map(|p| kirin_desk_relay::client::ProxySpec {
+                                name: p.name,
+                                local_addr: p.local_addr,
+                                local_port: p.local_port,
+                                remote_port: p.remote_port,
+                            })
+                            .collect();
+                    let client_cfg = kirin_desk_relay::client::TunnelClientConfig {
+                        server_addr,
+                        token,
+                        hostname,
+                        heartbeat_interval: std::time::Duration::from_secs(10),
+                        heartbeat_timeout: std::time::Duration::from_secs(30),
+                        connect_timeout: std::time::Duration::from_secs(5),
+                        local_dial_timeout: std::time::Duration::from_secs(2),
+                        backoff_base: std::time::Duration::from_secs(1),
+                        backoff_max: std::time::Duration::from_secs(60),
+                        proxies,
+                    };
+                    let client = kirin_desk_relay::client::TunnelClient::new(client_cfg);
+                    let arc = std::sync::Arc::new(client);
+                    *tunnel_run_handles().lock().unwrap() = Some(TunnelRunHandles {
+                        client: Some(arc.clone()),
+                        server: None,
+                    });
+                    {
+                        let mut st = tunnel_runtime_state().lock().unwrap();
+                        st.running = true;
+                        st.starting = false;
+                    }
+                    arc.run().await.map_err(|e| e.to_string())
+                }
+            });
+            match result {
+                Ok(()) => {} // 优雅退出（stop）——状态已由 stop 路径复位
+                Err(e) => {
+                    // 启动失败 / 运行判死退出：intent 保留（auto_start 不回位，
+                    // §3.4.3 —— 状态行显示原因，下次启动自动重试）。
+                    let mut st = tunnel_runtime_state().lock().unwrap();
+                    st.starting = false;
+                    st.running = false;
+                    st.error = Some(e);
+                }
+            }
+            *tunnel_run_handles().lock().unwrap() = None;
+        });
+    }
+
+    /// M8-T039 §3.4.3: 停止隧道（auto_start=false 落盘 → 优雅关闭 → 线程回收）。
+    /// 幂等：未运行点「停止」→ 仅落盘 false + 复位状态（无句柄即跳过关闭调用）。
+    fn tunnel_stop(&mut self) {
+        self.tunnel_auto_start = false;
+        if let Ok(mut cfg) = kirin_desk_utils::config::Config::load() {
+            cfg.tunnel.auto_start = false;
+            let _ = cfg.save();
+        }
+        if let Some(h) = tunnel_run_handles().lock().unwrap().take() {
+            if let Some(c) = &h.client {
+                c.stop(); // 优雅 Logout（client.rs:169）
+            }
+            if let Some(s) = &h.server {
+                s.shutdown(); // 广播关闭（server.rs:225 起）
+            }
+        }
+        {
+            let mut st = tunnel_runtime_state().lock().unwrap();
+            st.starting = false;
+            st.running = false;
+            st.error = None;
+        }
+    }
+
+    /// M8-T039 P5：隧道运行态错误写入（状态行跨帧展示；auto_start 不回位
+    /// 的「保留 intent」语义由调用路径保证——校验失败先于落盘，不写 true）。
+    fn tunnel_set_error(&self, msg: &str) {
+        let mut st = tunnel_runtime_state().lock().unwrap();
+        st.starting = false;
+        st.running = false;
+        st.error = Some(msg.to_string());
     }
 }
 
