@@ -35,6 +35,7 @@ mod devices;
 mod domain;
 mod session;
 mod settings;
+mod tunnel;
 mod widgets;
 
 /// 中文语言代码。
@@ -150,6 +151,7 @@ pub static ALL: &[&[(&str, &str, &str)]] = &[
     devices::TABLE,
     domain::TABLE,
     session::TABLE,
+    tunnel::TABLE,
     widgets::TABLE,
 ];
 

@@ -3840,13 +3840,19 @@ struct KirinDeskApp {
     unattended_autostart: bool,
     /// M8-T037: 显示名「默认受控」——应用启动自动开启服务端（自动监听）。
     unattended_auto_server: bool,
-    // M8-T026: 内网穿透设置（Settings 页 Tunnel (内网穿透) 分组）
+    // M8-T026: 内网穿透设置（Tunnel 独立页，M8-T039；proxies 多行文本）。
     tunnel_enabled: bool,
     tunnel_mode: String,
     tunnel_server_addr: String,
     tunnel_token: String,
     tunnel_proxies: String,
     show_secret_tunnel_token: bool,
+    // M8-T039 新增（表单值，P3；运行态字段 tunnel_runtime_state 归 P5 追加）：
+    tunnel_bind_addrs: String, // 监听地址列表（逗号分隔，默认 "0.0.0.0,::"）
+    tunnel_bind_port: String,  // 端口（默认 "7000"）
+    tunnel_port_range: String, // 端口范围（默认 "60000-61000"）
+    tunnel_auto_start: bool,   // GUI 最后运行状态（§3.4.3，启动/停止写入，P5 消费）
+    tunnel_notice: String,     // 页面瞬态提示（「已保存」等）
     /// 本次启动是否由系统开机自启拉起（`--autostart`）——用于窗口最小化启动。
     autostart_launched: bool,
     /// 无人值守自动开启服务端是否已执行（一次性标记）。
@@ -3877,6 +3883,8 @@ enum Tab {
     Domain,
     Devices,
     Connect,
+    /// M8-T039：内网穿透独立页（通用 TCP 反向代理）。
+    Tunnel,
     Settings,
 }
 impl Default for Tab {
@@ -4402,6 +4410,7 @@ impl eframe::App for KirinDeskApp {
                     (Tab::Domain, "🌐", t!("session.tab.domain")),
                     (Tab::Devices, "🖥", t!("session.tab.devices")),
                     (Tab::Connect, "🔗", t!("session.tab.connect")),
+                    (Tab::Tunnel, "🚇", t!("tunnel.tab")),
                     (Tab::Settings, "⚙", t!("session.tab.settings")),
                 ] {
                     if selectable_pill(
@@ -4487,6 +4496,7 @@ impl eframe::App for KirinDeskApp {
             Tab::Domain => self.show_domain(ui, &theme),
             Tab::Devices => self.show_devices(ui, &theme),
             Tab::Connect => self.show_connect(ui, &theme),
+            Tab::Tunnel => self.show_tunnel(ui, &theme),
             Tab::Settings => self.show_settings(ui, &theme),
         });
 
@@ -5692,13 +5702,19 @@ impl KirinDeskApp {
             self.unattended_enabled = cfg.unattended.enabled;
             self.unattended_autostart = cfg.unattended.auto_start_on_boot;
             self.unattended_auto_server = cfg.unattended.auto_start_server;
-            // M8-T026: 内网穿透设置（Settings 页 Tunnel 分组回填；proxies 转多行文本）。
+            // M8-T026: 内网穿透设置（Tunnel 独立页回填；proxies 转多行文本）。
             self.tunnel_enabled = cfg.tunnel.enabled;
             self.tunnel_mode = cfg.tunnel.mode.clone();
             self.tunnel_server_addr = cfg.tunnel.server_addr.clone();
             self.tunnel_token = cfg.tunnel.token.clone();
             self.tunnel_proxies =
                 kirin_desk_utils::config::TunnelConfig::format_proxy_lines(&cfg.tunnel.proxies);
+            // M8-T039: Tunnel 页表单字段回填（Server 模式参数 + 最后运行状态；
+            // 运行态 auto_start 供 P5 首帧自动恢复，见 update() config_loaded 块）。
+            self.tunnel_bind_addrs = cfg.tunnel.bind_addrs.clone();
+            self.tunnel_bind_port = cfg.tunnel.bind_port.to_string();
+            self.tunnel_port_range = cfg.tunnel.port_range.clone();
+            self.tunnel_auto_start = cfg.tunnel.auto_start;
         }
         // M10-T003: 启动时加载已保存设备列表（文件不存在 → 空列表）。
         self.reload_devices();
@@ -8846,98 +8862,8 @@ impl KirinDeskApp {
             // Dashboard「服务端设置」、连接模式迁 Dashboard 工作模式按钮（M8-T034）、
             // 音频总开关与高危警告迁 Dashboard Server 卡（会话级 toggle / 挑战码
             // 所在页提示闭环）；静态 temp_mode 仅由 CLI/config 管理（GUI 无入口）。
-
-            // M8-T026 (TNL-CFG-004): 内网穿透设置——客户端填写 relay 服务器
-            // 地址 / token / 代理列表；服务端参数（bind_port/port_range/heartbeat）
-            // 不占 GUI，在 config/default.toml 配置，穿透服务端走 CLI `tunnel serve`。
-            egui::CollapsingHeader::new(t!("settings.tunnel.title")).show(ui, |ui| {
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(t!("settings.tunnel.desc"))
-                            .size(theme.small_size)
-                            .color(theme.fg_weak),
-                    )
-                    .selectable(false),
-                );
-                ui.add_space(4.0);
-                // M8-T036 (需求 4): 开启按钮 + Mode 两按钮同一行——「开启」为
-                // 颜色切换状态按钮（ON=品牌蓝 / OFF=灰，state_button），
-                // Client/Server 选中态同款高亮（原 segmented 语义不变）。
-                ui.horizontal(|ui| {
-                    let on = self.tunnel_enabled;
-                    let resp = state_button(ui, theme, t!("settings.tunnel.enable"), on)
-                        .on_hover_text(if on {
-                            t!("settings.tunnel.toggle_off_hint")
-                        } else {
-                            t!("settings.tunnel.toggle_on_hint")
-                        });
-                    if resp.clicked() {
-                        self.tunnel_enabled = !on;
-                    }
-                    let mut set_mode: Option<String> = None;
-                    for (label, is_sel, mode) in [
-                        ("Client", self.tunnel_mode != "server", "client"),
-                        ("Server", self.tunnel_mode == "server", "server"),
-                    ] {
-                        let r = state_button(ui, theme, label, is_sel);
-                        if r.clicked() {
-                            set_mode = Some(mode.to_string());
-                        }
-                    }
-                    if let Some(m) = set_mode {
-                        self.tunnel_mode = m;
-                    }
-                });
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(t!("settings.tunnel.mode_hint"))
-                            .size(theme.small_size)
-                            .color(theme.fg_weak),
-                    )
-                    .selectable(false),
-                );
-                ui.add_space(4.0);
-                labeled_input(
-                    ui,
-                    theme,
-                    t!("settings.tunnel.server_address"),
-                    &mut self.tunnel_server_addr,
-                    "relay.example.com:7000",
-                    Validity::None,
-                    None,
-                    true,
-                );
-                labeled_input(
-                    ui,
-                    theme,
-                    t!("settings.tunnel.token"),
-                    &mut self.tunnel_token,
-                    "required",
-                    Validity::None,
-                    Some(&mut self.show_secret_tunnel_token),
-                    false,
-                );
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(t!("settings.tunnel.proxies_label"))
-                            .size(theme.small_size)
-                            .color(theme.fg_weak),
-                    )
-                    .selectable(false),
-                );
-                egui::TextEdit::multiline(&mut self.tunnel_proxies)
-                    .desired_rows(3)
-                    .desired_width(ui.available_width())
-                    .show(ui);
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(t!("settings.tunnel.format_hint"))
-                            .size(theme.small_size)
-                            .color(theme.fg_weak),
-                    )
-                    .selectable(false),
-                );
-            });
+            // M8-T039: 「Tunnel (内网穿透)」分组整体移除——迁至顶部导航独立页
+            // （show_tunnel，Tab::Tunnel）；本页不再渲染（见 show_tunnel）。
 
             // M13-T005 (UA-UI-001): 无人值守模式卡片——总开关 + 子选项 +
             // 自启注册状态 + 安全提示。保存按钮统一落盘（见下方 Save 分支）。
@@ -9472,16 +9398,8 @@ impl KirinDeskApp {
                     cfg.unattended.enabled = self.unattended_enabled;
                     cfg.unattended.auto_start_server = self.unattended_auto_server;
                     cfg.unattended.auto_start_on_boot = self.unattended_autostart;
-                    // M8-T026 (TNL-CFG-004): 内网穿透设置持久化（proxies 多行文本
-                    // 解析回 Vec<TunnelProxy>；服务端参数保留配置默认值）。
-                    cfg.tunnel.enabled = self.tunnel_enabled;
-                    cfg.tunnel.mode = self.tunnel_mode.clone();
-                    cfg.tunnel.server_addr = self.tunnel_server_addr.clone();
-                    cfg.tunnel.token = self.tunnel_token.clone();
-                    cfg.tunnel.proxies =
-                        kirin_desk_utils::config::TunnelConfig::parse_proxy_lines(
-                            &self.tunnel_proxies,
-                        );
+                    // M8-T039: Tunnel 字段不再归 Settings 保存——迁移至 Tunnel 页
+                    // 独立「保存」（tunnel_save，不写 enabled / auto_start）。
                     match cfg.save() {
                         Ok(()) => {
                             // UI-IDWL-004: 审计新增永久 ID 条目（附 device_id）。
@@ -9540,6 +9458,161 @@ impl KirinDeskApp {
                 }
             });
         });
+    }
+
+    /// M8-T039 §3.1/§3.4：内网穿透独立页（通用 TCP 反向代理）。
+    fn show_tunnel(&mut self, ui: &mut egui::Ui, theme: &Theme) {
+        ui.heading(t!("tunnel.title"));
+        ui.separator();
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            // ── 定位说明（§3.4.1 文案，tunnel.desc）──
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(t!("tunnel.desc"))
+                        .size(theme.small_size)
+                        .color(theme.fg_weak),
+                )
+                .selectable(false),
+            );
+            ui.add_space(4.0);
+            // ── [开启] [Client] [Server]（迁移 Settings 组 8867-8890 逻辑）──
+            // 开启按钮仅改内存 tunnel_enabled；模式按钮写 tunnel_mode。
+            ui.horizontal(|ui| {
+                let on = self.tunnel_enabled;
+                let resp = state_button(ui, theme, t!("tunnel.enable"), on).on_hover_text(if on {
+                    t!("tunnel.enable_hint_on")
+                } else {
+                    t!("tunnel.enable_hint_off")
+                });
+                if resp.clicked() {
+                    self.tunnel_enabled = !on;
+                }
+                let mut set_mode: Option<String> = None;
+                for (label, is_sel, mode) in [
+                    ("Client", self.tunnel_mode != "server", "client"),
+                    ("Server", self.tunnel_mode == "server", "server"),
+                ] {
+                    let r = state_button(ui, theme, label, is_sel);
+                    if r.clicked() {
+                        set_mode = Some(mode.to_string());
+                    }
+                }
+                if let Some(m) = set_mode {
+                    self.tunnel_mode = m;
+                }
+            });
+            ui.add_space(4.0);
+            // ── 模式条件区块 ──
+            if self.tunnel_mode == "client" {
+                // Client 区块（全量，本任务实现）：Server Address / Token(👁) /
+                // Proxies 多行 + 格式提示（迁移 8904-8934 区域逻辑，键迁移改名）。
+                // Token 行保持现状（密文 + 👁），无 ✏️📋（P4 不得加）。
+                ui.heading(t!("tunnel.client.title"));
+                labeled_input(
+                    ui,
+                    theme,
+                    t!("tunnel.server_address"),
+                    &mut self.tunnel_server_addr,
+                    "relay.example.com:7000",
+                    Validity::None,
+                    None,
+                    true,
+                );
+                labeled_input(
+                    ui,
+                    theme,
+                    t!("tunnel.token"),
+                    &mut self.tunnel_token,
+                    "required",
+                    Validity::None,
+                    Some(&mut self.show_secret_tunnel_token),
+                    false,
+                );
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(t!("tunnel.proxies_label"))
+                            .size(theme.small_size)
+                            .color(theme.fg_weak),
+                    )
+                    .selectable(false),
+                );
+                egui::TextEdit::multiline(&mut self.tunnel_proxies)
+                    .desired_rows(3)
+                    .desired_width(ui.available_width())
+                    .show(ui);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(t!("tunnel.proxies_format"))
+                            .size(theme.small_size)
+                            .color(theme.fg_weak),
+                    )
+                    .selectable(false),
+                );
+            } else {
+                // Server 区块（结构占位，P4 认领）：
+                ui.heading(t!("tunnel.server.title"));
+                // ══ [P4 认领] Server 区块配置输入与校验（监听地址 / 端口 /
+                //    端口范围 / Token 行含 ✏️📋）══
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(t!("tunnel.server.placeholder"))
+                            .size(theme.small_size)
+                            .color(theme.fg_weak),
+                    )
+                    .selectable(false),
+                );
+            }
+            ui.separator();
+            // ── 保存（独立于 Settings 全局 Save）──
+            // 启用条件挂 tunnel_save_allowed()（P3 占位恒 true；P4 挂校验结果）。
+            if self.tunnel_save_allowed()
+                && action_button(
+                    ui,
+                    theme,
+                    ButtonKind::Primary,
+                    t!("tunnel.save"),
+                    ButtonState::Enabled,
+                )
+                .clicked()
+            {
+                self.tunnel_save();
+            }
+            if !self.tunnel_notice.is_empty() {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(&self.tunnel_notice)
+                            .size(theme.small_size)
+                            .color(theme.fg_weak),
+                    )
+                    .selectable(false),
+                );
+            }
+            // ══ [P5 认领] 运行控制区（▶ 启动 / ■ 停止 + 状态行）══
+        });
+    }
+
+    /// M8-T039：Tunnel 页保存（§3.4.3）——只落盘配置字段，不写 enabled / auto_start。
+    fn tunnel_save(&mut self) {
+        if let Ok(mut cfg) = kirin_desk_utils::config::Config::load() {
+            cfg.tunnel.mode = self.tunnel_mode.clone();
+            cfg.tunnel.server_addr = self.tunnel_server_addr.clone();
+            cfg.tunnel.token = self.tunnel_token.clone();
+            cfg.tunnel.bind_addrs = self.tunnel_bind_addrs.trim().to_string();
+            cfg.tunnel.bind_port = self.tunnel_bind_port.trim().parse().unwrap_or(7000);
+            cfg.tunnel.port_range = self.tunnel_port_range.trim().to_string();
+            cfg.tunnel.proxies =
+                kirin_desk_utils::config::TunnelConfig::parse_proxy_lines(&self.tunnel_proxies);
+            match cfg.save() {
+                Ok(()) => self.tunnel_notice = t!("tunnel.saved").to_string(),
+                Err(e) => self.tunnel_notice = tf!("tunnel.save_failed", e),
+            }
+        }
+    }
+
+    /// M8-T039：保存允许判定（P3 占位恒 true；P4 认领实现——挂
+    /// Server 区块输入校验结果，非法值禁用保存）。
+    fn tunnel_save_allowed(&self) -> bool {
+        true
     }
 }
 

@@ -6,7 +6,8 @@
 
 pub static TABLE: &[(&str, &str, &str)] = &[
     // ── 分组标题 ──
-    ("settings.tunnel.title", "内网穿透", "Tunnel (Intranet Traversal)"),
+    // M8-T039: `settings.tunnel.*` 全部键随 Settings Tunnel 分组整体删除——
+    // 内网穿透迁至顶部导航独立页（tunnel.rs 分区，键前缀 `tunnel.*`）。
     ("settings.unattended.title", "无人值守模式", "Unattended Mode"),
     ("settings.identity.title", "身份", "Identity"),
     ("settings.whitelist.title", "白名单", "Whitelist"),
@@ -17,27 +18,6 @@ pub static TABLE: &[(&str, &str, &str)] = &[
     // （R-12 基建单测引用），本页改用独立键。
     ("settings.about.title", "关于", "About"),
     ("settings.about.tagline", "P2P 远程桌面 — 安全直连。", "P2P Remote Desktop — secure direct connections."),
-
-    // ── Tunnel（内网穿透）──
-    ("settings.tunnel.desc",
-     "内网穿透：被控端主动出站连接公网 relay 服务器，把内网 TCP 服务（SSH/RDP/HTTP）映射到公网端口——P2P 直连不可达时的兜底。默认关闭，仅在有公网服务器（自建 relay）时启用。",
-     "Intranet traversal: the controlled end actively connects outbound to a public relay server, mapping intranet TCP services (SSH/RDP/HTTP) to public ports — the fallback when P2P direct connection is unreachable. Disabled by default; enable only when you have a public server (self-hosted relay)."),
-    ("settings.tunnel.enable", "开启", "Enable"),
-    ("settings.tunnel.toggle_on_hint",
-     "点击开启内网穿透（保存后生效）",
-     "Click to enable intranet traversal (takes effect after Save)"),
-    ("settings.tunnel.toggle_off_hint",
-     "点击关闭内网穿透（保存后生效）",
-     "Click to disable intranet traversal (takes effect after Save)"),
-    ("settings.tunnel.mode_hint",
-     "Client = 被控端主动出站（推荐）；Server = 公网 relay 服务端（也可用 CLI `tunnel serve`，服务端参数在 default.toml）。",
-     "Client = controlled end connects outbound (recommended); Server = public relay server (or use CLI `tunnel serve`; server parameters live in default.toml)."),
-    ("settings.tunnel.server_address", "服务器地址：", "Server Address:"),
-    ("settings.tunnel.token", "令牌：", "Token:"),
-    ("settings.tunnel.proxies_label", "Proxies（每行一个）：", "Proxies (one per line):"),
-    ("settings.tunnel.format_hint",
-     "格式：name|本地地址:端口|远端端口（远端端口留空 = 服务端自动分配）\ne.g. ssh|127.0.0.1:22|6022",
-     "Format: name|local_addr:port|remote_port (empty remote_port = auto-assigned by server)\ne.g. ssh|127.0.0.1:22|6022"),
 
     // ── Unattended Mode ──
     ("settings.unattended.desc",
