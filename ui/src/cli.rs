@@ -51,7 +51,7 @@ fn audit_temp_event(event: kirin_desk_utils::audit::AuditEvent, detail: &str) {
 async fn cmd_connect_id(device_id: &str) {
     use kirin_desk_core::connection::id_mode::{IdConnectError, IdConnector, IdModeConfig};
     use kirin_desk_core::crypto::handshake::{
-        client_handshake_with_confirm, CoreReason, PinExpectation,
+        client_handshake_with_confirm, PinExpectation,
     };
     use kirin_desk_utils::audit::AuditEvent;
     use std::sync::{Arc, Mutex};
@@ -1530,7 +1530,7 @@ async fn cmd_dns(args: Vec<String>) {
         // ── M8-T040 (WBS 7.2): `dns resolve <host> [--type A|AAAA|SRV|TXT]` ──
         // 经 DoH/DoT 加密解析（调试/验证面，需求 §八）；展示端点与耗时。
         "resolve" => {
-            use kirin_desk_dns::{RecordType as DnsRt, Resolver as _};
+            use kirin_desk_dns::RecordType as DnsRt;
             let host = args.get(3).map(|s| s.as_str()).unwrap_or("");
             if host.is_empty() {
                 println!("Usage: kirin_desk dns resolve <host> [--type A|AAAA|SRV|TXT]");
@@ -4981,7 +4981,7 @@ async fn cmd_self_test() {
             let mut ft_ok = false;
             let deadline = std::time::Instant::now() + Duration::from_secs(60);
             // 检查面板任务状态的辅助（发送完成/失败）。
-            let mut check_panel =
+            let check_panel =
                 |ft_ok: &mut bool, panel: &std::sync::MutexGuard<'_, super::FilePanelState>| {
                     if let Some(t) = panel.tasks.iter().find(|t| t.name == "roundtrip.bin") {
                         match &t.status {
@@ -5212,7 +5212,7 @@ async fn cmd_self_test() {
                     .connect_stream(&info2, "alice-device")
                     .await
                     .unwrap();
-                let mut ch2 = client_handshake_with_confirm_generic(
+                let ch2 = client_handshake_with_confirm_generic(
                     stream2,
                     &alice,
                     "alice",
