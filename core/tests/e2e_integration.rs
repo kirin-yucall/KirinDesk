@@ -68,8 +68,7 @@ fn test_e2e_connection_state_machine() {
 
         mgr.apply_event(&ConnectionEvent::ConnectRequest {
             peer_id: "remote-pc".to_string(),
-            ipv6: "2001:db8::1".parse().unwrap(),
-            port: 3389,
+            addr: std::net::SocketAddr::new("2001:db8::1".parse().unwrap(), 3389),
         }).await;
         assert_eq!(mgr.get("remote-pc").await.unwrap().state, ConnectionState::Resolving);
 

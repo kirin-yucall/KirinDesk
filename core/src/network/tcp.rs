@@ -1,4 +1,4 @@
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -36,8 +36,8 @@ pub enum TcpError {
 ///
 /// M8-T033：双栈监听。`[::]` 监听在 Windows 上为 IPv6-only（v4 连接被拒），
 /// 故按「v6 双栈 → v6-only + v4 双监听 → 仅 v4」逐级回退，保证 v4 客户端
-/// 可连（详见 [`TcpServer::bind`]）。`accept` 把 v4 连接统一映射为
-/// v4-mapped v6（`::ffff:a.b.c.d`），调用方签名不变。
+/// 可连（详见 [`TcpServer::bind`]）。R-19b：`accept` 返回 `SocketAddr`，
+/// v4-mapped v6（`::ffff:a.b.c.d`）在事件层呈现为真实 v4 地址（前缀剥离）。
 pub struct TcpServer {
     /// 主监听：v6 双栈（v4-mapped 承接 v4）或 v6-only。
     v6: Option<TcpListener>,
@@ -161,9 +161,10 @@ impl TcpServer {
             })
     }
 
-    /// Accept 一条入站连接。v4 连接映射为 v4-mapped v6（`::ffff:a.b.c.d`），
-    /// 下游限速/审计经 `IpAddr::to_canonical()` 还原 v4，行为不变。
-    pub async fn accept(&self) -> Result<(TcpStream, SocketAddrV6), TcpError> {
+    /// Accept 一条入站连接。R-19b：返回 `SocketAddr`（v4/v6 统一视角）——
+    /// v4-mapped v6（`::ffff:a.b.c.d`）呈现为真实 v4（`map_addr` 前缀剥离），
+    /// 原生 v6 保持不变；下游限速/审计无需再 `to_canonical()`（幂等，兼容旧路径）。
+    pub async fn accept(&self) -> Result<(TcpStream, SocketAddr), TcpError> {
         let (stream, addr) = match (&self.v6, &self.v4) {
             (Some(v6), Some(v4)) => {
                 tokio::select! {
@@ -183,28 +184,16 @@ impl TcpServer {
         Ok((stream, Self::map_addr(addr)))
     }
 
-    /// 把 accept 得到的 [`SocketAddr`] 统一映射为 v6（v4 → v4-mapped）。
-    fn map_addr(addr: SocketAddr) -> SocketAddrV6 {
+    /// 把 accept 得到的 [`SocketAddr`] 规范化为事件层统一视角（R-19b）：
+    /// v4 保持 v4；v4-mapped v6（`::ffff:a.b.c.d`）还原为真实 v4 地址
+    /// （前缀剥离）；原生 v6 保持不变。
+    fn map_addr(addr: SocketAddr) -> SocketAddr {
         match addr {
-            SocketAddr::V6(v6) => v6,
-            SocketAddr::V4(v4) => {
-                let octets = v4.ip().octets();
-                SocketAddrV6::new(
-                    Ipv6Addr::new(
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0xffff,
-                        (octets[0] as u16) << 8 | octets[1] as u16,
-                        (octets[2] as u16) << 8 | octets[3] as u16,
-                    ),
-                    v4.port(),
-                    0,
-                    0,
-                )
-            }
+            SocketAddr::V4(v4) => SocketAddr::V4(v4),
+            SocketAddr::V6(v6) => match v6.ip().to_canonical() {
+                IpAddr::V4(v4) => SocketAddr::new(IpAddr::V4(v4), v6.port()),
+                IpAddr::V6(_) => SocketAddr::V6(v6),
+            },
         }
     }
 
@@ -343,9 +332,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_dual_stack_accepts_ipv4() {
-        // M8-T033: 双栈路径（v6 双栈或 v6-only+v4 双监听）下 v4 回环可连
-        // TcpServer，且 accept 把 v4 地址映射为 v4-mapped v6 —— 下游限速/
-        // 审计 `to_canonical()` 还原 v4，行为不变。
+        // M8-T033 + R-19b: 双栈路径（v6 双栈或 v6-only+v4 双监听）下 v4 回环
+        // 可连 TcpServer；R-19b 起 accept 把 v4 连接呈现为**真实 v4 地址**
+        // （不再 v4-mapped v6 `::ffff:` 前缀），事件层视角 v4/v6 统一。
         let server = TcpServer::bind(0).await.unwrap();
         let port = server.port();
         let handle = tokio::spawn(async move {
@@ -354,13 +343,13 @@ mod tests {
         let remote = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
         let stream = TcpClient::connect(remote).await.unwrap();
         let (_stream, addr) = handle.await.unwrap();
-        // v4 连接 → v4-mapped v6（`::ffff:127.0.0.1`），下游 canonical 化还原 v4。
-        let octets = addr.ip().octets();
-        assert_eq!(&octets[..10], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-        assert_eq!(&octets[10..12], &[0xff, 0xff]);
-        assert_eq!(
-            addr.ip().to_canonical(),
-            std::net::IpAddr::from(Ipv4Addr::LOCALHOST)
+        // v4 连接 → 真实 v4 地址（`127.0.0.1`，端口为客户端临时源端口），
+        // 无 `::ffff:` 前缀。
+        assert_eq!(addr.ip(), remote.ip(), "v4 连接应呈现为真实 v4 地址");
+        assert!(matches!(addr, SocketAddr::V4(_)));
+        assert!(
+            !addr.ip().to_string().starts_with("::ffff:"),
+            "不应残留 v4-mapped 前缀: {addr}"
         );
         assert!(stream.peer_addr().is_ok());
     }
@@ -370,12 +359,16 @@ mod tests {
         let server = TcpServer::bind(0).await.unwrap();
         let port = server.port();
         let handle = tokio::spawn(async move {
-            server.accept().await.unwrap();
+            server.accept().await.unwrap()
         });
         let remote = SocketAddr::from((Ipv6Addr::LOCALHOST, port));
         let stream = TcpClient::connect(remote).await.unwrap();
+        // R-19b：原生 v6 路径零回归——accept 呈现的仍是 v6 地址（[::1]，
+        // 端口为客户端临时源端口）。
+        let (_stream, addr) = handle.await.unwrap();
+        assert_eq!(addr.ip(), remote.ip(), "原生 v6 连接应原样呈现");
+        assert!(matches!(addr, SocketAddr::V6(_)));
         assert!(stream.peer_addr().is_ok());
-        handle.await.unwrap();
     }
 
     // ── R-31：set_nodelay 辅助（审计 §4-3，Windows Nagle 小包滞留） ──

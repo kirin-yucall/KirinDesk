@@ -6764,7 +6764,9 @@ impl KirinDeskApp {
     #[allow(clippy::too_many_arguments)]
     async fn handle_incoming_connection(
         stream: tokio::net::TcpStream,
-        addr: std::net::SocketAddrV6,
+        // R-19b: accept 返回 SocketAddr（v4/v6 统一视角，v4-mapped 已呈现为
+        // 真实 v4）——与 `TcpServer::accept` 新签名对齐。
+        addr: std::net::SocketAddr,
         cfg: kirin_desk_utils::config::Config,
         skip_whitelist: bool,
         unattended: bool,

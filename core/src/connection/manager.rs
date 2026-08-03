@@ -1,5 +1,5 @@
 use crate::connection::client::ConnectionOptions;
-use std::net::Ipv6Addr;
+use std::net::{IpAddr, SocketAddr};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
@@ -30,10 +30,11 @@ impl std::fmt::Display for ConnectionState {
 /// Events that trigger state transitions.
 #[derive(Debug, Clone)]
 pub enum ConnectionEvent {
+    /// R-19b：地址字段泛化为 `SocketAddr`（v4/v6 统一，对齐 M8-T025-P2 模式）。
+    /// 事件层应用 [`canonical_addr`] 规范化——v4-mapped v6 呈现为真实 v4。
     ConnectRequest {
         peer_id: String,
-        ipv6: Ipv6Addr,
-        port: u16,
+        addr: SocketAddr,
     },
     DnsResolved,
     HandshakeSuccess,
@@ -60,8 +61,8 @@ pub struct ReconnectContext {
 pub struct ManagedConnection {
     pub state: ConnectionState,
     pub peer_id: String,
-    pub peer_ipv6: Option<Ipv6Addr>,
-    pub peer_port: Option<u16>,
+    /// R-19b：对端地址（v4/v6 统一视角，v4-mapped 已规范化为真实 v4）。
+    pub peer_addr: Option<SocketAddr>,
     pub reconnect_attempts: u32,
     pub max_reconnect_attempts: u32,
     /// R-03 (R03-S2)：重连上下文（`attempt_reconnect` 据此重建连接）。
@@ -73,8 +74,7 @@ impl std::fmt::Debug for ManagedConnection {
         f.debug_struct("ManagedConnection")
             .field("state", &self.state)
             .field("peer_id", &self.peer_id)
-            .field("peer_ipv6", &self.peer_ipv6)
-            .field("peer_port", &self.peer_port)
+            .field("peer_addr", &self.peer_addr)
             .field("reconnect_attempts", &self.reconnect_attempts)
             .field("max_reconnect_attempts", &self.max_reconnect_attempts)
             .field(
@@ -90,8 +90,7 @@ impl ManagedConnection {
         Self {
             state: ConnectionState::Idle,
             peer_id: peer_id.into(),
-            peer_ipv6: None,
-            peer_port: None,
+            peer_addr: None,
             reconnect_attempts: 0,
             max_reconnect_attempts: 5,
             reconnect_ctx: None,
@@ -119,15 +118,10 @@ impl ManagedConnection {
         match (&self.state, event) {
             (
                 ConnectionState::Idle,
-                ConnectionEvent::ConnectRequest {
-                    peer_id,
-                    ipv6,
-                    port,
-                },
+                ConnectionEvent::ConnectRequest { peer_id, addr },
             ) => {
                 self.peer_id = peer_id.clone();
-                self.peer_ipv6 = Some(*ipv6);
-                self.peer_port = Some(*port);
+                self.peer_addr = Some(canonical_addr(*addr));
                 self.transition_to(ConnectionState::Resolving);
             }
             (ConnectionState::Resolving, ConnectionEvent::DnsResolved) => {
@@ -166,6 +160,16 @@ impl ManagedConnection {
             self.peer_id, self.state, new_state
         );
         self.state = new_state;
+    }
+}
+
+/// R-19b：事件层地址规范化——v4-mapped v6（`::ffff:a.b.c.d`）呈现为真实 v4
+/// 地址（前缀剥离），原生 v6 保持不变。保证事件层视角 v4/v6 统一（与传输层
+/// 双栈能力一致；即使调用方直接构造 v4-mapped 地址，事件层亦不泄漏该形态）。
+fn canonical_addr(addr: SocketAddr) -> SocketAddr {
+    match addr.ip().to_canonical() {
+        IpAddr::V4(v4) => SocketAddr::new(IpAddr::V4(v4), addr.port()),
+        IpAddr::V6(v6) => SocketAddr::new(IpAddr::V6(v6), addr.port()),
     }
 }
 
@@ -227,7 +231,7 @@ impl Default for ConnectionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv6Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 
     #[test]
     fn test_state_transitions() {
@@ -235,8 +239,7 @@ mod tests {
 
         conn.apply_event(&ConnectionEvent::ConnectRequest {
             peer_id: "test-peer".to_string(),
-            ipv6: "2001:db8::1".parse().unwrap(),
-            port: 3389,
+            addr: SocketAddr::new("2001:db8::1".parse().unwrap(), 3389),
         });
         assert_eq!(conn.state, ConnectionState::Resolving);
 
@@ -271,8 +274,7 @@ mod tests {
         let mut conn = ManagedConnection::new("test-peer");
         conn.apply_event(&ConnectionEvent::ConnectRequest {
             peer_id: "test-peer".to_string(),
-            ipv6: "2001:db8::1".parse().unwrap(),
-            port: 3389,
+            addr: SocketAddr::new("2001:db8::1".parse().unwrap(), 3389),
         });
         conn.apply_event(&ConnectionEvent::DnsResolved);
         conn.apply_event(&ConnectionEvent::HandshakeSuccess);
@@ -282,5 +284,91 @@ mod tests {
         // 幂等：再次调用不改变状态。
         conn.enter_reconnecting();
         assert_eq!(conn.state, ConnectionState::Reconnecting);
+    }
+
+    // ── R-19b：v4/v6 混合用例（地址字段泛化为 SocketAddr + v4-mapped 规范化） ──
+
+    /// v4 对端事件 → 事件层呈现为真实 v4 地址（非 `::ffff:` 前缀）。
+    #[test]
+    fn test_connect_request_v4_presented_as_v4() {
+        let mut conn = ManagedConnection::new("v4-peer");
+        conn.apply_event(&ConnectionEvent::ConnectRequest {
+            peer_id: "v4-peer".to_string(),
+            addr: SocketAddr::new(Ipv4Addr::new(192, 168, 1, 50).into(), 3389),
+        });
+        let addr = conn.peer_addr.expect("peer_addr 应已登记");
+        assert_eq!(
+            addr,
+            SocketAddr::new(Ipv4Addr::new(192, 168, 1, 50).into(), 3389)
+        );
+        assert!(
+            matches!(addr, SocketAddr::V4(_)),
+            "v4 对端应呈现为 v4 地址: {addr}"
+        );
+        assert!(
+            !addr.ip().to_string().starts_with("::ffff:"),
+            "不应残留 v4-mapped 前缀: {addr}"
+        );
+    }
+
+    /// 调用方直接构造 v4-mapped v6（`::ffff:203.0.113.7`）→ 事件层规范化
+    /// 为真实 v4（前缀剥离）。
+    #[test]
+    fn test_connect_request_v4_mapped_canonicalized() {
+        let mut conn = ManagedConnection::new("mapped-peer");
+        let v4_mapped = SocketAddrV6::new(
+            Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0xcb00, 0x7107), // ::ffff:203.0.113.7
+            8080,
+            0,
+            0,
+        );
+        assert!(v4_mapped.ip().to_string().starts_with("::ffff:"));
+        conn.apply_event(&ConnectionEvent::ConnectRequest {
+            peer_id: "mapped-peer".to_string(),
+            addr: SocketAddr::V6(v4_mapped),
+        });
+        let addr = conn.peer_addr.expect("peer_addr 应已登记");
+        assert_eq!(
+            addr,
+            SocketAddr::new(Ipv4Addr::new(203, 0, 113, 7).into(), 8080),
+            "v4-mapped 应呈现为真实 v4"
+        );
+        assert!(!addr.ip().to_string().starts_with("::ffff:"));
+    }
+
+    /// 原生 v6 事件 → 事件层原样保留 v6（既有 IPv6 路径零回归）。
+    #[test]
+    fn test_connect_request_v6_preserved() {
+        let mut conn = ManagedConnection::new("v6-peer");
+        let v6 = SocketAddr::new("2001:db8::1".parse().unwrap(), 3389);
+        conn.apply_event(&ConnectionEvent::ConnectRequest {
+            peer_id: "v6-peer".to_string(),
+            addr: v6,
+        });
+        let addr = conn.peer_addr.expect("peer_addr 应已登记");
+        assert_eq!(addr, v6);
+        assert!(matches!(addr, SocketAddr::V6(_)));
+    }
+
+    /// canonical_addr 纯函数：v4-mapped 剥离前缀；原生 v4/v6 原样。
+    #[test]
+    fn test_canonical_addr_mixed() {
+        // v4 原样。
+        let v4 = SocketAddr::new(Ipv4Addr::new(10, 0, 0, 1).into(), 22);
+        assert_eq!(canonical_addr(v4), v4);
+        // 原生 v6 原样。
+        let v6 = SocketAddr::new("2001:db8::2".parse().unwrap(), 22);
+        assert_eq!(canonical_addr(v6), v6);
+        // v4-mapped v6 → 真实 v4。
+        let mapped = SocketAddrV6::new(
+            Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x0a00, 0x0001), // ::ffff:10.0.0.1
+            22,
+            0,
+            0,
+        );
+        assert_eq!(canonical_addr(SocketAddr::V6(mapped)), v4);
+        // v4 SocketAddrV4 分支直接覆盖。
+        let v4_direct = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 22);
+        assert_eq!(canonical_addr(SocketAddr::V4(v4_direct)), v4);
     }
 }
