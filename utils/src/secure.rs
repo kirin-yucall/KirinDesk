@@ -3,7 +3,8 @@
 //! 审计背景（`功能审计报告_2026-08-02.md` §4 P2-9 / M15-T005 / UI-SET-010）：
 //! GoDaddy API Key/Secret、relay token 等敏感字段明文存配置。本模块提供
 //! 密文格式、主密钥来源分层与脱敏工具；`config.rs` 字段接线与旧配置迁移
-//! （R13-S1 后半 / R13-S3）随波次 2 合并后落地。
+//! （R13-S1 后半 / R13-S3）已由 R-13b 落地（`config.rs::Config::load_from` /
+//! `save_to` 加密域接线，见 `task_docs/修复任务/W1_R-13b_配置加密接线.md`）。
 //!
 //! # 密文格式
 //!
@@ -37,7 +38,9 @@ use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use sha2::Sha256;
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// 环境变量名：配置加密口令（任何平台可设；优先级高于平台密钥环）。
 pub const ENV_CONFIG_KEY: &str = "KIRIN_CONFIG_KEY";
@@ -239,6 +242,72 @@ impl KeyProvider {
     pub fn source(&self) -> KeySource {
         self.source
     }
+}
+
+impl KeySource {
+    /// 人类可读标签（`config show` 加密状态行 / 日志）。
+    pub fn label(self) -> &'static str {
+        match self {
+            KeySource::EnvPassphrase => "env KIRIN_CONFIG_KEY (PBKDF2)",
+            KeySource::WindowsDpapi => "Windows DPAPI",
+            KeySource::MacosKeychain => "macOS Keychain",
+            KeySource::Plaintext => "plaintext (no key source)",
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════
+// R-13b: 进程内按配置目录缓存的主密钥提供者 + 字段级加解密助手
+// ════════════════════════════════════════════════════════════════
+
+/// 按配置目录缓存的主密钥提供者（进程内每目录解析一次；真实场景单一配置
+/// 目录，测试多目录各自一致）。线程安全（OnceLock + Mutex）。
+static KEY_PROVIDERS: OnceLock<Mutex<HashMap<PathBuf, Arc<KeyProvider>>>> = OnceLock::new();
+
+/// 解析（或复用）指定配置目录的主密钥提供者。
+///
+/// Windows 下首次调用会在 `dir` 内创建 DPAPI 主密钥 blob（`kirin_config_key.dpapi`）；
+/// 无可用密钥源 → fail-open [`KeySource::Plaintext`]（启动醒目警告一次）。
+pub fn key_provider_for(dir: &Path) -> Arc<KeyProvider> {
+    let map = KEY_PROVIDERS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(p) = guard.get(dir) {
+        return Arc::clone(p);
+    }
+    let p = Arc::new(KeyProvider::load(dir));
+    guard.insert(dir.to_path_buf(), Arc::clone(&p));
+    p
+}
+
+/// 用提供者加密单字段（`{v:...}`）；无密钥（fail-open 明文模式）→ 原样返回。
+pub fn encrypt_with_provider(
+    provider: &KeyProvider,
+    plaintext: &str,
+    context: &str,
+) -> Result<String, SecureError> {
+    match provider.key() {
+        Some(key) => encrypt_to_string(key, plaintext, context),
+        None => Ok(plaintext.to_string()),
+    }
+}
+
+/// 解密单字段：密文 `{v:...}` → 明文；非密文格式（旧明文）→ 原样返回
+/// （迁移候选，由调用方决定重写）；密钥缺失 → [`SecureError::KeyUnavailable`]；
+/// 密钥错误/篡改 → [`SecureError::Decrypt`]。
+pub fn decrypt_field(
+    provider: &KeyProvider,
+    value: &str,
+    context: &str,
+) -> Result<String, SecureError> {
+    if !looks_encrypted(value) {
+        return Ok(value.to_string());
+    }
+    let key = provider.key().ok_or_else(|| {
+        SecureError::KeyUnavailable(format!(
+            "ciphertext field '{context}' cannot be decrypted without a key source"
+        ))
+    })?;
+    decrypt_from_string(key, value, context)
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -908,5 +977,87 @@ mod tests {
         let k2 = dpapi::load_or_create_key(&dir).unwrap();
         assert_eq!(k1, k2);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------- R-13b: 按目录缓存提供者 + 字段级助手 ----------
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn key_provider_for_caches_per_dir() {
+        let _g = env_lock().lock().unwrap();
+        std::env::remove_var(ENV_CONFIG_KEY);
+        let dir = temp_dir("cache");
+        let p1 = key_provider_for(&dir);
+        let p2 = key_provider_for(&dir);
+        assert!(std::ptr::eq(Arc::as_ptr(&p1), Arc::as_ptr(&p2)), "同目录缓存复用");
+        assert_eq!(p1.source(), KeySource::WindowsDpapi);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn encrypt_with_provider_plaintext_fail_open() {
+        // 无密钥提供者（构造：Plaintext 源）→ 原样返回，不加密。
+        let p = KeyProvider {
+            key: None,
+            source: KeySource::Plaintext,
+        };
+        assert_eq!(
+            encrypt_with_provider(&p, "tok", "tunnel.token").unwrap(),
+            "tok"
+        );
+        // 有密钥 → 密文格式，可解密回原文。
+        let p2 = KeyProvider {
+            key: Some(test_key()),
+            source: KeySource::EnvPassphrase,
+        };
+        let ct = encrypt_with_provider(&p2, "tok", "tunnel.token").unwrap();
+        assert!(looks_encrypted(&ct));
+        assert_eq!(decrypt_from_string(&test_key(), &ct, "tunnel.token").unwrap(), "tok");
+    }
+
+    #[test]
+    fn decrypt_field_plaintext_passthrough() {
+        // 旧明文（非密文格式）→ 原样返回（迁移候选由调用方处理）。
+        let p = KeyProvider {
+            key: Some(test_key()),
+            source: KeySource::EnvPassphrase,
+        };
+        assert_eq!(decrypt_field(&p, "legacy-plain", "godaddy.api_key").unwrap(), "legacy-plain");
+        assert_eq!(decrypt_field(&p, "", "godaddy.api_key").unwrap(), "");
+    }
+
+    #[test]
+    fn decrypt_field_ciphertext_roundtrip_and_errors() {
+        let p = KeyProvider {
+            key: Some(test_key()),
+            source: KeySource::EnvPassphrase,
+        };
+        let ct = encrypt_to_string(&test_key(), "s3cr3t", "tunnel.token").unwrap();
+        assert_eq!(decrypt_field(&p, &ct, "tunnel.token").unwrap(), "s3cr3t");
+        // 篡改 → Decrypt。
+        let mut body = B64.decode(&ct[3..ct.len() - 1]).unwrap();
+        body[0] ^= 0xFF;
+        let tampered = format!("{VERSION_PREFIX}{}}}", B64.encode(&body));
+        assert!(matches!(
+            decrypt_field(&p, &tampered, "tunnel.token"),
+            Err(SecureError::Decrypt)
+        ));
+        // 无密钥源 → KeyUnavailable。
+        let no_key = KeyProvider {
+            key: None,
+            source: KeySource::Plaintext,
+        };
+        assert!(matches!(
+            decrypt_field(&no_key, &ct, "tunnel.token"),
+            Err(SecureError::KeyUnavailable(_))
+        ));
+    }
+
+    #[test]
+    fn key_source_labels() {
+        assert!(KeySource::EnvPassphrase.label().contains("KIRIN_CONFIG_KEY"));
+        assert!(KeySource::WindowsDpapi.label().contains("DPAPI"));
+        assert!(KeySource::MacosKeychain.label().contains("Keychain"));
+        assert!(KeySource::Plaintext.label().contains("plaintext"));
     }
 }

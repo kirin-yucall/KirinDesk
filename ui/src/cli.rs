@@ -793,6 +793,20 @@ fn cmd_config() {
                 c.unattended.auto_start_server,
                 kirin_desk_utils::autostart::is_installed()
             );
+            // R-13b (S3)：配置加密状态 + 隧道令牌脱敏显示——密钥/令牌不进
+            // `config show` 输出（落盘密文 `{v:...}` 也不显示；仅状态与掩码）。
+            let key_dir = Config::config_dir().unwrap_or_else(|_| std::env::temp_dir());
+            let provider = kirin_desk_utils::secure::key_provider_for(&key_dir);
+            println!(
+                "Encryption:    {} ({})",
+                provider.source().label(),
+                if provider.key().is_some() {
+                    "enabled"
+                } else {
+                    "disabled — sensitive fields stored in plaintext (see warning)"
+                }
+            );
+            println!("Tunnel Token:  {}", mask(&c.tunnel.token));
         }
         Err(_) => {
             println!("No config. Run 'kirin_desk setup'");

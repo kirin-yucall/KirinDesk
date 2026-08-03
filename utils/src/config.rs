@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::secure;
+
 /// M15-T003: 白名单条目 — 域名模式 + 可选过期时间。
 ///
 /// 模式支持 `*.example.com` 通配前缀（匹配 `example.com` 及其任意子域）；
@@ -632,7 +634,9 @@ fn default_api_url() -> String {
 /// - `provider`：当前激活服务商注册表键名（默认 "godaddy"；UI 下拉框 / CLI
 ///   `dns list-providers` 的数据源为 `dns_providers::dns_provider_defs()`）。
 /// - `providers`：每服务商独立凭据表（`[dns.providers.*]`，原始字符串，
-///   敏感字段对接 M15-T005 加密，未启用时明文+文件权限告警）。
+///   R-13b 起敏感字段（`api_key`/`api_secret`/`api_token`/`token` 等，见
+///   [`SENSITIVE_DNS_FIELD_KEYS`]）经 `secure.rs` 密文落盘 `{v:...}`，
+///   加载时解密为内存明文；非敏感 key（domain/region 等）保持明文。
 ///
 /// 迁移：旧 `[godaddy]` 表（api_key/api_secret/api_url）在加载时自动迁入
 /// `[dns.providers.godaddy]` 并写回（见 `Config::load_from`）；`[godaddy]`
@@ -881,6 +885,7 @@ impl Config {
     /// 条件：`[dns.providers]` 尚无 "godaddy" 条目 且 旧段 api_key/api_secret
     /// 任一非空。迁移仅搬 api_key/api_secret/api_url（Credential::Godaddy
     /// 字段）；`domain` 留在 `[godaddy]`（设备级域名，CLI 兼容读）。
+    /// 内存态搬运（R-13b：落盘时经 `save_to` 加密，不再明文落盘）。
     /// 返回 `true` = 本次发生了迁移（调用方应写回）。
     pub fn migrate_legacy_godaddy(&mut self) -> bool {
         if self.dns.providers.contains_key("godaddy") {
@@ -1188,11 +1193,20 @@ impl Config {
                 path: path.to_path_buf(),
                 detail: e.to_string(),
             })?;
+        // R-13b (R13-S1/S2)：解密敏感字段（密文 → 内存明文）；旧明文非空
+        // 字段 → 迁移候选。解密失败（密钥丢失/篡改）→ fail-closed 拒绝加载。
+        let plaintext_detected = decrypt_sensitive_fields(&mut config, &Self::key_dir(path))?;
         // M9-DNS000 (§4.2): 旧 `[godaddy]` 表 → `[dns.providers.godaddy]`
         // 自动迁移（仅当新段缺失且旧段有值时；迁移后写回，用户可见）。
-        if config.migrate_legacy_godaddy() {
+        let migrated = config.migrate_legacy_godaddy();
+        // R-13b (R13-S2)：旧明文/旧结构 → 首次加载自动加密重写。写回失败
+        // 走显式告警路径（R-13 设计定稿）：`write_private` 原子替换保证磁盘
+        // 不被半写坏；内存态配置继续可用，不阻断。
+        if plaintext_detected || migrated {
             if let Err(e) = config.save_to(path) {
-                tracing::warn!("Config: legacy [godaddy] migration write-back failed: {e}");
+                tracing::warn!(
+                    "Config: 敏感字段加密迁移写回失败（原文件未被修改，内存态配置继续可用）: {e}"
+                );
             }
         }
         tracing::debug!("Config: successfully parsed from {:?}", path);
@@ -1210,8 +1224,18 @@ impl Config {
     /// S-07 (F-8): 经 `fsutil::write_private` 落盘——Unix 0600 + 父目录 0700 +
     /// O_NOFOLLOW + 原子替换（config 含 challenge/token/GoDaddy 凭据，同机
     /// 低权限用户不可读）；父目录由 write_private 自动创建。
+    ///
+    /// R-13b (R13-S1): 保存前对敏感字段（`[godaddy]` api_key/api_secret、
+    /// `[tunnel]` token、`device.challenge_code`、`[dns.providers.*]` 敏感
+    /// key）经 `secure.rs` 加密为 `{v: base64(nonce‖ciphertext)}` 再序列化——
+    /// 落盘形态无明文；AAD 绑定配置段上下文。密钥环缺失（Linux 无桌面
+    /// 密钥环且未设 KIRIN_CONFIG_KEY）→ fail-open 明文 + 醒目告警
+    /// （`KeyProvider::load` 一次性输出，不阻断开发使用）。
     pub fn save_to(&self, path: &std::path::Path) -> Result<(), ConfigError> {
-        let content = toml::to_string_pretty(self)
+        let mut clone = self.clone();
+        let provider = secure::key_provider_for(&Self::key_dir(path));
+        encrypt_sensitive_fields(&mut clone, &provider)?;
+        let content = toml::to_string_pretty(&clone)
             .map_err(|e| ConfigError::SerializeError(e.to_string()))?;
         crate::fsutil::write_private(path, content.as_bytes())
             .map_err(|e| ConfigError::IoError {
@@ -1592,6 +1616,161 @@ pub enum ConfigError {
     SerializeError(String),
     #[error("No home/config directory found")]
     NoHomeDir,
+    /// R-13b: 敏感字段加密失败（保存前）。密钥在握但加密失败 → 拒绝落盘
+    /// （fail-closed，不写可能泄露的明文）。
+    #[error("配置敏感字段加密失败（{field}）：{reason}")]
+    Encrypt { field: String, reason: String },
+    /// R-13b: 敏感字段解密失败（加载时）。密文无法用当前主密钥解密（主密钥
+    /// 变更/丢失——重装系统、更换用户或修改 KIRIN_CONFIG_KEY——或密文被篡改）。
+    /// fail-closed：拒绝加载，避免把密文当凭据使用。
+    #[error(
+        "配置敏感字段解密失败（{field}）：{reason}——主密钥可能已变更/丢失 \
+         （重装系统、更换 Windows 用户或修改 KIRIN_CONFIG_KEY），或密文被篡改"
+    )]
+    Decrypt { field: String, reason: String },
+}
+
+// ════════════════════════════════════════════════════════════════
+// R-13b: 配置加密域（接线 `utils/src/secure.rs`，密文 `{v: base64(nonce‖ct)}`）
+// ════════════════════════════════════════════════════════════════
+
+/// `[dns.providers.*]` 段中入加密域的字段 key。
+///
+/// 依据：`dns_providers.rs` 注册表 `secret: true` 的字段 key 全量 + 审计点名的
+/// GoDaddy `api_key`/`api_secret`（旧 `[godaddy]` 段两字段均入加密域，
+/// 见 `功能审计报告_2026-08-03.md` §2-P2-9）。非敏感 key（domain、region、
+/// access_key_id 等标识性字段）保持明文。drift 由
+/// `test_sensitive_key_list_covers_registry_secret_fields` 守护。
+const SENSITIVE_DNS_FIELD_KEYS: &[&str] = &[
+    "api_key",
+    "api_secret",
+    "api_token",
+    "token",
+    "secret_key",
+    "secret_access_key",
+    "access_key_secret",
+    "client_secret",
+    "app_secret",
+    "consumer_key",
+    "api_password",
+    "domain_key",
+    "service_account_json",
+];
+
+/// 是否 `[dns.providers.*]` 段的敏感字段 key（入加密域）。
+fn is_sensitive_dns_field(key: &str) -> bool {
+    SENSITIVE_DNS_FIELD_KEYS.contains(&key)
+}
+
+/// 敏感字段 AAD 上下文（配置段点分路径，如 `godaddy.api_key`、
+/// `dns.providers.cloudflare.api_token`）——防止密文跨字段/跨段替换。
+fn field_context(section: &str, key: &str) -> String {
+    format!("{section}.{key}")
+}
+
+/// R-13b: 保存前加密全部敏感字段（原地修改；fail-open 明文模式原样保留，
+/// 密钥来源解析时的醒目警告即「按设计告警可用」路径）。
+fn encrypt_sensitive_fields(
+    cfg: &mut Config,
+    provider: &secure::KeyProvider,
+) -> Result<(), ConfigError> {
+    let encrypt = |value: &str, ctx: &str| -> Result<String, ConfigError> {
+        secure::encrypt_with_provider(provider, value, ctx).map_err(|e| ConfigError::Encrypt {
+            field: ctx.to_string(),
+            reason: e.to_string(),
+        })
+    };
+    cfg.godaddy.api_key = encrypt(&cfg.godaddy.api_key, &field_context("godaddy", "api_key"))?;
+    cfg.godaddy.api_secret =
+        encrypt(&cfg.godaddy.api_secret, &field_context("godaddy", "api_secret"))?;
+    cfg.tunnel.token = encrypt(&cfg.tunnel.token, &field_context("tunnel", "token"))?;
+    cfg.device.challenge_code =
+        encrypt(&cfg.device.challenge_code, &field_context("device", "challenge_code"))?;
+    for (name, fields) in cfg.dns.providers.iter_mut() {
+        for (k, v) in fields.iter_mut() {
+            if is_sensitive_dns_field(k) {
+                *v = encrypt(v, &field_context(&format!("dns.providers.{name}"), k))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// R-13b: 加载后解密敏感字段（密文 → 内存明文）。
+///
+/// 返回 `true` = 发现非空明文敏感字段（旧明文配置，迁移加密重写候选）。
+/// 密文解密失败（密钥缺失/错误/篡改）→ [`ConfigError::Decrypt`]（fail-closed，
+/// 拒绝加载——避免把密文当凭据使用）。
+///
+/// 惰性密钥解析：文件内无任何密文字段时**不**触碰密钥环/DPAPI blob
+/// （`config/default.toml` 模板与全新配置加载不产生主密钥 blob 副作用）。
+fn decrypt_sensitive_fields(cfg: &mut Config, key_dir: &Path) -> Result<bool, ConfigError> {
+    let map_has_ciphertext = |cfg: &Config| {
+        cfg.dns.providers.values().any(|fields| {
+            fields
+                .iter()
+                .any(|(k, v)| is_sensitive_dns_field(k) && secure::looks_encrypted(v))
+        })
+    };
+    let has_ciphertext = secure::looks_encrypted(&cfg.godaddy.api_key)
+        || secure::looks_encrypted(&cfg.godaddy.api_secret)
+        || secure::looks_encrypted(&cfg.tunnel.token)
+        || secure::looks_encrypted(&cfg.device.challenge_code)
+        || map_has_ciphertext(cfg);
+    let provider = has_ciphertext.then(|| secure::key_provider_for(key_dir));
+
+    let mut plaintext_detected = false;
+    let mut decrypt_one =
+        |value: &mut String, ctx: &str, has_provider: bool| -> Result<(), ConfigError> {
+            if secure::looks_encrypted(value) {
+                // 有密文必有 provider（has_ciphertext 扫描保证）。
+                let p = provider.as_deref().expect("has_ciphertext ⇒ provider resolved");
+                let pt = secure::decrypt_field(p, value, ctx).map_err(|e| {
+                    ConfigError::Decrypt {
+                        field: ctx.to_string(),
+                        reason: e.to_string(),
+                    }
+                })?;
+                *value = pt;
+            } else if has_provider && !value.is_empty() {
+                // 旧明文非空 → 迁移候选（空明文不迁移：模板/新配置不产生
+                // 无谓重写，见任务文档 R13-S2 定稿）。
+                plaintext_detected = true;
+            }
+            Ok(())
+        };
+
+    decrypt_one(&mut cfg.godaddy.api_key, &field_context("godaddy", "api_key"), provider.is_some())?;
+    decrypt_one(
+        &mut cfg.godaddy.api_secret,
+        &field_context("godaddy", "api_secret"),
+        provider.is_some(),
+    )?;
+    decrypt_one(&mut cfg.tunnel.token, &field_context("tunnel", "token"), provider.is_some())?;
+    decrypt_one(
+        &mut cfg.device.challenge_code,
+        &field_context("device", "challenge_code"),
+        provider.is_some(),
+    )?;
+    for (name, fields) in cfg.dns.providers.iter_mut() {
+        for (k, v) in fields.iter_mut() {
+            if is_sensitive_dns_field(k) {
+                decrypt_one(v, &field_context(&format!("dns.providers.{name}"), k), provider.is_some())?;
+            }
+        }
+    }
+    Ok(plaintext_detected)
+}
+
+impl Config {
+    /// R-13b: 敏感字段主密钥目录（默认配置路径 = 配置目录；任意路径 = 父目录；
+    /// 无父目录 → 回退配置目录/临时目录）。
+    fn key_dir(path: &Path) -> PathBuf {
+        path.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| Self::config_dir().unwrap_or_else(|_| std::env::temp_dir()))
+    }
 }
 
 #[cfg(test)]
@@ -2632,6 +2811,298 @@ mod tests {
         .unwrap();
         let loaded2 = Config::load_from(&legacy).unwrap();
         assert!(loaded2.dns.security.enforce());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------- R-13b: 配置加密存取（S1）与迁移（S2） ----------
+
+    /// 每测试独立临时根目录（并行测试互不干扰；不触碰真实用户配置）。
+    fn r13b_temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "kirin_desk_r13b_{}_{}",
+            std::process::id(),
+            name
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 构造带真实敏感值的完整配置。
+    fn r13b_config_with_secrets() -> Config {
+        let mut cfg = Config::default();
+        cfg.godaddy.api_key = "gd-key-123".to_string();
+        cfg.godaddy.api_secret = "gd-secret-456".to_string();
+        cfg.tunnel.token = "tunnel-token-789".to_string();
+        cfg.device.challenge_code = "challenge-abc".to_string();
+        cfg.dns.providers.insert(
+            "cloudflare".to_string(),
+            [("api_token".to_string(), "cf-token-111".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        cfg.dns.providers.insert(
+            "azure".to_string(),
+            [
+                ("tenant_id".to_string(), "t-id".to_string()),
+                ("client_secret".to_string(), "az-secret-222".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        cfg.dns.providers.insert(
+            "westcn".to_string(),
+            [
+                ("username".to_string(), "wc-user".to_string()),
+                ("api_password".to_string(), "wc-pass-333".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        cfg
+    }
+
+    #[test]
+    fn test_r13b_sensitive_fields_roundtrip_encrypted() {
+        let dir = r13b_temp_dir("roundtrip");
+        let path = dir.join("test.toml");
+        let cfg = r13b_config_with_secrets();
+        cfg.save_to(&path).unwrap();
+        let loaded = Config::load_from(&path).unwrap();
+        assert_eq!(loaded.godaddy.api_key, "gd-key-123");
+        assert_eq!(loaded.godaddy.api_secret, "gd-secret-456");
+        assert_eq!(loaded.tunnel.token, "tunnel-token-789");
+        assert_eq!(loaded.device.challenge_code, "challenge-abc");
+        assert_eq!(
+            loaded.dns.providers["cloudflare"].get("api_token").map(String::as_str),
+            Some("cf-token-111")
+        );
+        assert_eq!(
+            loaded.dns.providers["azure"].get("client_secret").map(String::as_str),
+            Some("az-secret-222")
+        );
+        assert_eq!(
+            loaded.dns.providers["westcn"].get("api_password").map(String::as_str),
+            Some("wc-pass-333")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_r13b_no_plaintext_on_disk() {
+        let dir = r13b_temp_dir("noplain");
+        let path = dir.join("test.toml");
+        let cfg = r13b_config_with_secrets();
+        cfg.save_to(&path).unwrap();
+        // 首次加载：旧 [godaddy] 段有凭据 → 迁移到 [dns.providers.godaddy]
+        // 并加密写回（S2 路径）。加载完成后文件内容即最终形态。
+        let loaded = Config::load_from(&path).unwrap();
+        assert_eq!(loaded.godaddy.api_key, "gd-key-123");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        // 敏感明文值零命中（落盘形态验收）。
+        for secret in [
+            "gd-key-123",
+            "gd-secret-456",
+            "tunnel-token-789",
+            "challenge-abc",
+            "cf-token-111",
+            "az-secret-222",
+            "wc-pass-333",
+        ] {
+            assert!(!raw.contains(secret), "明文泄露: {secret}");
+        }
+        // 敏感 key 值均为密文格式。
+        assert!(raw.contains("api_key = \"{v:"));
+        assert!(raw.contains("api_secret = \"{v:"));
+        assert!(raw.contains("token = \"{v:"));
+        assert!(raw.contains("challenge_code = \"{v:"));
+        assert!(raw.contains("api_token = \"{v:"));
+        assert!(raw.contains("client_secret = \"{v:"));
+        assert!(raw.contains("api_password = \"{v:"));
+        // 非敏感 key 保持明文可读（设计：标识字段不入加密域）。
+        assert!(raw.contains("tenant_id = \"t-id\""));
+        assert!(raw.contains("username = \"wc-user\""));
+        // 二次加载幂等：不再重写文件（内容稳定）。
+        let _ = Config::load_from(&path).unwrap();
+        let raw2 = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(raw2, raw, "密文配置二次加载不重写（幂等）");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_r13b_legacy_plaintext_auto_migrates_on_load() {
+        let dir = r13b_temp_dir("migrate");
+        let path = dir.join("legacy.toml");
+        // 旧明文配置（含旧 [godaddy] 段明文 + [dns.providers.cloudflare] 明文）。
+        std::fs::write(
+            &path,
+            "[device]\nid = \"dev-1\"\nname = \"Old\"\nchallenge_code = \"legacy-challenge\"\n\
+             [godaddy]\napi_key = \"legacy-key\"\napi_secret = \"legacy-secret\"\n\
+             domain = \"example.com\"\n\
+             [dns]\nprovider = \"godaddy\"\n\
+             [dns.providers.cloudflare]\napi_token = \"cf-legacy-token\"\n\
+             [network]\nport = 3389\n\
+             [media]\n\
+             [logging]\n",
+        )
+        .unwrap();
+        let loaded = Config::load_from(&path).unwrap();
+        assert_eq!(loaded.device.challenge_code, "legacy-challenge");
+        assert_eq!(loaded.godaddy.api_key, "legacy-key");
+        assert_eq!(loaded.godaddy.api_secret, "legacy-secret");
+        assert_eq!(
+            loaded.dns.providers["cloudflare"].get("api_token").map(String::as_str),
+            Some("cf-legacy-token")
+        );
+        // 迁移：旧 [godaddy] → [dns.providers.godaddy]（内存态）。
+        assert_eq!(
+            loaded.dns.providers["godaddy"].get("api_key").map(String::as_str),
+            Some("legacy-key")
+        );
+        // 落盘已被自动加密重写：无明文、密文格式。
+        let raw = std::fs::read_to_string(&path).unwrap();
+        for secret in ["legacy-key", "legacy-secret", "cf-legacy-token", "legacy-challenge"] {
+            assert!(!raw.contains(secret), "迁移后明文残留: {secret}");
+        }
+        assert!(raw.contains("{v:"));
+        // 幂等：二次加载不再重写（文件内容稳定）。
+        let _ = Config::load_from(&path).unwrap();
+        let raw2 = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(raw2, raw);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_r13b_empty_plaintext_not_rewritten_on_load() {
+        // 模板形态（全部空敏感字段）→ 加载不触发迁移重写（不产生无谓写盘）。
+        let dir = r13b_temp_dir("empty");
+        let path = dir.join("template.toml");
+        let content = "[device]\nid = \"\"\nname = \"My Device\"\nchallenge_code = \"\"\n\
+             [godaddy]\napi_key = \"\"\napi_secret = \"\"\ndomain = \"example.com\"\n\
+             [dns]\nprovider = \"godaddy\"\n\
+             [network]\nport = 3389\n\
+             [media]\n\
+             [logging]\n";
+        std::fs::write(&path, content).unwrap();
+        let loaded = Config::load_from(&path).unwrap();
+        assert!(loaded.godaddy.api_key.is_empty());
+        assert!(loaded.tunnel.token.is_empty());
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after, content, "空明文加载不得重写文件");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_r13b_decrypt_wrong_key_fails_closed() {
+        // 密文配置 + 密钥不匹配（主密钥变更/丢失场景）→ 加载 fail-closed。
+        let dir = r13b_temp_dir("wrongkey");
+        let path = dir.join("bad.toml");
+        // 用固定密钥 [9u8;32] 加密（与 DPAPI 随机主密钥必然不同）。
+        let ct = crate::secure::encrypt_to_string(&[9u8; 32], "some-key", "godaddy.api_key")
+            .unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "[device]\nid = \"d\"\nname = \"D\"\n\
+                 [godaddy]\napi_key = \"{ct}\"\napi_secret = \"\"\ndomain = \"example.com\"\n\
+                 [network]\nport = 3389\n\
+                 [media]\n\
+                 [logging]\n"
+            ),
+        )
+        .unwrap();
+        let err = Config::load_from(&path).unwrap_err();
+        assert!(matches!(err, ConfigError::Decrypt { .. }), "must fail-closed: {err}");
+        assert!(err.to_string().contains("godaddy.api_key"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_r13b_corrupt_ciphertext_fails_closed() {
+        let dir = r13b_temp_dir("corrupt");
+        let path = dir.join("bad.toml");
+        std::fs::write(
+            &path,
+            "[device]\nid = \"d\"\nname = \"D\"\n\
+             [godaddy]\napi_key = \"{v:!!!not-base64!!!}\"\napi_secret = \"\"\ndomain = \"example.com\"\n\
+             [network]\nport = 3389\n\
+             [media]\n\
+             [logging]\n",
+        )
+        .unwrap();
+        let err = Config::load_from(&path).unwrap_err();
+        assert!(matches!(err, ConfigError::Decrypt { .. }), "must fail-closed: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_r13b_sensitive_key_list_covers_registry_secret_fields() {
+        // drift 守护：dns_providers 注册表中 secret: true 的字段 key 必须全部
+        // 在 SENSITIVE_DNS_FIELD_KEYS 内（新增服务商密文字段漏登记会明文落盘）。
+        for def in crate::dns_providers::dns_provider_defs() {
+            for field in def.fields {
+                if field.secret {
+                    assert!(
+                        SENSITIVE_DNS_FIELD_KEYS.contains(&field.key),
+                        "注册表 secret 字段 {} 未入加密域（{}）",
+                        field.key,
+                        def.id
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_r13b_challenge_code_and_tunnel_roundtrip_via_legacy_path() {
+        // 全空配置保存 → 敏感字段以密文落盘（空串也加密，不泄露「是否已填」），
+        // 加载后仍为空串。
+        let dir = r13b_temp_dir("empty_save");
+        let path = dir.join("test.toml");
+        let cfg = Config::default();
+        cfg.save_to(&path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("challenge_code = \"{v:"));
+        assert!(raw.contains("token = \"{v:"));
+        let loaded = Config::load_from(&path).unwrap();
+        assert!(loaded.device.challenge_code.is_empty());
+        assert!(loaded.tunnel.token.is_empty());
+        assert!(loaded.godaddy.api_key.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_r13b_dns_provider_godaddy_fields_all_encrypted() {
+        // [dns.providers.godaddy] 的 api_key/api_secret 与 [godaddy] 段同入加密域。
+        let dir = r13b_temp_dir("gdmap");
+        let path = dir.join("test.toml");
+        let mut cfg = Config::default();
+        cfg.dns.providers.insert(
+            "godaddy".to_string(),
+            [
+                ("api_key".to_string(), "map-key".to_string()),
+                ("api_secret".to_string(), "map-secret".to_string()),
+                ("api_url".to_string(), "https://api.godaddy.com".to_string()),
+                ("domain".to_string(), "example.com".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        cfg.save_to(&path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("map-key"));
+        assert!(!raw.contains("map-secret"));
+        assert!(raw.contains("api_url = \"https://api.godaddy.com\""), "api_url 非敏感保持明文");
+        assert!(raw.contains("domain = \"example.com\""));
+        let loaded = Config::load_from(&path).unwrap();
+        assert_eq!(
+            loaded.dns.providers["godaddy"].get("api_key").map(String::as_str),
+            Some("map-key")
+        );
+        assert_eq!(
+            loaded.dns.providers["godaddy"].get("api_secret").map(String::as_str),
+            Some("map-secret")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
