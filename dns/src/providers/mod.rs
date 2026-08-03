@@ -5,8 +5,9 @@
 //! 上层（discovery/heartbeat/srv/aaaa/txt/UI/CLI）只依赖 `provider` 抽象层，
 //! 禁止直接引用具体服务商类型（架构红线，总体需求 §七.1）。
 //!
-//! 注册：`register_all()` 由集成者（Stage 3）填充各 `register` 调用——
-//! 各模块自行暴露 `pub fn register(registry: &mut ProviderRegistry)`。
+//! 注册：`register_all()` 已全量填充（M9-DNS001~020 全部落地，commit `0e5bc74`）——
+//! 各模块自行暴露 `pub fn register(registry: &mut ProviderRegistry)`；
+//! 新增服务商 = 新目录 + 下方 `register_all` 加一行，上层零改动。
 
 pub mod aliyun;
 pub mod azure;

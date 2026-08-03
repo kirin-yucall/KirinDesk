@@ -418,6 +418,8 @@ The master key is chosen automatically from a fallback chain:
 
 Migration is seamless: an existing plaintext config is automatically encrypted and rewritten on first load (`#[serde(default)]` keeps old fields compatible); a failed rewrite never corrupts the file (atomic replace via `write_private`, and the in-memory config keeps working). Keys/tokens are never logged and appear masked (`****`) in `config show` / `status` output.
 
+Implementation evidence (R-13b, implemented 2026-08-04): `utils/src/config.rs` (`save_to` / `load_from` / `encrypt_sensitive_fields` / `decrypt_sensitive_fields` / `field_context` — `{v:...}` ciphertext + AAD bound to the section context), `utils/src/secure.rs` (`key_provider_for` / `encrypt_with_provider` / `decrypt_field` / `KeySource::label` — DPAPI / Keychain / PBKDF2 fallback chain), and `ui/src/cli.rs` `config show` (Encryption status + masked tunnel token); 14 unit tests (utils 145 green). Details: `task_docs/修复任务/W1_R-13b_配置加密接线.md` §7.
+
 ## License
 
 Apache 2.0 (KirinDesk core) + LGPL (FFmpeg libraries, dynamically loaded)

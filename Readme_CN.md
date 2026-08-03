@@ -398,6 +398,13 @@ ChaCha20Poly1305 密文存储（格式 `{v: base64(nonce‖ciphertext)}`，AAD �
 幂等，二次加载不重写）；写回失败不破坏原文件（`write_private` 原子替换，内存态
 配置继续可用）。密钥/令牌不写日志、不进 `config show` / `status` 输出（掩码 `****`）。
 
+实现证据（R-13b 已实现，2026-08-04）：`utils/src/config.rs` `save_to`/`load_from`/
+`encrypt_sensitive_fields`/`decrypt_sensitive_fields`/`field_context`（密文 `{v:...}` +
+AAD 段上下文绑定）、`utils/src/secure.rs` `key_provider_for`/`encrypt_with_provider`/
+`decrypt_field`/`KeySource::label`（DPAPI / Keychain / PBKDF2 分层）、`ui/src/cli.rs`
+`config show`（Encryption 状态 + Tunnel Token 掩码）；单测 14 项（utils 145 全绿），
+详见 `task_docs/修复任务/W1_R-13b_配置加密接线.md` §7。
+
 ## License
 
 Apache 2.0（KirinDesk 核心）+ LGPL（FFmpeg 库，动态加载）
