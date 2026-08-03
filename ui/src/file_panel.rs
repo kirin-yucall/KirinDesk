@@ -13,7 +13,7 @@ use egui::{RichText, Ui};
 use crate::theme::Theme;
 use crate::t;
 use crate::tf;
-use crate::widgets::{action_button, badge, status_dot, BadgeKind, ButtonKind, ButtonState};
+use crate::widgets::{badge, status_dot, BadgeKind};
 
 // ════════════════════════════════════════════════════════════════
 // UI → 会话任务命令

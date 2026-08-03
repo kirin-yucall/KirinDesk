@@ -19,8 +19,10 @@
 //!
 //! 上游 [`crate::injector::InputInjector`] 已把 `ev.x/ev.y` 缩放到服务端像素空间。
 //! CGEvent 使用 **point** 坐标（Retina 与像素存在 scale 因子），本模块经
-//! `CGDisplayPixelsWide / CGDisplayBounds` 求主显示器 scale 换算。多显示器
-//! 偏移（副屏注入）暂以主显示器为基准，注释于 [`to_display_point`]。
+//! `CGDisplayPixelsWide/High` + `CGDisplayBounds` 求每屏 scale 换算，并叠加
+//! 多屏布局偏移（R-21b）：选中显示器按像素分辨率匹配（M8-T018 归一化基数
+//! = 所选屏分辨率），副屏在左/上时全局坐标为负、右/下时为正
+//! （[`to_global_point`]）。
 //!
 //! # 键码
 //!
@@ -164,7 +166,13 @@ type CFReleaseFn = unsafe extern "C" fn(cf: *const c_void);
 type AXIsProcessTrustedFn = unsafe extern "C" fn() -> bool;
 type CGMainDisplayIDFn = unsafe extern "C" fn() -> u32;
 type CGDisplayPixelsWideFn = unsafe extern "C" fn(display: u32) -> usize;
+type CGDisplayPixelsHighFn = unsafe extern "C" fn(display: u32) -> usize;
 type CGDisplayBoundsFn = unsafe extern "C" fn(display: u32) -> CGRect;
+type CGGetActiveDisplayListFn = unsafe extern "C" fn(
+    max_displays: u32,
+    active_displays: *mut u32,
+    display_count: *mut u32,
+) -> i32; // CGError（0 = kCGErrorSuccess）
 
 /// 已解析的 framework 函数表。
 ///
@@ -186,7 +194,9 @@ struct CGDlls {
     ax_is_process_trusted: AXIsProcessTrustedFn,
     cg_main_display_id: CGMainDisplayIDFn,
     cg_display_pixels_wide: CGDisplayPixelsWideFn,
+    cg_display_pixels_high: CGDisplayPixelsHighFn,
     cg_display_bounds: CGDisplayBoundsFn,
+    cg_get_active_display_list: CGGetActiveDisplayListFn,
 }
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -254,7 +264,13 @@ impl CGDlls {
             ax_is_process_trusted: sym!(&as_, "AXIsProcessTrusted", AXIsProcessTrustedFn),
             cg_main_display_id: sym!(&cg, "CGMainDisplayID", CGMainDisplayIDFn),
             cg_display_pixels_wide: sym!(&cg, "CGDisplayPixelsWide", CGDisplayPixelsWideFn),
+            cg_display_pixels_high: sym!(&cg, "CGDisplayPixelsHigh", CGDisplayPixelsHighFn),
             cg_display_bounds: sym!(&cg, "CGDisplayBounds", CGDisplayBoundsFn),
+            cg_get_active_display_list: sym!(
+                &cg,
+                "CGGetActiveDisplayList",
+                CGGetActiveDisplayListFn
+            ),
             _cg: cg,
             _cf: cf,
             _as: as_,
@@ -374,6 +390,98 @@ pub fn mouse_event_type(button_bits: u8) -> Result<(i32, i32), InjectError> {
 }
 
 // ════════════════════════════════════════════════════════════════
+// 多显示器布局偏移换算（R-21b，对齐 M8-T018 坐标映射；跨平台纯函数）
+// ════════════════════════════════════════════════════════════════
+
+/// 单块显示器的布局快照（`CGDisplayBounds` 全局原点 + 像素/逻辑尺寸）。
+///
+/// 坐标映射（M8-T018 CLI-MON-010 / SRV-MON-010）：客户端归一化坐标基数 =
+/// **所选显示器像素分辨率**；服务端注入侧把事件缩放到该屏像素空间
+/// （显示器局部坐标），注入时叠加该屏在全局布局中的原点偏移。
+///
+/// - `origin`：全局坐标空间原点（point）。主屏固定为 (0,0)；副屏在
+///   主屏**左/上**时为负、**右/下**时为正（`CGDisplayBounds` 语义）。
+/// - `width_px` / `height_px`：像素分辨率（Retina 下大于逻辑尺寸）。
+/// - `bounds`：逻辑尺寸（point，`CGDisplayBounds` 的 size）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DisplayRect {
+    /// 全局坐标空间原点（point）。
+    pub origin: CGPoint,
+    /// 像素分辨率宽（注入坐标基数，M8-T018）。
+    pub width_px: u32,
+    /// 像素分辨率高。
+    pub height_px: u32,
+    /// 逻辑尺寸（point）。
+    pub bounds: CGSize,
+}
+
+impl DisplayRect {
+    /// 每 point 像素数（Retina scale）。
+    ///
+    /// `min(px_w / bounds_w, px_h / bounds_h)`：两方向取小，规避旋转/异常
+    /// 布局下的极端值；尺寸非法（宽或高为 0）时回退 1:1（与修复前
+    /// `to_display_point` 的 1:1 回退语义一致，不除零）。
+    pub fn scale(&self) -> f64 {
+        if self.width_px > 0
+            && self.height_px > 0
+            && self.bounds.width > 0.0
+            && self.bounds.height > 0.0
+        {
+            (self.width_px as f64 / self.bounds.width)
+                .min(self.height_px as f64 / self.bounds.height)
+        } else {
+            1.0
+        }
+    }
+}
+
+/// 显示器局部像素坐标 → 全局 CGEvent point 坐标（多屏布局偏移换算）。
+///
+/// 公式：`global = display.origin + local_px / display.scale`。
+/// - 主屏（origin = (0,0)）：即修复前既有行为 `local_px / scale`（无偏移特例）；
+/// - 副屏：叠加该屏全局原点偏移——副屏在**左/上**时全局坐标为负、
+///   在**右/下**时为正（R-21b 修复：此前恒以主屏为原点，副屏注入偏移缺失）。
+pub fn to_global_point(local_x_px: u32, local_y_px: u32, display: &DisplayRect) -> CGPoint {
+    let s = display.scale();
+    CGPoint::new(
+        display.origin.x + local_x_px as f64 / s,
+        display.origin.y + local_y_px as f64 / s,
+    )
+}
+
+/// 布局表内选择"选中显示器"：按像素分辨率精确匹配。
+///
+/// M8-T018：归一化坐标基数 = 所选屏分辨率，注入侧 `dst_w/dst_h` 即所选屏
+/// 分辨率（`InputInjector::set_resolution` 在显示器切换时同步更新），由此
+/// 识别目标屏。返回首个精确匹配索引；无匹配 → `None`（调用方回退主屏）。
+/// 同分辨率多屏取首个匹配（注入接口未携带屏索引，分辨率匹配为最小可行
+/// 方案；实机验证项登记 R-26b J03）。
+pub fn select_display_by_resolution(
+    displays: &[DisplayRect],
+    width_px: u32,
+    height_px: u32,
+) -> Option<usize> {
+    displays
+        .iter()
+        .position(|d| d.width_px == width_px && d.height_px == height_px)
+}
+
+/// 主屏索引：全局原点 (0,0) 者（`CGDisplayBounds` 语义，主屏必为 (0,0)）。
+///
+/// 布局表无 (0,0) 项时回退首屏；表为空 → `None`（调用方兜底）。
+pub fn primary_display_index(displays: &[DisplayRect]) -> Option<usize> {
+    displays
+        .iter()
+        .position(|d| d.origin.x == 0.0 && d.origin.y == 0.0)
+        .or_else(|| (!displays.is_empty()).then_some(0))
+}
+
+/// 活跃显示器数量上限（`CGGetActiveDisplayList` 输出缓冲大小；macOS 实际
+/// 上限 16，取 32 留余量）。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const MAX_ACTIVE_DISPLAYS: u32 = 32;
+
+// ════════════════════════════════════════════════════════════════
 // 注入入口（macOS 真实实现）
 // ════════════════════════════════════════════════════════════════
 
@@ -408,7 +516,7 @@ pub fn inject(ev: &PipeEvent, dst_w: u32, dst_h: u32) -> Result<(), InjectError>
         ));
     }
 
-    let event = build_event(dlls, ev)?;
+    let event = build_event(dlls, ev, dst_w, dst_h)?;
     if event.is_null() {
         return Err(InjectError::InjectFailed(
             "CGEventCreate returned NULL".to_string(),
@@ -559,16 +667,19 @@ fn inject_special_key(combo: Option<SpecialCombo>) -> Result<(), InjectError> {
 
 /// 按事件种类构建 CGEventRef（已设修饰键 flags；调用方负责 post + release）。
 ///
-/// `ev.x / ev.y` 已由上游缩放到服务端像素空间（坐标换算见 [`to_display_point`]）。
+/// `ev.x / ev.y` 已由上游缩放到服务端像素空间（坐标换算见 [`to_display_point`]，
+/// 含多屏布局偏移）。
 #[cfg(target_os = "macos")]
 fn build_event(
     dlls: &CGDlls,
     ev: &PipeEvent,
+    dst_w: u32,
+    dst_h: u32,
 ) -> Result<*mut c_void, InjectError> {
     let flags = modifier_flags(ev.modifiers);
     let event = match ev.kind {
         InputKind::MouseMove => {
-            let p = to_display_point(dlls, ev.x, ev.y);
+            let p = to_display_point(dlls, ev.x, ev.y, dst_w, dst_h);
             // SAFETY: NULL source（默认 source），类型/按键为上述常量。
             unsafe {
                 (dlls.cg_event_create_mouse_event)(
@@ -581,7 +692,7 @@ fn build_event(
         }
         InputKind::MouseButton => {
             let (event_type, button) = mouse_event_type(ev.button)?;
-            let p = to_display_point(dlls, ev.x, ev.y);
+            let p = to_display_point(dlls, ev.x, ev.y, dst_w, dst_h);
             let e = unsafe {
                 (dlls.cg_event_create_mouse_event)(
                     std::ptr::null_mut(),
@@ -669,25 +780,57 @@ fn build_event(
     Ok(event)
 }
 
-/// 像素坐标 → CGEvent point 坐标（主显示器 scale 换算）。
-///
-/// CGEvent 使用 point（逻辑点）：Retina 下 1 point = scale 像素。
-/// `scale = pixels_wide / bounds_width`；bounds 查询失败（宽 0）时回退 1:1。
-///
-/// 限制：以**主显示器**左上角为原点（多显示器副屏注入的偏移换算留待后续，
-/// 与设计文档 MAC-T002 的简单方案一致）。
+/// 查询单块显示器的布局快照（像素分辨率 + `CGDisplayBounds`）。
 #[cfg(target_os = "macos")]
-fn to_display_point(dlls: &CGDlls, x_px: u32, y_px: u32) -> CGPoint {
-    // SAFETY: 无参/单参查询函数。
-    let display = unsafe { (dlls.cg_main_display_id)() };
-    let px_w = unsafe { (dlls.cg_display_pixels_wide)(display) } as f64;
-    let bounds = unsafe { (dlls.cg_display_bounds)(display) };
-    let scale = if px_w > 0.0 && bounds.size.width > 0.0 {
-        px_w / bounds.size.width
-    } else {
-        1.0
+fn display_rect(dlls: &CGDlls, id: u32) -> DisplayRect {
+    // SAFETY: 单参查询函数（CGDisplayPixelsWide/High/Bounds）。
+    let px_w = unsafe { (dlls.cg_display_pixels_wide)(id) } as u32;
+    let px_h = unsafe { (dlls.cg_display_pixels_high)(id) } as u32;
+    let bounds = unsafe { (dlls.cg_display_bounds)(id) };
+    DisplayRect {
+        origin: bounds.origin,
+        width_px: px_w,
+        height_px: px_h,
+        bounds: bounds.size,
+    }
+}
+
+/// 像素坐标 → CGEvent point 坐标（每屏 scale 换算 + 多屏布局偏移，R-21b）。
+///
+/// CGEvent 使用 point（逻辑点）：Retina 下 1 point = scale 像素，各屏
+/// scale 独立（`scale = pixels / bounds`）。`dst_w/dst_h` 为**选中显示器**
+/// 分辨率（M8-T018 归一化基数 = 所选屏分辨率）——`CGGetActiveDisplayList`
+/// 枚举活跃显示器布局后按像素分辨率匹配目标屏（[`select_display_by_resolution`]），
+/// 取其全局原点叠加偏移（[`to_global_point`]）：副屏在左/上时注入点为负
+/// 全局坐标、右/下为正。无匹配/枚举失败回退主显示器（`CGMainDisplayID`，
+/// 与修复前行为一致——不因布局查询异常而崩溃）。
+#[cfg(target_os = "macos")]
+fn to_display_point(dlls: &CGDlls, x_px: u32, y_px: u32, dst_w: u32, dst_h: u32) -> CGPoint {
+    // SAFETY: 输出缓冲固定 MAX_ACTIVE_DISPLAYS 项（maxDisplays 同值），
+    // displayCount 由系统写入（<= maxDisplays）。
+    let mut ids = [0u32; MAX_ACTIVE_DISPLAYS as usize];
+    let mut count: u32 = 0;
+    let err = unsafe {
+        (dlls.cg_get_active_display_list)(MAX_ACTIVE_DISPLAYS, ids.as_mut_ptr(), &mut count)
     };
-    CGPoint::new(x_px as f64 / scale, y_px as f64 / scale)
+
+    let mut layouts: Vec<DisplayRect> = Vec::with_capacity(MAX_ACTIVE_DISPLAYS as usize);
+    if err == 0 {
+        for &id in ids.iter().take(count.min(MAX_ACTIVE_DISPLAYS) as usize) {
+            layouts.push(display_rect(dlls, id));
+        }
+    }
+
+    let target =
+        match select_display_by_resolution(&layouts, dst_w, dst_h).and_then(|i| layouts.get(i)) {
+            Some(d) => *d,
+            None => {
+                // SAFETY: 无参查询函数（CGMainDisplayID）。
+                let main = unsafe { (dlls.cg_main_display_id)() };
+                display_rect(dlls, main)
+            }
+        };
+    to_global_point(x_px, y_px, &target)
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -844,5 +987,204 @@ mod tests {
         let p = CGPoint::new(1.5, 2.5);
         assert_eq!(p.x, 1.5);
         assert_eq!(p.y, 2.5);
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // R-21b: 多显示器布局偏移换算（副屏在左/上/右/下四象限）
+    // ════════════════════════════════════════════════════════════
+
+    /// 主屏布局（1920x1080，1:1 scale，全局原点 (0,0)）。
+    fn primary() -> DisplayRect {
+        DisplayRect {
+            origin: CGPoint::new(0.0, 0.0),
+            width_px: 1920,
+            height_px: 1080,
+            bounds: CGSize {
+                width: 1920.0,
+                height: 1080.0,
+            },
+        }
+    }
+
+    /// 副屏布局（1920x1080，1:1 scale，全局原点 (ox, oy)）。
+    fn secondary(ox: f64, oy: f64) -> DisplayRect {
+        DisplayRect {
+            origin: CGPoint::new(ox, oy),
+            width_px: 1920,
+            height_px: 1080,
+            bounds: CGSize {
+                width: 1920.0,
+                height: 1080.0,
+            },
+        }
+    }
+
+    /// 主屏无偏移回归：局部坐标 == 全局坐标（修复前既有行为不变）。
+    #[test]
+    fn test_global_point_primary_no_offset() {
+        assert_eq!(
+            to_global_point(960, 540, &primary()),
+            CGPoint::new(960.0, 540.0)
+        );
+        // 全范围边界（局部 max 像素）。
+        assert_eq!(
+            to_global_point(1919, 1079, &primary()),
+            CGPoint::new(1919.0, 1079.0)
+        );
+        // 左上角。
+        assert_eq!(to_global_point(0, 0, &primary()), CGPoint::new(0.0, 0.0));
+    }
+
+    /// 副屏在右：原点 (1920, 0)——局部坐标整体右移主屏宽。
+    #[test]
+    fn test_global_point_secondary_right() {
+        // 局部中心 → 全局 (1920+960, 0+540)。
+        assert_eq!(
+            to_global_point(960, 540, &secondary(1920.0, 0.0)),
+            CGPoint::new(2880.0, 540.0)
+        );
+        // 副屏左上角（局部 0,0）→ 全局 (1920, 0)。
+        assert_eq!(
+            to_global_point(0, 0, &secondary(1920.0, 0.0)),
+            CGPoint::new(1920.0, 0.0)
+        );
+        // 副屏右下角（局部 max）→ 全局 (1920+1919, 1079)。
+        assert_eq!(
+            to_global_point(1919, 1079, &secondary(1920.0, 0.0)),
+            CGPoint::new(3839.0, 1079.0)
+        );
+    }
+
+    /// 副屏在左：原点 (-1920, 0)——局部坐标映射为**负**全局坐标。
+    #[test]
+    fn test_global_point_secondary_left() {
+        assert_eq!(
+            to_global_point(960, 540, &secondary(-1920.0, 0.0)),
+            CGPoint::new(-960.0, 540.0)
+        );
+        // 副屏左上角 → 全局 (-1920, 0)。
+        assert_eq!(
+            to_global_point(0, 0, &secondary(-1920.0, 0.0)),
+            CGPoint::new(-1920.0, 0.0)
+        );
+        // 副屏右下角 → 全局 (-1, 1079)（紧贴主屏左缘）。
+        assert_eq!(
+            to_global_point(1919, 1079, &secondary(-1920.0, 0.0)),
+            CGPoint::new(-1.0, 1079.0)
+        );
+    }
+
+    /// 副屏在上：原点 (0, -1080)。
+    #[test]
+    fn test_global_point_secondary_above() {
+        assert_eq!(
+            to_global_point(960, 540, &secondary(0.0, -1080.0)),
+            CGPoint::new(960.0, -540.0)
+        );
+        assert_eq!(
+            to_global_point(0, 0, &secondary(0.0, -1080.0)),
+            CGPoint::new(0.0, -1080.0)
+        );
+        // 副屏下缘（局部 max y）→ 全局 y = -1。
+        assert_eq!(
+            to_global_point(960, 1079, &secondary(0.0, -1080.0)),
+            CGPoint::new(960.0, -1.0)
+        );
+    }
+
+    /// 副屏在下：原点 (0, 1080)。
+    #[test]
+    fn test_global_point_secondary_below() {
+        assert_eq!(
+            to_global_point(960, 540, &secondary(0.0, 1080.0)),
+            CGPoint::new(960.0, 1620.0)
+        );
+        assert_eq!(
+            to_global_point(0, 0, &secondary(0.0, 1080.0)),
+            CGPoint::new(0.0, 1080.0)
+        );
+        assert_eq!(
+            to_global_point(1919, 1079, &secondary(0.0, 1080.0)),
+            CGPoint::new(1919.0, 2159.0)
+        );
+    }
+
+    /// Retina 副屏：2560x1440 像素 / 1280x720 point（scale=2）——
+    /// 局部像素先缩为逻辑点再叠加原点偏移。
+    #[test]
+    fn test_global_point_retina_scale() {
+        let retina = DisplayRect {
+            origin: CGPoint::new(1920.0, 0.0),
+            width_px: 2560,
+            height_px: 1440,
+            bounds: CGSize {
+                width: 1280.0,
+                height: 720.0,
+            },
+        };
+        assert_eq!(retina.scale(), 2.0);
+        // 右下角（局部 max 像素）→ 全局 (1920+1280, 0+720)。
+        assert_eq!(
+            to_global_point(2560, 1440, &retina),
+            CGPoint::new(3200.0, 720.0)
+        );
+        // 中心 → (1920+640, 0+360)。
+        assert_eq!(
+            to_global_point(1280, 720, &retina),
+            CGPoint::new(2560.0, 360.0)
+        );
+    }
+
+    /// scale 回退：尺寸非法（宽/高 0）→ 1:1，不除零。
+    #[test]
+    fn test_display_rect_scale_fallback() {
+        let d = DisplayRect {
+            origin: CGPoint::new(0.0, 0.0),
+            width_px: 0,
+            height_px: 0,
+            bounds: CGSize {
+                width: 0.0,
+                height: 0.0,
+            },
+        };
+        assert_eq!(d.scale(), 1.0);
+        assert_eq!(to_global_point(100, 200, &d), CGPoint::new(100.0, 200.0));
+    }
+
+    /// 选中显示器 = 像素分辨率匹配（M8-T018 基数跟随）；无匹配 → None。
+    #[test]
+    fn test_select_display_by_resolution() {
+        // 屏0 主 1920x1080；屏1 右 2560x1440（Retina 逻辑 1280x720）。
+        let right = DisplayRect {
+            origin: CGPoint::new(1920.0, 0.0),
+            width_px: 2560,
+            height_px: 1440,
+            bounds: CGSize {
+                width: 1280.0,
+                height: 720.0,
+            },
+        };
+        let displays = [primary(), right];
+        // 选中屏 = 主屏（基数 1920x1080，set_resolution 未切换前）。
+        assert_eq!(select_display_by_resolution(&displays, 1920, 1080), Some(0));
+        // 选中屏 = 副屏（基数 2560x1440，切换后换算基准同步更新）。
+        assert_eq!(select_display_by_resolution(&displays, 2560, 1440), Some(1));
+        // 无匹配（如捕获上报分辨率与 CGDisplayPixels 不一致）→ None（回退主屏）。
+        assert_eq!(select_display_by_resolution(&displays, 3840, 2160), None);
+        // 空表 → None（不 panic）。
+        assert_eq!(select_display_by_resolution(&[], 1920, 1080), None);
+    }
+
+    /// 主屏索引：全局原点 (0,0) 者；无则回退首屏；空表 → None。
+    #[test]
+    fn test_primary_display_index() {
+        // 副屏在左 → 主屏 → 副屏在下：主屏为索引 1。
+        let displays = [secondary(-1920.0, 0.0), primary(), secondary(0.0, 1080.0)];
+        assert_eq!(primary_display_index(&displays), Some(1));
+        // 布局表无 (0,0) 项 → 回退首屏。
+        let no_primary = [secondary(-1920.0, 0.0), secondary(0.0, 1080.0)];
+        assert_eq!(primary_display_index(&no_primary), Some(0));
+        // 空表 → None。
+        assert_eq!(primary_display_index(&[]), None);
     }
 }

@@ -187,6 +187,68 @@
 
 ### Fixed
 
+- **R-15b hw_bridge 零拷贝真实实现（审计 §4-5 / §2-P1-5，修复计划 2026-08-04 WBS 3.3）**：
+  `libkirin_gpu/src/hw_bridge.cpp` 的 `kgpu_hw_upload` 由桩（恒 NULL）替换为
+  **真实实现**——NV12 纹理经 `AVD3D11FrameDescriptor` 零拷贝直绑
+  （无 `av_hwframe_transfer_data`、无 CPU 往返）、BGRA8 纹理由 D3D11 像素
+  着色器两 Pass 在 GPU 内转 NV12（BT.601 limited，零 CPU；测试校验才回读）；
+  `AVHWDeviceContext` 手工包装内核 D3D11 device（与 capture 同实例前提），
+  `avutil-60.dll` 运行时动态加载（与 media 架构红线一致，不静态链接导入库）。
+  Rust 侧（`gpu_ffi/kernel.rs` 等）接驳激活并新增 7 个测试：零拷贝绑定断言
+  （`test_hw_upload_frame_type` / `test_hw_upload_zero_copy`）、BGRA GPU 转换
+  绑定、C 侧自检（含 BT.601 内容校验，UV 平面读回受 Intel 驱动限制时软跳过）、
+  三态决策（首帧 FullFrame/同帧 Static/微变 Incremental，微变读回 ≤16KB）、
+  1080p 基准 **GPU 0.65ms/帧 < 2ms**（CPU 回退 22~27ms/帧，P1G 对比数据）。
+  随附修复两个休眠 bug（该 C++ 内核首次实机编译运行）：
+  (1) `hash_buf_b` 缺 `D3D11_BIND_UNORDERED_ACCESS` → swap 后 UAV 创建失败 →
+  三态恒 FULLFRAME（`d3d11_context.cpp`）；(2) 源文件 UTF-8 编码在 MSVC
+  CP936 代码页下解析错位 → `target_compile_options(/utf-8)`。
+  另：`media/build.rs` 自动探测仓库内 FFmpeg 8.1.1 dev 头（include/lib 随
+  捆绑 8.1.1 shared build，`KG_HAVE_FFMPEG_HEADERS` 生效）；`AV_PIX_FMT_D3D11`
+  常量核对为 8.1.1 实测枚举值 171；`kgpu_init/shutdown` 引用计数化（多持有者
+  并行安全，生产单次 init/shutdown 语义不变）
+- **R-20b 身份存储 PKCS#8 宣称修正（审计 §2-P3-18，修复计划 2026-08-04 WBS 3.7）**：
+  `core/src/crypto/ed25519.rs` 存储格式注释/文档与实现对齐——Ed25519 私钥
+  落盘为**自定义加密存储（AEAD + AAD 上下文）**：JSON `{nonce, ciphertext}`、
+  ChaCha20Poly1305（当前 AAD 为空字节串）、密钥由 device_id 派生；明确
+  **不实现真 PKCS#8**（避免无谓复杂度），该格式现仅作 legacy 迁移源
+  （`try_migrate_legacy`），新存储走 KeyStore 后端（DPAPI/Keychain/secret-tool）。
+  全仓 grep 核对：其余 PKCS#8 提及均为真实使用（Google OAuth RSA PEM、
+  rcgen 证书、relay 服务器密钥 PKCS#8 DER），无虚假宣称残留
+- **R-22b FFmpeg 字段偏移硬编码核对清单（审计 §2-P3-21，修复计划 2026-08-04 WBS 3.8）**：
+  `media/src/ffmpeg/api.rs` 头部升级核对清单补齐**运行时验证方法**（偏移
+  重核后回归：`dlls.rs` major 断言单测、符号表加载、`quic_loopback`/
+  `quic_bisect` 出码流 + 解码回读、`avctx_get_int/get_ptr` 读回自检）；
+  `dlls.rs` 版本断言（`SNAPSHOT_FFMPEG_MAJOR=62`）与「偏移依赖」说明保持
+  不变——主版本不符直接拒绝加载，绝不带错偏移运行。无逻辑改动
+- **R-23b HW 编码器 reconfigure 空实现收口（审计 §2-P3-22，修复计划 2026-08-04 WBS 3.9）**：
+  `FfmpegHwEncoder::reconfigure` 不再 `Ok(())` 静默成功。审计结论：生产唯一
+  调用点 = `WindowPipeline` 每窗口编码前；自适应层会真实产出 QP/preset 变更，
+  但 HW 编码器以 cbr 码率模式运行（QP 全仓零消费者，分辨率走
+  `ensure_codec_dims` 懒重开）→ 参数真实变化时返回显式
+  `EncodeError::NotImplemented`（新增变体），`force_idr` 真实置位（与软编
+  对齐），无变化幂等 `Ok`；调用方（`window_pipeline.rs`）显式规避——记
+  warning 沿用旧配置继续编码。新增 5 个单测锁定三态行为
+  （`media/src/encoder/video/ffmpeg_hw.rs`）
+- **R-33 ui/dns/utils warnings 归零（审计 §1 构建列，修复计划 2026-08-04 WBS 3.10）**：
+  本任务范围内 `cargo check` 警告从 39 条降至 0（ui 23 + dns 8 + utils 2 +
+  core 2 基线；不含并行任务在途代码）：未用 import 删除（BLOCK_SIZE/
+  FileTransferError/stat_card/FontDefinitions/ResolverError/Read/ButtonKind/
+  ButtonState/action_button）、未用变量与赋值收敛（pos/use_temp_key/
+  unattended/state_file）、f64→f32 字面量显式化（`1.5_f32` 等 10 处）、
+  DoH JSON 契约字段 non_snake_case 标注、dead_code 标注带理由（dns 测试
+  注入接口与 Google 错误体字段、macOS 专用 xml_escape）、
+  `kirin_gpu_linked` cfg 在 ui/Cargo.toml 声明（与 media 同配置）
+- **R-19b ConnectRequest SocketAddr 泛化（审计 §2-P3-19，修复计划 2026-08-04 WBS 3.6）**：
+  连接事件层地址视角从 v6-only 泛化为 v4/v6 统一（传输层已双栈，事件层不再 v6-only）：
+  `ConnectionEvent::ConnectRequest` 的 `ipv6+port` 字段合并为 `addr: SocketAddr`
+  （对齐 M8-T025-P2 泛化模式，`core/src/connection/manager.rs`），`ManagedConnection`
+  的 `peer_ipv6/peer_port` 合并为 `peer_addr: Option<SocketAddr>`；`TcpServer::accept`
+  改返回 `SocketAddr` 且 v4-mapped v6（`::ffff:` 前缀）在事件层呈现为真实 v4 地址
+  （`core/src/network/tcp.rs`，map_addr 前缀剥离）；UI 服务端连接处理签名同步
+  （`ui/src/lib.rs::handle_incoming_connection`）。core 新增 v4/v6 混合用例
+  （v4 直连呈现真实 v4、v4-mapped 规范化、原生 v6 保留、canonical_addr 纯函数）；
+  core 218 项 lib 测试全绿
 - **视频无画面（阻断，修复计划 2026-08-03 P0）**：服务端捕获循环把编码窗口
   （`EncodedWindow`，4K 下 ~125KB）经 `SecureChannelSender::send_packets` 发送，
   超过 `MAX_PACKET_PAYLOAD`（≈1151B）小分片上限 → `payload too large` → 捕获循环
@@ -303,6 +365,115 @@
     media TCP×2）；失败不致命（连接仍可用，仅延迟优化失效，告警处理）；
     全量回归 1537 项全绿 + `--cli self-test` 全过；小包频繁发送的流量开销
     变化并入 R-26b A 组延迟实测项
+- **CLI identity/version 子命令（R-09b，审计 §4-6 / §2-P2-10）**：补齐
+  08-02 审计遗留的 CLI 缺口（`ui/src/cli.rs` dispatch/help/`CliCommand`
+  变体区，只增不改）：
+  - `version`：程序版本 + 核心 crate 版本表（`env!("CARGO_PKG_VERSION")`，
+    覆盖 core/dns/input/media/relay/relay-server/updater/utils/ui 九个工作区
+    成员；`VERSION_TABLE_CRATES` 以 `include_str!` 内联各成员 Cargo.toml，
+    单测守护"全部成员 `version.workspace = true`"，版本表不会静默失真）
+  - `identity`：Device ID（`effective_device_id` 语义，与 GUI Dashboard
+    身份卡一致）、Ed25519 公钥（32 字节小写 hex + base64）、SHA-256 指纹
+    （`core::crypto::ed25519::fingerprint`，与 known_hosts 比对算法一致）、
+    密钥文件路径（`IdentityManager::default_path`，同 GUI 路径）、known_hosts
+    条目数与存储路径（复用 `KnownHostsStore`）；`--json` 输出单行 JSON
+    （device_id/ed25519_public_key_hex/ed25519_public_key_base64/
+    fingerprint_sha256/key_file/known_hosts_path/known_hosts_count 七字段，
+    jq 可解析，供脚本集成）
+  - `--help` 同步（COMMANDS 两行 + EXAMPLES 两行）；`cli_tests` 新增单测：
+    dispatch 映射、`--json` 精确匹配、JSON 字段契约（单行 + serde 往返
+    解析 + 字段集完整）、版本表 workspace 版本守护；ui 测试全绿 +
+    `--cli self-test` 全过 + 全量回归只增不减
+- **macOS 多显示器坐标偏移（R-21b，审计 §4-10 / §2-P3-20）**：
+  `input/src/macos.rs` 注入坐标由"恒以主显示器为原点"补齐多屏布局偏移换算
+  （对齐 `M8-T018_多显示器查看模式.md` 坐标映射）：
+  - 多屏布局换算纯函数（跨平台可单测）：`DisplayRect`（`CGDisplayBounds`
+    全局原点 + 像素/逻辑尺寸，`scale()` = 每 point 像素数，Retina 各屏独立）+
+    `to_global_point`（局部像素 → 全局 CGEvent point，公式
+    `origin + local_px / scale`——副屏在**左/上**时全局坐标为负、**右/下**
+    为正）+ `select_display_by_resolution`（按像素分辨率匹配"选中显示器"，
+    M8-T018 归一化基数 = 所选屏分辨率）+ `primary_display_index`（主屏 =
+    全局原点 (0,0)）
+  - 运行时接入：`to_display_point` 经 `CGGetActiveDisplayList` 枚举活跃
+    显示器布局（新增 `CGDisplayPixelsHigh` / `CGGetActiveDisplayList` 两个
+    dlopen 符号，输出缓冲 32 上限），按注入器传入的选中屏分辨率
+    （`InputInjector::set_resolution` 显示器切换时同步更新）匹配目标屏并
+    叠加其全局原点偏移；无匹配/枚举失败回退主显示器（`CGMainDisplayID`，
+    与修复前行为一致，不崩溃）
+  - 新增 9 项单测：副屏在左/上/右/下四象限偏移、Retina 2x scale、主屏无
+    偏移回归、分辨率匹配/无匹配/空表、主屏索引回退、scale 非法尺寸回退
+    1:1（input 43 → 52 项全绿）；同分辨率多屏取首个匹配为已知限制（注入
+    接口未携带屏索引，分辨率匹配为最小可行方案），实机验证项登记 R-26b
+    J03（需 macOS 设备，待设备）
+- **AV1 阶段 B 接入（R-32，审计 §4-8 / §2-P3-23，M13-T002 阶段 B）**：
+  R-16 阶段 A（av1_probe 探索，SVT-AV1 链路验证 + 码率效率 ~6×）结论接入
+  产品路径：
+  - `Codec::AV1` 枚举变体（`media/src/encoder/types.rs`）+ 协商字符串
+    `as_str`/`from_str`（`"av1"`，与 h264/h265 同族 wire 格式，序列化兼容）；
+    `ffmpeg_sw_name` → `libsvtav1`
+  - 编码能力协商接线（session/proto 路径）：客户端握手
+    `supported_codecs` 携带本端**可解码**列表（`decoder::client_supported_codecs`，
+    按 [av1, h265, h264] 优先级，解码链存在性过滤）；服务端
+    `negotiate_codec_by_server_priority`（core 新增，服务端编码优先级
+    AV1 → H.265 → H.264 从交集挑选，交集为空 → 空串 → 客户端 H.264 兜底，
+    兼容旧客户端空广告）；`core::crypto::handshake` 新增追加式
+    `client_handshake_with_codecs_generic`（旧函数委托空列表，行为不变）；
+    服务端两侧握手（`ui/src/policy.rs::server_accept_handshake` + GUI
+    `ui/src/lib.rs` 内联握手）均按 `encoder::detect_supported_codecs_cached()`
+    协商应答
+  - 编码器接入（SVT-AV1）：捆绑 FFmpeg 8.1.1 full build 勘察结论 =
+    **含 libsvtav1**（静态编入 avcodec-62.dll，无独立 SvtAv1 DLL；ffmpeg.exe
+    `-encoders` 实测确认 libsvtav1/libaom-av1/librav1e + libdav1d/av1 解码器）。
+    `ffmpeg_sw.rs::open_with_dict` AV1 专用参数（preset=8 数值档、跳过
+    maxrate——SVT VBR 下 maxrate 报 "Max Bitrate only supported with CRF"、
+    无 zerolatency tune）+ `encode_inner` EAGAIN 短等待排空（SVT 异步
+    lookahead，单帧调用也能取回包，x264/x265 零额外延迟）；
+    `decoder::factory` AV1 解码链（软解 `av1`，HW AV1 待零拷贝桥后评估——
+    规避 h264_qsv 同族 MFX 驱动损坏崩溃风险）
+  - 回退链（验收口径）：`factory::create_video_encoder` 跨 codec 兜底——
+    AV1 全链（libsvtav1 → libaom_av1 → librav1e）不可用 → **自动回退
+    H.264（libx264）且无报错**；AV1 暂不接 HW（`FfmpegHwEncoder` 候选名
+    表 h264/hevc 系与 AV1 不匹配，待 AV1 HW 链并入）；会话层按协商结果
+    创建编码/解码器（`ui/src/lib.rs` 服务端编码器 + 客户端解码器、
+    `media/src/session.rs` 经 `MediaTransport::negotiated_codec`，默认 H.264
+    零改动）
+  - 单测：Codec wire 往返、AV1 回退链形状 + 跨 codec 兜底（无 AV1 编码器
+    → H.264 且不报错）、协商函数（服务端优先级/客户端顺序/交集空）、
+    带 codec 列表握手 wire 往返（服务端读到 supported_codecs 并应答
+    selected_codec=av1）、AV1 码流合法性（Annex B 起始码 + 关键帧）、
+    AV1 编码 → 解码回读（生产解码链软解 av1，多帧全可解）；全量回归
+    只增不减
+- **id_mode 打洞 hook 接入（R-18b，审计 §4-7 / §2-P3-16）**：
+  `core/src/connection/id_mode.rs` 三级路径由"直连→中继"两级补齐为
+  "直连→打洞→中继"真三级：
+  - S1 打洞 hook（`IdConnector::try_punch` / `try_punch_with_session`）：
+    直连失败后经 rendezvous（R-08b `--rendezvous-port` 独立监听）交换候选
+    + UDP 探测 / TCP 同时打开（复用 `punch::PunchSession::establish()`，
+    PUNCH-001~006）；候选来源 = `DeviceInfo`（UDP 条目 + 服务器观察地址
+    OBSERVED 条目，PUNCH-PROTO-001）；会话复用 PUNCH-SEC-003（发起方生成
+    128 位随机 session_id 并 pin，`try_punch_with_session` 供经控制面告知
+    对端后的配对入口）；单段参数取快速失败预算（整体受 connect_timeout
+    约束，PUNCH-PROTO-007）
+  - S2 结果映射：TCP 同时打开成功（`PunchTcp`，PUNCH-SEC-001 内建 Ed25519
+    双向握手 + 公钥 pin 强制比对，返回流不再重复握手）→ 路径交付；UDP
+    成功（`PunchUdp`）→ socket 属媒体层 QUIC 升级路径（`M8-T026_接口交互
+    协调.md` §3.6），初始编排以中继为控制面让位；失败/无候选/未配置
+    rendezvous → 中继兜底（连通性不降级）
+  - S3 配置与审计：`IdModeConfig` 新增 `identity`（打洞握手身份，None 懒
+    加载默认身份 `~/.kirin_desk/identity/ed25519.json`）与
+    `punch_rendezvous_addr`（None = 未配置跳过，不再产生 `punch_skipped`，
+    路径选择如实审计）；打洞尝试/成败写 utils 审计（PUNCH-SEC-004）；
+    本端打洞地址按对端族选择（回环/本机接口，R-17），pin 取自解析响应
+  - S4 测试：core 新增 4 项单测（无候选跳过 / 未配置 rendezvous 跳过 /
+    打洞 TCP 建立——进程内 rendezvous + 对端会话，PunchTcp + 内建握手
+    身份 / 无对端快速失败）+ self-test 增段 `R-18b id_mode punch path`
+    （子用例 A：直连失败 → 打洞发起（rendezvous 候选登记审计）→ 降中继；
+    子用例 B：设备侧会话同 session 响应 → punch-tcp 建立 + 双端互转审计）；
+    core 225 项全绿 + `--cli self-test` 全过 + 全量回归只增不减
+  - 遗留：设备侧打洞响应器（relay `id_client` 接 `PeerCandidates` + 探测
+    应答）与 `[tunnel] rendezvous_addr` 配置接线为后续任务——当前生产默认
+    未注入 rendezvous 时打洞阶段跳过（日志注明），已配置时打洞尝试发起并
+    审计，无响应自动降中继
 
 ## [v0.1.0] - 2026-07-31
 

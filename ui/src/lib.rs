@@ -16,9 +16,9 @@ use file_panel::{FileCommand, FileDirection, FilePanelState, FileTask, FileTaskS
 
 use kirin_desk_core::connection::file_transfer::{
     block_len, block_offset, derive_transfer_id, sanitize_filename, sha256_file,
-    validate_block_count, ChunkReceiver, FileOfferMeta, FileOp, FileTransferError,
+    validate_block_count, ChunkReceiver, FileOfferMeta, FileOp,
     FileTransferFrame, SlideWindowSender, StoredTransfer, TransferScheduler, TransferStore,
-    BLOCK_SIZE, DEFAULT_MAX_FILE_SIZE,
+    DEFAULT_MAX_FILE_SIZE,
 };
 // R-03 (R03-S1): 可复用建连链路（CLI/GUI/断线重连共用）。
 use kirin_desk_core::connection::client::{
@@ -53,7 +53,7 @@ use terminal::Terminal;
 use theme::{Theme, ThemeMode};
 use widgets::{
     action_button, badge, card, copy_button, labeled_input, log_view, segmented_control,
-    selectable_pill, stat_card, stat_card_with_footer, state_button, status_dot, status_dot_char,
+    selectable_pill, stat_card_with_footer, state_button, status_dot, status_dot_char,
     stepper, toggle_switch, toolbar_button, BadgeKind, ButtonKind, ButtonState, LogViewOptions,
     StatRow, Validity,
 };
@@ -328,6 +328,9 @@ fn audio_enabled_global() -> &'static AtomicBool {
 }
 
 /// R-04：音频开关读取（CLI 解析测试 / 会话启动共用；`pub(crate)`）。
+// R-33: 当前生产路径经 `audio_enabled_global()` 直读 + `set_audio_enabled` 直写，
+// 本读接口无调用者——保留（会话启动共用语义，CLI 测试/未来接线用）并标注。
+#[allow(dead_code)]
 pub(crate) fn audio_enabled() -> bool {
     audio_enabled_global().load(Ordering::Relaxed)
 }
@@ -992,6 +995,9 @@ enum PendingStatus {
 }
 
 /// Shared state between the GUI and the server listener thread.
+// R-33: 当前服务端监听线程经 `server_runtime_state()` 共享运行态，本结构为
+// 早期共享态设计（pending 连接队列）——保留并标注（后续连接窗口功能接线用）。
+#[allow(dead_code)]
 struct ServerState {
     pending_connections: Vec<PendingConnection>,
     next_id: u64,
@@ -1408,7 +1414,11 @@ struct ReconnectCtx {
     server_id: String,
     /// 展示用地址（窗口标题/日志）。
     addr_label: String,
+    // R-33: 建连元数据（域名/设备类型）当前仅构造登记、重连展示未读取——
+    // 保留（窗口标题/日志后续使用）并标注。
+    #[allow(dead_code)]
     domain: String,
+    #[allow(dead_code)]
     device_type: String,
 }
 
@@ -3879,6 +3889,9 @@ struct KirinDeskApp {
     server_running: bool,
     server_status: String,
     pending_connections: Vec<PendingConnection>,
+    // R-33: 服务端待处理连接 id 计数——当前 GUI 以弹出卡方式呈现连接请求，
+    // 队列 id 未读取（保留，连接窗口列表功能接线用）。
+    #[allow(dead_code)]
     next_pending_id: u64,
     // Status bar
     local_ipv6: String,
@@ -3931,6 +3944,9 @@ struct KirinDeskApp {
     /// 本次启动是否由系统开机自启拉起（`--autostart`）——用于窗口最小化启动。
     autostart_launched: bool,
     /// 无人值守自动开启服务端是否已执行（一次性标记）。
+    // R-33: 标记由启动流程写入，读侧尚未接线（无人值守自启服务端状态展示
+    // 后续使用）——保留并标注。
+    #[allow(dead_code)]
     server_auto_started: bool,
     // M8-T017: 临时连接（Dashboard 卡片）状态——明文码仅本次进程持有
     // （TMP-SEC-001，状态文件只存哈希）；窗口过期/关闭后复位。
@@ -4172,7 +4188,9 @@ impl eframe::App for KirinDeskApp {
             self.gui_log = buf.all();
             // Keep max ~100 lines for display
             if self.gui_log.len() > 8000 {
-                if let Some(pos) = self.gui_log.as_bytes().iter().rposition(|&b| b == b'\n') {
+                // R-33: rposition 的返回值仅作"存在换行"判定（截断起点由下方
+                // skip(cut) 重新计算），故用 contains 替代，消除未用变量告警。
+                if self.gui_log.as_bytes().contains(&b'\n') {
                     let cut = self.gui_log.len().saturating_sub(6000);
                     let start = self
                         .gui_log
@@ -6581,7 +6599,6 @@ impl KirinDeskApp {
         } else {
             Some(self.nickname.clone())
         };
-        let use_temp_key = self.device_id.is_empty();
 
         self.server_running = true;
         self.server_status = format!("Starting on port {}...", port);
@@ -6605,7 +6622,6 @@ impl KirinDeskApp {
         // IP mode bypasses whitelist check（无人值守下在 cfg 加载后强制关闭，
         // 见下方 `unattended` 判定 —— UA-ACCEPT-004）。
         let mut skip_whitelist = temp_mode || ip_mode;
-        let mut unattended = false;
 
         // M15 (SRV-SEC-KH/RL/AUDIT): 服务端策略组件 — known_hosts / 审计 /
         // 速率限制 / DNS 配置（供 TXT 公钥兜底）。
@@ -6623,8 +6639,9 @@ impl KirinDeskApp {
         ));
         let cfg = kirin_desk_utils::config::Config::load().unwrap_or_default();
         // M13-T005 (UA-ACCEPT-004): 无人值守下强制关闭 temp-mode/ip-mode 旁路——
-        // 不提供任何临时放行未知设备的路径。
-        unattended = cfg.unattended.enabled;
+        // 不提供任何临时放行未知设备的路径。（R-33：直接声明绑定，消除
+        // unused_assignments——初始 false 从未被读取。）
+        let unattended = cfg.unattended.enabled;
         if unattended {
             skip_whitelist = false;
         }
@@ -7193,12 +7210,12 @@ impl KirinDeskApp {
                 // 发送循环（与视频写半互斥，tag=Audio）。
                 if audio_enabled_global().load(Ordering::Relaxed) && server_audio_allowed() {
                     let sender_audio = sender_shared.clone();
-                    let stop_audio = stop_capture.clone();
+                    let stop_audio = stop_capture;
                     tokio::spawn(async move {
                         let (audio_pkt_tx, mut audio_pkt_rx) =
                             tokio::sync::mpsc::channel::<Vec<EncodedPacket>>(32);
                         let audio_tx_task = audio_pkt_tx.clone();
-                        let stop_pipe = stop_audio.clone();
+                        let stop_pipe = stop_audio;
                         tokio::task::spawn_blocking(move || {
                             let mut pipeline = match kirin_desk_media::AudioPipeline::new() {
                                 Ok(p) => p,
@@ -7907,7 +7924,7 @@ impl KirinDeskApp {
                         ui.painter().rect_stroke(
                             card.response.rect,
                             egui::Rounding::same(theme.rounding_card),
-                            egui::Stroke::new(1.5, theme.primary),
+                            egui::Stroke::new(1.5_f32, theme.primary),
                         );
                     }
                     // M10-T004: 单击 → 自动填入 Connect 页并切换标签页。

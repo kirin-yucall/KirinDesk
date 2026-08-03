@@ -122,7 +122,7 @@ pub fn action_button(
             w.weak_bg_fill = fill;
             w.bg_stroke = Stroke::new(theme.border_width, theme.border);
             w.rounding = egui::Rounding::same(theme.rounding_control);
-            w.fg_stroke = Stroke::new(1.0, fg);
+            w.fg_stroke = Stroke::new(1.0_f32, fg);
         }
         v.widgets.hovered.bg_fill = hover;
         v.widgets.active.bg_fill = hover;
@@ -157,7 +157,7 @@ pub fn selectable_pill(ui: &mut Ui, theme: &Theme, text: &str, selected: bool) -
             w.bg_fill = fill;
             w.weak_bg_fill = fill;
             w.rounding = egui::Rounding::same(theme.rounding_control);
-            w.fg_stroke = Stroke::new(1.0, fg);
+            w.fg_stroke = Stroke::new(1.0_f32, fg);
             w.bg_stroke = Stroke::new(theme.border_width, theme.border);
         }
         if !selected {
@@ -200,7 +200,7 @@ pub fn toolbar_button(ui: &mut Ui, theme: &Theme, icon: &str, tooltip: &str) -> 
         ] {
             w.bg_fill = theme.bg_strong;
             w.rounding = egui::Rounding::same(theme.rounding_control);
-            w.fg_stroke = Stroke::new(1.0, theme.fg);
+            w.fg_stroke = Stroke::new(1.0_f32, theme.fg);
             w.bg_stroke = Stroke::new(theme.border_width, theme.border);
         }
         v.widgets.hovered.bg_fill = theme.bg_panel;
@@ -500,6 +500,9 @@ pub struct StatRow<'a> {
 
 /// 信息卡片（§4 StatCard）：标题栏（Small 弱色）+ 分隔线 + 键值行。
 /// 返回本帧被复制的内容（`None` = 未复制；M8-T028 状态栏浮出提示用）。
+// R-33: 当前卡面统一走 `stat_card_with_footer`（footer=None 时行为一致），
+// 本入口无调用者——保留（组件库对称 API，供后续卡面复用）并标注。
+#[allow(dead_code)]
 pub fn stat_card(ui: &mut Ui, theme: &Theme, title: &str, rows: &[StatRow<'_>]) -> Option<String> {
     stat_card_impl(ui, theme, title, rows, None)
 }

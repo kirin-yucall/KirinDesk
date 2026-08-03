@@ -268,7 +268,10 @@ struct Engine {
 
 impl Engine {
     /// 单测/装配用全参构造。
+    // R-33: 目前仅测试模块与装配辅助调用（生产路径走 `Engine { .. }` 直构）——
+    // 保留全参构造接口并标注，避免 dead_code。
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
     fn new(
         provider: Option<Arc<dyn Provider>>,
         domain: String,

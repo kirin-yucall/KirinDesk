@@ -45,4 +45,4 @@ ENTRYPOINT ["/app/relay-server"]
 # 默认参数；docker run 可用尾随参数覆盖，如：
 #   docker run ... kirin-relay-server --bind-port 9000 --port-range 50000-50099
 #   docker run ... kirin-relay-server --bind-addrs 0.0.0.0,:: --bind-port 9000 --port-range 50000-50099
-CMD ["--bind-port", "7000", "--port-range", "60000-60099"]
+CMD ["--bind-port", "7000", "--port-range", "60000-61000"]

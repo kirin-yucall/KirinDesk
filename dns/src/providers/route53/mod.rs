@@ -42,6 +42,8 @@ impl Route53Provider {
     }
 
     /// 测试用：注入自定义端点的客户端。
+    // R-33: 仅测试模块调用（mock 端点注入）——保留接口并标注，避免 dead_code。
+    #[allow(dead_code)]
     pub(crate) fn with_client(client: Route53Client) -> Self {
         Self { client }
     }

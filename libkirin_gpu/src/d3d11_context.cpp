@@ -42,6 +42,13 @@ namespace kirin_gpu {
 // ── 进程内单例（未初始化时为 nullptr）────────────────────────────
 static KgContext*           g_ctx  = nullptr;
 static std::mutex           g_mtx;
+// R-15b（2026-08-04，并行单测实测修复）：持有者引用计数。
+// 幂等 init 的语义扩展：kgpu_init 每成功一次 +1，kgpu_shutdown 每调用
+// 一次 -1，归零才释放。生产路径（init 一次 / shutdown 一次）行为不变；
+// 多持有者（Rust 单测并行各持内核句柄、Drop 各自 shutdown）不再互相
+// 杀死共享上下文（实测 0xc0000005：一个测试 Drop → shutdown 释放 device，
+// 并行中其它测试仍在使用 → 悬垂）。
+static int32_t              g_ctx_refs = 0;
 
 KgContext* context_get()    { return g_ctx; }
 std::mutex& context_mutex() { return g_mtx; }
@@ -108,7 +115,13 @@ static bool alloc_grid_buffers(KgContext* c) {
     // hash：uint4(16B)/tile，UAV + SRV（Pass1 写、Pass2 读）。
     UINT hash_bind = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
     c->hash_buf_a = create_structured(c->device, 16, c->total, hash_bind);
-    c->hash_buf_b = create_structured(c->device, 16, c->total, D3D11_BIND_SHADER_RESOURCE);
+    // R-15b 修复（2026-08-04，首次 MSVC 实测）：hash_buf_b 也必须含
+    // D3D11_BIND_UNORDERED_ACCESS——swap_hash_buffers 每帧把 UAV 重建到
+    // 当前的 hash_buf_a（轮流指向前 buf_a / 前 buf_b）；原代码 buf_b 仅
+    // SHADER_RESOURCE 绑定，轮到它时 CreateUnorderedAccessView 失败且
+    // hr 被忽略 → UAV 为 null → Pass1 空写 → diff 恒全 dirty（FULLFRAME
+    // 永不收敛，1080p 实测 dirty_ratio 恒 1.0）。
+    c->hash_buf_b = create_structured(c->device, 16, c->total, hash_bind);
     if (!c->hash_buf_a || !c->hash_buf_b) return false;
 
     // dirty 位图：uint/tile（UAV + SRV 便于读回 / Pass3 聚合）。
@@ -229,7 +242,11 @@ uint8_t* alloc_dirty_mirror(KgContext* c, uint32_t bytes) {
 
 static int32_t kgpu_init_impl(void* device_handle) {
     std::lock_guard<std::mutex> lk(g_mtx);
-    if (g_ctx) return KG_OK;  // 幂等
+    if (g_ctx) {
+        // 幂等：已初始化则引用计数 +1（多持有者场景），保持首个 device。
+        ++g_ctx_refs;
+        return KG_OK;
+    }
 
     KgContext* c = new (std::nothrow) KgContext();
     if (!c) return KG_ERR_INIT;
@@ -253,8 +270,9 @@ static int32_t kgpu_init_impl(void* device_handle) {
     }
 
     if (!c->ctx) {
-        hr = c->device->GetImmediateContext(&c->ctx);
-        if (FAILED(hr) || !c->ctx) {
+        // GetImmediateContext 返回 void（D3D11）；失败仅表现为 ctx 为空。
+        c->device->GetImmediateContext(&c->ctx);
+        if (!c->ctx) {
             if (c->owns_device) c->device->Release();
             delete c;
             return KG_ERR_INIT;
@@ -276,6 +294,7 @@ static int32_t kgpu_init_impl(void* device_handle) {
     }
 
     c->initialized = true;
+    g_ctx_refs = 1;
     g_ctx = c;
     return KG_OK;
 }
@@ -283,8 +302,14 @@ static int32_t kgpu_init_impl(void* device_handle) {
 static void kgpu_shutdown_impl(void) {
     std::lock_guard<std::mutex> lk(g_mtx);
     if (!g_ctx) return;
+    // R-15b：引用计数归零才真正释放（多持有者安全）。
+    if (--g_ctx_refs > 0) return;
     KgContext* c = g_ctx;
     g_ctx = nullptr;
+
+    // hw_bridge 先释放（其 AVHWDeviceContext 持有本 device 的引用，须在
+    // device 释放前 unref；本函数已持 g_mtx，hw_bridge_shutdown 不加锁）。
+    hw_bridge_shutdown();
 
     // 逆序释放：CS → 缓冲 → context → device。
     safe_release(c->hash_cs);
@@ -315,6 +340,11 @@ extern "C" {
 
 int32_t kgpu_init(void* device_handle) {
     return kirin_gpu::kgpu_init_impl(device_handle);
+}
+
+void* kgpu_device_handle(void) {
+    std::lock_guard<std::mutex> lk(kirin_gpu::g_mtx);
+    return kirin_gpu::g_ctx ? static_cast<void*>(kirin_gpu::g_ctx->device) : nullptr;
 }
 
 void kgpu_shutdown(void) {

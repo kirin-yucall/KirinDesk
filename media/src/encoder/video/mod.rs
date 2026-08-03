@@ -44,6 +44,10 @@ pub enum EncodeError {
     /// 视频/键鼠不受影响）。与 [`Unsupported`](Self::Unsupported) 区分：后者
     /// 指后端/编码标准缺失，本变体指平台级能力缺失。
     UnsupportedPlatform(String),
+    /// 运行时参数重配未实现（R-23b）：编码器以固定参数模式运行（如 HW 编码器
+    /// 的 cbr 码率模式），请求的 QP/preset 变更无法原地应用。返回本错误即
+    /// **不再静默成功**——调用方应显式规避（记日志并沿用旧配置继续编码）。
+    NotImplemented(String),
 }
 
 impl std::fmt::Display for EncodeError {
@@ -55,6 +59,7 @@ impl std::fmt::Display for EncodeError {
             EncodeError::GpuKernel(m) => write!(f, "GPU kernel failed: {}", m),
             EncodeError::InvalidConfig(m) => write!(f, "invalid config: {}", m),
             EncodeError::UnsupportedPlatform(m) => write!(f, "unsupported platform: {}", m),
+            EncodeError::NotImplemented(m) => write!(f, "not implemented: {}", m),
         }
     }
 }
@@ -242,6 +247,9 @@ mod tests {
         assert!(EncodeError::UnsupportedPlatform("macos".into())
             .to_string()
             .contains("unsupported platform"));
+        assert!(EncodeError::NotImplemented("qp change".into())
+            .to_string()
+            .contains("not implemented"));
     }
 
     #[test]

@@ -36,6 +36,9 @@ pub struct GodaddyClient {
     /// 内部 reqwest 客户端。
     client: reqwest::Client,
     /// 认证处理（sso-key）。
+    // R-33: 生产路径经 `client` 请求头注入，仅测试直接读取该句柄——
+    // 保留字段（认证句柄生命周期归属）并标注，避免 dead_code。
+    #[allow(dead_code)]
     auth: Arc<Auth>,
     /// API 基址（生产 `https://api.godaddy.com`；OTE `https://api.ote-godaddy.com`）。
     base_url: String,

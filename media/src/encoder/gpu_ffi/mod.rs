@@ -97,6 +97,10 @@ extern "C" {
     /// `device_handle` 平台语义：Windows=ID3D11Device* / Linux=VkDevice(待) /
     /// macOS=MTLDevice(待)。NULL → 自建 device。
     pub(crate) fn kgpu_init(device_handle: *mut core::ffi::c_void) -> i32;
+    /// 内核当前 D3D11 device 句柄（只借用；未初始化/非 Windows → NULL）。
+    /// 生产路径暂由 capture 集成使用；当前仅 hw_bridge 测试调用。
+    #[allow(dead_code)]
+    pub(crate) fn kgpu_device_handle() -> *mut core::ffi::c_void;
     pub(crate) fn kgpu_shutdown();
     pub(crate) fn kgpu_tile_hash(
         texture: *mut core::ffi::c_void,
@@ -110,15 +114,49 @@ extern "C" {
         out_len: *mut u32,
     ) -> i32;
     pub(crate) fn kgpu_hw_upload(texture: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+    /// hwframes 绑定信息探针（P1B §T2.3 / R-15b 测试断言；见 kirin_gpu.h）。
+    /// 仅 hw_bridge 测试调用（cfg(kirin_gpu_linked)）。
+    #[allow(dead_code)]
+    pub(crate) fn kgpu_hw_upload_probe(
+        frame: *mut core::ffi::c_void,
+        out: *mut KgHwFrameInfo,
+    ) -> i32;
+    /// hw_bridge C 侧自检（0 = 通过；正 = 失败位掩码；负 = 无法运行）。
+    /// 仅 hw_bridge 测试调用（cfg(kirin_gpu_linked)）。
+    #[allow(dead_code)]
+    pub(crate) fn kgpu_hw_upload_selftest() -> i32;
     pub(crate) fn kgpu_dirty_indices(
         texture: *mut core::ffi::c_void,
         out_idx: *mut u32,
         out_count: *mut u32,
     ) -> i32;
 
-    // RLE 编解码（blit_rle.cpp 导出，供 Rust 单测覆盖一致算法）。
+    // RLE 编解码（blit_rle.cpp 导出，供 Rust 单测覆盖一致算法；
+    // 仅 cfg(kirin_gpu_linked) 测试使用 → allow(dead_code) 抑制 lib 构建告警）。
+    #[allow(dead_code)]
     pub(crate) fn kgpu_rle_encode(src: *const u8, src_len: u32, dst: *mut u8, dst_cap: u32) -> u32;
+    #[allow(dead_code)]
     pub(crate) fn kgpu_rle_decode(src: *const u8, src_len: u32, dst: *mut u8, dst_cap: u32) -> u32;
+}
+
+/// hwframes 绑定信息（与 `include/kirin_gpu.h` 的 `KgHwFrameInfo` 布局一致）。
+///
+/// 由 [`kgpu_hw_upload_probe`] 填充，供零拷贝绑定断言（R-15b 测试）：
+/// - `frame`：AVFrame*（与输入一致）
+/// - `pix_fmt`：AV_PIX_FMT_D3D11（1000085）
+/// - `has_hw_frames_ctx`：0/1（hw_frames_ctx 非空）
+/// - `bound_texture`：AVD3D11FrameDescriptor.texture（绑定纹理句柄；
+///   NV12 输入时 == 输入纹理 → 零拷贝断言）
+/// - `width` / `height`：AVFrame 尺寸
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct KgHwFrameInfo {
+    pub frame: *mut core::ffi::c_void,
+    pub pix_fmt: i32,
+    pub has_hw_frames_ctx: i32,
+    pub bound_texture: *mut core::ffi::c_void,
+    pub width: i32,
+    pub height: i32,
 }
 
 /// 错误码 → `EncodeError`。

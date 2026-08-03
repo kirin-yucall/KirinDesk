@@ -17,7 +17,7 @@ use crate::crypto::handshake::{
     client_handshake_with_confirm, CoreReason, HandshakeError, PinExpectation, SecureChannel,
 };
 use kirin_desk_dns::{default_provider, DeviceInfo, DiscoveryService, IpFamily};
-use kirin_desk_dns::{Resolver, ResolverError};
+use kirin_desk_dns::Resolver;
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::sync::Arc;

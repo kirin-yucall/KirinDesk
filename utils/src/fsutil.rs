@@ -20,7 +20,7 @@
 //! `set_private_permissions`（占位实现，注释"待 S-07 write_private 收口"）
 //! 在 S-07 合并后薄封装到本模块（见 keystore.rs）。
 
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::Path;
 
 /// 私密文件写入（S-07a）：Unix `0600` + 父目录 `0700` + `O_NOFOLLOW`；

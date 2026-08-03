@@ -7,7 +7,7 @@
 #                               # ID 模式需预置到 [tunnel] server_pubkey）
 #   4. docker compose down      # 停止（密钥卷保留，pubkey 不变）
 #
-# 防火墙：放行 7000/tcp 与 60000-60099/tcp（UDP 无需，纯 TCP 隧道）。
+# 防火墙：放行 7000/tcp 与 60000-61000/tcp（UDP 无需，纯 TCP 隧道）。
 
 services:
   relay-server:
@@ -23,7 +23,7 @@ services:
       - RUST_LOG=${RUST_LOG:-info}
     ports:
       - "7000:7000/tcp"                 # 控制端口（可用环境变量覆盖，见下）
-      - "60000-60099:60000-60099/tcp"   # 自动分配端口范围
+      - "60000-61000:60000-61000/tcp"   # 自动分配端口范围（与 [tunnel] port_range 默认值一致）
     volumes:
       # Ed25519 服务器密钥持久化：容器重建后 pubkey 不变，
       # 客户端预置的 server_pubkey 无需同步更新

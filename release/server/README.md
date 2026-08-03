@@ -11,13 +11,13 @@ frps 等价的独立服务端二进制（M8-T026），部署在**公网服务器
 ## 快速开始（Windows）
 
 ```bat
-relay-server.exe --bind-port 7000 --token <高熵token≥32字节> --port-range 60000-60099
+relay-server.exe --bind-port 7000 --token <高熵token≥32字节> --port-range 60000-61000
 ```
 
 显式 IPv4+IPv6 双监听（多地址，可选）：
 
 ```bat
-relay-server.exe --bind-addrs 0.0.0.0,:: --bind-port 7000 --token <高熵token≥32字节> --port-range 60000-60099
+relay-server.exe --bind-addrs 0.0.0.0,:: --bind-port 7000 --token <高熵token≥32字节> --port-range 60000-61000
 ```
 
 启动后控制台会打印服务器 Ed25519 公钥（**客户端 ID 模式须预置
@@ -41,7 +41,7 @@ relay-server.exe --bind-port 7000 --rendezvous-port 7001 --token <高熵token≥
 | `--rendezvous-port <PORT>` | `7001` | 打洞 rendezvous 端口（P1 打洞候选登记/互转/限速/审计，PUNCH-006）；**须与 `--bind-port` 不同**，非法值（非数字/0）或冲突拒绝启动 |
 | `--no-rendezvous` | 启用 | 关闭打洞 rendezvous（不监听 `--rendezvous-port`）；与 `--rendezvous-port` 同时给出为冲突，拒绝启动 |
 | `--token <TOKEN>` | 空（告警） | 客户端认证 token；也可经环境变量 `KIRIN_RELAY_TOKEN` 提供（推荐，避免进程列表泄露） |
-| `--port-range <S-E>` | 无 | 自动分配端口范围（客户端 `remote_port=0` 请求用），如 `60000-60099` |
+| `--port-range <S-E>` | 无 | 自动分配端口范围（客户端 `remote_port=0` 请求用），如 `60000-61000`（须与客户端 `[tunnel] port_range` 默认值一致并同步放行防火墙） |
 | `--server-key <PATH>` | `~/.kirin_desk/relay_server_key.pem` | Ed25519 服务器密钥；不存在则自动生成并持久化（ID-SEC-001） |
 | `--max-proxies <N>` | `32` | 每会话代理数量上限 |
 | `--max-work-conns <N>` | `100` | 每代理并发 work 连接上限 |

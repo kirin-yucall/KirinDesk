@@ -710,6 +710,9 @@ fn record_from_rdata(
 
 /// DoH `application/dns-json` 响应（Cloudflare 格式为主，兼容 Google/阿里）。
 #[derive(serde::Deserialize)]
+// R-33: non_snake_case 仅在结构体级 allow 生效（字段级 allow 对 rustc 该 lint
+// 无效，实测）——字段名 Status/Answer 为 dns-json 契约大写，须保留原名。
+#[allow(non_snake_case)]
 struct DohResponse {
     /// 0 = 成功；非 0（SERVFAIL/NXDOMAIN 等）→ 该端点不可用。
     #[serde(default)]
@@ -719,13 +722,15 @@ struct DohResponse {
 }
 
 #[derive(serde::Deserialize)]
+// R-33: 同上——TTL 为 DoH JSON 契约字段名（Cloudflare 大写；Google 小写经
+// alias="ttl" 兼容），字段级 allow 无效，统一放结构体级。
+#[allow(non_snake_case)]
 struct DohAnswer {
     name: String,
     #[serde(rename = "type")]
     rtype: u16,
     /// Cloudflare 用大写 TTL；Google/部分实现小写 `ttl`——双键兼容。
     #[serde(default, alias = "ttl")]
-    #[allow(non_snake_case)]
     TTL: u32,
     data: String,
 }

@@ -83,12 +83,13 @@ pub enum TempModeError {
 }
 
 /// 墙钟当前时刻（unix 秒）；测试可**按状态文件路径**注入（见 `TEST_NOW`）。
-fn now_secs_for(state_file: &Path) -> u64 {
+/// R-33: 参数仅测试注入分支使用——下划线前缀抑制非 test 编译的未用告警。
+fn now_secs_for(_state_file: &Path) -> u64 {
     #[cfg(test)]
     {
         // 测试注入：`set_test_now(path, v)` 模拟该路径窗口的墙钟时刻
         // （v = 0 = 未注入，走真实时钟）。按路径隔离 → 并行测试互不干扰。
-        if let Some(v) = test_now_map().lock().unwrap().get(state_file) {
+        if let Some(v) = test_now_map().lock().unwrap().get(_state_file) {
             if *v != 0 {
                 return *v;
             }

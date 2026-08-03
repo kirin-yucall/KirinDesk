@@ -38,6 +38,9 @@ mod settings;
 mod tunnel;
 mod widgets;
 
+// R-33: Lang 转换接口与语言常量当前未被调用（M8-T038 语言选项固定中文基线，
+// 语言切换/持久化接线时启用）——整组标注，避免 dead_code。
+#[allow(dead_code)]
 /// 中文语言代码。
 pub const LANG_ZH: &str = "zh";
 /// 英文语言代码。
@@ -54,6 +57,7 @@ pub enum Lang {
 
 impl Lang {
     /// BCP-47 语言代码（`"zh"` / `"en"`）。
+    #[allow(dead_code)]
     pub fn code(self) -> &'static str {
         match self {
             Lang::Zh => LANG_ZH,
@@ -63,6 +67,7 @@ impl Lang {
 
     /// 由语言代码解析；`en*` → 英文，其余 → [`Lang::Zh`]（宽松前缀解析，
     /// 兼容 `"en-US"` 等变体；未知代码不报错）。
+    #[allow(dead_code)]
     pub fn from_code(code: &str) -> Lang {
         let c = code.to_ascii_lowercase();
         if c == LANG_EN || c.starts_with("en-") {
@@ -77,6 +82,7 @@ impl Lang {
     ///
     /// 注：GUI 场景个别平台（如 Windows 桌面）可能不导出 `LANG`，此时回落
     /// 中文基线——M8-T038 起上层优先经 [`system()`]（含系统 API 兜底）。
+    #[allow(dead_code)]
     pub fn from_env() -> Lang {
         env_lang().unwrap_or(Lang::Zh)
     }

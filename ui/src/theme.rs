@@ -12,7 +12,7 @@
 //!   字形 + 系统字体回退，见 §7 汇报）。
 
 use eframe::egui;
-use egui::{Color32, FontData, FontDefinitions, FontFamily, FontId, Rounding, Stroke, TextStyle};
+use egui::{Color32, FontData, FontFamily, FontId, Rounding, Stroke, TextStyle};
 use std::sync::OnceLock;
 
 // ════════════════════════════════════════════════════════════════
@@ -208,26 +208,26 @@ impl Theme {
         v.warn_fg_color = self.warning;
         v.error_fg_color = self.danger;
         v.selection.bg_fill = self.selection;
-        v.selection.stroke = Stroke::new(1.0, self.fg);
+        v.selection.stroke = Stroke::new(1.0_f32, self.fg);
 
         let rounding = Rounding::same(self.rounding_control);
         let border = Stroke::new(self.border_width, self.border);
-        v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, self.fg_weak);
+        v.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, self.fg_weak);
         v.widgets.noninteractive.bg_fill = self.bg_panel;
         v.widgets.noninteractive.weak_bg_fill = self.bg_strong;
         v.widgets.noninteractive.bg_stroke = border;
         v.widgets.noninteractive.rounding = rounding;
-        v.widgets.inactive.fg_stroke = Stroke::new(1.0, self.fg);
+        v.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, self.fg);
         v.widgets.inactive.bg_fill = self.bg_panel;
         v.widgets.inactive.weak_bg_fill = self.bg_strong;
         v.widgets.inactive.bg_stroke = border;
         v.widgets.inactive.rounding = rounding;
-        v.widgets.hovered.fg_stroke = Stroke::new(1.0, self.fg);
+        v.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, self.fg);
         v.widgets.hovered.bg_fill = self.bg_strong;
         v.widgets.hovered.weak_bg_fill = self.bg_strong;
         v.widgets.hovered.bg_stroke = Stroke::new(self.border_width, self.primary);
         v.widgets.hovered.rounding = rounding;
-        v.widgets.active.fg_stroke = Stroke::new(1.0, self.fg);
+        v.widgets.active.fg_stroke = Stroke::new(1.0_f32, self.fg);
         v.widgets.active.bg_fill = self.bg_strong;
         v.widgets.active.weak_bg_fill = self.bg_strong;
         v.widgets.active.bg_stroke = Stroke::new(self.border_width, self.primary);

@@ -34,6 +34,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=KIRIN_GPU_FORCE_LINK");
     println!("cargo:rerun-if-env-changed=KIRIN_GPU_SKIP");
     println!("cargo:rerun-if-env-changed=KIRIN_GPU_FFMPEG_INCLUDE_DIR");
+    println!("cargo:rerun-if-env-changed=KIRIN_GPU_FFMPEG_LIB_DIR");
 
     if !should_attempt_link() {
         return;
@@ -101,9 +102,41 @@ fn build_and_link(kgpu_dir: &Path) -> Result<(), String> {
     cfg.arg("-S").arg(kgpu_dir);
     cfg.arg("-B").arg(&build_dir);
     cfg.arg("-DCMAKE_BUILD_TYPE=Release");
-    // FFmpeg 头可选：仅在显式提供时启用 hw_bridge 真实路径。
-    if let Ok(inc) = env::var("KIRIN_GPU_FFMPEG_INCLUDE_DIR") {
-        cfg.arg(format!("-DFFMPEG_INCLUDE_DIR={inc}"));
+    // FFmpeg 头（hw_bridge 真实实现，R-15b）：默认自动探测仓库内
+    // ffmpeg/ffmpeg-8.1.1-full_build-shared/ 的 dev 头（与捆绑 DLL 同版本
+    // 的 GyanD 8.1.1 shared build，含 include/ + lib/）；显式 env
+    // KIRIN_GPU_FFMPEG_INCLUDE_DIR 优先（可指向其它路径）。
+    let ffmpeg_inc: Option<PathBuf> = match env::var("KIRIN_GPU_FFMPEG_INCLUDE_DIR") {
+        Ok(inc) if !inc.is_empty() => Some(PathBuf::from(inc)),
+        _ => {
+            // 仓库内默认：<workspace>/ffmpeg/ffmpeg-8.1.1-full_build-shared/include。
+            // workspace_root 是 main() 的局部变量，build_and_link 仅接收
+            // kgpu_dir（= workspace_root/libkirin_gpu）——由 kgpu_dir.parent()
+            // 推导即 workspace_root（R-15b 最终修法，2026-08-04）。
+            let ws_root = kgpu_dir.parent().unwrap_or(Path::new("."));
+            let root = ws_root
+                .join("ffmpeg")
+                .join("ffmpeg-8.1.1-full_build-shared");
+            let inc = root.join("include");
+            if inc.join("libavutil").join("hwcontext.h").is_file() {
+                Some(inc)
+            } else {
+                None
+            }
+        }
+    };
+    if let Some(inc) = ffmpeg_inc {
+        cfg.arg(format!("-DFFMPEG_INCLUDE_DIR={}", inc.display()));
+        // 同 root 的 lib/（导入库/def——仅用于 CMake 定位 DLL 目录，不静态链接）。
+        if let Some(lib) = inc.parent().map(|p| p.join("lib")) {
+            if lib.join("avutil-60.def").is_file() || lib.join("avutil.lib").is_file() {
+                cfg.arg(format!("-DFFMPEG_LIB_DIR={}", lib.display()));
+            }
+        }
+    } else if let Ok(lib) = env::var("KIRIN_GPU_FFMPEG_LIB_DIR") {
+        if !lib.is_empty() {
+            cfg.arg(format!("-DFFMPEG_LIB_DIR={lib}"));
+        }
     }
     run(&mut cfg)?;
 

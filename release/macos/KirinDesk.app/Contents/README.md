@@ -25,5 +25,6 @@ KirinDesk.app/
 ## 权限声明（Info.plist）
 
 - `NSDesktopCaptureUsageDescription`：屏幕录制（zed-scap / ScreenCaptureKit）
+- `NSCameraUsageDescription`：摄像头（远程查看可选功能）
 - `NSMicrophoneUsageDescription`：麦克风（音频环回通常不需要；可选输入设备预留）
 - `LSMinimumSystemVersion` = 12.0（ScreenCaptureKit 最低要求）

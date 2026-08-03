@@ -36,9 +36,15 @@ pub enum Ed25519Error {
     KeyStore(#[from] KeyStoreError),
 }
 
-/// 自定义加密存储格式（R-20 命名对齐：**非 PKCS#8**）。
-/// JSON `{nonce, ciphertext}`：ChaCha20Poly1305 加密后的 Ed25519 私钥字节；
-/// 密钥由 `derive_identity_key`（SHA-256(device_id)）派生。
+/// 自定义加密存储格式（R-20b：**非 PKCS#8**，宣称与实现一致）。
+///
+/// 这是本项目自有的「自定义加密存储（AEAD + AAD 上下文）」格式，**不实现
+/// 真 PKCS#8**（避免无谓复杂度，审计方案①）：
+/// - JSON `{nonce, ciphertext}`：ChaCha20Poly1305 AEAD 加密后的 Ed25519 私钥
+///   原始字节（32B）；当前 AAD 为空字节串（`b""`，见 `save`/`load`），
+///   密钥由 `derive_identity_key`（SHA-256(device_id)）派生；
+/// - 该格式现仅作 **legacy 迁移源**（`try_migrate_legacy`）——新存储走
+///   [`KeyStore`](crate::crypto::keystore) 后端（DPAPI / Keychain / secret-tool）。
 #[derive(Debug, Serialize, Deserialize)]
 struct EncryptedPrivateKey {
     /// Nonce used for ChaCha20Poly1305 encryption.

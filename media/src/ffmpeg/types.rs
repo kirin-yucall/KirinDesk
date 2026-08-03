@@ -65,13 +65,21 @@ pub const AV_PIX_FMT_YUVJ420P: i32 = 12;
 
 // ── Hardware pixel formats (P1C 硬件编码层使用；本阶段先定义常量) ──
 //
-// 数值取自 FFmpeg libavutil/pixfmt.h（FFmpeg 7.x/8.x 稳定值）。
-// 仅作 av_hwframe / hw_frames_ctx 契约，编码器侧用 av_opt_set_pix_fmt
-// 而非直接比较这些数值，因此即便主版本微调也不会影响安全包装路径。
-pub const AV_PIX_FMT_D3D11: i32 = 1000085;
+// **R-15b 核对（2026-08-04）**：`AV_PIX_FMT_D3D11` 在捆绑 8.1.1
+// （GyanD shared build，libavutil 60.26.101）的 pixfmt.h 中为**枚举位置
+// 值 171**（hw_bridge.cpp kgpu_hw_upload_probe 实测读回 frame->format
+// == 171，与头文件一致）；旧值 1000085 来自早期 FFmpeg 版本，在 8.x
+// 头中已不存在（8.1.1 全部 hw 格式均为无显式值的普通枚举成员）。
+// 该常量用于 hwframes 契约断言（R-15b test_hw_upload_frame_type）与
+// ffmpeg_hw.rs 调试 pix_fmt()；编码器侧配置仍走 av_opt_set_pix_fmt，
+// 不受影响。
+// **遗留**：`AV_PIX_FMT_VAAPI/VIDEOTOOLBOX/QSV/CUDA` 等仍为早期版本
+// 值（仅 ffmpeg_hw.rs 调试显示使用，无运行时依赖）；精确核对清单归
+// R-22b（FFmpeg 字段偏移核对），本处不擅改。
+pub const AV_PIX_FMT_D3D11: i32 = 171; // 8.1.1 实测枚举位置（R-15b）
 pub const AV_PIX_FMT_D3D11VA_VLD: i32 = 83;
 pub const AV_PIX_FMT_DXVA2_VLD: i32 = 80;
-pub const AV_PIX_FMT_VAAPI: i32 = 8192; // AV_PIX_FMT_VAAPI 偏移起点
+pub const AV_PIX_FMT_VAAPI: i32 = 8192; // AV_PIX_FMT_VAAPI 偏移起点（遗留值）
 pub const AV_PIX_FMT_VIDEOTOOLBOX: i32 = 8193;
 pub const AV_PIX_FMT_QSV: i32 = 8194;
 pub const AV_PIX_FMT_CUDA: i32 = 8195;

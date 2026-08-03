@@ -287,7 +287,7 @@ impl Terminal {
                                 font_id: font.clone(),
                                 color: Color32::BLACK,
                                 background: Color32::from_gray(180), // 反显风格
-                                underline: egui::Stroke::new(1.0, Color32::BLACK),
+                                underline: egui::Stroke::new(1.0_f32, Color32::BLACK),
                                 ..Default::default()
                             },
                         );

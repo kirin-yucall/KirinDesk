@@ -300,7 +300,16 @@ impl WindowPipeline {
             preset: self.encode_config.preset.clone(),
         };
         // 应用自适应配置（force_idr 标记 + 未来码率/分辨率联动）。
-        let _ = self.encoder.reconfigure(&enc_cfg);
+        // R-23b：HW 编码器（ffmpeg_hw.rs）对 QP/preset 运行时变更显式报
+        // NotImplemented（不再静默成功）——此处调用方规避：记 warning 并沿用
+        // 旧配置继续编码，不阻断窗口（分辨率变更本就走 ensure_codec_dims，
+        // 不受影响）。
+        if let Err(e) = self.encoder.reconfigure(&enc_cfg) {
+            tracing::warn!(
+                "WindowPipeline: encoder reconfigure rejected ({e}) — keeping previous \
+                 encode config for this window"
+            );
+        }
 
         // 编码（P1C：逐帧经 VideoEncoderPipeline；CPU RGBA 路径）。
         // windows_capture 产 RGBA 字节而非 GpuTexture 句柄，故 on_frame 传入

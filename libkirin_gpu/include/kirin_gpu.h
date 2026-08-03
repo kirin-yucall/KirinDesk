@@ -55,6 +55,11 @@ typedef struct KgTileMap {
 //   → tile_diff CPU 回退，不阻断编译/运行。
 int32_t kgpu_init(void *device_handle);
 
+// ── 内核当前 D3D11 device 句柄（Windows；供同 device 纹理创建/测试）──
+//   返回 kgpu_init 持有的 ID3D11Device*（复用调用方 device 或自建）；
+//   未初始化 / 非 Windows → NULL。调用方只借用不释放。
+void   *kgpu_device_handle(void);
+
 // 幂等关闭（重复调用安全）。释放 device / CS / 缓冲。
 void    kgpu_shutdown(void);
 
@@ -72,9 +77,38 @@ int32_t kgpu_blit_tiles_rle(void *texture, const KgTileMap *map,
 
 // ── 纹理 → FFmpeg hwframes 桥（零拷贝绑定纹理句柄）─────────────
 //   返回 AVFrame*（d3d11va hwframes，AV_PIX_FMT_D3D11）。
-//   失败返回 NULL（无 FFmpeg 头 / device lost）。
+//   失败返回 NULL（无 FFmpeg 头 / DLL 缺失 / device lost / 纹理格式不支持）。
 //   调用方须 av_frame_unref + av_frame_free。
+//   输入纹理格式：
+//     - DXGI_FORMAT_NV12           → 直接零拷贝绑定（bound == 输入纹理）
+//     - DXGI_FORMAT_B8G8R8A8_UNORM → D3D11 像素着色器 GPU 内转 NV12（零 CPU）
+//     - 其它格式                   → NULL（调用方回退 CPU 路径）
 void   *kgpu_hw_upload(void *texture);
+
+// ── hwframes 绑定信息探针（P1B §T2.3 / R-15b 测试断言用）────────
+//   读取 kgpu_hw_upload 产出 AVFrame 的关键字段，供 Rust 侧断言：
+//   frame 非 NULL / hw_frames_ctx 非空 / pix_fmt == AV_PIX_FMT_D3D11 /
+//   绑定纹理与输入纹理一致（零拷贝断言）。
+//   frame 为 NULL → KG_ERR_PARAM。
+typedef struct KgHwFrameInfo {
+    void     *frame;             // AVFrame*（与传入一致）
+    int32_t   pix_fmt;           // AV_PIX_FMT_D3D11（1000085）
+    int32_t   has_hw_frames_ctx; // 0/1（AVFrame.hw_frames_ctx 非空）
+    void     *bound_texture;     // AVD3D11FrameDescriptor.texture（绑定纹理）
+    int32_t   width;             // AVFrame.width
+    int32_t   height;            // AVFrame.height
+} KgHwFrameInfo;
+int32_t kgpu_hw_upload_probe(void *frame, KgHwFrameInfo *out);
+
+// ── hw_bridge 自检（P1B §T2.3 / R-15b）──────────────────────────
+//   C 侧完整自检（含 BGRA→NV12 GPU 转换内容校验 + 零拷贝断言）：
+//   返回 0 = 全部通过；正值 = 失败位掩码：
+//     bit0: NV12 直接绑定（frame 类型断言）失败
+//     bit1: 零拷贝断言（绑定纹理 == 输入纹理）失败
+//     bit2: BGRA→NV12 GPU 转换内容校验失败（Y/Cb/Cr 与 BT.601 偏差）
+//     bit3: hw_frames_ctx / pix_fmt / 尺寸断言失败
+//   负值 = 无法运行（KG_ERR_INIT 无 GPU / KG_ERR_NOTIMPL 桩路径）。
+int32_t kgpu_hw_upload_selftest(void);
 
 // ── dirty 索引读回（大动分支 ROI 组装用，≤ 几 KB）──────────────
 //   out_idx：调用方分配的 u32 数组（容量 = grid_w * grid_h）

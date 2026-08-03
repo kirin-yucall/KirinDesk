@@ -50,6 +50,9 @@ fn command_line() -> Result<String, AutostartError> {
 /// `&`/`"` 等字符，直接 `format!` 内插可注入任意 XML 节点（自启项被
 /// 篡改）。以最小依赖实现（等价于 `plist` crate 序列化字符串的安全
 /// 语义；引入完整 plist 序列化依赖留待后续评估）。
+// R-33: 仅 macOS 自启 plist 路径调用（本平台非 macOS 编译时无调用点）——
+// 标注避免 dead_code。
+#[allow(dead_code)]
 fn xml_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 8);
     for c in s.chars() {

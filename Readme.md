@@ -1,6 +1,6 @@
 # 🦄 KirinDesk — The P2P Remote Desktop Built to Retire SSH
 
-**Fully Decentralized · Pure P2P Direct Connect · Zero Relay Servers · Zero TLS Certificates · End-to-End Encrypted**
+**P2P Direct First · Relay-Assisted Hole Punching · Optional Relay Fallback · Zero TLS Certificates · End-to-End Encrypted**
 
 > **中文版:** [Readme_CN.md](Readme_CN.md) ｜ **English:** This file
 
@@ -21,7 +21,7 @@ The only "currency" that keeps this project running is ❤️. If KirinDesk help
 
 Every device should be able to reach every other device directly — securely, privately, with no third party standing between them. That simple conviction is the entire reason KirinDesk exists. We believe the remote-control experience of the future does not route through corporate cloud farms, does not beg a relay server to stay online, and does not lean on an obscure chain of certificates. It is two devices shaking hands across the open Internet and speaking only to each other.
 
-KirinDesk turns that belief into working software by standing on three pillars that are anything but exotic: **IPv6** gives every device a globally reachable address; **the DNS system** becomes a decentralized, censorship-resistant bulletin board where devices publish where they are and who they are; and **modern public-key cryptography** replaces the entire legacy TLS certificate apparatus with something simpler, stronger, and truly zero-trust. No relay servers. No STUN/TURN. No port forwarding. No certificate authorities. Just devices, DNS, and math.
+KirinDesk turns that belief into working software by standing on three pillars that are anything but exotic: **IPv6** gives every device a globally reachable address; **the DNS system** becomes a decentralized, censorship-resistant bulletin board where devices publish where they are and who they are; and **modern public-key cryptography** replaces the entire legacy TLS certificate apparatus with something simpler, stronger, and truly zero-trust. No certificate authorities. Just devices, DNS, and math — with an **optional self-hosted relay server** ready to assist when the direct path is blocked (see below).
 
 ## Why the World Needs KirinDesk
 
@@ -39,19 +39,26 @@ TeamViewer, AnyDesk, and their peers route every pixel of your screen through ve
 
 **KirinDesk was built to retire all three.**
 
-## The KirinDesk Answer: Pure P2P, Zero Middlemen
+## The KirinDesk Answer: Direct First, Assisted When Necessary
 
-When you connect with KirinDesk, your device reaches out directly to the target device — not to a relay, not through a broker. The two endpoints negotiate a mutually authenticated, end-to-end encrypted tunnel and talk to each other for the life of the session. Nothing in between can read, block, or log your traffic, because nothing is in between.
+When you connect with KirinDesk, the **direct path is always tried first**: your device reaches out straight to the target device — no broker, no third-party cloud, no middleman. The two endpoints negotiate a mutually authenticated, end-to-end encrypted tunnel and talk to each other for the life of the session.
 
 ```
-Legacy approach                               KirinDesk
-────────────────                               ─────────
+Legacy approach                               KirinDesk (direct path)
+────────────────                               ─────────────────────
 device ──▶ central server ──▶ device           device ──▶ device
           (relay / outage /                    (direct / zero
            sniffable)                          middlemen)
 ```
 
-With IPv6, every device is globally reachable — no NAT traversal tricks, no STUN/TURN servers, no manual port forwarding on routers that refuse to cooperate. The address is just there, and KirinDesk connects to it. It is the closest thing the Internet has to the way networking was always meant to work.
+But KirinDesk is no longer *only* pure P2P. When a direct path doesn't exist — NAT, restrictive firewall, churned addresses — an **optional self-hosted relay server** (the same `relay-server` used for 内网穿透) steps in with two assists:
+
+- **Relay-assisted hole punching** — the server runs a rendezvous service (customizable port, `--rendezvous-port`, default 7001) that exchanges hole-punching candidates between the two devices. **It only plays matchmaker and never enters the data path** — once the punch succeeds, traffic flows device-to-device (UDP hole punching + QUIC).
+- **Device-ID relay fallback** — if even punching fails, the tunnel falls back to relaying through the server by device ID. The relay never holds keys: the channel stays end-to-end encrypted, and the server can only forward ciphertext it cannot read.
+
+Either way, no third party can read your traffic. On the direct path nothing is in between; on the assisted paths the relay is a dumb pipe.
+
+With IPv6, every device is globally reachable — no manual port forwarding on routers that refuse to cooperate. The address is just there, and KirinDesk connects to it directly. Where a direct path is blocked, the optional relay server lends a hand as described above — direct first, assisted when necessary, end-to-end encrypted throughout.
 
 ## Security Reimagined: Zero Trust, Zero Certificates
 
@@ -63,7 +70,7 @@ KirinDesk throws away the legacy TLS certificate system — no certificate autho
 
 The result is a security model with a far smaller attack surface than the status quo: no passwords to brute-force over the wire, no certificates to forge, no trust anchor you didn't personally mint. The math does the talking.
 
-Hardening continues past the handshake: **handshake pins are always enforced** (the old empty-pin bypass is gone — a peer key that isn't explicitly confirmed is refused), and configuration-secret encryption is landing (R-13: the crypto layer in utils/src/secure.rs is implemented; wiring to config storage is in progress — until then DNS provider keys and tunnel tokens remain in cleartext, protected by file permissions). Connection rate limiting, audit logging, and SSH-style known-hosts fingerprint confirmation round out the defense-in-depth.
+Hardening continues past the handshake: **handshake pins are always enforced** (the old empty-pin bypass is gone — a peer key that isn't explicitly confirmed is refused), and sensitive configuration (DNS provider keys, tunnel tokens, challenge code) is encrypted at rest (R-13, see below). Connection rate limiting, audit logging, and SSH-style known-hosts fingerprint confirmation round out the defense-in-depth.
 
 ## Domain & Device-ID Whitelists: Access Control That Follows Devices, Not Addresses
 
@@ -90,19 +97,19 @@ KirinDesk's Server mode gives headless machines — Ubuntu servers, VPSes, cloud
 
 | Aspect | Traditional SSH | RDP / VNC | Commercial Remote Desktop | **KirinDesk** |
 |--------|-----------------|-----------|---------------------------|---------------|
-| Connectivity | Direct port | Direct port | Central server relay | **Pure P2P direct** |
-| Relay server | None | None | Required | **None at all** |
+| Connectivity | Direct port | Direct port | Central server relay | **P2P direct, hole-punch assisted** |
+| Relay server | None | None | Required | **Optional, self-hosted (punch assist + fallback)** |
 | Port exposure | 22, globally scanned | Scannable | None | **No fixed port exposure** |
 | Authentication | Password / key | Password / cert | Vendor account | Challenge code + Ed25519 signature |
 | Encryption | Transport-level | Weak / none | Vendor-dependent | **End-to-end AEAD, forward-secret** |
 | Access control | — | — | Vendor accounts | **Domain / device-ID whitelist (strict mode)** |
-| Privacy | — | — | Traffic via third party | **Zero middlemen** |
+| Privacy | — | — | Traffic via third party | **End-to-end encrypted; relay can't read** |
 | Decentralized | ✗ | ✗ | ✗ | **✓ Fully decentralized** |
 
 ## Core Features
 
-- **Pure P2P over IPv6 / IPv4** — direct device-to-device tunnels; no relay, no STUN/TURN, no port forwarding. IPv6-first with IPv4 dual-stack support
-- **Zero-trust cryptography** — Ed25519 identities, X25519 ECDH, AEAD (AES-256-GCM / ChaCha20-Poly1305), per-session keys with perfect forward secrecy; handshake pins always enforced; sensitive config (API keys, tokens) encryption landing (R-13, see below)
+- **P2P over IPv6 / IPv4, direct first** — device-to-device tunnels with no middleman; when a direct path is blocked, relay-assisted hole punching (rendezvous coordination only, server never in the data path) with device-ID relay fallback; IPv6-first with IPv4 dual-stack support
+- **Zero-trust cryptography** — Ed25519 identities, X25519 ECDH, AEAD (AES-256-GCM / ChaCha20-Poly1305), per-session keys with perfect forward secrecy; handshake pins always enforced; sensitive config (API keys, tokens, challenge code) encrypted at rest (R-13, see below)
 - **DNS as the decentralized registry — 20 providers** — self-register and self-discover through any of 20 DNS providers (GoDaddy, Cloudflare, Aliyun, DNSPod, AWS Route 53, Azure, Google Cloud DNS, Huawei, Namecheap, DigitalOcean, Vultr, Linode, Hetzner, OVH, Porkbun, Baidu Cloud, Volcano Engine, JD Cloud, West.cn, Xin Net) via SRV + AAAA + TXT records queried in parallel, with heartbeat keep-alive
 - **Domain & device-ID whitelists (strict mode)** — access control expressed in stable names, not volatile IPs; domain or device-ID (exact / `*` prefix / expirable) matches; temp mode issues a 10-character one-time code with whitelist bypass for emergencies
 - **Dual connection modes + automatic transport fallback** — domain mode (DNS discovery, recommended) or direct IPv6/IPv4 mode; QUIC first, with graceful in-session degradation to TCP (resume, no re-connect)
@@ -112,10 +119,10 @@ KirinDesk's Server mode gives headless machines — Ubuntu servers, VPSes, cloud
 - **Remote shell (PTY)** — a full SSH replacement for headless servers
 - **File transfer** — encrypted, bidirectional and resumable (windowed ACK, SHA-256 verification, atomic rename); drag & drop in the GUI, `send` / `recv` in the CLI
 - **Unattended mode** — user-level boot autostart + auto-accept whitelisted/known clients, no approval dialogs
-- **Tunnel (内网穿透)** — FRP-style generic TCP reverse proxy: publish local TCP services (SSH/RDP/HTTP…) on a public relay server; SCRAM-style challenge-response token auth (password never on the wire), multi-address listeners, GUI start/stop with state restore; standalone `relay-server` for Docker/systemd/headless deployment; optional rendezvous-assisted hole punching + device-ID relay fallback
+- **Tunnel (内网穿透)** — FRP-style generic TCP reverse proxy: publish local TCP services (SSH/RDP/HTTP…) on a public relay server; SCRAM-style challenge-response token auth (password never on the wire), fully customizable server ports (`--bind-port` / `--bind-addrs` / `--rendezvous-port`), clients connect to any custom port with a token; multi-address listeners, GUI start/stop with state restore; standalone `relay-server` for Docker/systemd/headless deployment; optional rendezvous-assisted hole punching + device-ID relay fallback
 - **Clipboard sharing** — copy/paste across machines over the encrypted channel
 - **i18n** — full GUI in 中文 / English (follows the system language by default)
-- **Security hardening** — connection rate limiting, audit logging (30+ events), SSH-style known-hosts fingerprint confirmation, config encryption landing (R-13)
+- **Security hardening** — connection rate limiting, audit logging (30+ events), SSH-style known-hosts fingerprint confirmation, config encryption (R-13)
 - **Cross-platform** — Windows (egui GUI + CLI), Linux (pipewire capture, VAAPI, uinput), macOS (zed-scap, VideoToolbox, Keychain identity storage)
 - **Automatic logging** — daily rotating logs with automatic cleanup
 - **Packaged for the real world** — NSIS installer (Windows), .deb with systemd service (Ubuntu), universal .app + .dmg (macOS), in-app auto-update with release/beta channels
@@ -131,7 +138,7 @@ Since v0.1.0 a major round of features and hardening has landed — full record 
 - **Unattended mode** — boot autostart, auto-accept whitelisted/known clients
 - **Multi-monitor viewing** — live monitor switching from the session toolbar
 - **Single-GPU & virtual-device filtering** — the real GPU is selected; virtual drivers/displays are filtered out
-- **Security** — mandatory pin verification, config encryption landing (R-13), device-ID whitelists, SCRAM-style tunnel auth, rate limiting & audit logs
+- **Security** — mandatory pin verification, config encryption (R-13), device-ID whitelists, SCRAM-style tunnel auth, rate limiting & audit logs
 
 ## Quick Start
 
@@ -158,9 +165,9 @@ sudo apt install build-essential libssl-dev pkg-config \
 
 git clone <repo>
 cd KirinDesk
-# --jobs 8: hard cap on build threads (no full-core packing — the packager
+# --jobs 4: hard cap on build threads (no full-core packing — the packager
 # device is big.LITTLE; too many threads may crash it)
-cargo build --release -p kirin-desk-ui --jobs 8
+cargo build --release -p kirin-desk-ui --jobs 4
 
 # Configure & run the server
 ./target/release/kirin-desk-ui --cli setup
@@ -204,9 +211,9 @@ cd ../..
 **3. Build** — `target/` is generated by cargo (git-ignored, not tracked):
 
 ```bash
-# --jobs 8: hard cap on build threads (no full-core packing — the packager
+# --jobs 4: hard cap on build threads (no full-core packing — the packager
 # device is big.LITTLE; too many threads may crash it). See M14 constraint.
-cargo build --release -p kirin-desk-ui --jobs 8
+cargo build --release -p kirin-desk-ui --jobs 4
 ```
 
 ### Client Connection
@@ -229,6 +236,8 @@ The relay server (`tunnel serve`) login uses a **challenge-response (SCRAM-style
 - **Token quality** — use a high-entropy random string of ≥ 32 bytes (`openssl rand -base64 32`); tokens shorter than 16 characters trigger a warning
 
 > **Upgrade note:** server and client must run the same version (same release). Old v1.0 clients are explicitly rejected by a token-configured server with an `upgrade client` hint; new clients error out against old servers. Upgrade both ends together.
+
+> **Deployment**: `relay-server --bind-port 7000 --rendezvous-port 7001 --token <high-entropy-token>` — control port, rendezvous (hole-punch) port and bind addresses are all customizable; clients connect via `[tunnel] server_addr = "relay.example.com:<custom-port>"` with the same token (server also accepts `KIRIN_RELAY_TOKEN`). Full reference: `release/server/README.md`.
 
 ## GUI Overview
 
@@ -266,6 +275,8 @@ The relay server (`tunnel serve`) login uses a **challenge-response (SCRAM-style
             +────────────────────────────────+
 ```
 
+> **Direct path**: device ⇄ device over IPv6/IPv4, nothing in between. **Assisted path (optional)**: a self-hosted `relay-server` runs rendezvous hole punching — candidate exchange only, it never enters the data path — and falls back to relaying the end-to-end encrypted tunnel (device-ID relay) when punching fails. Server ports (control / rendezvous / bind addresses) are all customizable; clients connect to any custom port with a SCRAM-style token.
+
 ## Project Structure
 
 ```
@@ -278,7 +289,7 @@ KirinDesk/
 ├── relay-server/  # Standalone tunnel server binary (Docker / systemd / headless deployment)
 ├── ui/            # egui desktop GUI (i18n 中文/English) + clap CLI
 ├── updater/       # Auto-update (check / download / install)
-├── utils/         # Config (encryption landing, R-13), logging, error types, audit
+├── utils/         # Config (sensitive fields encrypted at rest, R-13), logging, error types, audit
 ├── ffmpeg/        # FFmpeg 8.1.1 shared libs (avcodec-62/avutil-60/swscale-9; git-ignored, restore after clone)
 ├── config/        # Configuration structures & defaults
 └── release/       # Installers & packaging (NSIS / deb / dmg)
@@ -333,7 +344,29 @@ nickname = "my-pc"
 challenge_code = ""  # required for server mode (fail-closed)
 
 [dns]
-provider = "godaddy" # any of the 20 providers; credentials encryption landing (R-13)
+provider = "godaddy" # any of the 20 providers; credentials encrypted at rest (R-13)
+
+# M8-T040: encrypted DNS enforcement for domain mode (server + client, enforce by default)
+[dns.security]
+mode = "enforce"      # enforce (domain mode requires DoH/DoT, fail-closed) | off (IP mode only)
+doh = ["https://cloudflare-dns.com/dns-query", "https://dns.google/resolve", "https://dns.alidns.com/resolve"]
+dot = ["1.1.1.1:853", "8.8.8.8:853", "2400:3200::1:853"]
+resolve_timeout_ms = 5000
+cache_ttl_secs = 50
+
+# M8-T040: DDNS auto-update (read/written by the Domain tab "DDNS" card)
+[ddns]
+enabled = false       # master switch (off by default; disabling does not delete published records)
+interval_secs = 300   # update period (lower bound 60s; falls back to [network] heartbeat_interval if unset)
+ipv4_mode = "auto"    # auto = public egress IP (multi-source HTTPS) | manual = fixed address (never overwritten)
+ipv4_manual = ""
+ipv4_sources = ["ipify", "ip.sb", "icanhazip"]
+ipv6_mode = "auto"    # auto = local global unicast | manual = fixed address (never overwritten)
+ipv6_manual = ""
+publish_srv = true    # SRV (remote port) / TXT (signature fingerprint) / A / AAAA toggles
+publish_txt = true
+publish_a = true
+publish_aaaa = true
 
 [network]
 port = 3389
@@ -383,7 +416,7 @@ The master key is chosen automatically from a fallback chain:
 | No keyring / any platform | Env var `KIRIN_CONFIG_KEY` (passphrase, PBKDF2-HMAC-SHA256 derived — highest priority) |
 | None available | **fail-open**: plaintext storage + a prominent startup warning (doesn't block development use) |
 
-Migration is seamless: an existing plaintext config is automatically encrypted and rewritten on first load (`#[serde(default)]` keeps old fields compatible); a failed migration never destroys the original file (`.bak` backup). Keys/tokens are never logged and appear masked (`****`) in `config show` / `status` output.
+Migration is seamless: an existing plaintext config is automatically encrypted and rewritten on first load (`#[serde(default)]` keeps old fields compatible); a failed rewrite never corrupts the file (atomic replace via `write_private`, and the in-memory config keeps working). Keys/tokens are never logged and appear masked (`****`) in `config show` / `status` output.
 
 ## License
 

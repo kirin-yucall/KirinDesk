@@ -13,7 +13,7 @@
 //! 据此回退到 [`FfmpegSwEncoder`](super::ffmpeg_sw::FfmpegSwEncoder)。HW 管道
 //! 存在但惰性，待真实 HW DLL 就绪后由 `try_open` 走通。
 //!
-//! # P1B↔P1C 接驳（2026-07-31）
+//! # P1B↔P1C 接驳（2026-07-31；R-15b 2026-08-04 真实化）
 //!
 //! [`create`](FfmpegHwEncoder::create) / [`try_open`](FfmpegHwEncoder::try_open)
 //! 接 `Option<&dyn GpuKernel>`：当 `kernel.is_linked()` 时
@@ -22,9 +22,14 @@
 //! 失败 / 未链接 / 无 pending 纹理 → 回退既有 CPU NV12 路径（`set_cpu_frame`
 //! 喂入）。两条路径共用 `encode_inner` 的 receive_packet / 打包循环。
 //!
-//! **注意**：C++ 侧 `kgpu_hw_upload`（hw_bridge.cpp）当前桩实现恒返回 NULL
-//! → `hw_upload` 返 `GpuKernel` 错误，本编码器自动回退 CPU NV12 路径；待
-//! P1B hw_bridge.cpp 真实实现后零拷贝路径自动生效，无需改本文件。
+//! **R-15b 状态（2026-08-04）**：C++ 侧 `kgpu_hw_upload`（hw_bridge.cpp）已
+//! 由桩（恒 NULL）替换为真实实现（NV12 纹理零拷贝直绑 / BGRA8 GPU 内转
+//! NV12，动态加载 avutil-60.dll）；本文件的零拷贝接驳（设备串绑定 +
+//! FramePool 槽位 + try_encode_zero_copy）无需改动即自动生效——`hw_upload`
+//! 仅在无 FFmpeg 头/DLL、device lost 或纹理格式不支持时返 `GpuKernel` 错误，
+//! 编码器据此回退 CPU NV12 路径（保底不变）。零拷贝断言见
+//! `gpu_ffi/kernel.rs` 的 hw_bridge 测试（test_hw_upload_frame_type /
+//! test_hw_upload_zero_copy）。
 //!
 //! # 关键约束（父文档）
 //!
@@ -127,6 +132,11 @@ pub struct FfmpegHwEncoder {
     pending_h: u32,
     force_idr_next: bool,
     sent_first: bool,
+    /// 上次经 `reconfigure` 应用的参数基线（qp/preset；R-23b）。
+    ///
+    /// `None` = 尚未收到过配置（首次调用视作基线，幂等 `Ok`）；用于判定
+    /// 「实际变更」——参数真的变化时才显式报 `NotImplemented`，不再静默吞掉。
+    last_cfg: Option<crate::proto::EncodeConfig>,
 }
 
 unsafe impl Send for FfmpegHwEncoder {}
@@ -302,6 +312,7 @@ impl FfmpegHwEncoder {
             pending_h: 0,
             force_idr_next: true, // 会话首帧强制 IDR。
             sent_first: false,
+            last_cfg: None,
         };
 
         // width/height/pix_fmt/time_base/framerate 在 FFmpeg 8.1.1 共享构建的
@@ -799,8 +810,45 @@ impl VideoEncoder for FfmpegHwEncoder {
         self.name
     }
 
-    fn reconfigure(&mut self, _cfg: &crate::proto::EncodeConfig) -> Result<(), EncodeError> {
-        // 真实 HW 场景：close → apply → open2（重开必须重新 apply）。
+    fn reconfigure(&mut self, cfg: &crate::proto::EncodeConfig) -> Result<(), EncodeError> {
+        // R-23b（审计 §2-P3-22）：reconfigure 不再静默成功。
+        //
+        // 审计结论（2026-08-04）：生产唯一调用点 = WindowPipeline 每窗口编码
+        // 前（`window_pipeline.rs::encode_window`，`let _ =` 忽略返回值），cfg
+        // 源自自适应层（`session.rs` 轮询 shared_config → `update_encode_config`）。
+        // 各参数字段现状：
+        // - `force_idr`：真实语义（窗口首帧/跳帧后强制 IDR）——此处置位
+        //   （`set_cpu_frame` 通道亦设置，双保险），与软编 `ffmpeg_sw.rs` 对齐；
+        // - `frame_ratio`：由 `WindowPipeline::select_frames` 消费，不经编码器；
+        // - 分辨率变更：**不走本通道**——由 `ensure_codec_dims` 按帧懒重开
+        //   （释放旧 ctx → 重建 hw device → 全新 ctx + open2）；
+        // - `qp`/`preset`：自适应层（`adaptive::adjuster.rs` compute_config /
+        //   handle_encode_timeout）会真实产出变更，但 HW 编码器以 cbr 码率模式
+        //   运行（`apply_encoder_config` 只设 b/maxrate），QP 无对应应用路径
+        //   （全仓 grep `EncodeConfig.qp` 零消费者）→ **显式 NotImplemented**，
+        //   调用方据此规避（记 warning 沿用旧配置），绝不假装成功。
+        if cfg.force_idr {
+            self.force_idr_next = true;
+        }
+        // 变更检测基于上次应用的基线；无论是否变更都先推进基线
+        // （首次调用 = 建立基线；随后同参调用幂等 Ok，参数真实变化才报错）。
+        let changed = match &self.last_cfg {
+            Some(last) => last.qp != cfg.qp || last.preset != cfg.preset,
+            None => false,
+        };
+        self.last_cfg = Some(cfg.clone());
+        if changed {
+            return Err(EncodeError::NotImplemented(format!(
+                "FfmpegHwEncoder('{}'): runtime QP/preset change (qp {:?} -> {:?}, preset {:?} \
+                 -> {:?}) not implemented — HW encoder runs in cbr bitrate mode (R-23b); \
+                 caller should keep the previous config",
+                self.name,
+                self.last_cfg.as_ref().map(|c| c.qp),
+                cfg.qp,
+                self.last_cfg.as_ref().map(|c| c.preset.as_str()),
+                cfg.preset,
+            )));
+        }
         Ok(())
     }
 
@@ -1255,5 +1303,108 @@ mod tests {
         assert_eq!(p.capacity, 4);
         let p = FramePool::new(0);
         assert_eq!(p.capacity, 2);
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // R-23b：reconfigure 不再静默成功（审计 §2-P3-22 收口单测）
+    // 骨架构造器不触碰 FFmpeg 句柄（全 null / 空缓冲），仅验证
+    // reconfigure 的纯状态逻辑（基线判定 / force_idr / 显式错误）。
+    // ════════════════════════════════════════════════════════════════
+
+    fn hw_encoder_skeleton() -> FfmpegHwEncoder {
+        FfmpegHwEncoder {
+            codec: Codec::H264,
+            name: "h264_qsv",
+            hw_type: HwType::QSV,
+            ctx: ptr::null_mut(),
+            hw_device_ctx: ptr::null_mut(),
+            hw_frames_ctx: ptr::null_mut(),
+            width: 320,
+            height: 32,
+            pix_fmt: 0,
+            kernel: None,
+            frame_pool: FramePool::new(2),
+            extradata: Vec::new(),
+            pts_base: 0,
+            sws: None,
+            frame: ptr::null_mut(),
+            packet: ptr::null_mut(),
+            frame_buf: Vec::new(),
+            pending_rgba: Vec::new(),
+            pending_w: 0,
+            pending_h: 0,
+            force_idr_next: false,
+            sent_first: false,
+            last_cfg: None,
+        }
+    }
+
+    fn enc_cfg(qp: u32, preset: &str, force_idr: bool) -> crate::proto::EncodeConfig {
+        crate::proto::EncodeConfig {
+            qp,
+            force_idr,
+            frame_ratio: 1.0,
+            preset: preset.into(),
+        }
+    }
+
+    /// 首次调用（无基线）→ 幂等 Ok，且 force_idr 真实置位。
+    #[test]
+    fn test_reconfigure_first_call_is_ok() {
+        let mut enc = hw_encoder_skeleton();
+        assert!(enc.reconfigure(&enc_cfg(22, "medium", true)).is_ok());
+        assert!(enc.force_idr_next, "force_idr 应置位");
+        assert_eq!(enc.last_cfg.as_ref().map(|c| c.qp), Some(22));
+    }
+
+    /// 相同参数重复调用 → Ok（无实际变更，不报错）。
+    #[test]
+    fn test_reconfigure_same_config_ok() {
+        let mut enc = hw_encoder_skeleton();
+        let cfg = enc_cfg(22, "medium", false);
+        assert!(enc.reconfigure(&cfg).is_ok());
+        assert!(enc.reconfigure(&cfg).is_ok(), "同参数应幂等 Ok");
+        assert!(!enc.force_idr_next, "force_idr=false 不应置位");
+    }
+
+    /// QP 实际变更 → 显式 NotImplemented（不再静默成功）；force_idr 仍应用。
+    #[test]
+    fn test_reconfigure_qp_change_not_implemented() {
+        let mut enc = hw_encoder_skeleton();
+        assert!(enc.reconfigure(&enc_cfg(22, "medium", false)).is_ok());
+        let err = enc
+            .reconfigure(&enc_cfg(26, "medium", true))
+            .expect_err("QP 变更必须显式报错，不再静默成功");
+        assert!(
+            matches!(err, EncodeError::NotImplemented(_)),
+            "期望 NotImplemented，实际: {err}"
+        );
+        assert!(err.to_string().contains("not implemented"));
+        // 报错前 force_idr 已应用（双保险通道）。
+        assert!(enc.force_idr_next, "报错同时 force_idr 仍应置位");
+        // 基线已推进到新值（后续同参调用 Ok）。
+        assert_eq!(enc.last_cfg.as_ref().map(|c| c.qp), Some(26));
+        assert!(enc.reconfigure(&enc_cfg(26, "medium", false)).is_ok());
+    }
+
+    /// preset 实际变更 → 显式 NotImplemented。
+    #[test]
+    fn test_reconfigure_preset_change_not_implemented() {
+        let mut enc = hw_encoder_skeleton();
+        assert!(enc.reconfigure(&enc_cfg(22, "medium", false)).is_ok());
+        let err = enc
+            .reconfigure(&enc_cfg(22, "ultrafast", false))
+            .expect_err("preset 变更必须显式报错");
+        assert!(matches!(err, EncodeError::NotImplemented(_)));
+        assert_eq!(enc.last_cfg.as_ref().map(|c| c.preset.as_str()), Some("ultrafast"));
+    }
+
+    /// force_idr 单独变化（qp/preset 不变）→ Ok 且置位（软编同语义）。
+    #[test]
+    fn test_reconfigure_force_idr_only_ok() {
+        let mut enc = hw_encoder_skeleton();
+        assert!(enc.reconfigure(&enc_cfg(22, "medium", false)).is_ok());
+        assert!(enc.reconfigure(&enc_cfg(22, "medium", true)).is_ok());
+        assert!(enc.force_idr_next);
     }
 }

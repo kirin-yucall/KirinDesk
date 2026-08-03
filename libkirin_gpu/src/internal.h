@@ -35,6 +35,10 @@ struct KgContext;
 KgContext* context_get();
 std::mutex& context_mutex();
 
+// hw_bridge 生命周期钩子（hw_bridge.cpp 提供；d3d11_context.cpp 的
+// kgpu_shutdown 在持有 context_mutex 时调用；无 FFmpeg 头时为空实现）。
+void hw_bridge_shutdown();
+
 // 平台无关的 KgContext 描述（用于内部诊断；不强求每平台都填）。
 struct KgContextInfo {
     uint32_t width;
