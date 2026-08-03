@@ -244,8 +244,8 @@ async fn cmd_connect_id(device_id: &str) {
 
 /// R-11: CLI 子命令枚举（dispatch 抽取为可测纯函数）。
 ///
-/// R-09（波次 2）将在此枚举追加 `Identity`/`Version` 变体——只增不改，
-/// 并同步更新 `parse_cli_command` 与 `print_help`。
+/// R-09b（波次 2，审计 §4-6 / §2-P2-10）：追加 `Version`/`Identity` 变体——
+/// 只增不改，并同步更新 `parse_cli_command` 与 `print_help`。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum CliCommand {
     Help,
@@ -270,6 +270,11 @@ pub(crate) enum CliCommand {
     Dns,
     /// M8-T040: DDNS 子命令组（`ddns status/enable/disable/set-ipv4/set-ipv6/update`）。
     Ddns,
+    /// R-09b: 程序版本 + 核心 crate 版本表（`version`）。
+    Version,
+    /// R-09b: 设备身份卡（`identity [--json]`）：Device ID、Ed25519 公钥
+    /// （hex/SHA-256 指纹）、密钥文件路径、known_hosts 条目数。
+    Identity,
     /// 未识别命令（保留原文供报错/help；无子命令时为空串）。
     Unknown(String),
 }
@@ -297,6 +302,9 @@ pub(crate) fn parse_cli_command(args: &[String]) -> CliCommand {
         Some("self-test") => CliCommand::SelfTest,
         Some("dns") => CliCommand::Dns,
         Some("ddns") => CliCommand::Ddns,
+        // R-09b（波次 2）：`version` / `identity` 子命令。
+        Some("version") => CliCommand::Version,
+        Some("identity") => CliCommand::Identity,
         Some(other) => CliCommand::Unknown(other.to_string()),
         None => CliCommand::Unknown(String::new()),
     }
@@ -429,6 +437,9 @@ pub async fn run_cli() {
         CliCommand::Dns => cmd_dns(args).await,
         // M8-T040: `ddns <subcommand>` 子命令组（§八）。
         CliCommand::Ddns => cmd_ddns(args).await,
+        // R-09b: `version` / `identity`（`identity --json` 输出单行 JSON）。
+        CliCommand::Version => cmd_version(),
+        CliCommand::Identity => cmd_identity(args),
         CliCommand::Unknown(cmd) => {
             println!("Unknown command: {}", cmd);
             print_help();
@@ -499,6 +510,10 @@ fn print_help() {
     println!("  tunnel status          Show tunnel configuration and proxy list");
     println!("  self-test            Run local self-connection test");
     println!("  status               Show system status");
+    println!("  identity [--json]    Show device identity card (R-09b): Device ID, Ed25519");
+    println!("                       public key (hex + SHA-256 fingerprint), key file path,");
+    println!("                       known_hosts entry count; --json = single-line JSON");
+    println!("  version              Show program version + core crate versions (R-09b)");
     println!("  help                 Show this help");
     println!();
     println!("EXAMPLES:");
@@ -514,6 +529,160 @@ fn print_help() {
     println!("  kirin_desk unattended on         # enable unattended mode");
     println!("  kirin_desk autostart enable      # register OS boot autostart");
     println!("  kirin_desk temp-mode    # 5-min temp window: shows 8-char temp code (clients must present it)");
+    println!("  kirin_desk identity --json    # machine-readable identity card (jq)");
+    println!("  kirin_desk version            # program + core crate versions");
+}
+
+// ════════════════════════════════════════════════════════════════
+// R-09b（波次 2，审计 §4-6 / §2-P2-10）：version / identity 子命令
+// ════════════════════════════════════════════════════════════════
+
+/// R-09b: 版本表覆盖的工作区成员（crate 名 → 清单文件）。
+///
+/// 清单经 `include_str!` 编译期内联（文件缺失即编译失败）；
+/// `cli_tests::test_version_table_crates_use_workspace_version`
+/// 守护"成员仍使用 workspace 统一版本"（版本表不会静默失真）。
+const VERSION_TABLE_CRATES: &[(&str, &str)] = &[
+    ("kirin-desk-core", include_str!("../../core/Cargo.toml")),
+    ("kirin-desk-dns", include_str!("../../dns/Cargo.toml")),
+    ("kirin-desk-input", include_str!("../../input/Cargo.toml")),
+    ("kirin-desk-media", include_str!("../../media/Cargo.toml")),
+    ("kirin-desk-relay", include_str!("../../relay/Cargo.toml")),
+    (
+        "relay-server",
+        include_str!("../../relay-server/Cargo.toml"),
+    ),
+    (
+        "kirin-desk-updater",
+        include_str!("../../updater/Cargo.toml"),
+    ),
+    ("kirin-desk-utils", include_str!("../../utils/Cargo.toml")),
+    ("kirin-desk-ui", include_str!("../Cargo.toml")),
+];
+
+/// R-09b: 核心 crate 版本表（程序 + 依赖版本）。
+///
+/// 全部工作区成员使用 `version.workspace = true`（根 Cargo.toml 统一
+/// 版本），因此各 crate 版本恒等于 `env!("CARGO_PKG_VERSION")`。
+fn core_crate_versions() -> Vec<(&'static str, &'static str)> {
+    let version = env!("CARGO_PKG_VERSION");
+    VERSION_TABLE_CRATES
+        .iter()
+        .map(|(name, _)| (*name, version))
+        .collect()
+}
+
+/// R-09b: `version` — 程序版本 + 核心 crate 版本表（帮助首行同款头）。
+fn cmd_version() {
+    println!("KirinDesk v{}", env!("CARGO_PKG_VERSION"));
+    println!("P2P Remote Desktop - IPv6 + Zero Trust");
+    println!();
+    println!("CORE CRATES:");
+    for (name, version) in core_crate_versions() {
+        println!("  {:<22} {}", name, version);
+    }
+}
+
+/// R-09b: identity 子命令参数解析（纯函数）：是否输出 `--json`。
+fn identity_json_flag(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--json")
+}
+
+/// R-09b: 设备身份信息（与 GUI Dashboard 身份卡同源）。
+struct IdentityInfo {
+    /// Device ID（`effective_device_id` 语义，与 UI 身份卡一致）。
+    device_id: String,
+    /// Ed25519 公钥 32 字节小写十六进制。
+    pubkey_hex: String,
+    /// Ed25519 公钥 base64（DNS TXT 注册同款编码）。
+    pubkey_base64: String,
+    /// SHA-256 指纹（base64 公钥 → SHA-256 → 冒号分组小写十六进制，
+    /// 与 `core::crypto::ed25519::fingerprint` / known_hosts 算法一致）。
+    fingerprint_sha256: String,
+    /// 密钥文件路径（`IdentityManager::default_path`，与 GUI 同路径）。
+    key_file: String,
+    /// known_hosts 存储路径。
+    known_hosts_path: String,
+    /// known_hosts 条目数。
+    known_hosts_count: usize,
+}
+
+/// R-09b: 汇总身份信息（复用 `load_identity` + `KnownHostsStore`）。
+fn identity_info(cfg: &Config) -> Result<IdentityInfo, String> {
+    use kirin_desk_core::crypto::ed25519::{fingerprint, IdentityManager};
+    use kirin_desk_utils::known_hosts::KnownHostsStore;
+
+    // Device ID 语义与 GUI 身份卡一致（M8-T031：空/旧占位 → 自动硬盘 UUID）。
+    let device_id = kirin_desk_utils::device::effective_device_id(&cfg.device.id);
+    let identity = load_identity(cfg).map_err(|e| e.to_string())?;
+    let pubkey_bytes = identity.public_key().to_bytes();
+    let pubkey_base64 = identity.public_key_base64();
+    let key_file = IdentityManager::default_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "(unknown)".to_string());
+    let kh = KnownHostsStore::load().map_err(|e| e.to_string())?;
+    let known_hosts_count = kh.hosts().len();
+    let known_hosts_path = KnownHostsStore::default_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "(unknown)".to_string());
+    // 先算指纹再 move 字段（struct 字面量按源序求值，先 move 后借 → E0382）。
+    let fingerprint_sha256 = fingerprint(&pubkey_base64);
+    Ok(IdentityInfo {
+        device_id,
+        pubkey_hex: pubkey_bytes.iter().map(|b| format!("{:02x}", b)).collect(),
+        pubkey_base64,
+        fingerprint_sha256,
+        key_file,
+        known_hosts_path,
+        known_hosts_count,
+    })
+}
+
+/// R-09b: `identity` — 设备身份卡；`--json` 输出单行 JSON（jq 可解析）。
+fn cmd_identity(args: Vec<String>) {
+    let cfg = match Config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            println!("Identity error: config load failed: {}", e);
+            return;
+        }
+    };
+    let info = match identity_info(&cfg) {
+        Ok(i) => i,
+        Err(e) => {
+            println!("Identity error: {}", e);
+            return;
+        }
+    };
+    if identity_json_flag(&args) {
+        println!(
+            "{}",
+            serde_json::to_string(&identity_json(&info)).expect("JSON serialization")
+        );
+    } else {
+        println!("=== KirinDesk Identity ===");
+        println!("Device ID:        {}", info.device_id);
+        println!("Ed25519 Pubkey:   {}", info.pubkey_hex);
+        println!("Fingerprint:      {}  (SHA-256)", info.fingerprint_sha256);
+        println!("Key File:         {}", info.key_file);
+        println!(
+            "Known Hosts:      {} entries ({})",
+            info.known_hosts_count, info.known_hosts_path
+        );
+    }
+}
+
+/// R-09b: 身份信息 → JSON 值（`--json` 输出；纯函数，供单测守护字段）。
+fn identity_json(info: &IdentityInfo) -> serde_json::Value {
+    serde_json::json!({
+        "device_id": info.device_id,
+        "ed25519_public_key_hex": info.pubkey_hex,
+        "ed25519_public_key_base64": info.pubkey_base64,
+        "fingerprint_sha256": info.fingerprint_sha256,
+        "key_file": info.key_file,
+        "known_hosts_path": info.known_hosts_path,
+        "known_hosts_count": info.known_hosts_count,
+    })
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -6011,7 +6180,8 @@ mod cli_tests {
 
     #[test]
     fn test_parse_cli_command_known_commands() {
-        // 全部已知子命令 → 对应变体（17 项；help 别名单测见下）
+        // 全部已知子命令 → 对应变体（20 项；help 别名单测见下；
+        // R-09b 追加 version/identity）
         let cases: &[(&str, CliCommand)] = &[
             ("help", CliCommand::Help),
             ("setup", CliCommand::Setup),
@@ -6031,6 +6201,8 @@ mod cli_tests {
             ("tunnel", CliCommand::Tunnel),
             ("status", CliCommand::Status),
             ("self-test", CliCommand::SelfTest),
+            ("version", CliCommand::Version),
+            ("identity", CliCommand::Identity),
         ];
         for (name, expected) in cases {
             let got = parse_cli_command(&v(&["kirin_desk", name, "extra"]));
@@ -6075,6 +6247,90 @@ mod cli_tests {
             parse_cli_command(&v(&["kirin_desk", "connect", "--id", "abc"])),
             CliCommand::Connect
         );
+    }
+
+    // ── R-09b（波次 2）：version / identity 参数解析与输出格式 ────────
+
+    #[test]
+    fn test_identity_json_flag_parsing() {
+        // `--json` 精确匹配（位置无关）
+        assert!(identity_json_flag(&v(&[
+            "kirin_desk",
+            "identity",
+            "--json"
+        ])));
+        assert!(identity_json_flag(&v(&[
+            "kirin_desk",
+            "--json",
+            "identity"
+        ])));
+        assert!(!identity_json_flag(&v(&["kirin_desk", "identity"])));
+        assert!(
+            !identity_json_flag(&v(&["kirin_desk", "identity", "--jsonish"])),
+            "前缀不可命中"
+        );
+        assert!(!identity_json_flag(&v(&[])), "空参数表 → false");
+    }
+
+    #[test]
+    fn test_identity_json_roundtrip_jq_parsable() {
+        // `--json` 输出字段契约：单行 JSON，serde 往返可解析（等价 jq）
+        let info = IdentityInfo {
+            device_id: "HD-TEST".to_string(),
+            pubkey_hex: "00".repeat(32),
+            pubkey_base64: "dGVzdA==".to_string(),
+            fingerprint_sha256: "a1b2:c3d4".to_string(),
+            key_file: "C:/users/t/.kirin_desk/identity/ed25519.json".to_string(),
+            known_hosts_path: "C:/users/t/kirin_desk/known_hosts".to_string(),
+            known_hosts_count: 3,
+        };
+        let line = serde_json::to_string(&identity_json(&info)).unwrap();
+        assert!(!line.contains('\n'), "JSON 必须单行（脚本友好）");
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed["device_id"], "HD-TEST");
+        assert_eq!(parsed["ed25519_public_key_hex"], "00".repeat(32));
+        assert_eq!(parsed["ed25519_public_key_base64"], "dGVzdA==");
+        assert_eq!(parsed["fingerprint_sha256"], "a1b2:c3d4");
+        assert_eq!(parsed["known_hosts_count"], 3);
+        assert_eq!(
+            parsed["key_file"],
+            "C:/users/t/.kirin_desk/identity/ed25519.json"
+        );
+        assert_eq!(
+            parsed["known_hosts_path"],
+            "C:/users/t/kirin_desk/known_hosts"
+        );
+        // 字段集完整（脚本依赖方缺字段即失败）
+        for key in [
+            "device_id",
+            "ed25519_public_key_hex",
+            "ed25519_public_key_base64",
+            "fingerprint_sha256",
+            "key_file",
+            "known_hosts_path",
+            "known_hosts_count",
+        ] {
+            assert!(parsed.get(key).is_some(), "JSON 缺字段 {key}");
+        }
+    }
+
+    #[test]
+    fn test_version_table_crates_use_workspace_version() {
+        // 版本表前提守护：全部成员必须 `version.workspace = true`
+        // （任一成员脱离 workspace 版本 → 版本表失真，此测试先行失败）
+        for (name, manifest) in VERSION_TABLE_CRATES {
+            assert!(
+                manifest.contains("version.workspace = true"),
+                "{name} Cargo.toml 未使用 workspace 统一版本，version 表需同步更新"
+            );
+        }
+        // 表内 crate 与成员清单一一对应 + 版本全部等于 CARGO_PKG_VERSION
+        let entries = core_crate_versions();
+        assert_eq!(entries.len(), VERSION_TABLE_CRATES.len());
+        let expected = env!("CARGO_PKG_VERSION");
+        for (name, v) in entries {
+            assert_eq!(v, expected, "{name} 版本必须与 workspace 版本一致");
+        }
     }
 
     #[test]
@@ -6229,6 +6485,9 @@ mod cli_tests {
             "tunnel",
             "status",
             "self-test",
+            // R-09b（波次 2）：version / identity
+            "version",
+            "identity",
         ] {
             let got = parse_cli_command(&v(&["kirin_desk", name]));
             assert!(
