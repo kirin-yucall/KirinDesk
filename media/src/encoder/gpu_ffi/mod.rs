@@ -143,7 +143,7 @@ extern "C" {
 ///
 /// 由 [`kgpu_hw_upload_probe`] 填充，供零拷贝绑定断言（R-15b 测试）：
 /// - `frame`：AVFrame*（与输入一致）
-/// - `pix_fmt`：AV_PIX_FMT_D3D11（1000085）
+/// - `pix_fmt`：AV_PIX_FMT_D3D11（8.1.1 实测枚举值 171，R-15b 核对）
 /// - `has_hw_frames_ctx`：0/1（hw_frames_ctx 非空）
 /// - `bound_texture`：AVD3D11FrameDescriptor.texture（绑定纹理句柄；
 ///   NV12 输入时 == 输入纹理 → 零拷贝断言）
