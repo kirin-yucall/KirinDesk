@@ -84,7 +84,7 @@ fn server_cfg_on(
     let range_base = 40000 + (uuid::Uuid::new_v4().as_u128() % 2000) as u16;
     TunnelServerConfig {
         bind_port,
-        bind_addr: None, // S-24 (F-29)：默认双栈；自测显式回环绑定
+        bind_addrs: Vec::new(), // S-24 (F-29)：默认双栈；自测显式回环绑定
         token: token.to_string(),
         port_range: Some((range_base, range_base + 256)),
         heartbeat_timeout: Duration::from_millis(500),
@@ -1482,5 +1482,104 @@ async fn test_candidate_register_same_device_accepted() {
         0
     );
 
+    srv_task.abort();
+}
+
+// ════════════════════════════════════════════════════════════════
+// M8-T039 (P2): 多地址多监听器 / v6-only / 回退语义 单测
+// ════════════════════════════════════════════════════════════════
+
+/// 取一个空闲端口（测试用；drop 后可能被并发测试复用，仅用于同批次内）。
+async fn pick_free_port() -> u16 {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let p = l.local_addr().unwrap().port();
+    drop(l);
+    p
+}
+
+#[tokio::test]
+async fn bind_multi_addrs_same_port() {
+    // M8-T039 P6/P8：多地址同端口监听 —— `0.0.0.0` 与 `[::]` 两个 listener
+    // 并存（v6-only 与 v4 显式监听互不冲突，无 EADDRINUSE）；`port()` 取
+    // 首个监听器端口且非 0。数据面：IPv4 客户端走 v4 监听器、IPv6 客户端
+    // 走 v6 监听器（本机回环双链路连通）。
+    let port = pick_free_port().await;
+    assert_ne!(port, 0);
+    let mut cfg = server_cfg("secret", None);
+    cfg.bind_addrs = vec![
+        format!("0.0.0.0:{}", port).parse().unwrap(),
+        format!("[::]:{}", port).parse().unwrap(),
+    ];
+    let server = TunnelServer::bind(cfg)
+        .await
+        .expect("双地址同端口监听应成功（v6-only 规避 EADDRINUSE）");
+    assert_eq!(server.port(), port, "port() 应取首个监听器端口");
+    let srv_task = tokio::spawn(server.run());
+
+    let _ = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("IPv4 客户端应连通 v4 监听器（0.0.0.0）");
+    let _ = TcpStream::connect(("::1", port))
+        .await
+        .expect("IPv6 客户端应连通 v6 监听器（[::]，v6-only）");
+
+    srv_task.abort();
+}
+
+#[tokio::test]
+async fn v6_only_isolated() {
+    // M8-T039 P6/P8：set_only_v6 断言 —— 仅绑 `[::1]:0` 时 IPv4 回环连接
+    // 必须失败（v6 监听不收 IPv4），IPv6 回环必须连通。
+    let mut cfg = server_cfg("secret", None);
+    cfg.bind_addrs = vec!["[::1]:0".parse().unwrap()];
+    let server = TunnelServer::bind(cfg)
+        .await
+        .expect("v6-only 单监听绑定应成功");
+    let port = server.port();
+    assert_ne!(port, 0);
+    let srv_task = tokio::spawn(server.run());
+
+    let v4 = tokio::time::timeout(
+        Duration::from_secs(2),
+        TcpStream::connect(("127.0.0.1", port)),
+    )
+    .await;
+    assert!(v4.is_err(), "v6-only 监听不得接受 IPv4 连接");
+    let _ = TcpStream::connect(("::1", port))
+        .await
+        .expect("IPv6 客户端应连通 v6-only 监听器");
+
+    srv_task.abort();
+}
+
+#[tokio::test]
+async fn bind_single_127_regression() {
+    // S-24 (F-29) 回归（P2-4 对齐 self-test 语义）：单地址 `127.0.0.1:0`。
+    let mut cfg = server_cfg("secret", None);
+    cfg.bind_addrs = vec!["127.0.0.1:0".parse().unwrap()];
+    let server = TunnelServer::bind(cfg).await.expect("单回环地址绑定应成功");
+    let port = server.port();
+    assert_ne!(port, 0);
+    let srv_task = tokio::spawn(server.run());
+    let _ = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("回环客户端应连通");
+    srv_task.abort();
+}
+
+#[tokio::test]
+async fn bind_empty_falls_back_dual_stack() {
+    // M8-T039 P7：bind_addrs 空列表 → 旧默认双栈路径（`[::]` 优先 +
+    // `0.0.0.0` 回退，语义零变化）；v4 回环连通（本机无 v6 环境时该断言
+    // 即够，按平台能力取 v4 断言）。
+    let server = TunnelServer::bind(server_cfg("secret", None))
+        .await
+        .expect("空 bind_addrs 应走默认双栈绑定成功");
+    let port = server.port();
+    assert_ne!(port, 0);
+    let srv_task = tokio::spawn(server.run());
+    let _ = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("默认双栈下 v4 回环应连通");
     srv_task.abort();
 }

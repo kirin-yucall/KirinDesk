@@ -54,9 +54,11 @@ const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct TunnelServerConfig {
     /// 控制端口（0 = 系统分配，测试用）。
     pub bind_port: u16,
-    /// S-24（F-29）：显式绑定地址（None = 默认 `[::]` 双栈 + `0.0.0.0` 回退）。
-    /// 自测/受限环境传 `Some(127.0.0.1:0)` 仅监听回环——默认行为零变更。
-    pub bind_addr: Option<SocketAddr>,
+    /// 显式监听地址列表（多地址多监听器，M8-T039 §3.2.2；空 = 默认
+    /// `[::]` 优先 + `0.0.0.0` 回退，兼容现状）。每个地址独立 `TcpListener`；
+    /// **IPv6 地址一律 `set_only_v6(true)`**（与 v4 显式监听并存，规避平台
+    /// 双栈差异与 EADDRINUSE 冲突）。
+    pub bind_addrs: Vec<SocketAddr>,
     /// token 认证（TNL-SEC-001）。
     pub token: String,
     /// 自动分配端口范围（`remote_port: 0` 时使用，TNL-SERVER-003）。
@@ -90,7 +92,7 @@ impl Default for TunnelServerConfig {
     fn default() -> Self {
         Self {
             bind_port: DEFAULT_BIND_PORT,
-            bind_addr: None,
+            bind_addrs: Vec::new(),
             token: String::new(),
             port_range: None,
             heartbeat_timeout: DEFAULT_HEARTBEAT_TIMEOUT,
@@ -203,7 +205,7 @@ impl ServerShared {
 /// 隧道服务端（frps 等价）。
 pub struct TunnelServer {
     shared: Arc<ServerShared>,
-    listener: TcpListener,
+    listeners: Vec<TcpListener>,
 }
 
 /// 服务器关闭句柄（`run()` 移走 `TunnelServer` 后仍可优雅关闭；测试/CLI 用）。
@@ -246,25 +248,36 @@ impl TunnelServer {
         self.shutdown_handle().shutdown();
     }
 
-    /// 绑定控制端口（`[::]` 优先 + `0.0.0.0` 回退，对齐 M8-T025 双栈；
-    /// S-24 / F-29：`cfg.bind_addr` 显式指定时仅绑定该地址——自测 relay
-    /// 绑 `127.0.0.1`，不暴露全接口）。
+    /// 绑定控制端口（M8-T039：多地址多监听器。`bind_addrs` 为空 → 默认
+    /// `[::]` 优先 + `0.0.0.0` 回退，对齐 M8-T025 双栈；显式指定 → 每个地址
+    /// 独立 `TcpListener`，IPv6 一律 `set_only_v6(true)`（与 v4 显式监听并存，
+    /// 规避平台双栈差异与 EADDRINUSE 冲突；S-24/F-29 语义不变——自测 relay
+    /// 传 `["127.0.0.1:0"]` 仅监听回环）。任一地址绑定失败 → 整体失败）。
     ///
     /// 显式设置 `SO_REUSEADDR`（tokio `TcpSocket`，零新依赖）：对齐 FRP/Go
     /// 默认行为——服务端重启（含优雅关闭后的 TIME_WAIT 窗口）可立即重绑
     /// 同端口（TNL-STAB-003 重连场景的生产前提）。
     pub async fn bind(cfg: TunnelServerConfig) -> Result<Self, TunnelServerError> {
         let port = cfg.bind_port;
-        let listener = match cfg.bind_addr {
-            Some(addr) => bind_reuseaddr_addr(addr).await.map_err(|e| {
-                TunnelServerError::Bind { port, source: e }
-            })?,
-            None => match bind_reuseaddr(port).await {
-                Ok(l) => l,
-                Err(_) => bind_reuseaddr_v4(port).await.map_err(|e| {
+        // M8-T039：多地址多监听器。空列表 → 旧默认双栈逻辑
+        // （bind_reuseaddr 失败回退 bind_reuseaddr_v4，语义零变化）。
+        let listeners: Vec<TcpListener> = if cfg.bind_addrs.is_empty() {
+            match bind_reuseaddr(port).await {
+                Ok(l) => vec![l],
+                Err(_) => vec![bind_reuseaddr_v4(port).await.map_err(|e| {
                     TunnelServerError::Bind { port, source: e }
-                })?,
-            },
+                })?],
+            }
+        } else {
+            let mut out = Vec::with_capacity(cfg.bind_addrs.len());
+            for addr in &cfg.bind_addrs {
+                // v6 一律 v6-only：`::` 只收 IPv6、`0.0.0.0` 只收 IPv4，
+                // 两个 listener 并行、无平台歧义。
+                let l = bind_reuseaddr_addr_opt(*addr, addr.is_ipv6()).await
+                    .map_err(|e| TunnelServerError::Bind { port, source: e })?;
+                out.push(l);
+            }
+            out // 任一失败 → 提前返回 Err（不做部分成功）
         };
         let rate_limit_cfg = cfg.rate_limit.clone();
         let tunnel_conn_rate_limit_cfg = cfg.tunnel_conn_rate_limit.clone();
@@ -295,12 +308,12 @@ impl TunnelServer {
             shutting_down: AtomicBool::new(false),
             shutdown_tx: broadcast::channel(64).0,
         });
-        Ok(Self { shared, listener })
+        Ok(Self { shared, listeners })
     }
 
-    /// 实际监听端口（`bind_port: 0` 时为系统分配值）。
+    /// 实际监听端口（`bind_port: 0` 时为系统分配值；多监听器场景取首个）。
     pub fn port(&self) -> u16 {
-        self.listener.local_addr().map(|a| a.port()).unwrap_or(0)
+        self.listeners[0].local_addr().map(|a| a.port()).unwrap_or(0)
     }
 
     /// 当前统计。
@@ -345,22 +358,37 @@ impl TunnelServer {
                 }
             }
         });
-        loop {
-            if shared.shutting_down.load(Ordering::SeqCst) {
-                info!("Tunnel server shutting down (accept loop stopped)");
-                break;
-            }
-            let (stream, addr) = match self.listener.accept().await {
-                Ok(x) => x,
-                Err(e) => {
-                    warn!("tunnel accept error: {}", e);
-                    continue;
-                }
-            };
+        // M8-T039：每 listener 一个 accept 任务（共享 Arc<Shared>），
+        // 循环体逐字保留原单循环（shutting_down 检查 + handle_incoming 分发）。
+        // 优雅关闭：shutdown 广播 → 各 accept 任务检查到标志后退出。
+        let mut set = tokio::task::JoinSet::new();
+        for listener in self.listeners {
             let shared = shared.clone();
-            tokio::spawn(async move {
-                let _ = handle_incoming(shared, stream, addr).await;
+            set.spawn(async move {
+                loop {
+                    if shared.shutting_down.load(Ordering::SeqCst) {
+                        info!("Tunnel server shutting down (accept loop stopped)");
+                        break;
+                    }
+                    let (stream, addr) = match listener.accept().await {
+                        Ok(x) => x,
+                        Err(e) => {
+                            warn!("tunnel accept error: {}", e);
+                            continue;
+                        }
+                    };
+                    let shared = shared.clone();
+                    tokio::spawn(async move {
+                        let _ = handle_incoming(shared, stream, addr).await;
+                    });
+                }
             });
+        }
+        // 汇合全部 accept 任务（任一异常仅告警，不吞整体退出）。
+        while let Some(res) = set.join_next().await {
+            if let Err(e) = res {
+                warn!("tunnel accept task error: {}", e);
+            }
         }
         Ok(())
     }
@@ -1281,6 +1309,29 @@ async fn bind_reuseaddr_addr(addr: SocketAddr) -> Result<TcpListener, std::io::E
     socket.set_reuseaddr(true)?;
     socket.bind(addr)?;
     socket.listen(1024)
+}
+
+/// M8-T039：绑定**显式地址**（SO_REUSEADDR）；`only_v6: true` 时 IPv6 socket
+/// 一律 `set_only_v6(true)`（与 v4 显式监听并存，规避平台双栈差异与
+/// EADDRINUSE 冲突）；v4 地址走 [`bind_reuseaddr_addr`] 既有路径。
+async fn bind_reuseaddr_addr_opt(
+    addr: SocketAddr,
+    only_v6: bool,
+) -> Result<TcpListener, std::io::Error> {
+    if addr.is_ipv6() && only_v6 {
+        // M8-T025 同款做法（tokio TcpSocket 未暴露 set_only_v6 setter）：
+        // socket2 显式 IPV6_V6ONLY=true —— v6-only 监听只收 IPv6。
+        use socket2::{Domain, Protocol, Socket, Type};
+        let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+        socket.set_only_v6(true)?;
+        socket.set_reuse_address(true)?;
+        socket.set_nonblocking(true)?;
+        socket.bind(&addr.into())?;
+        socket.listen(1024)?;
+        TcpListener::from_std(socket.into())
+    } else {
+        bind_reuseaddr_addr(addr).await
+    }
 }
 
 /// 绑定 `[::]:port`（SO_REUSEADDR；Windows 上 TIME_WAIT 端口可立即重绑）。

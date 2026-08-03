@@ -4055,7 +4055,7 @@ async fn cmd_self_test() {
                     bind_port: 0,
                     // S-24 (F-29)：自测 relay 仅绑回环（127.0.0.1），
                     // 不暴露全接口（token 为已知测试值）。
-                    bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+                    bind_addrs: vec!["127.0.0.1:0".parse().unwrap()],
                     token: "self-test-token".to_string(),
                     server_key_path: Some(tmp_key.clone()),
                     heartbeat_timeout: Duration::from_secs(2),
@@ -4876,8 +4876,23 @@ async fn cmd_tunnel_serve() {
             t.port_range
         );
     }
+    // M8-T039：可选显式监听地址列表（默认 "0.0.0.0,::" 或空串 → relay 回退
+    // 默认双栈，行为与现状一致）。解析失败 → 拒绝启动（fail-closed，对齐
+    // 空 token 拒绝语义）。
+    let bind_addrs = if t.bind_addrs.trim().is_empty() {
+        Vec::new()
+    } else {
+        match kirin_desk_utils::config::parse_bind_addr_list(&t.bind_addrs, t.bind_port) {
+            Ok(v) => v,
+            Err(e) => {
+                println!("ERROR: invalid [tunnel].bind_addrs: {e}");
+                return;
+            }
+        }
+    };
     let srv_cfg = TunnelServerConfig {
         bind_port: t.bind_port,
+        bind_addrs,
         token: t.token.clone(),
         port_range,
         heartbeat_timeout: Duration::from_secs(t.heartbeat_timeout.max(1)),
@@ -4890,6 +4905,14 @@ async fn cmd_tunnel_serve() {
     };
     println!("=== Tunnel server (mode=server) ===");
     println!("  Control port: {}", t.bind_port);
+    println!(
+        "  Bind addrs:   {}",
+        if t.bind_addrs.trim().is_empty() {
+            "(default dual-stack)".to_string()
+        } else {
+            t.bind_addrs.clone()
+        }
+    );
     println!(
         "  Port range:   {}",
         if t.port_range.is_empty() {

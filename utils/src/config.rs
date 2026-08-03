@@ -234,6 +234,19 @@ pub struct TunnelConfig {
     #[serde(default = "default_tunnel_bind_port")]
     pub bind_port: u16,
 
+    /// 服务端监听地址列表（server 模式，逗号分隔，可多个，IPv4/IPv6 均可）。
+    /// 默认 "0.0.0.0,::" —— 显式同时监听 IPv4 与 IPv6（跨平台稳定，
+    /// 不依赖单地址双栈行为；原「[::] 优先 + 0.0.0.0 回退」语义保留为空值时兜底，
+    /// 见 relay `TunnelServerConfig.bind_addrs` 空列表处理）。
+    #[serde(default = "default_tunnel_bind_addrs")]
+    pub bind_addrs: String, // 例: "0.0.0.0,::" / "127.0.0.1" / "0.0.0.0,::,192.168.1.10"
+
+    /// GUI 最后运行状态（M8-T039 §3.4.3）：GUI「启动/停止」随最后一次使用
+    /// 保持；程序启动读 true → 自动恢复隧道。仅 GUI 消费，CLI 不读；
+    /// 与 `enabled`（配置级总开关，CLI 消费）语义独立、互不干扰。
+    #[serde(default)]
+    pub auto_start: bool,
+
     /// 服务端自动分配端口区间（`remote_port = 0` 时），格式 `"start-end"`。
     #[serde(default = "default_tunnel_port_range")]
     pub port_range: String,
@@ -304,6 +317,12 @@ fn default_tunnel_bind_port() -> u16 {
     7000
 }
 
+/// M8-T039: server 监听地址默认值 —— 显式 IPv4+IPv6 双监听（跨平台稳定，
+/// 不依赖单地址双栈行为）。
+fn default_tunnel_bind_addrs() -> String {
+    "0.0.0.0,::".to_string()
+}
+
 fn default_tunnel_port_range() -> String {
     "60000-61000".to_string()
 }
@@ -328,6 +347,10 @@ impl Default for TunnelConfig {
             server_addr: String::new(),
             token: String::new(),
             bind_port: default_tunnel_bind_port(),
+            // M8-T039：server 监听地址（默认 IPv4+IPv6 双监听）+ GUI 最后运行状态
+            // （默认 false —— 旧用户曾手开 enabled=true 的，缺省不自动拉起）。
+            bind_addrs: default_tunnel_bind_addrs(),
+            auto_start: false,
             port_range: default_tunnel_port_range(),
             heartbeat_interval: default_tunnel_heartbeat_interval(),
             heartbeat_timeout: default_tunnel_heartbeat_timeout(),
@@ -396,6 +419,42 @@ impl TunnelConfig {
         }
         lines
     }
+}
+
+/// M8-T039: 解析服务端监听地址列表（GUI 校验 + CLI/共享层使用；纯 std，不引入新依赖）。
+/// 逗号拆分、trim、逐个解析为 IpAddr 后拼 port；非 IP 即报错
+/// （不支持域名——监听地址必须是本机 IP）。
+/// 空字符串/纯空白 → Ok(vec![])（上层回退默认双栈，兼容旧配置语义）。
+pub fn parse_bind_addr_list(s: &str, port: u16) -> Result<Vec<std::net::SocketAddr>, String> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Ok(vec![]);
+    }
+    let mut out = Vec::new();
+    for part in trimmed.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            return Err(format!("监听地址存在空段: '{s}'")); // 例 "0.0.0.0,,::"
+        }
+        match part.parse::<std::net::IpAddr>() {
+            Ok(ip) => out.push(std::net::SocketAddr::new(ip, port)),
+            Err(_) => {
+                return Err(format!(
+                    "无效监听地址 '{part}'（仅支持本机 IP，不支持域名）"
+                ))
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// M8-T039: 生成高熵随机 Token：32 字节 OsRng → 64 位 hex（128 bit 熵之上加倍，
+/// 对齐 TNL-SEC-009「≥32 字节高熵随机串」建议；hex 无歧义、便于复制粘贴）。
+pub fn generate_random_token() -> String {
+    use rand::RngCore;
+    let mut buf = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut buf);
+    buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// M13-T006: 文件传输配置（`[file_transfer]` 段）。
@@ -1537,6 +1596,140 @@ mod tests {
         assert_eq!(parsed[0].name, "ssh");
         assert_eq!(parsed[0].remote_port, 0); // remote_port=0 省略第三段
         assert_eq!(parsed[1].remote_port, 60080);
+    }
+
+    // ---------- M8-T039 (P1): bind_addrs / auto_start 字段与工具函数测试 ----------
+
+    #[test]
+    fn test_tunnel_default_bind_addrs() {
+        // 默认 "0.0.0.0,::"（显式 IPv4+IPv6 双监听）；auto_start 默认 false
+        // （旧用户曾手开 enabled=true 的，缺省不自动拉起，行为兼容）。
+        let tunnel = TunnelConfig::default();
+        assert_eq!(tunnel.bind_addrs, "0.0.0.0,::");
+        assert!(!tunnel.auto_start);
+    }
+
+    #[test]
+    fn test_tunnel_legacy_toml_missing_bind_addrs_auto_start() {
+        // 旧配置 [tunnel] 段缺 bind_addrs / auto_start → 加载不失败，
+        // 默认值兜底生效（`#[serde(default)]`）。
+        let dir = std::env::temp_dir().join("kirin_desk_test_tunnel_p1");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.toml");
+        std::fs::write(
+            &path,
+            "[device]\nid = \"old-device\"\nname = \"Old\"\n\
+             [godaddy]\napi_key = \"\"\napi_secret = \"\"\ndomain = \"example.com\"\n\
+             [network]\nport = 3389\n\
+             [media]\nencoder = \"auto\"\nframerate = 30\nbitrate = 5000\n\
+             [logging]\nlevel = \"info\"\nformat = \"text\"\n\
+             [tunnel]\nenabled = true\nmode = \"server\"\nbind_port = 7000\n\
+             port_range = \"60000-61000\"\n",
+        )
+        .unwrap();
+        let loaded = Config::load_from(&path).unwrap();
+        assert!(loaded.tunnel.enabled);
+        assert_eq!(loaded.tunnel.mode, "server");
+        assert_eq!(loaded.tunnel.bind_port, 7000);
+        assert_eq!(loaded.tunnel.bind_addrs, "0.0.0.0,::");
+        assert!(!loaded.tunnel.auto_start);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_tunnel_bind_addrs_roundtrip() {
+        // 显式 bind_addrs / auto_start 落盘 → 重新加载保持（P4 GUI 编辑持久化基础）。
+        let dir = std::env::temp_dir().join("kirin_desk_test_tunnel_bind");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.toml");
+        let mut config = Config::default();
+        config.tunnel.bind_addrs = "0.0.0.0,::,192.168.1.10".to_string();
+        config.tunnel.auto_start = true;
+        config.save_to(&path).unwrap();
+        let loaded = Config::load_from(&path).unwrap();
+        assert_eq!(loaded.tunnel.bind_addrs, "0.0.0.0,::,192.168.1.10");
+        assert!(loaded.tunnel.auto_start);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_parse_bind_addr_list_empty_or_whitespace() {
+        // 空串 / 纯空白 → Ok(vec![])（上层回退默认双栈，兼容旧配置语义）。
+        assert!(parse_bind_addr_list("", 7000).unwrap().is_empty());
+        assert!(parse_bind_addr_list("   ", 7000).unwrap().is_empty());
+        assert!(parse_bind_addr_list("\n\t ", 7000).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_parse_bind_addr_list_v4_v6_default() {
+        // "0.0.0.0,::" + port 7000 → 两个 SocketAddr（v4 + v6 同端口）。
+        let addrs = parse_bind_addr_list("0.0.0.0,::", 7000).unwrap();
+        assert_eq!(addrs.len(), 2);
+        assert_eq!(
+            addrs[0],
+            "0.0.0.0:7000".parse::<std::net::SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            addrs[1],
+            "[::]:7000".parse::<std::net::SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_parse_bind_addr_list_with_whitespace() {
+        // 带空白 "0.0.0.0, :: ,192.168.1.10" → 三项（逗号分隔 + 逐项 trim）。
+        let addrs = parse_bind_addr_list("0.0.0.0, :: ,192.168.1.10", 7000).unwrap();
+        assert_eq!(addrs.len(), 3);
+        assert_eq!(
+            addrs[0],
+            "0.0.0.0:7000".parse::<std::net::SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            addrs[1],
+            "[::]:7000".parse::<std::net::SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            addrs[2],
+            "192.168.1.10:7000".parse::<std::net::SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_parse_bind_addr_list_empty_segment() {
+        // 空段 "0.0.0.0,,::" → Err（错误文案中文，指出空段）。
+        let err = parse_bind_addr_list("0.0.0.0,,::", 7000).unwrap_err();
+        assert!(err.contains("空段"));
+    }
+
+    #[test]
+    fn test_parse_bind_addr_list_domain_rejected() {
+        // 域名不支持（监听地址必须是本机 IP）。
+        let err = parse_bind_addr_list("relay.example.com", 7000).unwrap_err();
+        assert!(err.contains("relay.example.com"));
+        assert!(err.contains("域名"));
+    }
+
+    #[test]
+    fn test_parse_bind_addr_list_invalid_ip() {
+        // 非 IP（"999.1.1.1"）→ Err。
+        let err = parse_bind_addr_list("999.1.1.1", 7000).unwrap_err();
+        assert!(err.contains("999.1.1.1"));
+    }
+
+    #[test]
+    fn test_generate_random_token_hex_length() {
+        // 32 字节 OsRng → 64 位 hex，全 hex 字符集（≥32 字节熵，TNL-SEC-009）。
+        let token = generate_random_token();
+        assert_eq!(token.len(), 64);
+        assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_generate_random_token_distinct() {
+        // 两次调用结果不同（随机性冒烟；64 hex 位碰撞概率可忽略）。
+        let a = generate_random_token();
+        let b = generate_random_token();
+        assert_ne!(a, b);
     }
 
     #[test]
