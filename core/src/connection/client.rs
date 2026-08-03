@@ -21,6 +21,7 @@ use kirin_desk_dns::{Resolver, ResolverError};
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::sync::Arc;
+use tracing::debug;
 
 /// DNS 发现配置（domain 模式；`ConnectionOptions::dns = None` = IP 直连）。
 ///
@@ -436,6 +437,12 @@ pub async fn connect_peer(
     let stream = tokio::net::TcpStream::connect(addr)
         .await
         .map_err(ConnectError::Tcp)?;
+    // R-31（审计 §4-3）：TCP 连接建立后关闭 Nagle —— Windows 默认开启
+    // Nagle，大帧后紧跟的小包（音频/键鼠）会被滞留。失败不致命（连接仍
+    // 可用，仅延迟优化失效），按告警处理。
+    if let Err(e) = crate::network::tcp::set_nodelay(&stream) {
+        debug!("set_nodelay failed: {e}");
+    }
     // R-02：pin 强类型——已解析出公钥 → `Exact` 强制比对；无带外公钥 →
     // `UserConfirmRequired`（确认回调必填，缺失即拒绝，无静默跳过路径）。
     let pin = match trusted_key.as_deref() {

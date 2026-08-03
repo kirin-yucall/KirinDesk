@@ -30,6 +30,8 @@ use kirin_desk_core::crypto::handshake as core_handshake;
 use kirin_desk_core::crypto::handshake::{
     PinExpectation, SecureChannel, SecureChannelReader, SecureChannelWriter,
 };
+// R-31（审计 §4-3）：TCP 连接建立后关闭 Nagle（大帧后小包不滞留）。
+use kirin_desk_core::network::tcp::set_nodelay;
 
 // ════════════════════════════════════════════════════════════════
 // QuicMediaTransport
@@ -1018,6 +1020,12 @@ async fn connect_tcp_transport(
     let stream = TcpClient::connect_with_timeout(addr, timeout_secs)
         .await
         .map_err(tcp_err_to_transport)?;
+    // R-31（审计 §4-3）：TCP 建连后关闭 Nagle —— Windows 默认开启 Nagle，
+    // 大视频帧后紧跟的小音频/键鼠包会被滞留。失败不致命（连接仍可用，
+    // 仅延迟优化失效），按告警处理。
+    if let Err(e) = set_nodelay(&stream) {
+        debug!("set_nodelay failed: {e}");
+    }
 
     // R-28（审计 §4-1）：握手读必须带超时——`client_handshake_generic` 内部
     // 无任何 timeout 包裹（服务端侧有 `server_read_init_with_timeout`，客户端
@@ -1126,6 +1134,11 @@ async fn accept_tcp_transport(
 ) -> Result<TcpMediaTransport, TransportError> {
     let (stream, remote) = tcp_listener.accept().await?;
     debug!("accept_tcp_transport: accepted from {remote}");
+    // R-31（审计 §4-3）：服务端 accept 侧同样关闭 Nagle（服务端→客户端
+    // 的小包不被大帧滞留）。失败不致命，按告警处理。
+    if let Err(e) = set_nodelay(&stream) {
+        debug!("set_nodelay failed: {e}");
+    }
 
     let ch = core_handshake::server_handshake_verified_with_nickname_generic(
         stream,

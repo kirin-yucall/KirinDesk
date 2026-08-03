@@ -175,6 +175,11 @@ impl TcpServer {
             (None, Some(v4)) => v4.accept().await?,
             (None, None) => unreachable!("TcpServer always holds at least one listener"),
         };
+        // R-31（审计 §4-3）：accept 侧同样关闭 Nagle —— 服务端→客户端的小包
+        // （音频/键鼠）不被大帧滞留。失败不致命（连接仍可用，仅延迟优化失效）。
+        if let Err(e) = set_nodelay(&stream) {
+            debug!("set_nodelay failed: {e}");
+        }
         Ok((stream, Self::map_addr(addr)))
     }
 
@@ -240,6 +245,21 @@ impl TcpClient {
             .map_err(|_| TcpError::Timeout { remote: addr })?
             .map_err(|e| TcpError::Connect { remote: addr, source: e })
     }
+}
+
+// ── R-31：TCP_NODELAY（Nagle 关闭） ───────────────────────────
+
+/// R-31（审计 §4-3）：关闭 Nagle 算法（`TCP_NODELAY`）。
+///
+/// Windows 默认开启 Nagle：大帧（视频）在途未 ACK 时，其后紧跟的小包
+/// （音频/键鼠）不会立即发出，产生交互延迟。全仓 TCP 连接建立后统一调用
+/// 本辅助（落点：`TcpServer::accept`、`client.rs::connect_peer`、
+/// media TCP transport；relay 为叶子 crate 不依赖 core，直接调用
+/// `TcpStream::set_nodelay`）。
+///
+/// 失败不致命：仅延迟优化失效，连接仍可用，调用方按告警处理。
+pub fn set_nodelay(stream: &TcpStream) -> std::io::Result<()> {
+    stream.set_nodelay(true)
 }
 
 // ── 泛型消息收发（用于 QUIC 流等） ──────────────────────────
@@ -356,6 +376,40 @@ mod tests {
         let stream = TcpClient::connect(remote).await.unwrap();
         assert!(stream.peer_addr().is_ok());
         handle.await.unwrap();
+    }
+
+    // ── R-31：set_nodelay 辅助（审计 §4-3，Windows Nagle 小包滞留） ──
+
+    /// R-31：helper 在已连接 socket 上生效（`nodelay()` 可读回 true）。
+    #[tokio::test]
+    async fn test_set_nodelay_roundtrip() {
+        let server = TcpServer::bind(0).await.unwrap();
+        let port = server.port();
+        let handle = tokio::spawn(async move {
+            server.accept().await.unwrap();
+        });
+        let remote = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        let stream = TcpClient::connect(remote).await.unwrap();
+        set_nodelay(&stream).unwrap();
+        assert!(stream.nodelay().unwrap(), "TCP_NODELAY 应已开启");
+        handle.await.unwrap();
+    }
+
+    /// R-31：`TcpServer::accept` 返回的流已统一关闭 Nagle。
+    #[tokio::test]
+    async fn test_accept_side_nodelay_enabled() {
+        let server = TcpServer::bind(0).await.unwrap();
+        let port = server.port();
+        let handle = tokio::spawn(async move {
+            let (stream, _) = server.accept().await.unwrap();
+            stream.nodelay().unwrap()
+        });
+        let remote = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        let _stream = TcpClient::connect(remote).await.unwrap();
+        assert!(
+            handle.await.unwrap(),
+            "accept 侧连接应已设置 TCP_NODELAY"
+        );
     }
 
     #[tokio::test]
