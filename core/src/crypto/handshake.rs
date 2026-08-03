@@ -1910,7 +1910,6 @@ mod tests {
         let alice = gen_identity(&dir, "alice");
         let bob = gen_identity(&dir, "bob");
         let bob_pub = bob.public_key_base64();
-        let alice_pub = alice.public_key_base64();
         let (client_end, mut server_end) = tokio::io::duplex(65536);
 
         let client_fut = client_handshake_with_codecs_generic(
