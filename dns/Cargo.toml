@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-tokio = { workspace = true, features = ["time", "sync"] }
+tokio = { workspace = true, features = ["time", "sync", "net", "io-util", "rt"] }
 serde.workspace = true
 serde_json.workspace = true
 reqwest.workspace = true
@@ -26,3 +26,14 @@ rsa = "0.9"
 hmac.workspace = true
 # sha2 "oid" 特性：rsa 0.9 的 Pkcs1v15Sign::new 要求摘要实现 AssociatedOid
 sha2 = { workspace = true, features = ["oid"] }
+# M8-T040 (W2-A / WBS 3.4): DoT wire 路径 —— rustls + webpki 信任根
+# （版本与 quinn 0.11 依赖树对齐，避免重复 rustls 版本；DDNS-DOH-005 证书校验）。
+# 显式 ring 提供者（纯 Rust 无 C 工具链依赖；quinn 已启用 ring feature，
+# reqwest 侧 aws-lc-rs 并存——运行时 install_default 解决二义性）。
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "1.0"
+# M8-T040 (W2-B / WBS 4.3): DdnsService::start(cfg) 读取 utils Config 全量
+# 配置（[ddns]/[network]/[dns] 段）。utils 为叶子 crate（零 workspace 依赖），
+# dns → utils 单向，无环（F-1 依赖方向复查）。
+kirin-desk-utils = { path = "../utils" }

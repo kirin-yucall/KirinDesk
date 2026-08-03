@@ -17,6 +17,7 @@ use crate::crypto::handshake::{
     client_handshake_with_confirm, CoreReason, HandshakeError, PinExpectation, SecureChannel,
 };
 use kirin_desk_dns::{default_provider, DeviceInfo, DiscoveryService, IpFamily};
+use kirin_desk_dns::{Resolver, ResolverError};
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -27,7 +28,7 @@ use std::sync::Arc;
 /// 当前激活服务商（`provider` + `credentials` 为事实源）；`api_key` /
 /// `api_secret` / `api_url` 为旧 `[godaddy]` 兼容字段，provider 化后不再参与
 /// 发现，保留仅为不破坏既有构造方。
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DnsConfig {
     /// 旧 GoDaddy API key（`[godaddy] api_key`；兼容字段，不再使用）。
     pub api_key: String,
@@ -46,6 +47,31 @@ pub struct DnsConfig {
     /// `dns.provider` 对应条目传给 `default_provider`）。纯内存结构，
     /// 不参与序列化。
     pub credentials: BTreeMap<String, BTreeMap<String, String>>,
+    /// M8-T040：域名模式加密 DNS 解析器（DoH/DoT，fail-closed）。
+    /// `None` = 未配置/已关闭（mode=off）→ 域名模式拒绝连接
+    /// （`ConnectError::EncryptedDnsRequired`，DDNS-DOH-003/007）。
+    /// 测试注入 mock（WBS 5.7）。
+    pub resolver: Option<Arc<dyn Resolver>>,
+}
+
+impl std::fmt::Debug for DnsConfig {
+    /// 手动实现：`Arc<dyn Resolver>` 无 Debug，且日志只应展示解析器是否
+    /// 已装配（不泄漏端点内部）。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DnsConfig")
+            .field("domain", &self.domain)
+            .field("ip_family", &self.ip_family)
+            .field("provider", &self.provider)
+            .field(
+                "resolver",
+                &(if self.resolver.is_some() {
+                    "Some(encrypted)"
+                } else {
+                    "None(fail-closed)"
+                }),
+            )
+            .finish()
+    }
 }
 
 /// 客户端信任策略（R03-S1：确认策略以回调注入，CLI 自动 / GUI 弹窗复用）。
@@ -152,6 +178,14 @@ pub enum ConnectError {
     NoTxtKey,
     #[error("ERROR: 设备无可用 IPv4/IPv6 地址（ip_family={0}）")]
     NoConnectAddr(String),
+    /// M8-T040：域名模式强制加密 DNS 不可用 → fail-closed 拒连（DDNS-DOH-003）。
+    /// 文案（DDNS-DOH-003）：「域名模式要求加密 DNS（DoH/DoT），当前不可用」。
+    #[error("域名模式要求加密 DNS（DoH/DoT），当前不可用: {0}")]
+    EncryptedDnsRequired(String),
+    /// M8-T040：加密 DNS 解析失败（响应畸形等；全端点不可用归
+    /// [`ConnectError::EncryptedDnsRequired`]）。
+    #[error("加密 DNS 解析失败 {host}: {err}")]
+    DnsResolveFailed { host: String, err: String },
     #[error("Connection aborted: {0}")]
     TrustRejected(String),
     #[error("TCP connect FAILED: {0}")]
@@ -216,6 +250,8 @@ impl ConnectError {
             | ConnectError::Discovery(_)
             | ConnectError::Provider(_)
             | ConnectError::NoConnectAddr(_)
+            | ConnectError::EncryptedDnsRequired(_)
+            | ConnectError::DnsResolveFailed { .. }
             | ConnectError::Tcp(_) => RefusalReason::ServerUnreachable,
             ConnectError::NoReconnectContext => RefusalReason::Other,
         }
@@ -241,12 +277,21 @@ fn ip_family_label(family: IpFamily) -> &'static str {
 pub async fn resolve_peer(opts: &ConnectionOptions) -> Result<ResolvedPeer, ConnectError> {
     let is_ip = opts.target.parse::<IpAddr>().is_ok() || opts.target.contains(':');
     if !is_ip {
-        // ── Domain 模式：发现 → TXT 校验 → 地址族选择 ──
+        // ── Domain 模式：发现 → TXT 校验 → 加密解析 → 地址族选择 ──
         let dns = opts.dns.as_ref().ok_or(ConnectError::DnsNotConfigured)?;
         let device_id = opts
             .target
             .trim_end_matches(&format!(".{}", dns.domain))
             .to_string();
+        // ── M8-T040：域名模式强制加密 DNS（DDNS-DOH-001/003）──
+        // fail-closed 前置检查：未注入加密解析器（未配置 / mode=off）→ 立即
+        // 拒连（不落发现调用，绝不回退明文；DDNS-DOH-007）。
+        let resolver = dns.resolver.as_ref().ok_or_else(|| {
+            ConnectError::EncryptedDnsRequired(
+                "未配置加密解析器（[dns.security] 缺失或 mode=off——域名模式强制 DoH/DoT）"
+                    .to_string(),
+            )
+        })?;
         // M9-DNS023：按 `[dns] provider` + `[dns.providers.*]` 构建当前激活
         // 服务商（旧 GoDaddyClient 直连逻辑删除，发现走 `dyn Provider`）。
         let provider = default_provider(&dns.provider, &dns.credentials)
@@ -260,11 +305,23 @@ pub async fn resolve_peer(opts: &ConnectionOptions) -> Result<ResolvedPeer, Conn
             // CLI-DNS-006: TXT 公钥缺失 → 拒绝连接，不回退信任网络公钥。
             return Err(ConnectError::NoTxtKey);
         }
+        // 发现记录给出的地址（SRV 端口 + A/AAAA）；作为加密解析结果的兜底
+        // （提供方 API 为 HTTPS 管理面，非明文 DNS，DDNS-SEC-001 红线合规）。
         let selected = info.select_connect_addr(dns.ip_family).ok_or_else(|| {
             ConnectError::NoConnectAddr(ip_family_label(dns.ip_family).to_string())
         })?;
+        // 解析入口收敛 `core::dns::resolve_for_connect`（唯一入口红线）。
+        let host = format!("{}.{}", device_id, dns.domain);
+        let resolved = crate::dns::resolve_for_connect(
+            &host,
+            selected.port(),
+            dns.ip_family,
+            resolver.as_ref(),
+        )
+        .await?;
+        let addr = resolved.first().copied().unwrap_or(selected);
         Ok(ResolvedPeer {
-            addr: selected.to_string(),
+            addr: addr.to_string(),
             device_id,
             device_type: info.device_type.clone(),
             domain: dns.domain.clone(),
@@ -366,7 +423,17 @@ pub async fn connect_peer(
     } else {
         opts.client_domain.clone()
     };
-    let stream = tokio::net::TcpStream::connect(&peer.addr)
+    // M8-T040（红线）：peer.addr 必须是 IP 字面量 —— 先解析为 `SocketAddr`
+    // 再直连，**禁止字符串形态直连**（`TcpStream::connect(&str)` 会触发系统
+    // 明文 DNS，DDNS-SEC-001）。域名模式的地址一律来自加密解析
+    // （`resolve_for_connect`，resolve_peer 侧完成）。
+    let addr: std::net::SocketAddr = peer.addr.parse().map_err(|_| {
+        ConnectError::Tcp(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("peer.addr '{}' 非 IP 字面量（禁止字符串解析路径）", peer.addr),
+        ))
+    })?;
+    let stream = tokio::net::TcpStream::connect(addr)
         .await
         .map_err(ConnectError::Tcp)?;
     // R-02：pin 强类型——已解析出公钥 → `Exact` 强制比对；无带外公钥 →
@@ -403,6 +470,7 @@ pub async fn connect_peer(
 mod tests {
     use super::*;
     use crate::crypto::ed25519::IdentityManager;
+    use kirin_desk_dns::Record;
 
     fn test_opts(target: &str, port: u16, trust: TrustPolicy) -> ConnectionOptions {
         ConnectionOptions {
@@ -423,6 +491,71 @@ mod tests {
             dns: None,
             trust,
         }
+    }
+
+    /// M8-T040：域名模式 + 未注入加密解析器 → fail-closed 拒连
+    /// （EncryptedDnsRequired，DDNS-DOH-003/007；不落发现调用）。
+    #[tokio::test]
+    async fn test_domain_mode_without_resolver_fail_closed() {
+        let mut opts = test_opts("my-pc.example.com", 3389, TrustPolicy::Verified("k".into()));
+        opts.dns = Some(DnsConfig {
+            api_key: String::new(),
+            api_secret: String::new(),
+            api_url: String::new(),
+            domain: "example.com".to_string(),
+            ip_family: IpFamily::Auto,
+            provider: "godaddy".to_string(),
+            credentials: BTreeMap::new(),
+            resolver: None, // mode=off / 未配置
+        });
+        let err = resolve_peer(&opts).await.unwrap_err();
+        assert!(
+            matches!(err, ConnectError::EncryptedDnsRequired(_)),
+            "未配置加密解析器必须 fail-closed，got {err:?}"
+        );
+    }
+
+    /// M8-T040：域名模式 + 已注入解析器 → 通过前置检查，走到发现
+    /// （无凭据 → Provider 错误而非 EncryptedDnsRequired，证明解析器路径生效）。
+    #[tokio::test]
+    async fn test_domain_mode_with_resolver_proceeds_to_discovery() {
+        use kirin_desk_dns::{RecordData, RecordType, ResolverError};
+        struct MockResolver;
+        #[async_trait::async_trait]
+        impl Resolver for MockResolver {
+            async fn resolve(
+                &self,
+                _host: &str,
+                rt: RecordType,
+            ) -> Result<Vec<Record>, ResolverError> {
+                Ok(match rt {
+                    RecordType::A => vec![Record {
+                        name: "my-pc.example.com".into(),
+                        rtype: RecordType::A,
+                        ttl: 300,
+                        data: RecordData::Plain("203.0.113.7".into()),
+                    }],
+                    RecordType::AAAA => vec![],
+                    _ => vec![],
+                })
+            }
+        }
+        let mut opts = test_opts("my-pc.example.com", 3389, TrustPolicy::Verified("k".into()));
+        opts.dns = Some(DnsConfig {
+            api_key: String::new(),
+            api_secret: String::new(),
+            api_url: String::new(),
+            domain: "example.com".to_string(),
+            ip_family: IpFamily::Auto,
+            provider: "godaddy".to_string(),
+            credentials: BTreeMap::new(),
+            resolver: Some(Arc::new(MockResolver)),
+        });
+        let err = resolve_peer(&opts).await.unwrap_err();
+        assert!(
+            !matches!(err, ConnectError::EncryptedDnsRequired(_)),
+            "注入解析器后应进入发现流程（无凭据 → Provider 错误），got {err:?}"
+        );
     }
 
     #[tokio::test]

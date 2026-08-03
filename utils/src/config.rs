@@ -91,6 +91,10 @@ pub struct Config {
     #[serde(default)]
     pub dns: DnsConfig,
 
+    /// M8-T040: DDNS 域名自动更新维护（`[ddns]` 段，域名页「DDNS 维护」卡读写）。
+    #[serde(default)]
+    pub ddns: DdnsConfig,
+
     /// Network settings
     pub network: NetworkConfig,
 
@@ -641,6 +645,11 @@ pub struct DnsConfig {
     /// M9-DNS000: 每服务商凭据表（`[dns.providers.<name>]`）。
     #[serde(default)]
     pub providers: BTreeMap<String, BTreeMap<String, String>>,
+
+    /// M8-T040: 域名模式加密 DNS 强制（`[dns.security]` 段：DoH/DoT 端点、
+    /// 强制开关；默认 enforce）。未配置该段 → 默认 enforce（安全默认）。
+    #[serde(default)]
+    pub security: DnsSecurityConfig,
 }
 
 impl Default for DnsConfig {
@@ -648,12 +657,222 @@ impl Default for DnsConfig {
         Self {
             provider: default_dns_provider(),
             providers: BTreeMap::new(),
+            security: DnsSecurityConfig::default(),
         }
     }
 }
 
 fn default_dns_provider() -> String {
     "godaddy".to_string()
+}
+
+/// M8-T040: 域名模式加密 DNS 强制配置（`[dns.security]` 段，需求 §5.2）。
+///
+/// 域名模式（服务端 + 客户端）下的全部 DNS 解析必须走 DoH/DoT（DDNS-DOH-001）；
+/// `mode = "enforce"`（默认）时加密 DNS 全部端点不可用 → fail-closed 拒连
+/// （DDNS-DOH-003）；`mode = "off"` 显式关闭强制——仅限 IP 模式使用，域名
+/// 模式下关闭强制即自动降级为不可用并提示（DDNS-DOH-007），**绝不回退明文**。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsSecurityConfig {
+    /// 强制模式："enforce"（默认，域名模式强制 DoH/DoT，fail-closed）| "off"。
+    #[serde(default = "default_dns_security_mode")]
+    pub mode: String,
+
+    /// DoH 端点优先序（`application/dns-json`，GET，强制 HTTPS + 证书校验）。
+    #[serde(default = "default_doh_endpoints")]
+    pub doh: Vec<String>,
+
+    /// DoT 端点优先序（TLS TCP 853）。
+    #[serde(default = "default_dot_endpoints")]
+    pub dot: Vec<String>,
+
+    /// 单端点超时（毫秒，默认 5000；全列表总超时 15s 在解析器侧固定）。
+    #[serde(default = "default_dns_resolve_timeout_ms")]
+    pub resolve_timeout_ms: u64,
+
+    /// 解析结果缓存 TTL（秒，默认 50，沿用 discovery 缓存语义，DDNS-DOH-006）。
+    #[serde(default = "default_dns_cache_ttl_secs")]
+    pub cache_ttl_secs: u64,
+}
+
+impl Default for DnsSecurityConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_dns_security_mode(),
+            doh: default_doh_endpoints(),
+            dot: default_dot_endpoints(),
+            resolve_timeout_ms: default_dns_resolve_timeout_ms(),
+            cache_ttl_secs: default_dns_cache_ttl_secs(),
+        }
+    }
+}
+
+/// 默认 enforce：安全默认，域名模式自启用即强制加密解析（需求 §5.3）。
+fn default_dns_security_mode() -> String {
+    "enforce".to_string()
+}
+
+fn default_doh_endpoints() -> Vec<String> {
+    vec![
+        "https://cloudflare-dns.com/dns-query".to_string(),
+        "https://dns.google/resolve".to_string(),
+        "https://dns.alidns.com/resolve".to_string(),
+    ]
+}
+
+fn default_dot_endpoints() -> Vec<String> {
+    vec![
+        "1.1.1.1:853".to_string(),
+        "8.8.8.8:853".to_string(),
+        "2400:3200::1:853".to_string(),
+    ]
+}
+
+fn default_dns_resolve_timeout_ms() -> u64 {
+    5000
+}
+
+fn default_dns_cache_ttl_secs() -> u64 {
+    50
+}
+
+impl DnsSecurityConfig {
+    /// 是否强制加密 DNS（enforce）。未知值按安全默认 enforce 处理（不静默关闭）。
+    pub fn enforce(&self) -> bool {
+        !self.mode.eq_ignore_ascii_case("off")
+    }
+}
+
+/// M8-T040: DDNS 地址获取模式（IPv4/IPv6 各一，需求 §4.2/§4.3）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DdnsMode {
+    /// 自动：IPv4 = 公网出口 IP（外部服务），IPv6 = 本机全局单播。
+    Auto,
+    /// 手动：用户填写固定地址，心跳永不覆盖（仅刷新 TTL，DDNS-IPV4-004）。
+    Manual,
+}
+
+/// M8-T040: DDNS 域名自动更新维护配置（`[ddns]` 段，需求 §5.1）。
+///
+/// 默认全部关闭/自动；`interval_secs` 下限 60s（防服务商 API 配额滥用，
+/// DDNS-002），未设置时回退 `[network] heartbeat_interval`（§5.3 兼容迁移）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DdnsConfig {
+    /// 总开关（默认关；开启后后台 DdnsService 周期运行，DDNS-001）。
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// 更新周期（秒，默认 300；下限 60s 收敛；`None` = 回退 [network] heartbeat_interval）。
+    #[serde(default)]
+    pub interval_secs: Option<u64>,
+
+    /// IPv4 模式（auto = 公网出口 IP；manual = 固定地址）。
+    #[serde(default = "default_ddns_mode")]
+    pub ipv4_mode: DdnsMode,
+
+    /// 手动固定 IPv4（"0.0.0.0" 空占位；心跳永不覆盖，DDNS-IPV4-004）。
+    #[serde(default)]
+    pub ipv4_manual: String,
+
+    /// 公网 IP 服务优先序（全部 HTTPS；默认 ipify → ip.sb → icanhazip）。
+    #[serde(default = "default_ipv4_sources")]
+    pub ipv4_sources: Vec<String>,
+
+    /// IPv6 模式（auto = 本机全局单播；manual = 上游固定/转发场景）。
+    #[serde(default = "default_ddns_mode")]
+    pub ipv6_mode: DdnsMode,
+
+    /// 手动固定 IPv6（"::" 空占位；心跳永不覆盖，DDNS-IPV6-003）。
+    #[serde(default)]
+    pub ipv6_manual: String,
+
+    /// 自动维护 SRV（远控端口，DDNS-REC-001）。
+    #[serde(default = "default_true")]
+    pub publish_srv: bool,
+
+    /// 自动维护 TXT（签名/DeviceMeta，DDNS-REC-002）。
+    #[serde(default = "default_true")]
+    pub publish_txt: bool,
+
+    /// 自动维护 A 记录（DDNS-REC-003）。
+    #[serde(default = "default_true")]
+    pub publish_a: bool,
+
+    /// 自动维护 AAAA 记录（DDNS-REC-003）。
+    #[serde(default = "default_true")]
+    pub publish_aaaa: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_ddns_mode() -> DdnsMode {
+    DdnsMode::Auto
+}
+
+fn default_ipv4_sources() -> Vec<String> {
+    vec![
+        "ipify".to_string(),
+        "ip.sb".to_string(),
+        "icanhazip".to_string(),
+    ]
+}
+
+impl Default for DdnsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_secs: None,
+            ipv4_mode: default_ddns_mode(),
+            ipv4_manual: String::new(),
+            ipv4_sources: default_ipv4_sources(),
+            ipv6_mode: default_ddns_mode(),
+            ipv6_manual: String::new(),
+            publish_srv: default_true(),
+            publish_txt: default_true(),
+            publish_a: default_true(),
+            publish_aaaa: default_true(),
+        }
+    }
+}
+
+/// M8-T040: DDNS 更新周期下限（60s，防服务商 API 配额滥用，DDNS-002）。
+pub const DDNS_INTERVAL_MIN_SECS: u64 = 60;
+
+impl DdnsConfig {
+    /// 生效更新周期（秒）：`[ddns] interval_secs` 优先（≥60s 下限收敛）；
+    /// 未设置 → 回退 `[network] heartbeat_interval`（同样 ≥60s 收敛，§5.3）。
+    pub fn effective_interval_secs(&self, network_heartbeat_secs: u64) -> u64 {
+        let base = self.interval_secs.unwrap_or(network_heartbeat_secs);
+        base.max(DDNS_INTERVAL_MIN_SECS)
+    }
+
+    /// 手动 IPv4 地址（配置为合法 Ipv4Addr 且非 `0.0.0.0` 空占位 → `Some`）。
+    pub fn ipv4_manual_addr(&self) -> Option<std::net::Ipv4Addr> {
+        let s = self.ipv4_manual.trim();
+        if s.is_empty() || s == "0.0.0.0" {
+            return None;
+        }
+        s.parse().ok()
+    }
+
+    /// 手动 IPv6 地址（配置为合法 Ipv6Addr 且非 `::` 空占位 → `Some`）。
+    pub fn ipv6_manual_addr(&self) -> Option<std::net::Ipv6Addr> {
+        let s = self.ipv6_manual.trim();
+        if s.is_empty() || s == "::" {
+            return None;
+        }
+        s.parse().ok()
+    }
+}
+
+impl Config {
+    /// M8-T040: DDNS 生效更新周期（秒；含 [network] 回退与 60s 下限收敛）。
+    pub fn effective_ddns_interval(&self) -> u64 {
+        self.ddns.effective_interval_secs(self.network.heartbeat_interval)
+    }
 }
 
 impl Config {
@@ -887,6 +1106,7 @@ impl Default for Config {
                 api_url: default_api_url(),
             },
             dns: DnsConfig::default(),
+            ddns: DdnsConfig::default(),
             network: NetworkConfig {
                 port: default_port(),
                 heartbeat_interval: default_heartbeat_interval(),
@@ -2224,6 +2444,194 @@ mod tests {
         cfg.save_to(&path).unwrap();
         let loaded = Config::load_from(&path).unwrap();
         assert_eq!(loaded.ui.language, "en");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------- M8-T040 (P1): [ddns] / [dns.security] 配置测试 ----------
+
+    #[test]
+    fn test_ddns_defaults() {
+        // 默认：总开关关、auto/auto、周期回退 [network] heartbeat_interval、
+        // 三源优先序、publish 四开关全开（DDNS-001/002，需求 §5.1）。
+        let config = Config::default();
+        assert!(!config.ddns.enabled);
+        assert_eq!(config.ddns.ipv4_mode, DdnsMode::Auto);
+        assert_eq!(config.ddns.ipv6_mode, DdnsMode::Auto);
+        assert_eq!(config.ddns.ipv4_sources, vec!["ipify", "ip.sb", "icanhazip"]);
+        assert!(config.ddns.publish_srv);
+        assert!(config.ddns.publish_txt);
+        assert!(config.ddns.publish_a);
+        assert!(config.ddns.publish_aaaa);
+        // [network] heartbeat_interval 默认 30 → 收敛到 60s 下限。
+        assert_eq!(config.effective_ddns_interval(), DDNS_INTERVAL_MIN_SECS);
+    }
+
+    #[test]
+    fn test_ddns_interval_floor_and_fallback() {
+        // 显式 interval_secs ≥ 60 原样；30 → 收敛 60；0 → 收敛 60（下限收敛）。
+        let mut cfg = DdnsConfig::default();
+        cfg.interval_secs = Some(300);
+        assert_eq!(cfg.effective_interval_secs(30), 300);
+        cfg.interval_secs = Some(30);
+        assert_eq!(cfg.effective_interval_secs(30), 60);
+        cfg.interval_secs = Some(60);
+        assert_eq!(cfg.effective_interval_secs(30), 60);
+        // 未设置 → 回退 [network] heartbeat_interval（仍受 60s 下限约束，§5.3）。
+        cfg.interval_secs = None;
+        assert_eq!(cfg.effective_interval_secs(120), 120);
+        assert_eq!(cfg.effective_interval_secs(30), 60);
+    }
+
+    #[test]
+    fn test_ddns_manual_addr_parse() {
+        // 手动地址：合法 IPv4/IPv6 解析；空/占位/非法 → None（DDNS-IPV4-004）。
+        let mut cfg = DdnsConfig::default();
+        assert!(cfg.ipv4_manual_addr().is_none());
+        cfg.ipv4_manual = "203.0.113.7".to_string();
+        assert_eq!(cfg.ipv4_manual_addr(), Some("203.0.113.7".parse().unwrap()));
+        cfg.ipv4_manual = "0.0.0.0".to_string();
+        assert!(cfg.ipv4_manual_addr().is_none());
+        cfg.ipv4_manual = "not-an-ip".to_string();
+        assert!(cfg.ipv4_manual_addr().is_none());
+        cfg.ipv6_manual = "2001:db8::1".to_string();
+        assert_eq!(cfg.ipv6_manual_addr(), Some("2001:db8::1".parse().unwrap()));
+        cfg.ipv6_manual = "::".to_string();
+        assert!(cfg.ipv6_manual_addr().is_none());
+    }
+
+    #[test]
+    fn test_ddns_invalid_mode_rejected() {
+        // 非法 mode 值 → 配置加载失败（拒绝，不静默回退）（WBS 2.3「非法值拒绝」）。
+        let dir = std::env::temp_dir().join("kirin_desk_test_ddns_bad_mode");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bad.toml");
+        std::fs::write(
+            &path,
+            "[device]\nid = \"d\"\nname = \"D\"\n\
+             [godaddy]\napi_key = \"\"\napi_secret = \"\"\ndomain = \"example.com\"\n\
+             [network]\nport = 3389\n\
+             [media]\n\
+             [logging]\n\
+             [ddns]\nipv4_mode = \"banana\"\n",
+        )
+        .unwrap();
+        assert!(Config::load_from(&path).is_err(), "非法模式必须拒绝");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_ddns_roundtrip() {
+        // 完整 [ddns] 段读写往返（模式/地址/开关/周期全部保持）。
+        let dir = std::env::temp_dir().join("kirin_desk_test_ddns_rt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ddns.toml");
+        let mut cfg = Config::default();
+        cfg.ddns.enabled = true;
+        cfg.ddns.interval_secs = Some(180);
+        cfg.ddns.ipv4_mode = DdnsMode::Manual;
+        cfg.ddns.ipv4_manual = "203.0.113.9".to_string();
+        cfg.ddns.ipv6_mode = DdnsMode::Manual;
+        cfg.ddns.ipv6_manual = "2001:db8::9".to_string();
+        cfg.ddns.publish_aaaa = false;
+        cfg.save_to(&path).unwrap();
+        let loaded = Config::load_from(&path).unwrap();
+        assert!(loaded.ddns.enabled);
+        assert_eq!(loaded.ddns.interval_secs, Some(180));
+        assert_eq!(loaded.ddns.ipv4_mode, DdnsMode::Manual);
+        assert_eq!(loaded.ddns.ipv4_manual, "203.0.113.9");
+        assert_eq!(loaded.ddns.ipv6_mode, DdnsMode::Manual);
+        assert_eq!(loaded.ddns.ipv6_manual, "2001:db8::9");
+        assert!(loaded.ddns.publish_srv);
+        assert!(!loaded.ddns.publish_aaaa);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_ddns_legacy_toml_missing_section() {
+        // 旧配置无 [ddns] 段 → 加载不失败，默认值兜底（追加式兼容）。
+        let dir = std::env::temp_dir().join("kirin_desk_test_ddns_legacy");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.toml");
+        std::fs::write(
+            &path,
+            "[device]\nid = \"old-device\"\nname = \"Old\"\n\
+             [godaddy]\napi_key = \"\"\napi_secret = \"\"\ndomain = \"example.com\"\n\
+             [network]\nport = 3389\n\
+             [media]\nencoder = \"auto\"\nframerate = 30\nbitrate = 5000\n\
+             [logging]\nlevel = \"info\"\nformat = \"text\"\n",
+        )
+        .unwrap();
+        let loaded = Config::load_from(&path).unwrap();
+        assert!(!loaded.ddns.enabled);
+        assert_eq!(loaded.ddns.ipv4_mode, DdnsMode::Auto);
+        assert_eq!(loaded.ddns.ipv4_sources.len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_dns_security_defaults() {
+        // [dns.security] 缺省：enforce + 三组 DoH/DoT 端点 + 超时/缓存默认值。
+        let sec = DnsSecurityConfig::default();
+        assert!(sec.enforce());
+        assert_eq!(sec.doh.len(), 3);
+        assert_eq!(sec.doh[0], "https://cloudflare-dns.com/dns-query");
+        assert_eq!(sec.dot.len(), 3);
+        assert_eq!(sec.dot[0], "1.1.1.1:853");
+        assert_eq!(sec.resolve_timeout_ms, 5000);
+        assert_eq!(sec.cache_ttl_secs, 50);
+    }
+
+    #[test]
+    fn test_dns_security_mode_off() {
+        // mode = "off"（大小写不敏感）→ 不强制；未知值 → 安全默认 enforce。
+        let sec = DnsSecurityConfig {
+            mode: "off".to_string(),
+            ..DnsSecurityConfig::default()
+        };
+        assert!(!sec.enforce());
+        let sec = DnsSecurityConfig {
+            mode: "OFF".to_string(),
+            ..DnsSecurityConfig::default()
+        };
+        assert!(!sec.enforce());
+        let sec = DnsSecurityConfig {
+            mode: "weird".to_string(),
+            ..DnsSecurityConfig::default()
+        };
+        assert!(sec.enforce(), "未知 mode 按 enforce 处理，不静默关闭");
+    }
+
+    #[test]
+    fn test_dns_security_roundtrip_and_legacy() {
+        // [dns.security] 显式配置往返 + 旧配置缺段兜底。
+        let dir = std::env::temp_dir().join("kirin_desk_test_sec_rt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sec.toml");
+        let mut cfg = Config::default();
+        cfg.dns.security.mode = "off".to_string();
+        cfg.dns.security.doh = vec!["https://dns.example.com/resolve".to_string()];
+        cfg.dns.security.resolve_timeout_ms = 3000;
+        cfg.save_to(&path).unwrap();
+        let loaded = Config::load_from(&path).unwrap();
+        assert!(!loaded.dns.security.enforce());
+        assert_eq!(loaded.dns.security.doh.len(), 1);
+        assert_eq!(loaded.dns.security.resolve_timeout_ms, 3000);
+        assert_eq!(loaded.dns.security.cache_ttl_secs, 50, "未设置字段取默认");
+
+        // 旧配置无 [dns.security] → enforce 默认（需求 §5.3 安全默认）。
+        let legacy = dir.join("legacy.toml");
+        std::fs::write(
+            &legacy,
+            "[device]\nid = \"old\"\nname = \"Old\"\n\
+             [godaddy]\napi_key = \"\"\napi_secret = \"\"\ndomain = \"example.com\"\n\
+             [dns]\nprovider = \"godaddy\"\n\
+             [network]\nport = 3389\n\
+             [media]\n\
+             [logging]\n",
+        )
+        .unwrap();
+        let loaded2 = Config::load_from(&legacy).unwrap();
+        assert!(loaded2.dns.security.enforce());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

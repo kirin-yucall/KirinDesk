@@ -29,6 +29,8 @@ socket2 = "0.6"
 dirs-next = "2.0"
 libloading = "0.8"   # M12-MAC MAC-T006：macOS Keychain 经 dlopen Security/CoreFoundation
 kirin-desk-dns = { path = "../dns" }
+# M8-T040 (W2-C / WBS 5.7): 单测 mock 解析器实现 Resolver trait（dns 侧同版本）
+async-trait = "0.1"
 # M8-T026-P1: 客户端审计（打洞成功/失败/重打洞/换路事件，PUNCH-SEC-004）
 kirin-desk-utils = { path = "../utils" }
 # M8-T026-P1: 打洞协议类型（候选交换/探测报文，relay 为叶子 crate，无循环）

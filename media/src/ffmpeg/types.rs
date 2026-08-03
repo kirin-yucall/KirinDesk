@@ -241,7 +241,7 @@ pub struct AVCodec {
 }
 
 // AVCodecContext：字段经 av_opt_set 配置；但 width/height/pix_fmt/time_base 在
-// FFmpeg 8.1.2 共享构建（GyanD full shared）的 AVOption 表里**缺失**（pix_fmt
+// FFmpeg 8.1.1 共享构建（GyanD full shared）的 AVOption 表里**缺失**（pix_fmt
 // 完全不在表里），只能结构体字段直写（见 `api::AVCtxField` 偏移常量，取自
 // FFmpeg 8.1 `libavcodec/avcodec.h` offsetof）。这些偏移随 FFmpeg 主版本变化，
 // 升级 FFmpeg 时必须重新核对。
@@ -261,7 +261,7 @@ pub struct SwsContext {
 //
 // `AVBufferRef` 与 `AVFrameSideData` 都是 FFmpeg 内部结构，本仓库仅持有
 // 不透明指针（同 `AVCodecContext` 的处理方式）：分配/释放/字段写入全部走
-// `api.rs` 的 safe 包装，绝不直接 deref。这避免了 GyanD 8.1.2 共享构建
+// `api.rs` 的 safe 包装，绝不直接 deref。这避免了 GyanD 8.1.1 共享构建
 // AVCodecContext 布局不兼容的同类 segfault 风险。
 
 /// `AVBufferRef` — FFmpeg 引用计数缓冲（hw device / hw frames ctx 都用它承载）。

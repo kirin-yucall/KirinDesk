@@ -2651,6 +2651,7 @@ name = "kirin-desk-core"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "async-trait",
  "base64",
  "bincode",
  "chacha20poly1305",
@@ -2687,17 +2688,21 @@ dependencies = [
  "get_if_addrs 0.4.1",
  "hex",
  "hmac",
+ "kirin-desk-utils",
  "md-5",
  "rand 0.8.7",
  "reqwest",
  "rsa",
+ "rustls",
  "serde",
  "serde_json",
  "sha1",
  "sha2",
  "thiserror 2.0.19",
  "tokio",
+ "tokio-rustls",
  "tracing",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -2771,6 +2776,7 @@ name = "kirin-desk-ui"
 version = "0.1.0"
 dependencies = [
  "arboard",
+ "async-trait",
  "bincode",
  "chrono",
  "crossterm",

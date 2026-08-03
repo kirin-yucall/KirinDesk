@@ -33,6 +33,35 @@
   - CLI（M9-DNS023）：`dns` 子命令组（list-providers / set-provider / test /
     domains / records / add / update / delete / register / unregister）；
     `register`/`discover`/`connect` 链路走当前激活 provider，旧用法零破坏
+- M8-T040 DDNS 域名自动更新维护 + 域名模式 DoH/DoT 强制（P1~P6 全量落地，
+  WBS/并行计划见 `task_docs/共享层/DNS域名维护客户端/M8-T040_*`）：
+  - 配置（P1）：`[ddns]` 段（enabled/interval_secs≥60 下限收敛/ipv4 与 ipv6
+    双模式 auto|manual/ipv4_sources/publish_srv|txt|a|aaaa 四开关）+ `[dns.security]`
+    段（mode 默认 enforce/doh/dot 端点/resolve_timeout_ms/cache_ttl_secs）；
+    `interval_secs` 未设置回退 `[network] heartbeat_interval`（§5.3 兼容迁移）
+  - dns 基础件（P2）：`public_ip.rs` 公网出口 IP 获取器（`PubIpSource` trait +
+    ipify/ip.sb/icanhazip 三源 HTTPS 严格 `Ipv4Addr` 校验 + 按序回退 + 缓存 +
+    拒绝 HTML/劫持页/特殊地址）；`secure_resolver.rs` DoH/DoT 加密解析器
+    （`application/dns-json` 三端兼容解析 + rustls DoT wire 编解码 A/AAAA/SRV/TXT
+    四型 + 端点优先序 + 缓存 50s + 单端点 5s/总 15s 超时 + fail-closed）
+  - 引擎（P3）：`HeartbeatService` 策略化（`Ipv4Policy::Auto(PublicIpFetcher)|
+    Manual`、`Ipv6Policy::Auto|Manual`，Manual 永不覆盖）；`ddns.rs` 新
+    `DdnsService`（周期编排 + 变更驱动 + publish_* 开关 + 更新前 DoH/DoT 反查
+    保护 + 连续 3 次失败暂停 + `DdnsStatus` watch 状态回读 + 关闭不删记录）
+  - core/media 接线（P4）：`core::dns::resolve_for_connect` 唯一域名模式解析
+    入口（红线：禁止 `to_socket_addrs`/`TcpStream::connect(&str)` 直连）；
+    `ConnectError` 新增 `EncryptedDnsRequired`/`DnsResolveFailed`；服务端启动
+    自检 `server_dns_self_check`（SRV/TXT/A 一致性校验 + 告警）
+  - UI（P5）：Domain 页「DDNS 维护」卡（总开关/周期/TTL/IPv4 与 IPv6 双模式/
+    只读自动值+重新检测/生效记录预览/状态行倒计时/立即更新/保存/服务商未配置
+    整卡禁用）；Connect 页域名模式加密 DNS 状态行（解析中/完成/拒连原因）；
+    i18n `ddns.*` 键（domain 分区）+ `connect.dnssec.*` 键（connect 分区）
+  - CLI（P7）：`ddns` 子命令组（status/enable/disable/set-ipv4/set-ipv6/update）
+    + `dns resolve <host> [--type]` 加密解析调试 + `serve` 域名模式自检联动 +
+    `[ddns] enabled` 策略化维护；self-test 新增 DOH 段（3 项）+ DDNS 段（4 项）
+  - **行为变更**：IPv4 自动 = **公网出口 IP**（非本机网卡地址，核心语义修正）；
+    域名模式全部 DNS 解析强制 DoH/DoT，全部端点不可用 → **fail-closed 拒连**
+    （不回退明文）；`[dns.security] mode=off` 仅限 IP 模式使用
 - M8-T039 Tunnel 内网穿透独立页 + Server 多监听 + Token ✏️📋 + 通用工具化：
   - 独立页（P3）：`Tab::Tunnel`（🚇 标签，Connect 与 Settings 之间）；Settings
     页「Tunnel (内网穿透)」分组与保存分支整体移除（`settings.tunnel.*` 10 键随删，
@@ -193,6 +222,21 @@
   Info 语义（品牌蓝 `#0969DA`）徽标渲染服务商名（如 "GoDaddy"，观感误认品牌
   logo）；服务商名保留于 ComboBox 选中文本，配置状态徽标（已配置/未配置）
   不受影响（`ui/src/domain_panel.rs`）
+- **M8-T040 收尾三小问题（R-30，审计 §8 三小问题）**：
+  - 反查保护 fail-open 删除：`Engine.resolver` 改 `Arc<dyn Resolver>`（类型系统
+    强制必非 None，编译期消灭 None 构造路径），`reverse_check` 删 `Ok(true)`
+    降级分支，`start()` 装配恒注入——DDNS-REC-005 不再存在静默失效路径，
+    与 core 连接层 fail-closed 主线语义一致（`dns/src/ddns.rs`）
+  - GUI 加密解析空结果状态行如实：解析返回合法空列表时状态行显示
+    「无记录」（i18n 新增 `connect.dnssec.no_records` 键），连接沿用
+    discovery 地址继续、行为不变（`ui/src/lib.rs`、`ui/src/i18n/connect.rs`）
+  - DoT 域名形态端点：`secure_resolver.rs` 端点接受 `host:port` 域名形态
+    （如 `dns.example.com:853`）——解析 IP 建连 + SNI 携带域名 + 证书按
+    域名校验（webpki-roots 信任根与强制校验不变）；新增 4 项 mock 契约
+    测试（解析形态 / SNI 域名 / 建连地址解析 / 构造过滤）（`dns/src/secure_resolver.rs`）
+- **打包线程上限 8 → 4（用户要求 2026-08-04）**：`release/package.bat`
+  `CARGO_BUILD_JOBS=8 → 4`；`.cargo/config.toml` `jobs = 8 → 4`（大小核机器
+  超限并行会死机，工作区所有 cargo 命令统一上限 4）
 
 ## [v0.1.0] - 2026-07-31
 

@@ -1781,6 +1781,13 @@ fn trigger_client_degrade(
     degrade: Option<&ClientDegrade>,
     slot: &mut Box<dyn MediaTransport>,
 ) {
+    // R-28（审计 §4-1）：防重入——recv 失败与 is_alive 轮询两处触发点可能
+    // 相继命中（42.327/42.398 模式），不守卫会 spawn 多个重拨任务重复建连。
+    // 已在降级等待中 → 忽略重复触发（降级等待分支会等 swap 或超时收尾）。
+    if *degrading {
+        warn!("[Session] degrade already in progress — ignoring repeated trigger");
+        return;
+    }
     let reason = quic_mut(slot)
         .map(|q| q.conn().close_reason_str())
         .unwrap_or_default();

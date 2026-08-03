@@ -64,7 +64,7 @@ fn main() {
         .unwrap_or(FRAMES_DEFAULT);
     if let Err(e) = ffmpeg::ensure_loaded() {
         eprintln!("FFmpeg not available: {e}");
-        eprintln!("（需 bundled FFmpeg 8.1.2 shared build，见 release/）");
+        eprintln!("（需 bundled FFmpeg 8.1.1 shared build，见 release/）");
         std::process::exit(1);
     }
     println!("== R-16 AV1 probe ==");

@@ -29,9 +29,10 @@ sudo apt install build-essential libssl-dev pkg-config \
 
 ```bash
 git clone <repo>
-cd ip6desk
+cd KirinDesk
 export CARGO_TARGET_DIR=/tmp/ktarget
-cargo build --release -p kirin-desk-ui
+# --jobs 8: 线程数上限(硬性约束),禁止满线程打包——大小核设备线程过多会死机
+cargo build --release -p kirin-desk-ui --jobs 8
 ./target/release/kirin-desk-ui --cli help
 ```
 

@@ -3937,6 +3937,8 @@ struct KirinDeskApp {
     copied_feedback: Option<(String, std::time::Instant)>,
     /// M9-DNS000: 域名维护页面状态（Domain 标签页，Dashboard 右侧按钮进入）。
     domain_panel: domain_panel::DomainPanelState,
+    /// M8-T040: DDNS 维护卡控制器（状态共享槽 + worker 句柄；WBS 6.2）。
+    ddns_ui: domain_panel::DdnsUi,
 }
 
 /// M8-T028 (UI-BTY-028): 状态栏「Copied: …」浮出提示持续时间。
@@ -6473,7 +6475,7 @@ impl KirinDeskApp {
     /// 迁自 Settings → DNS）/ 测试连接 / 域名列表+添加 / 记录查询与增删改
     /// （SRV 动态字段），后台线程执行 API 调用。
     fn show_domain(&mut self, ui: &mut egui::Ui, theme: &Theme) {
-        let saved = domain_panel::show_domain_page(ui, theme, &mut self.domain_panel);
+        let saved = domain_panel::show_domain_page(ui, theme, &mut self.domain_panel, &mut self.ddns_ui);
         if saved {
             // Domain 页保存凭据 → 同步 App 内存值（Connect 页 DNS 发现与
             // 状态栏徽标即时生效，无需重启）。godaddy 兼容字段仅激活服务商为
@@ -8697,7 +8699,73 @@ impl KirinDeskApp {
                                             return;
                                         }
                                     };
-                                    let addr = selected.to_string();
+                                    // ── M8-T040：域名模式强制加密 DNS（DDNS-DOH-001/003）──
+                                    // GUI 连接路径同样收敛 `resolve_for_connect` 加密解析入口；
+                                    // 未配置解析器（mode=off）/ 全端点不可用 → fail-closed 拒连，
+                                    // 绝不回退明文（DDNS-UI-007 状态行指示）。
+                                    let mut resolved_addr = selected;
+                                    let host = format!("{}.{}", device_id, target_domain);
+                                    match kirin_desk_core::dns::secure_resolver_from_config(&cfg) {
+                                        Some(resolver) => {
+                                            if let Ok(mut s) = connection_status().lock() {
+                                                *s = t!("connect.dnssec.resolving").to_string();
+                                            }
+                                            match kirin_desk_core::dns::resolve_for_connect(
+                                                &host,
+                                                selected.port(),
+                                                family,
+                                                resolver.as_ref(),
+                                            )
+                                            .await
+                                            {
+                                                Ok(addrs) => {
+                                                    if let Some(a) = addrs.first() {
+                                                        resolved_addr = *a;
+                                                    }
+                                                    if let Ok(mut s) = connection_status().lock() {
+                                                        if addrs.is_empty() {
+                                                            // R-30（审计 §8-2）：合法空列表 → 状态行
+                                                            // 如实显示「无记录」，连接沿用 discovery
+                                                            // 地址继续（行为不变，非 fail-closed）。
+                                                            *s = t!("connect.dnssec.no_records")
+                                                                .to_string();
+                                                        } else {
+                                                            *s = tf!(
+                                                                "connect.dnssec.resolved",
+                                                                "DoH/DoT"
+                                                            );
+                                                        }
+                                                    }
+                                                    tracing::info!(
+                                                        "[M8-T040] domain-mode encrypted resolve '{}' -> {} (records={})",
+                                                        host, resolved_addr, addrs.len()
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    tracing::error!(
+                                                        "[M8-T040] encrypted DNS unavailable for '{}': {}",
+                                                        host, e
+                                                    );
+                                                    if let Ok(mut s) = connection_status().lock() {
+                                                        *s =
+                                                            t!("connect.dnssec.refused").to_string();
+                                                    }
+                                                    return; // fail-closed（DDNS-DOH-003）
+                                                }
+                                            }
+                                        }
+                                        None => {
+                                            tracing::error!(
+                                                "[M8-T040] domain-mode connect refused: \
+                                                 no encrypted resolver (mode=off / not configured)"
+                                            );
+                                            if let Ok(mut s) = connection_status().lock() {
+                                                *s = t!("connect.dnssec.refused").to_string();
+                                            }
+                                            return; // fail-closed（DDNS-DOH-007）
+                                        }
+                                    }
+                                    let addr = resolved_addr.to_string();
                                     tracing::info!(
                                         "Discovered '{}': IPv6={}, IPv4={}, port={}, type={}, family={}",
                                         info.device_id,
@@ -8766,6 +8834,13 @@ impl KirinDeskApp {
                                                 // 凭据表为事实源）。
                                                 provider: cfg.dns.provider.clone(),
                                                 credentials: cfg.dns.providers.clone(),
+                                                // M8-T040: 域名模式强制加密 DNS
+                                                // （DoH/DoT；mode=off/未配置 → None
+                                                // → fail-closed 拒连并提示）。
+                                                resolver:
+                                                    kirin_desk_core::dns::secure_resolver_from_config(
+                                                        &cfg,
+                                                    ),
                                             }),
                                             domain.clone(),
                                         )

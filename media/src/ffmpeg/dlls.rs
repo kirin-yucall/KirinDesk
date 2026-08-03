@@ -74,14 +74,16 @@ pub const SWSCALE_LIB: &str = "libswscale.9.dylib";
 
 /// 字段偏移快照对应的 **libavcodec 库主版本**（R-22；R-06 修正语义）。
 ///
-/// `api.rs::avctx_offset` 与 `AVFRAME_CH_LAYOUT_OFFSET` 的偏移按 FFmpeg 8.1.2
-/// （GyanD full shared）实测确认；加载完成后断言 `avcodec_version()` 的
+/// `api.rs::avctx_offset` 与 `AVFRAME_CH_LAYOUT_OFFSET` 的偏移按 FFmpeg 8.1.1
+/// （GyanD full shared，libavcodec 62.28.101）实测确认（8.1.2 为 62.28.102，
+/// 同 major 62 兼容）；加载完成后断言 `avcodec_version()` 的
 /// major 与此一致，不符**直接加载失败报错**——绝不带着错偏移静默运行。
 /// 升级流程见 `api.rs` 升级核对清单与 `Readme.md`「FFmpeg 升级步骤」。
 ///
 /// **R-06 修正（2026-08-02）**：`avcodec_version()` 返回的是 **libavcodec
 /// 库版本**（`LIBAVCODEC_VERSION_INT = major<<16|minor<<8|micro`），不是
-/// FFmpeg 项目版本——FFmpeg 8.1.2 的 libavcodec 为 62.28.102（avcodec-62.dll）。
+/// FFmpeg 项目版本——FFmpeg 8.1.1 的 libavcodec 为 62.28.101（avcodec-62.dll；
+/// 8.1.2 为 62.28.102，同 major 兼容）。
 /// R-22 原值 8 与实际 DLL（major=62）恒不匹配，导致所有 avcodec-62.dll
 /// 环境下 `ensure_loaded` 永远失败（产品 FFmpeg 全链路不可用 + 阻塞 R-06
 /// 实机验证）；实机探测确认后修正为 62。
@@ -111,7 +113,7 @@ fn check_snapshot_major(ver: u32) -> Result<(), AvError> {
 #[cfg(target_os = "windows")]
 pub const LIB_SEARCH_PATHS: &[&str] = &[
     "{exe_dir}/../ffmpeg/bin/",
-    "{exe_dir}/ffmpeg/ffmpeg-8.1.2-full_build-shared/bin/",
+    "{exe_dir}/ffmpeg/ffmpeg-8.1.1-full_build-shared/bin/",
     "{exe_dir}/ffmpeg/bin/",
     "",
 ];
@@ -662,8 +664,8 @@ mod tests {
     /// 字段偏移须重核，绝不静默错乱）。
     #[test]
     fn test_check_snapshot_major() {
-        // 快照版本 8.1.2 → 通过；同 major 的 8.0.0 也通过（偏移按 major 绑定）。
-        let snapshot = (SNAPSHOT_FFMPEG_MAJOR << 16) | (1 << 8) | 2;
+        // 快照版本 8.1.1 → 通过；同 major 的 8.0.0 也通过（偏移按 major 绑定）。
+        let snapshot = (SNAPSHOT_FFMPEG_MAJOR << 16) | (1 << 8) | 1;
         assert!(check_snapshot_major(snapshot).is_ok());
         assert!(check_snapshot_major(SNAPSHOT_FFMPEG_MAJOR << 16).is_ok());
         // 7.x / 9.x → 明确报错并提示重核路径。

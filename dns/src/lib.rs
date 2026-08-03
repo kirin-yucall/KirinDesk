@@ -32,17 +32,23 @@
 
 pub mod a;
 pub mod aaaa;
+pub mod ddns;
 pub mod discovery;
 pub mod heartbeat;
 pub mod provider;
 pub mod providers;
+pub mod public_ip;
+pub mod secure_resolver;
 pub mod srv;
 pub mod txt;
 pub mod validate;
 
+pub use ddns::{DdnsError, DdnsMode, DdnsService, DdnsStatus, PublishedPreview};
 pub use discovery::{discover_device, DeviceInfo, DiscoveryError, DiscoveryService, IpFamily};
 pub use provider::{Credential, Provider, ProviderCapabilities, ProviderError, ProviderRegistry};
 pub use provider::{Record, RecordData, RecordType};
+pub use public_ip::{parse_response, PubIpError, PubIpSource, PublicIpFetcher};
+pub use secure_resolver::{Resolver, ResolverError, ResolvedRecord, SecureResolver};
 pub use txt::DeviceMeta;
 
 use std::collections::BTreeMap;

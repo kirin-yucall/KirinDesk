@@ -304,7 +304,7 @@ impl FfmpegHwEncoder {
             sent_first: false,
         };
 
-        // width/height/pix_fmt/time_base/framerate 在 FFmpeg 8.1.2 共享构建的
+        // width/height/pix_fmt/time_base/framerate 在 FFmpeg 8.1.1 共享构建的
         // AVOption 表里缺失 → 结构体字段直写（opaque 约束放宽）。
         // 仅设 open2 必需的最小字段（其它低延迟参数在 open2 成功后再 apply，
         // 避免失败的编码器因配置写入污染 ctx 状态导致 free_context 崩溃）。

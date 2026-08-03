@@ -82,4 +82,11 @@ pub static TABLE: &[(&str, &str, &str)] = &[
     // ── 连接过的设备列表 ──
     ("connect.devices.title", "连接过的设备:", "Previously connected devices:"),
     ("connect.devices.empty", "暂无记录 — 连接成功后自动保存", "No records yet — saved automatically after a successful connection"),
+
+    // ── M8-T040 (W3-A): 域名模式加密 DNS 解析状态行（DDNS-UI-007）──
+    ("connect.dnssec.resolving", "加密 DNS 解析中（DoH/DoT）…", "Resolving via encrypted DNS (DoH/DoT)…"),
+    ("connect.dnssec.resolved", "加密 DNS 解析完成（{0}）", "Encrypted DNS resolved ({0})"),
+    // R-30（审计 §8-2）：解析返回合法空列表时如实提示（连接沿用 discovery 地址，行为不变）。
+    ("connect.dnssec.no_records", "加密 DNS 解析完成：无记录（沿用发现地址连接）", "Encrypted DNS resolved: no records (connecting via discovered address)"),
+    ("connect.dnssec.refused", "加密 DNS 不可用，连接被拒（域名模式强制 DoH/DoT，DDNS-DOH-003）", "Encrypted DNS unavailable — connection refused (Domain mode requires DoH/DoT, DDNS-DOH-003)"),
 ];

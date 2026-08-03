@@ -63,7 +63,9 @@ KirinDesk throws away the legacy TLS certificate system — no certificate autho
 
 The result is a security model with a far smaller attack surface than the status quo: no passwords to brute-force over the wire, no certificates to forge, no trust anchor you didn't personally mint. The math does the talking.
 
-## Domain Whitelists: Access Control That Follows Devices, Not Addresses
+Hardening continues past the handshake: **handshake pins are always enforced** (the old empty-pin bypass is gone — a peer key that isn't explicitly confirmed is refused), and configuration-secret encryption is landing (R-13: the crypto layer in utils/src/secure.rs is implemented; wiring to config storage is in progress — until then DNS provider keys and tunnel tokens remain in cleartext, protected by file permissions). Connection rate limiting, audit logging, and SSH-style known-hosts fingerprint confirmation round out the defense-in-depth.
+
+## Domain & Device-ID Whitelists: Access Control That Follows Devices, Not Addresses
 
 Access control is where KirinDesk makes one of its most elegant — and most practical — departures from convention: **whitelists are expressed in domain names, not IP addresses.**
 
@@ -78,9 +80,11 @@ Domain whitelists fix every one of those problems at once:
 
 That is the kind of design that feels obvious in hindsight: move the whitelist from the layer that changes (IP) to the layer that doesn't (names), and convenience and security improve at once.
 
+KirinDesk adds a second, orthogonal whitelist dimension: **device-ID whitelists**. Entries can be exact (`my-pc`) or prefix wildcards (`office-*`), optionally expiring — a match on either dimension (domain **or** ID) grants access, and temporary connections (temp mode) bypass both for emergency access.
+
 ## A True SSH Replacement
 
-KirinDesk's Server mode gives headless machines — Ubuntu servers, VPSes, cloud instances — a remote administration channel that makes legacy SSH look positively medieval. No fixed port to scan, no password to brute-force: connections are gated by the domain whitelist and proven by a challenge code plus an Ed25519 signature. Traffic rides the same end-to-end encrypted, forward-secret tunnel as the remote desktop. And because the device publishes its own DNS records, even a machine behind a brand-new IPv6 address is found by name, instantly. The remote shell runs over a PTY on the encrypted channel — the terminal you love, with security you never had.
+KirinDesk's Server mode gives headless machines — Ubuntu servers, VPSes, cloud instances — a remote administration channel that makes legacy SSH look positively medieval. No fixed port to scan, no password to brute-force: connections are gated by the domain / device-ID whitelist and proven by a challenge code plus an Ed25519 signature. Traffic rides the same end-to-end encrypted, forward-secret tunnel as the remote desktop. And because the device publishes its own DNS records, even a machine behind a brand-new IPv6 address is found by name, instantly. The remote shell runs over a PTY on the encrypted channel — the terminal you love, with security you never had.
 
 ## At a Glance: KirinDesk vs. The Old Guard
 
@@ -91,23 +95,43 @@ KirinDesk's Server mode gives headless machines — Ubuntu servers, VPSes, cloud
 | Port exposure | 22, globally scanned | Scannable | None | **No fixed port exposure** |
 | Authentication | Password / key | Password / cert | Vendor account | Challenge code + Ed25519 signature |
 | Encryption | Transport-level | Weak / none | Vendor-dependent | **End-to-end AEAD, forward-secret** |
-| Access control | — | — | Vendor accounts | **Domain whitelist (strict mode)** |
+| Access control | — | — | Vendor accounts | **Domain / device-ID whitelist (strict mode)** |
 | Privacy | — | — | Traffic via third party | **Zero middlemen** |
 | Decentralized | ✗ | ✗ | ✗ | **✓ Fully decentralized** |
 
 ## Core Features
 
-- **Pure P2P over IPv6** — direct device-to-device tunnels; no relay, no STUN/TURN, no port forwarding
-- **Zero-trust cryptography** — Ed25519 identities, X25519 ECDH, AEAD (AES-256-GCM / ChaCha20-Poly1305), per-session keys with perfect forward secrecy
-- **DNS as the decentralized registry** — devices self-register and self-discover via GoDaddy DNS (SRV + AAAA + TXT queried in parallel), with heartbeat keep-alive
-- **Domain whitelist (strict mode)** — only whitelisted domains may initiate connections
-- **Dual connection modes** — domain mode (DNS discovery, recommended) or direct IPv6 mode
-- **Remote desktop** — FFmpeg libavcodec H.264/H.265 encode/decode with hardware acceleration (NVENC/AMF/QSV/VAAPI/libx264), QSV hardware decode with software fallback
+- **Pure P2P over IPv6 / IPv4** — direct device-to-device tunnels; no relay, no STUN/TURN, no port forwarding. IPv6-first with IPv4 dual-stack support
+- **Zero-trust cryptography** — Ed25519 identities, X25519 ECDH, AEAD (AES-256-GCM / ChaCha20-Poly1305), per-session keys with perfect forward secrecy; handshake pins always enforced; sensitive config (API keys, tokens) encryption landing (R-13, see below)
+- **DNS as the decentralized registry — 20 providers** — self-register and self-discover through any of 20 DNS providers (GoDaddy, Cloudflare, Aliyun, DNSPod, AWS Route 53, Azure, Google Cloud DNS, Huawei, Namecheap, DigitalOcean, Vultr, Linode, Hetzner, OVH, Porkbun, Baidu Cloud, Volcano Engine, JD Cloud, West.cn, Xin Net) via SRV + AAAA + TXT records queried in parallel, with heartbeat keep-alive
+- **Domain & device-ID whitelists (strict mode)** — access control expressed in stable names, not volatile IPs; domain or device-ID (exact / `*` prefix / expirable) matches; temp mode issues a 10-character one-time code with whitelist bypass for emergencies
+- **Dual connection modes + automatic transport fallback** — domain mode (DNS discovery, recommended) or direct IPv6/IPv4 mode; QUIC first, with graceful in-session degradation to TCP (resume, no re-connect)
+- **Remote desktop** — FFmpeg libavcodec H.264/H.265 encode/decode with hardware acceleration (NVENC/AMF/QSV/VAAPI/libx264), QSV hardware decode with software fallback; single-GPU selection with virtual driver/display filtering (sunlogin, IDD, Parsec…); multi-monitor viewing with live switching; privacy mode (black screen / lock)
 - **Adaptive media pipeline** — 70 ms windowed delivery over QUIC (datagram + reliable-stream transport, loss detection) with a feedback loop that adjusts encoding in real time
+- **Audio** — capture & playback, microphone talkback to the controlled machine (Opus), per-session switches
 - **Remote shell (PTY)** — a full SSH replacement for headless servers
+- **File transfer** — encrypted, bidirectional and resumable (windowed ACK, SHA-256 verification, atomic rename); drag & drop in the GUI, `send` / `recv` in the CLI
+- **Unattended mode** — user-level boot autostart + auto-accept whitelisted/known clients, no approval dialogs
+- **Tunnel (内网穿透)** — FRP-style generic TCP reverse proxy: publish local TCP services (SSH/RDP/HTTP…) on a public relay server; SCRAM-style challenge-response token auth (password never on the wire), multi-address listeners, GUI start/stop with state restore; standalone `relay-server` for Docker/systemd/headless deployment; optional rendezvous-assisted hole punching + device-ID relay fallback
+- **Clipboard sharing** — copy/paste across machines over the encrypted channel
+- **i18n** — full GUI in 中文 / English (follows the system language by default)
+- **Security hardening** — connection rate limiting, audit logging (30+ events), SSH-style known-hosts fingerprint confirmation, config encryption landing (R-13)
 - **Cross-platform** — Windows (egui GUI + CLI), Linux (pipewire capture, VAAPI, uinput), macOS (zed-scap, VideoToolbox, Keychain identity storage)
 - **Automatic logging** — daily rotating logs with automatic cleanup
-- **Packaged for the real world** — NSIS installer (Windows), .deb with systemd service (Ubuntu), universal .app + .dmg (macOS), and in-app auto-update
+- **Packaged for the real world** — NSIS installer (Windows), .deb with systemd service (Ubuntu), universal .app + .dmg (macOS), in-app auto-update with release/beta channels
+
+## 🆕 What's New (2026-08)
+
+Since v0.1.0 a major round of features and hardening has landed — full record in [CHANGELOG.md](CHANGELOG.md):
+
+- **DNS client for 20 providers** — record CRUD (A/AAAA/CNAME/MX/TXT/SRV/NS), connection test, domain list; Domain tab + `dns` CLI
+- **Tunnel (内网穿透) as a standalone page** — FRP-style reverse proxy with GUI start/stop & state restore, multi-address listeners, one-click token generate/copy; standalone `relay-server` (Docker/systemd)
+- **i18n** — GUI fully localized 中文 / English (follows system by default)
+- **File transfer** — encrypted, resumable, bidirectional
+- **Unattended mode** — boot autostart, auto-accept whitelisted/known clients
+- **Multi-monitor viewing** — live monitor switching from the session toolbar
+- **Single-GPU & virtual-device filtering** — the real GPU is selected; virtual drivers/displays are filtered out
+- **Security** — mandatory pin verification, config encryption landing (R-13), device-ID whitelists, SCRAM-style tunnel auth, rate limiting & audit logs
 
 ## Quick Start
 
@@ -151,7 +175,7 @@ git clone https://github.com/kirin-yucall/KirinDesk.git
 cd KirinDesk
 ```
 
-**1. Frontend dependencies** — `ui/frontend/node_modules/` is not tracked, restore it first:
+**1. Frontend dependencies** — `ui/frontend/node_modules/` is ignored by `.gitignore` (not tracked), restore it first:
 
 ```bash
 cd ui/frontend
@@ -160,18 +184,24 @@ npm run build         # generate dist/ (consumed by the Tauri app at runtime)
 cd ../..
 ```
 
-**2. FFmpeg binaries** — `ffmpeg/ffmpeg-8.1.2-full_build-shared/` is not tracked either:
+**2. FFmpeg binaries** — `ffmpeg/ffmpeg-8.1.1-full_build-shared/` is ignored by `.gitignore` (not tracked; the folder won't exist after cloning — `git ls-files ffmpeg/` is empty), so restore it manually:
 
-Download [ffmpeg-8.1.1-full_build-shared.zip](https://github.com/GyanD/codexffmpeg/releases/download/8.1.1/ffmpeg-8.1.1-full_build-shared.zip), extract it, and rename the folder to `ffmpeg/ffmpeg-8.1.2-full_build-shared/` (the loader's search path keeps this name, see `media/src/ffmpeg/dlls.rs`). **Why 8.1.1 instead of 8.1.2**: the 8.1.2 build bundles ffnvcodec 13.1 headers, so `h264_nvenc` requires NVIDIA driver ≥ 610.00; 8.1.1 bundles 13.0 headers and works on the mainstream 591-series drivers (verified on this machine with driver 591.86, 2026-08-02). Both ship libavcodec 62, so the hardcoded offset snapshot stays compatible — decision record: `task_docs/共享层/M8-T030_单GPU硬件加速与虚拟设备过滤_需求设计.md` §5.2. To run the prebuilt `release/KirinDesk.exe`, also copy its DLLs (`avcodec-62.dll`, `avutil-60.dll`, `swscale-9.dll`, ...) into `release/ffmpeg/bin/`.
+1. Download [ffmpeg-8.1.1-full_build-shared.zip](https://github.com/GyanD/codexffmpeg/releases/download/8.1.1/ffmpeg-8.1.1-full_build-shared.zip) (GyanD shared build; URL verified reachable on 2026-08-03);
+2. Extract and place the whole folder at `ffmpeg/ffmpeg-8.1.1-full_build-shared/` (the zip already uses this name — no rename needed); the loader searches this exact path (see `media/src/ffmpeg/dlls.rs`);
+3. Verify `bin/` contains `avcodec-62.dll` (libavcodec 62.28.101), `avutil-60.dll`, `swscale-9.dll`, etc. (a missing library fails the load).
 
-**FFmpeg upgrade steps** (R-22): the codec path writes `AVCodecContext`/`AVFrame` struct fields by hardcoded byte offsets, verified against FFmpeg **8.1.2** (avcodec-62/avutil-60). On any major upgrade:
+> **Why 8.1.1 instead of 8.1.2**: the 8.1.2 build bundles ffnvcodec 13.1 headers, so `h264_nvenc` requires NVIDIA driver ≥ 610.00; 8.1.1 bundles 13.0 headers and works on the mainstream 591-series drivers (verified on this machine with driver 591.86, 2026-08-02). Both ship libavcodec 62, so the hardcoded offset snapshot (`SNAPSHOT_FFMPEG_MAJOR = 62`) stays compatible — decision record: `task_docs/共享层/M8-T030_单GPU硬件加速与虚拟设备过滤_需求设计.md` §5.2.
+>
+> To run the prebuilt `release/KirinDesk.exe`, also copy its DLLs (`avcodec-62.dll`, `avutil-60.dll`, `swscale-9.dll`, ...) into `release/ffmpeg/bin/`.
+
+**FFmpeg upgrade steps** (R-22): the codec path writes `AVCodecContext`/`AVFrame` struct fields by hardcoded byte offsets, verified against FFmpeg **8.1.1** (avcodec-62/avutil-60, libavcodec 62.28.101; 8.1.x builds with major 62 are compatible). On any major upgrade:
 
 1. Re-verify every offset in `media/src/ffmpeg/api.rs` (`avctx_offset::*`, `AVFRAME_CH_LAYOUT_OFFSET`) against the new `avcodec.h`/`frame.h` (`offsetof`) — checklist is inline above the constants.
 2. Update DLL names / sonames (`AVCODEC_LIB` etc.), `DLL_VERSION_FALLBACKS`, and `SNAPSHOT_FFMPEG_MAJOR` in `media/src/ffmpeg/dlls.rs`. The loader fails fast with a clear error if the loaded major version mismatches the snapshot — never run with stale offsets.
 3. Re-check the `FnTable` symbol list (required symbols fail the load; optional HW symbols degrade).
 4. Update this file and the inline checklist to the new snapshot version.
 
-**3. Build** — `target/` is generated by cargo:
+**3. Build** — `target/` is generated by cargo (git-ignored, not tracked):
 
 ```bash
 # --jobs 8: hard cap on build threads (no full-core packing — the packager
@@ -189,14 +219,27 @@ KirinDesk.exe --cli connect my-server.example.com 22 mynickname
 KirinDesk.exe --cli connect 2001:db8::1 3389 mynickname
 ```
 
+### Tunnel (内网穿透) Authentication
+
+The relay server (`tunnel serve`) login uses a **challenge-response (SCRAM-style)** scheme (protocol v1.1.0):
+
+- **The password never crosses the wire** — the login packet carries only a random nonce and an HMAC-SHA256 proof (`auth_digest`); packet captures cannot recover the password
+- **Mutual authentication** — the server proves knowledge of the password with its own receipt; a fake server is rejected and dropped by the client
+- **Fail-closed** — `tunnel serve` refuses to start when `[tunnel].token` is empty; clients configured with a token refuse unauthenticated (token-less) servers
+- **Token quality** — use a high-entropy random string of ≥ 32 bytes (`openssl rand -base64 32`); tokens shorter than 16 characters trigger a warning
+
+> **Upgrade note:** server and client must run the same version (same release). Old v1.0 clients are explicitly rejected by a token-configured server with an `upgrade client` hint; new clients error out against old servers. Upgrade both ends together.
+
 ## GUI Overview
 
 | Tab | Function |
 |-----|----------|
-| **Dashboard** | Device overview (Device ID, IPv6, port, domain whitelist) |
-| **Connect** | Connect to a remote device — IPv6+Port or Domain+Nickname+Challenge forms |
-| **Settings** | Configure Device ID, Nickname, Challenge Code, GoDaddy API, domain whitelist, connection mode |
-| **Devices** | List of discovered / connected devices |
+| **Dashboard** | Device overview (Device ID, IPv6/IPv4, port, whitelists); allow-controlled / server switches; temp-mode card |
+| **Domain** | DNS provider management — 20 providers, per-provider credentials, connection test, domain list, record CRUD (A/AAAA/CNAME/MX/TXT/SRV/NS) |
+| **Devices** | Discovered / connected devices (nickname, notes, manual ordering) |
+| **Connect** | Connect to a remote device — IPv6/IPv4+Port or Domain+Nickname+Challenge forms, live connection log |
+| **Tunnel** | 内网穿透 — generic TCP reverse proxy: client/server config, bind addresses, token ✏️📋, proxies, start/stop with state restore |
+| **Settings** | Device ID, Nickname, Challenge Code, DNS provider & credentials, whitelists, connection mode, transport, language (System/中文/English), unattended mode, updates |
 
 ## Security Architecture
 
@@ -218,7 +261,7 @@ KirinDesk.exe --cli connect 2001:db8::1 3389 mynickname
 |  └─ AEAD AES-256-GCM      |       │  └─ AEAD AES-256-GCM      |
 +---------------------------+       +---------------------------+
             ↑                                ↑
-            │        GoDaddy DNS             │
+            │      DNS (20 providers)        │
             │  (SRV + AAAA + TXT records)    │
             +────────────────────────────────+
 ```
@@ -227,14 +270,16 @@ KirinDesk.exe --cli connect 2001:db8::1 3389 mynickname
 
 ```
 KirinDesk/
-├── core/          # Zero-trust crypto (Ed25519/X25519/AEAD/handshake), IPv6 networking, connection management
-├── dns/           # GoDaddy API client, SRV/AAAA/TXT management, service discovery & heartbeat
-├── media/         # Screen/audio capture, FFmpeg libavcodec encode/decode, QUIC transport, adaptive feedback
+├── core/          # Zero-trust crypto (Ed25519/X25519/AEAD/handshake), IPv6/IPv4 networking, hole punching & path manager
+├── dns/           # 20 DNS provider adapters, SRV/AAAA/A/TXT management, service discovery & heartbeat
+├── media/         # Screen/audio capture, FFmpeg libavcodec encode/decode, GPU selection, QUIC/TCP transport, adaptive feedback
 ├── input/         # Remote input: Windows SendInput / Linux uinput / macOS CGEvent
-├── ui/            # egui desktop GUI + clap CLI
+├── relay/         # Tunnel (内网穿透): generic TCP reverse proxy client/server, rendezvous, device-ID registry
+├── relay-server/  # Standalone tunnel server binary (Docker / systemd / headless deployment)
+├── ui/            # egui desktop GUI (i18n 中文/English) + clap CLI
 ├── updater/       # Auto-update (check / download / install)
-├── utils/         # Config, logging, error types
-├── ffmpeg/        # FFmpeg 8.1.2 shared libraries (avcodec-62/avutil-60/swscale-9)
+├── utils/         # Config (encryption landing, R-13), logging, error types, audit
+├── ffmpeg/        # FFmpeg 8.1.1 shared libs (avcodec-62/avutil-60/swscale-9; git-ignored, restore after clone)
 ├── config/        # Configuration structures & defaults
 └── release/       # Installers & packaging (NSIS / deb / dmg)
 ```
@@ -246,12 +291,34 @@ kirin_desk <command> [options]
 
   setup                Interactive configuration wizard
   config               Show current configuration
-  register [id] [p]    Register device with GoDaddy DNS
-  discover <id>        Discover a remote device
-  connect <t> [p] [n]  Connect to device (domain or IPv6)
-                       challenge: interactive prompt (TTY) or --challenge-stdin (pipe)
-  shell [port]         Remote shell server (domain whitelist)
-  serve [port]         Start listening for connections
+  register [id] [p]    Register device with DNS (current provider)
+  discover <id>        Discover a remote device (current DNS provider)
+  dns <subcommand>     DNS domain maintenance (M9-DNS023): list-providers |
+                       set-provider <name> | test [provider] | domains |
+                       records <domain> [type] | add|update <domain> <type>
+                       <name> <data> [--ttl N] [--priority N --weight N
+                       --port N] | delete <domain> <type> <name> |
+                       register <device-id> <port> | unregister <device-id>
+  connect <t> [p] [n]  Connect to device — domain (DNS discovery + TXT key
+                       binding) or IPv6/IPv4; challenge: interactive TTY
+                       prompt or --challenge-stdin (pipe)
+                       [--transport auto|quic|tcp] [--ip-family auto|ipv4|ipv6]
+                       [--no-audio]
+  send <path> <host> [p] [n]  Send a file to the remote (encrypted, resumable)
+  recv <host> [p] [n]         Receive files pushed by the remote
+  shell [port]         Remote shell server (domain/ID whitelist enforced)
+  shell <host> [p] [n] Connect to a remote shell (PTY mode)
+  serve [port]         Start listening ([--unattended] auto-accept)
+  known-hosts          List / add / remove trusted client keys (SSH-style)
+  whitelist            List / add / remove domain & device-ID entries, CSV
+                       import/export (whitelist add-id/remove-id)
+  temp-mode [off]      Enable 5-min temp window: temp challenge code + bypass
+  unattended <on|off|status>  Unattended mode (auto-accept, auto-start server)
+  autostart <enable|disable|status>  OS user-level boot autostart
+  tunnel start         Run tunnel client (frpc): map local TCP services to the
+                       public relay server
+  tunnel serve         Run tunnel server (frps) on this machine
+  tunnel status        Show tunnel configuration and proxy list
   status               Show system status
   self-test            End-to-end self test
   help                 Show this help
@@ -261,31 +328,62 @@ kirin_desk <command> [options]
 
 ```toml
 [device]
-id = "my-pc"
+id = ""              # empty = auto (disk UUID / machine-id / IOPlatformUUID)
 nickname = "my-pc"
-challenge_code = "my-secret"
+challenge_code = ""  # required for server mode (fail-closed)
 
-[godaddy]
-api_key = "..."
-api_secret = "..."
-domain = "example.com"
+[dns]
+provider = "godaddy" # any of the 20 providers; credentials encryption landing (R-13)
 
 [network]
 port = 3389
 allowed_domains = ["example.com"]
-ip_mode_allowed = false
+allowed_ids = []     # device-ID whitelist (exact match; `*` suffix = prefix)
 
-[codec]
-# Encoding settings
-h264_bitrate = 5000000    # target bitrate (bps)
-framerate = 30            # target frame rate
-# Decoding settings
-enable_hw_decode = true   # enable hardware decode (DXVA/VAAPI)
+[media]
+encoder = "auto"     # auto | nvenc | amf | qsv | vaapi | libx264
+framerate = 30
+bitrate = 5000       # kbps
+
+[media.gpu]
+prefer = "auto"      # auto | intel | nvidia | amd | luid:0x… (or KIRIN_GPU_PREFER)
+filter_virtual = true
+
+[transport]
+mode = "auto"        # auto | quic | tcp (graceful in-session degrade)
+ip_family = "auto"   # auto | ipv4 | ipv6
+
+[file_transfer]
+download_dir = ""    # default ~/Downloads/KirinDesk
+max_file_size = 4294967296  # 4 GiB per file
+
+[tunnel]
+enabled = false      # FRP-style reverse proxy — optional, off by default
+mode = "client"      # client | server
+server_addr = ""     # public relay server (domain / IP, :port suffix)
+token = ""           # SCRAM-style auth; never sent in cleartext
+bind_addrs = "0.0.0.0,::"    # server listeners (multi-address, comma-separated)
+port_range = "60000-61000"
 
 [logging]
 level = "info"
 format = "text"
 ```
+
+### Configuration Encryption (R-13)
+
+Sensitive fields — DNS provider API keys/secrets, tunnel tokens, etc. — are **never written to the config file in cleartext**. They are stored as ChaCha20-Poly1305 ciphertext (format `{v: base64(nonce‖ciphertext)}`, with the AAD bound to the field context to prevent cross-field swapping). You can grep the config file to verify there is no plaintext.
+
+The master key is chosen automatically from a fallback chain:
+
+| Platform | Key source |
+|----------|-----------|
+| Windows | DPAPI (current-user protection; blob at `config_dir/kirin_config_key.dpapi`) |
+| macOS | Keychain generic password (`kirindesk-config-key`) |
+| No keyring / any platform | Env var `KIRIN_CONFIG_KEY` (passphrase, PBKDF2-HMAC-SHA256 derived — highest priority) |
+| None available | **fail-open**: plaintext storage + a prominent startup warning (doesn't block development use) |
+
+Migration is seamless: an existing plaintext config is automatically encrypted and rewritten on first load (`#[serde(default)]` keeps old fields compatible); a failed migration never destroys the original file (`.bak` backup). Keys/tokens are never logged and appear masked (`****`) in `config show` / `status` output.
 
 ## License
 

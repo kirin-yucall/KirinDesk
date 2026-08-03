@@ -235,7 +235,7 @@ pub fn av_opt_set_pixel_fmt(obj: *mut c_void, name: &str, val: i32) -> Result<()
 
 // ── AVCodecContext 字段直写（opaque 约束放宽） ────────────────
 //
-// FFmpeg 8.1.2 共享构建（GyanD full shared）的 AVCodecContext AVOption 表
+// FFmpeg 8.1.1 共享构建（GyanD full shared）的 AVCodecContext AVOption 表
 // 缺少 width/height/pix_fmt/time_base 条目（pix_fmt 完全不在表里）—— av_opt_set*
 // 返回 AVERROR_OPTION_NOT_FOUND，AVDictionary 也不被 open2 消费。libx264/h264_qsv
 // 在 open2 时强制要求这些字段已设，故需结构体字段直写。
@@ -243,7 +243,7 @@ pub fn av_opt_set_pixel_fmt(obj: *mut c_void, name: &str, val: i32) -> Result<()
 // 偏移取自 FFmpeg 8.1 `libavcodec/avcodec.h` 的 `offsetof(AVCodecContext, x)`，
 // 经运行时实测确认（libx264 open2 成功出码流）。**升级 FFmpeg 主版本时必须重核**。
 //
-// ## 升级核对清单（R-22，快照 FFmpeg 8.1.2 / avcodec-62 / avutil-60）
+// ## 升级核对清单（R-22，快照 FFmpeg 8.1.1 / avcodec-62 / avutil-60）
 //
 // 升级 FFmpeg 主版本（≥9）或大改共享构建时，按序核对：
 // 1. 下方 `avctx_offset::*` 全部偏移：对照新版 `libavcodec/avcodec.h`
@@ -257,7 +257,7 @@ pub fn av_opt_set_pixel_fmt(obj: *mut c_void, name: &str, val: i32) -> Result<()
 // 5. 更新本清单与 `Readme.md`「FFmpeg 升级步骤」中的版本快照字样。
 // 主版本不符时 `ensure_loaded` 直接报错（`dlls.rs` 版本断言），不会带错偏移运行。
 
-/// AVCodecContext 字段偏移（FFmpeg 8.1.2 x86-64，经实测确认）。
+/// AVCodecContext 字段偏移（FFmpeg 8.1.1 x86-64，经实测确认）。
 pub mod avctx_offset {
     /// `uint8_t *extradata`。
     pub const EXTRADATA: usize = 72;

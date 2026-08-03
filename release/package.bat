@@ -47,9 +47,10 @@ exit /b %RC%
 
 :main
 :: ==========================================
-:: Limit Cargo parallel build jobs to 8
+:: Limit Cargo parallel build jobs to 4 (2026-08-04 用户要求：打包线程上限 4，
+:: 原 8 超限并行会导致大小核机器死机)
 :: ==========================================
-set "CARGO_BUILD_JOBS=8"
+set "CARGO_BUILD_JOBS=4"
 
 echo [1/3] Building release binary...
 where cargo >nul 2>&1
@@ -85,7 +86,7 @@ echo [3/3] Copying runtime dependencies...
 if exist "%RELEASE_DIR%ffmpeg" (
     echo    ffmpeg/ already exists, skipping
 ) else (
-    xcopy /E /I /Y "%PROJ_DIR%\ffmpeg\ffmpeg-8.1.2-full_build-shared" "%RELEASE_DIR%ffmpeg" >nul
+    xcopy /E /I /Y "%PROJ_DIR%\ffmpeg\ffmpeg-8.1.1-full_build-shared" "%RELEASE_DIR%ffmpeg" >nul
     echo    Copied ffmpeg DLLs
 )
 :: Config

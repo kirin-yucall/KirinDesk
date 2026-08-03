@@ -107,7 +107,7 @@ impl FfmpegSwEncoder {
 
         // 初始尺寸占位（320×32），真实尺寸在 ensure_codec_dims 重设。
         // open_with_dict 统一做：结构体字段直写（width/height/pix_fmt/time_base，
-        // 这几个字段在 FFmpeg 8.1.2 共享构建的 AVOption 表里缺失）+ 编解码器私有
+        // 这几个字段在 FFmpeg 8.1.1 共享构建的 AVOption 表里缺失）+ 编解码器私有
         // 选项（preset/tune/profile/gop_size 等，经 av_opt_set_int_self / av_opt_set）
         // + avcodec_open2。复刻实测可工作的序列（结构体写 + open2 → send_frame OK）。
         if let Err(e) = open_with_dict(ctx, codec, codec_kind, 320, 32) {
@@ -498,7 +498,7 @@ impl Drop for FfmpegSwEncoder {
 
 /// 从 AVCodecContext 读 extradata（SPS/PPS）。
 ///
-/// 注意：`AVCodecContext` 在本仓库保持不透明（GyanD 8.1.2 布局风险），
+/// 注意：`AVCodecContext` 在本仓库保持不透明（GyanD 8.1.1 布局风险），
 /// 但 `extradata` / `extradata_size` 是该结构末尾的稳定字段。为安全读取，
 /// 我们借助 avcodec_parameters_from_context 的等价路径——FFmpeg 8.x 未在
 /// 动态加载表里暴露该符号，因此本函数返回空 Vec，extradata 由首包 NAL 自带
@@ -522,7 +522,7 @@ fn open_with_dict(
     height: u32,
 ) -> Result<(), ffmpeg::AvError> {
     // 1) 结构体字段直写：width/height/coded_*/pix_fmt/time_base（这些字段在
-    //    FFmpeg 8.1.2 共享构建的 AVOption 表里缺失，av_opt_set 无效）。偏移取自
+    //    FFmpeg 8.1.1 共享构建的 AVOption 表里缺失，av_opt_set 无效）。偏移取自
     //    FFmpeg 8.1 头文件 offsetof，经实测确认。
     unsafe {
         ffmpeg::avctx_set_int(ctx, ffmpeg::avctx_offset::WIDTH, width as i32);

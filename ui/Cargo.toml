@@ -6,6 +6,8 @@ edition.workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+# M8-T040 (WBS 8.2): self-test mock PubIpSource / Resolver 实现（dns 侧同版本）
+async-trait = "0.1"
 kirin-desk-core = { path = "../core" }
 kirin-desk-dns = { path = "../dns" }
 kirin-desk-input = { path = "../input" }

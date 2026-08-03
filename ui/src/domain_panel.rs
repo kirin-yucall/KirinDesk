@@ -881,7 +881,14 @@ fn parse_mx_data(s: &str) -> Option<(u16, String)> {
 ///
 /// 返回 `true` = 本帧保存了服务商凭据（调用方据此同步 App 内存凭据，
 /// Connect 页 / 状态栏即时生效）。
-pub fn show_domain_page(ui: &mut egui::Ui, theme: &Theme, state: &mut DomainPanelState) -> bool {
+/// M8-T040 (WBS 6.1)：Domain 页入口。`ddns` 为 DDNS 卡控制器
+/// （KirinDeskApp 持有，状态共享槽 + worker 句柄）。
+pub fn show_domain_page(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    state: &mut DomainPanelState,
+    ddns: &mut DdnsUi,
+) -> bool {
     state.poll();
     state.sync_provider();
     let mut saved = false;
@@ -889,6 +896,9 @@ pub fn show_domain_page(ui: &mut egui::Ui, theme: &Theme, state: &mut DomainPane
     ui.separator();
     egui::ScrollArea::vertical().show(ui, |ui| {
         saved |= show_provider_card(ui, theme, state);
+        ui.add_space(theme.spacing);
+        // M8-T040：DDNS 维护卡（记录管理区上方，需求 §七 草图）。
+        show_ddns_card(ui, theme, state, ddns);
         ui.add_space(theme.spacing);
         show_domain_card(ui, theme, state);
         ui.add_space(theme.spacing);
@@ -1000,7 +1010,6 @@ fn show_provider_card(ui: &mut egui::Ui, theme: &Theme, state: &mut DomainPanelS
                 state.cred_values.clear();
                 state.show_secret.clear();
                 state.cred_ok = false;
-                state.cred_status = t!("domain.provider.switched").to_string();
             }
         });
         ui.add_space(4.0);
@@ -1510,3 +1519,630 @@ fn show_edit_window(ui: &mut egui::Ui, theme: &Theme, state: &mut DomainPanelSta
         state.editing = None;
     }
 }
+
+// ════════════════════════════════════════════════════════════════
+// M8-T040 (W3-A / WBS 6.1~6.2): DDNS 维护卡
+// ════════════════════════════════════════════════════════════════
+
+/// DDNS 维护卡控制器（`KirinDeskApp` 持有；生命周期 + 表单 + 状态共享槽）。
+///
+/// 设计（并行计划 §3.2 / WBS 6.2）：状态槽 `Mutex<Option<DdnsStatus>>` +
+/// worker 句柄，仿 DomainOp 共享槽模式；`DdnsService` 在后台线程（自带
+/// tokio runtime）运行，状态经 watch channel 回填，GUI 每帧 `poll()` 一次。
+/// 开关/模式切换即时生效不落盘（DDNS-UI-005），「保存」才写 `[ddns]` 段。
+#[derive(Default)]
+pub struct DdnsUi {
+    /// 运行中的服务句柄（`update_now` / `shutdown`）。
+    service: Option<std::sync::Arc<kirin_desk_dns::DdnsService>>,
+    /// 状态共享槽（worker 写，UI 帧读）。
+    status: std::sync::Arc<std::sync::Mutex<Option<kirin_desk_dns::DdnsStatus>>>,
+    /// watch 接收端（worker 发布 → 本槽）。
+    watch_rx: Option<tokio::sync::watch::Receiver<kirin_desk_dns::DdnsStatus>>,
+    /// 「立即更新」结果槽（后台线程写）。
+    update_slot: std::sync::Arc<std::sync::Mutex<Option<Result<(), String>>>>,
+    /// 表单态（进入页面首次从配置回填；之后以用户编辑为准）。
+    pub enabled: bool,
+    pub interval: String,
+    pub ipv4_mode: kirin_desk_dns::DdnsMode,
+    pub ipv4_manual: String,
+    pub ipv6_mode: kirin_desk_dns::DdnsMode,
+    pub ipv6_manual: String,
+    /// 表单是否已从配置回填。
+    synced: bool,
+    /// 「立即更新」忙碌（防并发）。
+    pub busy: bool,
+    /// 卡片瞬态提示（保存/更新结果）。
+    pub notice: String,
+    pub notice_ok: bool,
+}
+
+impl DdnsUi {
+    /// 每帧调用：watch → 共享槽 + 立即更新结果 → 提示。
+    pub fn poll(&mut self) {
+        if let Some(rx) = &mut self.watch_rx {
+            if rx.has_changed().unwrap_or(false) {
+                let st = rx.borrow().clone();
+                *self.status.lock().unwrap() = Some(st);
+            }
+        }
+        if let Some(r) = self.update_slot.lock().unwrap().take() {
+            self.busy = false;
+            self.notice_ok = r.is_ok();
+            self.notice = match r {
+                Ok(()) => t!("ddns.updated").to_string(),
+                Err(e) => tf!("ddns.update_failed", e),
+            };
+        }
+    }
+
+    /// 首次进入页面时从配置回填表单（后续编辑不覆盖）。
+    fn sync_from_cfg(&mut self, cfg: &kirin_desk_utils::config::Config) {
+        if self.synced {
+            return;
+        }
+        self.synced = true;
+        self.enabled = cfg.ddns.enabled;
+        self.interval = cfg
+            .ddns
+            .interval_secs
+            .unwrap_or(cfg.network.heartbeat_interval)
+            .to_string();
+        self.ipv4_mode = match cfg.ddns.ipv4_mode {
+            kirin_desk_utils::config::DdnsMode::Auto => kirin_desk_dns::DdnsMode::Auto,
+            kirin_desk_utils::config::DdnsMode::Manual => kirin_desk_dns::DdnsMode::Manual,
+        };
+        self.ipv4_manual = cfg.ddns.ipv4_manual.clone();
+        self.ipv6_mode = match cfg.ddns.ipv6_mode {
+            kirin_desk_utils::config::DdnsMode::Auto => kirin_desk_dns::DdnsMode::Auto,
+            kirin_desk_utils::config::DdnsMode::Manual => kirin_desk_dns::DdnsMode::Manual,
+        };
+        self.ipv6_manual = cfg.ddns.ipv6_manual.clone();
+    }
+
+    /// 状态快照（无 → None；未运行 → enabled=false 初始态）。
+    pub fn status_snapshot(&self) -> Option<kirin_desk_dns::DdnsStatus> {
+        self.status.lock().unwrap().clone()
+    }
+
+    /// 按当前表单重启后台服务（`persist=true` 时先落盘 `[ddns]` 段）。
+    /// 模式/开关切换即时生效不落盘（DDNS-UI-005）。
+    fn apply_and_restart(&mut self, base: &kirin_desk_utils::config::Config, persist: bool) {
+        use kirin_desk_utils::config::DdnsMode as CfgMode;
+        let mut cfg = base.clone();
+        cfg.ddns.enabled = self.enabled;
+        cfg.ddns.interval_secs = self.interval.trim().parse::<u64>().ok();
+        cfg.ddns.ipv4_mode = match self.ipv4_mode {
+            kirin_desk_dns::DdnsMode::Auto => CfgMode::Auto,
+            kirin_desk_dns::DdnsMode::Manual => CfgMode::Manual,
+        };
+        cfg.ddns.ipv4_manual = self.ipv4_manual.trim().to_string();
+        cfg.ddns.ipv6_mode = match self.ipv6_mode {
+            kirin_desk_dns::DdnsMode::Auto => CfgMode::Auto,
+            kirin_desk_dns::DdnsMode::Manual => CfgMode::Manual,
+        };
+        cfg.ddns.ipv6_manual = self.ipv6_manual.trim().to_string();
+        if persist {
+            if let Err(e) = cfg.save() {
+                self.notice_ok = false;
+                self.notice = tf!("ddns.update_failed", e);
+                return;
+            }
+            self.notice_ok = true;
+            self.notice = t!("ddns.saved").to_string();
+        }
+        self.restart(&cfg);
+    }
+
+    /// 重启后台服务：停旧 → 按配置启新（enabled=false 只停不启）。
+    fn restart(&mut self, cfg: &kirin_desk_utils::config::Config) {
+        // 停旧服务（DDNS-REC-007：不删除已发布记录）。
+        if let Some(svc) = self.service.take() {
+            svc.shutdown();
+        }
+        self.watch_rx = None;
+        self.status = std::sync::Arc::new(std::sync::Mutex::new(None));
+        if !cfg.ddns.enabled {
+            let mut st = kirin_desk_dns::DdnsStatus::initial();
+            st.enabled = false;
+            *self.status.lock().unwrap() = Some(st);
+            return;
+        }
+        let Some(pubkey) = device_public_key(cfg) else {
+            self.notice_ok = false;
+            self.notice = tf!("ddns.update_failed", "身份加载失败（ed25519.json）");
+            return;
+        };
+        let (watch_tx, watch_rx) =
+            tokio::sync::watch::channel(kirin_desk_dns::DdnsStatus::initial());
+        self.watch_rx = Some(watch_rx);
+        let cfg2 = cfg.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        // 后台线程自带 runtime（与 DomainOp worker 同模式）；任务运行至 shutdown。
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().expect("ddns worker runtime");
+            rt.block_on(async move {
+                let (svc, handle) = kirin_desk_dns::DdnsService::start(&cfg2, &pubkey, watch_tx);
+                let _ = tx.send(svc);
+                let _ = handle.await;
+            });
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(svc) => {
+                self.service = Some(svc);
+            }
+            Err(_) => {
+                self.notice_ok = false;
+                self.notice = tf!("ddns.update_failed", "后台服务启动超时");
+            }
+        }
+    }
+
+    /// 「立即更新」/「重新检测」：后台线程触发一轮全量发布（含公网 IP 重新探测）。
+    pub fn trigger_update_now(&mut self) {
+        if self.busy {
+            return;
+        }
+        let Some(svc) = self.service.clone() else {
+            self.notice_ok = false;
+            self.notice = tf!("ddns.update_failed", "DDNS 未运行（请先开启总开关）");
+            return;
+        };
+        self.busy = true;
+        self.notice = t!("ddns.update_busy").to_string();
+        let slot = self.update_slot.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().expect("ddns update runtime");
+            let r = rt.block_on(async move { svc.update_now().await.map_err(|e| e.to_string()) });
+            *slot.lock().unwrap() = Some(r);
+        });
+    }
+}
+
+/// 本机 Ed25519 公钥（TXT DeviceMeta 用；与 CLI `load_identity` 同解析语义）。
+fn device_public_key(cfg: &kirin_desk_utils::config::Config) -> Option<String> {
+    use kirin_desk_core::crypto::ed25519::IdentityManager;
+    let device_id = kirin_desk_utils::device::effective_device_id(&cfg.device.id);
+    let path = dirs_next::home_dir()?
+        .join(".kirin_desk")
+        .join("identity")
+        .join("ed25519.json");
+    let im = IdentityManager::load_or_generate(path, &device_id).ok()?;
+    Some(im.public_key_base64())
+}
+
+/// 倒计时展示（hh:mm:ss / mm:ss）。
+fn format_countdown(secs: i64) -> String {
+    let secs = secs.max(0);
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    if h > 0 {
+        format!("{h:02}:{m:02}:{s:02}")
+    } else {
+        format!("{m:02}:{s:02}")
+    }
+}
+
+/// 时间展示（HH:MM:SS 本地时区）。
+fn format_clock(dt: chrono::DateTime<chrono::Utc>) -> String {
+    dt.with_timezone(&chrono::Local)
+        .format("%H:%M:%S")
+        .to_string()
+}
+
+/// DDNS 维护卡（DDNS-UI-001~006；位于记录管理区上方）。
+/// 服务商未配置 → 整卡禁用 + 指引（DDNS-UI-006，复用 UI-DNS-004 文案体系）。
+fn show_ddns_card(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    state: &DomainPanelState,
+    ddns: &mut DdnsUi,
+) {
+    use kirin_desk_dns::DdnsMode;
+    let cfg = kirin_desk_utils::config::Config::load().unwrap_or_default();
+    ddns.sync_from_cfg(&cfg);
+    ddns.poll();
+
+    crate::widgets::card(ui, theme, t!("ddns.card.title"), |ui| {
+        // ── 禁用态（DDNS-UI-006） ──
+        if !state.configured {
+            ui.horizontal(|ui| {
+                status_dot(ui, theme.danger, t!("ddns.status.disabled"));
+            });
+            return;
+        }
+
+        // ── 总开关（DDNS-UI-001；即时生效不落盘） ──
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(t!("ddns.card.desc"))
+                        .size(theme.small_size)
+                        .color(theme.fg_weak),
+                )
+                .selectable(false),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let mut en = ddns.enabled;
+                if ui.checkbox(&mut en, t!("ddns.enabled")).changed() {
+                    ddns.enabled = en;
+                    ddns.apply_and_restart(&cfg, false);
+                }
+            });
+        });
+
+        // ── 更新周期 + TTL 展示（DDNS-UI-001 / DDNS-REC-004） ──
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(t!("ddns.interval"))
+                        .size(theme.small_size)
+                        .color(theme.fg_weak),
+                )
+                .selectable(false),
+            );
+            let mut te = egui::TextEdit::singleline(&mut ddns.interval)
+                .desired_width(48.0)
+                .hint_text("300");
+            te = te.font(egui::TextStyle::Monospace);
+            ui.add(te);
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(t!("ddns.interval_unit"))
+                        .size(theme.small_size)
+                        .color(theme.fg_weak),
+                )
+                .selectable(false),
+            );
+            ui.add_space(12.0);
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(format!("{}: {}", t!("ddns.ttl"), cfg.network.dns_ttl))
+                        .size(theme.small_size)
+                        .color(theme.fg_weak),
+                )
+                .selectable(false),
+            );
+        });
+
+        let st = ddns.status_snapshot();
+
+        // ── IPv4 行（DDNS-UI-002） ──
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(t!("ddns.ipv4"))
+                        .size(theme.small_size)
+                        .strong(),
+                )
+                .selectable(false),
+            );
+            if ui
+                .radio_value(&mut ddns.ipv4_mode, DdnsMode::Auto, t!("ddns.mode.auto"))
+                .changed()
+            {
+                ddns.apply_and_restart(&cfg, false);
+            }
+            if ui
+                .radio_value(&mut ddns.ipv4_mode, DdnsMode::Manual, t!("ddns.mode.manual"))
+                .changed()
+            {
+                ddns.apply_and_restart(&cfg, false);
+            }
+        });
+        match ddns.ipv4_mode {
+            DdnsMode::Auto => {
+                // 只读展示当前公网 IP + 获取时间 + 重新检测（DDNS-IPV4-005）。
+                let (current, at) = st
+                    .as_ref()
+                    .map(|s| (s.ipv4_current, s.ipv4_at))
+                    .unwrap_or((None, None));
+                ui.horizontal(|ui| {
+                    let text = match current {
+                        Some(ip) => tf!("ddns.auto.ipv4", ip),
+                        None => t!("ddns.auto.none").to_string(),
+                    };
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(text).size(theme.small_size))
+                            .selectable(false),
+                    );
+                    if let Some(at) = at {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(tf!("ddns.detected_at", format_clock(at)))
+                                    .size(theme.small_size)
+                                    .color(theme.fg_weak),
+                            )
+                            .selectable(false),
+                        );
+                    }
+                    if action_button(
+                        ui,
+                        theme,
+                        ButtonKind::Secondary,
+                        t!("ddns.redetect"),
+                        if ddns.busy { ButtonState::Busy } else { ButtonState::Enabled },
+                    )
+                    .clicked()
+                    {
+                        ddns.trigger_update_now();
+                    }
+                });
+            }
+            DdnsMode::Manual => {
+                labeled_input(
+                    ui,
+                    theme,
+                    t!("ddns.mode.manual"),
+                    &mut ddns.ipv4_manual,
+                    t!("ddns.manual.hint_v4"),
+                    Validity::None,
+                    None,
+                    true,
+                );
+            }
+        }
+
+        // ── IPv6 行（DDNS-UI-003） ──
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(t!("ddns.ipv6"))
+                        .size(theme.small_size)
+                        .strong(),
+                )
+                .selectable(false),
+            );
+            if ui
+                .radio_value(&mut ddns.ipv6_mode, DdnsMode::Auto, t!("ddns.mode.auto"))
+                .changed()
+            {
+                ddns.apply_and_restart(&cfg, false);
+            }
+            if ui
+                .radio_value(&mut ddns.ipv6_mode, DdnsMode::Manual, t!("ddns.mode.manual"))
+                .changed()
+            {
+                ddns.apply_and_restart(&cfg, false);
+            }
+        });
+        match ddns.ipv6_mode {
+            DdnsMode::Auto => {
+                let (current, at) = st
+                    .as_ref()
+                    .map(|s| (s.ipv6_current, s.ipv6_at))
+                    .unwrap_or((None, None));
+                ui.horizontal(|ui| {
+                    let text = match current {
+                        Some(ip) => tf!("ddns.auto.ipv6", ip),
+                        None => t!("ddns.auto.none").to_string(),
+                    };
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(text).size(theme.small_size))
+                            .selectable(false),
+                    );
+                    if let Some(at) = at {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(tf!("ddns.detected_at", format_clock(at)))
+                                    .size(theme.small_size)
+                                    .color(theme.fg_weak),
+                            )
+                            .selectable(false),
+                        );
+                    }
+                });
+            }
+            DdnsMode::Manual => {
+                labeled_input(
+                    ui,
+                    theme,
+                    t!("ddns.mode.manual"),
+                    &mut ddns.ipv6_manual,
+                    t!("ddns.manual.hint_v6"),
+                    Validity::None,
+                    None,
+                    true,
+                );
+            }
+        }
+
+        // ── 自动公布预览（DDNS-UI-004） ──
+        ui.add_space(6.0);
+        if let Some(s) = &st {
+            let pub_ok = |ok: bool| {
+                if ok {
+                    egui::RichText::new("✓")
+                        .color(theme.success)
+                        .size(theme.small_size)
+                } else {
+                    egui::RichText::new("✗")
+                        .color(theme.danger)
+                        .size(theme.small_size)
+                }
+            };
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(t!("ddns.publish.title"))
+                            .size(theme.small_size)
+                            .color(theme.fg_weak),
+                    )
+                    .selectable(false),
+                );
+                let srv = match s.published.srv_port {
+                    Some(p) => tf!("ddns.publish.srv", p),
+                    None => t!("ddns.publish.off").to_string(),
+                };
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!("{} ", srv)).size(theme.small_size),
+                    )
+                    .selectable(false),
+                );
+                ui.add(egui::Label::new(pub_ok(s.published.srv)));
+                let txt = match &s.published.txt_fingerprint {
+                    Some(f) => tf!("ddns.publish.txt", f),
+                    None => t!("ddns.publish.off").to_string(),
+                };
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!("  {} ", txt)).size(theme.small_size),
+                    )
+                    .selectable(false),
+                );
+                ui.add(egui::Label::new(pub_ok(s.published.txt)));
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!("  {} ", t!("ddns.publish.a")))
+                            .size(theme.small_size),
+                    )
+                    .selectable(false),
+                );
+                ui.add(egui::Label::new(pub_ok(s.published.a)));
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!("  {} ", t!("ddns.publish.aaaa")))
+                            .size(theme.small_size),
+                    )
+                    .selectable(false),
+                );
+                ui.add(egui::Label::new(pub_ok(s.published.aaaa)));
+            });
+        }
+
+        // ── 状态行（DDNS-UI-004：上次结果/原因/倒计时/暂停） ──
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            let status_text = match &st {
+                Some(s) if !s.enabled => t!("ddns.status.off").to_string(),
+                Some(s) => {
+                    if let Some(err) = &s.last_error {
+                        tf!("ddns.status.last_fail", err)
+                    } else if let Some(t) = s.last_update {
+                        let n = [s.published.srv, s.published.txt, s.published.a, s.published.aaaa]
+                            .iter()
+                            .filter(|b| **b)
+                            .count();
+                        tf!("ddns.status.last_ok", format_clock(t), n, 4)
+                    } else {
+                        t!("ddns.status.never").to_string()
+                    }
+                }
+                None if ddns.enabled => t!("ddns.update_busy").to_string(),
+                None => t!("ddns.status.off").to_string(),
+            };
+            let ok = match &st {
+                Some(s) => s.last_error.is_none(),
+                None => !ddns.enabled,
+            };
+            status_dot(
+                ui,
+                if ok { theme.success } else { theme.danger },
+                &status_text,
+            );
+        });
+        // 倒计时 / 暂停提示
+        if let Some(s) = &st {
+            if s.enabled {
+                if let Some(next) = s.next_update_at {
+                    let remain = (next - chrono::Utc::now()).num_seconds();
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(tf!(
+                                    "ddns.status.next",
+                                    format_countdown(remain)
+                                ))
+                                .size(theme.small_size)
+                                .color(theme.fg_weak),
+                            )
+                            .selectable(false),
+                        );
+                    });
+                } else if s.last_error.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(t!("ddns.status.paused"))
+                                    .size(theme.small_size)
+                                    .color(theme.danger),
+                            )
+                            .selectable(false),
+                        );
+                    });
+                }
+            }
+        }
+
+        // ── 立即更新 + 保存（DDNS-UI-005） ──
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if action_button(
+                ui,
+                theme,
+                ButtonKind::Success,
+                t!("ddns.update_now"),
+                if ddns.busy { ButtonState::Busy } else { ButtonState::Enabled },
+            )
+            .clicked()
+            {
+                ddns.trigger_update_now();
+            }
+            if action_button(
+                ui,
+                theme,
+                ButtonKind::Primary,
+                t!("ddns.save"),
+                ButtonState::Enabled,
+            )
+            .clicked()
+            {
+                // 校验（interval ≥60 / 手动地址合法性）后落盘 + 重启。
+                let interval_ok = ddns
+                    .interval
+                    .trim()
+                    .parse::<u64>()
+                    .map(|v| v >= 60)
+                    .unwrap_or(false);
+                let v4_ok = ddns.ipv4_mode != DdnsMode::Manual
+                    || ddns
+                        .ipv4_manual
+                        .trim()
+                        .parse::<std::net::Ipv4Addr>()
+                        .is_ok();
+                let v6_ok = ddns.ipv6_mode != DdnsMode::Manual
+                    || ddns
+                        .ipv6_manual
+                        .trim()
+                        .parse::<std::net::Ipv6Addr>()
+                        .is_ok();
+                if !interval_ok {
+                    ddns.notice_ok = false;
+                    ddns.notice = t!("ddns.interval_invalid").to_string();
+                } else if !v4_ok {
+                    ddns.notice_ok = false;
+                    ddns.notice = t!("ddns.manual_invalid_v4").to_string();
+                } else if !v6_ok {
+                    ddns.notice_ok = false;
+                    ddns.notice = t!("ddns.manual_invalid_v6").to_string();
+                } else {
+                    ddns.apply_and_restart(&cfg, true);
+                }
+            }
+        });
+        if !ddns.notice.is_empty() {
+            ui.horizontal(|ui| {
+                status_dot(
+                    ui,
+                    if ddns.notice_ok { theme.success } else { theme.danger },
+                    &ddns.notice,
+                );
+            });
+        }
+    });
+}
+

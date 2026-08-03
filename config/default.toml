@@ -29,6 +29,43 @@ api_url = "https://api.godaddy.com"
 [dns]
 provider = "godaddy"
 
+# M8-T040: 域名模式加密 DNS 强制（服务端 + 客户端，需求 §5.2）。
+# 域名模式下全部 DNS 解析必须走 DoH/DoT，fail-closed（DDNS-DOH-003）；
+# mode = "off" 显式关闭强制（仅限 IP 模式；域名模式将无法解析 → 提示不可用）。
+[dns.security]
+mode = "enforce"               # enforce（默认）| off
+# DoH 端点优先序（application/dns-json，GET，强制 HTTPS + 证书校验）
+doh = [
+  "https://cloudflare-dns.com/dns-query",
+  "https://dns.google/resolve",
+  "https://dns.alidns.com/resolve",
+]
+# DoT 端点优先序（TLS TCP 853）
+dot = [
+  "1.1.1.1:853",
+  "8.8.8.8:853",
+  "2400:3200::1:853",
+]
+resolve_timeout_ms = 5000       # 单端点超时
+cache_ttl_secs = 50             # 解析缓存 TTL（沿用 discovery 缓存语义）
+
+# M8-T040: DDNS 域名自动更新维护（域名页「DDNS 维护」卡读写，需求 §5.1）。
+# IPv4 自动 = 公网出口 IP（非本机网卡地址）；IPv6 自动 = 本机全局单播；
+# 手动模式地址心跳永不覆盖（仅刷新 TTL）。
+[ddns]
+enabled = false                # 总开关（默认关）
+interval_secs = 300            # 更新周期（默认 300s；下限 60s，低于下限收敛；
+                               # 未设置回退 [network] heartbeat_interval）
+ipv4_mode = "auto"             # auto（公网出口 IP）| manual（固定地址）
+ipv4_manual = ""               # 手动固定 IPv4（固定出口/静态映射场景；心跳永不覆盖）
+ipv4_sources = ["ipify", "ip.sb", "icanhazip"]   # 公网 IP 服务优先序（全部 HTTPS）
+ipv6_mode = "auto"             # auto（本机全局单播 IPv6）| manual（上游固定/转发场景）
+ipv6_manual = ""               # 手动固定 IPv6（心跳永不覆盖）
+publish_srv = true             # 自动维护 SRV（远控端口）
+publish_txt = true             # 自动维护 TXT（签名/DeviceMeta）
+publish_a = true               # 自动维护 A 记录
+publish_aaaa = true            # 自动维护 AAAA 记录
+
 [network]
 port = 3389
 heartbeat_interval = 30

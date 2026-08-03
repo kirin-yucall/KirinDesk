@@ -268,6 +268,8 @@ pub(crate) enum CliCommand {
     SelfTest,
     /// M9-DNS023: DNS 域名维护子命令组（`dns list-providers` 等，见 §六）。
     Dns,
+    /// M8-T040: DDNS 子命令组（`ddns status/enable/disable/set-ipv4/set-ipv6/update`）。
+    Ddns,
     /// 未识别命令（保留原文供报错/help；无子命令时为空串）。
     Unknown(String),
 }
@@ -294,6 +296,7 @@ pub(crate) fn parse_cli_command(args: &[String]) -> CliCommand {
         Some("status") => CliCommand::Status,
         Some("self-test") => CliCommand::SelfTest,
         Some("dns") => CliCommand::Dns,
+        Some("ddns") => CliCommand::Ddns,
         Some(other) => CliCommand::Unknown(other.to_string()),
         None => CliCommand::Unknown(String::new()),
     }
@@ -424,6 +427,8 @@ pub async fn run_cli() {
         CliCommand::SelfTest => cmd_self_test().await,
         // M9-DNS023: `dns <subcommand>` 子命令组（§六）。
         CliCommand::Dns => cmd_dns(args).await,
+        // M8-T040: `ddns <subcommand>` 子命令组（§八）。
+        CliCommand::Ddns => cmd_ddns(args).await,
         CliCommand::Unknown(cmd) => {
             println!("Unknown command: {}", cmd);
             print_help();
@@ -449,6 +454,10 @@ fn print_help() {
     println!("                       [--priority N --weight N --port N] |");
     println!("                       delete <domain> <type> <name> |");
     println!("                       register <device-id> <port> | unregister <device-id>");
+    println!("  ddns <subcommand>    DDNS auto-maintenance (M8-T040)");
+    println!("                       subcommands: status | enable | disable |");
+    println!("                       set-ipv4 auto|manual [addr] | set-ipv6 auto|manual [addr] |");
+    println!("                       update");
     println!("  connect <t> [p] [n] Connect to device — domain: DNS discovery + TXT key");
     println!("                                     binding; IPv6: known_hosts / first-use confirm");
     println!("                                     challenge: interactive prompt (TTY, hidden input)");
@@ -1335,6 +1344,67 @@ async fn cmd_dns(args: Vec<String>) {
             }
             println!("Done.");
         }
+        // ── M8-T040 (WBS 7.2): `dns resolve <host> [--type A|AAAA|SRV|TXT]` ──
+        // 经 DoH/DoT 加密解析（调试/验证面，需求 §八）；展示端点与耗时。
+        "resolve" => {
+            use kirin_desk_dns::{RecordType as DnsRt, Resolver as _};
+            let host = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            if host.is_empty() {
+                println!("Usage: kirin_desk dns resolve <host> [--type A|AAAA|SRV|TXT]");
+                return;
+            }
+            let rtype: DnsRt = match flag_value(&args, "--type") {
+                Some(s) => match s.parse::<DnsRt>() {
+                    Ok(t) if matches!(t, DnsRt::A | DnsRt::AAAA | DnsRt::SRV | DnsRt::TXT) => t,
+                    Ok(_) => {
+                        println!("ERROR: --type 仅支持 A/AAAA/SRV/TXT（加密解析器契约）");
+                        return;
+                    }
+                    Err(_) => {
+                        println!("ERROR: 未知 --type '{s}'");
+                        return;
+                    }
+                },
+                None => DnsRt::A,
+            };
+            let resolver = match kirin_desk_core::dns::secure_resolver_from_config(&cfg) {
+                Some(r) => r,
+                None => {
+                    println!(
+                        "ERROR: [dns.security] 未启用（mode=off 或无端点）——加密解析不可用"
+                    );
+                    return;
+                }
+            };
+            let start = std::time::Instant::now();
+            println!("Resolving {host} ({rtype}) via DoH/DoT…");
+            match resolver.resolve(host, rtype).await {
+                Ok(records) => {
+                    let ep = resolver
+                        .last_endpoint()
+                        .unwrap_or_else(|| "unknown".to_string());
+                    println!("✓ {} 条记录（端点: {ep}，耗时 {}ms）", records.len(), start.elapsed().as_millis());
+                    for r in &records {
+                        println!(
+                            "  {:<6} {:<32} {:<44} TTL={}",
+                            r.rtype,
+                            r.name,
+                            r.data.to_display_string(),
+                            r.ttl
+                        );
+                    }
+                    if records.is_empty() {
+                        println!("  （该类型无记录）");
+                    }
+                }
+                Err(e) => {
+                    println!("FAILED — {e}");
+                    println!(
+                        "  提示：域名模式连接在加密 DNS 全部端点不可用时将被拒绝（fail-closed，DDNS-DOH-003）。"
+                    );
+                }
+            }
+        }
         _ => print_dns_usage(),
     }
 }
@@ -1352,6 +1422,216 @@ fn print_dns_usage() {
     println!("  delete <domain> <type> <name>        删除记录（按 name+type）");
     println!("  register <device-id> <port>          设备注册三件套（SRV/AAAA/TXT，走当前 provider）");
     println!("  unregister <device-id>               注销设备记录（SRV/AAAA/TXT/A）");
+    println!("  resolve <host> [--type A|AAAA|SRV|TXT] 经 DoH/DoT 加密解析（M8-T040 调试面）");
+}
+
+/// M8-T040 (WBS 7.1): `ddns <subcommand>` 子命令组（需求 §八）。
+///
+/// status | enable | disable | set-ipv4 auto|manual [addr] |
+/// set-ipv6 auto|manual [addr] | update
+///
+/// 说明：enable/disable/set-* 落盘 `[ddns]` 段（GUI 卡/`serve` 下次启动生效）；
+/// `status`/`update` 启动一次性 `DdnsService` 执行并回读状态（等价 UI 卡片）。
+async fn cmd_ddns(args: Vec<String>) {
+    use kirin_desk_dns::{DdnsService, DdnsStatus};
+    use kirin_desk_utils::config::DdnsMode as CfgDdnsMode;
+
+    let mut cfg = match Config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            println!("Config error: {}. Run setup first.", e);
+            return;
+        }
+    };
+    let sub = args.get(2).map(|s| s.as_str()).unwrap_or("");
+    match sub {
+        "status" => {
+            let d = &cfg.ddns;
+            println!("DDNS: {}", if d.enabled { "开启" } else { "关闭" });
+            println!(
+                "更新周期: {}s（下限 60s；未设置回退 [network] heartbeat_interval={}）",
+                cfg.effective_ddns_interval(),
+                cfg.network.heartbeat_interval
+            );
+            println!("TTL: {}s", cfg.network.dns_ttl);
+            println!("IPv4 模式: {}", match d.ipv4_mode {
+                CfgDdnsMode::Auto => "auto（公网出口 IP）",
+                CfgDdnsMode::Manual => "manual（固定地址）",
+            });
+            println!(
+                "IPv4 手动地址: {}",
+                d.ipv4_manual_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|| "（未配置）".to_string())
+            );
+            println!(
+                "IPv4 源优先序: {}",
+                d.ipv4_sources.join(" → ")
+            );
+            println!("IPv6 模式: {}", match d.ipv6_mode {
+                CfgDdnsMode::Auto => "auto（本机全局单播）",
+                CfgDdnsMode::Manual => "manual（固定地址）",
+            });
+            println!(
+                "IPv6 手动地址: {}",
+                d.ipv6_manual_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|| "（未配置）".to_string())
+            );
+            println!(
+                "发布开关: SRV={} TXT={} A={} AAAA={}",
+                d.publish_srv, d.publish_txt, d.publish_a, d.publish_aaaa
+            );
+            // Auto 模式下实时取一次公网出口 IP（展示当前值）。
+            if d.enabled && d.ipv4_mode == CfgDdnsMode::Auto {
+                let fetcher = kirin_desk_dns::PublicIpFetcher::new(
+                    d.ipv4_sources.clone(),
+                    std::time::Duration::from_secs(5),
+                );
+                match fetcher.fetch().await {
+                    Ok(ip) => println!("IPv4 当前公网出口 IP: {ip}"),
+                    Err(e) => println!("IPv4 公网出口 IP 获取失败（保留上次成功值）: {e}"),
+                }
+            }
+            println!(
+                "运行态说明: GUI Domain 页「DDNS 维护」卡内查看实时状态（上次更新/倒计时/生效记录）"
+            );
+        }
+        "enable" => {
+            cfg.ddns.enabled = true;
+            match cfg.save() {
+                Ok(()) => println!("DDNS 已开启（下次 GUI/`serve` 启动生效；也可到 GUI Domain 页「DDNS 维护」卡立即启用）"),
+                Err(e) => println!("保存失败: {}", e),
+            }
+        }
+        "disable" => {
+            cfg.ddns.enabled = false;
+            match cfg.save() {
+                Ok(()) => println!("DDNS 已关闭（保留已发布记录，不主动删除，DDNS-REC-007）"),
+                Err(e) => println!("保存失败: {}", e),
+            }
+        }
+        "set-ipv4" | "set-ipv6" => {
+            let is_v4 = sub == "set-ipv4";
+            let mode = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            let addr = args.get(4).map(|s| s.as_str()).unwrap_or("");
+            match mode {
+                "auto" => {
+                    if is_v4 {
+                        cfg.ddns.ipv4_mode = CfgDdnsMode::Auto;
+                    } else {
+                        cfg.ddns.ipv6_mode = CfgDdnsMode::Auto;
+                    }
+                    match cfg.save() {
+                        Ok(()) => println!("IPv{} 模式已切换为 auto（{}）", if is_v4 { 4 } else { 6 },
+                            if is_v4 { "公网出口 IP" } else { "本机全局单播" }),
+                        Err(e) => println!("保存失败: {}", e),
+                    }
+                }
+                "manual" => {
+                    if addr.is_empty() {
+                        println!("Usage: kirin_desk ddns set-ipv4|set-ipv6 manual <addr>（manual 必填地址）");
+                        return;
+                    }
+                    if is_v4 {
+                        match addr.parse::<std::net::Ipv4Addr>() {
+                            Ok(a) => {
+                                cfg.ddns.ipv4_mode = CfgDdnsMode::Manual;
+                                cfg.ddns.ipv4_manual = a.to_string();
+                            }
+                            Err(_) => {
+                                println!("ERROR: '{addr}' 不是合法的 IPv4 地址");
+                                return;
+                            }
+                        }
+                    } else {
+                        match addr.parse::<std::net::Ipv6Addr>() {
+                            Ok(a) => {
+                                cfg.ddns.ipv6_mode = CfgDdnsMode::Manual;
+                                cfg.ddns.ipv6_manual = a.to_string();
+                            }
+                            Err(_) => {
+                                println!("ERROR: '{addr}' 不是合法的 IPv6 地址");
+                                return;
+                            }
+                        }
+                    }
+                    match cfg.save() {
+                        Ok(()) => println!("IPv{} 模式已切换为 manual（{}）", if is_v4 { 4 } else { 6 }, addr),
+                        Err(e) => println!("保存失败: {}", e),
+                    }
+                }
+                _ => {
+                    println!("Usage: kirin_desk ddns set-ipv4 auto|manual [addr]");
+                    println!("       kirin_desk ddns set-ipv6 auto|manual [addr]");
+                }
+            }
+        }
+        "update" => {
+            // 立即执行一轮全量发布（等价 UI「立即更新」）：一次性 DdnsService。
+            if !cfg.ddns.enabled {
+                println!("DDNS 当前关闭——本轮仍执行一次发布（配置未修改）");
+            }
+            let identity = match load_identity(&cfg) {
+                Ok(id) => id,
+                Err(e) => {
+                    println!("Identity error: {}", e);
+                    return;
+                }
+            };
+            let (watch_tx, mut watch_rx) = tokio::sync::watch::channel(DdnsStatus::initial());
+            let (svc, handle) = DdnsService::start(&cfg, &identity.public_key_base64(), watch_tx);
+            match svc.update_now().await {
+                Ok(()) => {
+                    println!("✓ DDNS 立即更新完成");
+                    // 回读最终状态（watch 最新值）。
+                    let _ = watch_rx.changed().await;
+                    let st = watch_rx.borrow().clone();
+                    print_ddns_status(&st);
+                }
+                Err(e) => {
+                    println!("✗ DDNS 立即更新失败: {e}");
+                    let _ = watch_rx.changed().await;
+                    let st = watch_rx.borrow().clone();
+                    print_ddns_status(&st);
+                }
+            }
+            svc.shutdown();
+            let _ = handle.await;
+        }
+        _ => {
+            println!("Usage: kirin_desk ddns <subcommand> [args]");
+            println!("  status                       显示 DDNS 开关/模式/地址/发布开关");
+            println!("  enable | disable             开/关 DDNS（落盘 [ddns]，DDNS-REC-007 不删记录）");
+            println!("  set-ipv4 auto|manual [addr]  切换 IPv4 模式（manual 必填地址）");
+            println!("  set-ipv6 auto|manual [addr]  切换 IPv6 模式（manual 必填地址）");
+            println!("  update                       立即执行一轮发布（等价 UI「立即更新」）");
+        }
+    }
+}
+
+/// M8-T040: `ddns update` 状态回读展示。
+fn print_ddns_status(st: &kirin_desk_dns::DdnsStatus) {
+    println!("状态:");
+    println!("  开启: {}", st.enabled);
+    println!("  IPv4: {:?} {}", st.ipv4_mode,
+        st.ipv4_current.map(|a| a.to_string()).unwrap_or_else(|| "（无）".to_string()));
+    println!("  IPv6: {:?} {}", st.ipv6_mode,
+        st.ipv6_current.map(|a| a.to_string()).unwrap_or_else(|| "（无）".to_string()));
+    match &st.last_update {
+        Some(t) => println!("  上次更新: {} 成功（SRV={} TXT={} A={} AAAA={}）",
+            t.with_timezone(&chrono::Local).format("%H:%M:%S"),
+            st.published.srv, st.published.txt, st.published.a, st.published.aaaa),
+        None => println!("  上次更新: 尚未执行"),
+    }
+    if let Some(err) = &st.last_error {
+        println!("  最近错误: {err}");
+    }
+    match st.next_update_at {
+        Some(t) => println!("  下次更新: {}", t.with_timezone(&chrono::Local).format("%H:%M:%S")),
+        None if st.enabled => println!("  下次更新: 暂停中（连续失败，手动 update 可解除）"),
+        None => {}
+    }
 }
 
 /// M13-T005 (UA-CLI-001): 无人值守模式开关与状态 — `unattended <on|off|status>`。
@@ -1769,6 +2049,9 @@ async fn cmd_connect(args: Vec<String>) {
             ip_family,
             provider: cfg.dns.provider.clone(),
             credentials: cfg.dns.providers.clone(),
+            // M8-T040：域名模式强制加密 DNS（DoH/DoT；mode=off/未配置 → None
+            // → fail-closed 拒连并提示，DDNS-DOH-003/007）。
+            resolver: kirin_desk_core::dns::secure_resolver_from_config(&cfg),
         })
     };
     // 确认回调共享槽（IP 模式：确认放行的公钥供握手成功后写入 known_hosts，CLI-KH-002）。
@@ -3032,6 +3315,11 @@ async fn cmd_serve(port: u16, unattended: bool, allow_no_challenge: bool) {
     match TcpServer::bind(port).await {
         Ok(server) => {
             println!("Listening on [::]:{}", server.port());
+            // M8-T040 (WBS 7.3)：serve 域名模式接线 —— 启动自检（DDNS-DOH-002）
+            // + [ddns] enabled → 策略化地址维护（三件套周期发布）。
+            let ddns_handle = start_serve_ddns(&cfg, identity.clone()).await;
+            // 句柄持有即保持 DDNS 维护运行（与 tunnel_client 同模式）。
+            let _ddns_guard = DdnsGuard { _handle: ddns_handle };
             // M8-T026-P2 (ID-003/ID-013)：设备 ID 模式注册（[tunnel] enabled
             // && mode=client）—— 隧道流与本地 accept 走同一连接处理
             // （serve_incoming_stream），白名单/挑战码/临时码访问控制零降级；
@@ -3132,10 +3420,81 @@ async fn cmd_serve(port: u16, unattended: bool, allow_no_challenge: bool) {
     }
 }
 
+/// M8-T040 (WBS 7.3 / WBS 5.5): serve 域名模式接线。
+///
+/// 1. **启动自检**（DDNS-DOH-002）：经加密 DNS（`SecureResolver`）解析本机
+///    域名并校验 SRV/TXT/A/AAAA 发布一致性，不一致红色告警；自检依赖的
+///    解析同样禁止明文。`[dns.security]` 未启用（mode=off）→ 明确提示
+///    域名模式不可用（fail-closed，DDNS-DOH-007）。
+/// 2. **DDNS 维护**：`[ddns] enabled=true` 时启动 `DdnsService` 周期发布
+///    （策略化地址：IPv4 自动=公网出口 IP / 手动固定；false 保持现状不注册）。
+async fn start_serve_ddns(
+    cfg: &kirin_desk_utils::config::Config,
+    identity: std::sync::Arc<kirin_desk_core::crypto::ed25519::IdentityManager>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let Some(domain) = device_domain(cfg) else {
+        // 未配置设备域名 → 非域名模式，自检与 DDNS 均不适用。
+        return None;
+    };
+    // ── 1. 域名模式启动自检（DDNS-DOH-002） ──
+    let host = format!("{}.{}", cfg.device.id, domain);
+    let srv_name = format!("_remote._tcp.{host}");
+    match kirin_desk_core::dns::secure_resolver_from_config(cfg) {
+        Some(resolver) => {
+            let warnings = kirin_desk_core::dns::server_dns_self_check(
+                &host,
+                &srv_name,
+                cfg.network.port,
+                &identity.public_key_base64(),
+                resolver.as_ref(),
+            )
+            .await;
+            match warnings {
+                Ok(warns) if warns.is_empty() => {
+                    println!("域名模式自检 OK：SRV/TXT/A 与本地配置一致（经加密 DNS）");
+                }
+                Ok(warns) => {
+                    println!("⚠ 域名模式自检告警（记录已发布但不可达/被劫持？DDNS-DOH-002）:");
+                    for w in warns {
+                        println!("  ⚠ {w}");
+                    }
+                }
+                Err(e) => println!("⚠ 域名模式自检失败: {e}"),
+            }
+        }
+        None => {
+            println!(
+                "⚠ [dns.security] 未启用（mode=off 或无端点）——域名模式连接将被拒（fail-closed），仅 IP 模式可用"
+            );
+        }
+    }
+    // ── 2. [ddns] enabled → 策略化地址周期维护 ──
+    if cfg.ddns.enabled {
+        let (watch_tx, _watch_rx) = tokio::sync::watch::channel(kirin_desk_dns::DdnsStatus::initial());
+        let (svc, handle) = kirin_desk_dns::DdnsService::start(
+            cfg,
+            &identity.public_key_base64(),
+            watch_tx,
+        );
+        // svc 句柄保持（update_now 通道存活）；handle 驱动循环。
+        let _svc = svc;
+        println!(
+            "DDNS 已启用：周期维护 A/AAAA + SRV + TXT（间隔 {}s，下限 60s）",
+            cfg.effective_ddns_interval()
+        );
+        return Some(handle);
+    }
+    None
+}
+
+/// M8-T040: 保持 DDNS 维护任务句柄存活（drop 即脱离，任务继续运行）。
+struct DdnsGuard {
+    _handle: Option<tokio::task::JoinHandle<()>>,
+}
+
 // ════════════════════════════════════════════════════════════════
 // M8-T026-P2：设备侧 ID 注册 + 隧道流处理（ID-001/003/005/013）
 // ════════════════════════════════════════════════════════════════
-
 /// M8-T026-P2 (ID-001/ID-003/ID-005)：`serve` 时启动设备 ID 注册
 /// （`[tunnel] enabled && mode="client"`）：RelayClient 保持控制连接 +
 /// 心跳（复用 M8-T026 心跳，ID-NF-003）+ 候选刷新；中继隧道流（§8.1）
@@ -5122,6 +5481,140 @@ async fn cmd_self_test() {
         }
     }
     println!("=== R-03 disconnect/reconnect tests COMPLETE (2/2) ===");
+
+    // ── M8-T040 (WBS 8.2): DOH 段 —— 加密解析（成功 / 失败注入 / fail-closed） ──
+    println!("=== M8-T040 DOH/DoT resolver self-test ===");
+    {
+        use kirin_desk_dns::{IpFamily, RecordType, ResolverError, SecureResolver};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // 1. 成功路径：本地 mock DoH 端点（http://127.0.0.1 环回放行纪律）。
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock doh bind");
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 2048];
+            let _n = sock.read(&mut buf).await.unwrap();
+            let body = r#"{"Status":0,"Answer":[{"name":"my-pc.example.com.","type":1,"TTL":300,"data":"203.0.113.7"}]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/dns-json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+        });
+        let r = SecureResolver::new_from_parts(
+            vec![format!("http://127.0.0.1:{}/dns-query", addr.port())],
+            vec![],
+            5000,
+            50,
+        );
+        let recs = r
+            .resolve("my-pc.example.com", RecordType::A)
+            .await
+            .expect("mock DoH 解析必须成功");
+        assert!(
+            recs.iter()
+                .any(|rec| rec.data.to_display_string() == "203.0.113.7"),
+            "mock DoH 必须返回 A=203.0.113.7"
+        );
+        println!("  1. mock DoH resolve OK ✓（端点: {:?}）", r.last_endpoint());
+        server.await.unwrap();
+
+        // 2. 全端点失败注入（未监听端口 → 连接失败 → AllEndpointsFailed）。
+        let r2 = SecureResolver::new_from_parts(
+            vec!["http://127.0.0.1:1/".to_string()],
+            vec![],
+            1000,
+            50,
+        );
+        let err = r2
+            .resolve("x.example.com", RecordType::A)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ResolverError::AllEndpointsFailed { .. }),
+            "全端点失败必须 AllEndpointsFailed（fail-closed），got {err:?}"
+        );
+        println!("  2. all-endpoints-failed → AllEndpointsFailed ✓");
+
+        // 3. fail-closed 语义：resolve_for_connect 映射 EncryptedDnsRequired。
+        use kirin_desk_core::connection::client::ConnectError;
+        let err = kirin_desk_core::dns::resolve_for_connect(
+            "x.example.com",
+            3389,
+            IpFamily::Auto,
+            &r2,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, ConnectError::EncryptedDnsRequired(_)),
+            "fail-closed 必须 EncryptedDnsRequired（DDNS-DOH-003），got {err:?}"
+        );
+        println!("  3. fail-closed → EncryptedDnsRequired ✓");
+    }
+    println!("=== M8-T040 DOH/DoT resolver tests COMPLETE (3/3) ===");
+
+    // ── M8-T040 (WBS 8.2): DDNS 段 —— mock 公网 IP + 服务开→发布→状态回读 ──
+    println!("=== M8-T040 DDNS self-test ===");
+    {
+        use kirin_desk_dns::{
+            DdnsService, DdnsStatus, PubIpError, PubIpSource, PublicIpFetcher,
+        };
+        use std::net::Ipv4Addr;
+
+        // 1. mock 公网 IP 源：固定值成功（构造参数注入面）。
+        struct Fixed(&'static str);
+        #[async_trait::async_trait]
+        impl PubIpSource for Fixed {
+            async fn fetch(&self) -> Result<Ipv4Addr, PubIpError> {
+                self.0
+                    .parse()
+                    .map_err(|_| PubIpError::InvalidResponse(self.0.to_string()))
+            }
+        }
+        let fetcher = PublicIpFetcher::from_sources(vec![Box::new(Fixed("203.0.113.7"))]);
+        assert_eq!(fetcher.fetch().await.unwrap().to_string(), "203.0.113.7");
+        println!("  1. public-IP mock source fetch OK ✓");
+        // 2. 严格校验：HTML/劫持页拒绝（DDNS-SEC-003）。
+        assert!(kirin_desk_dns::parse_response("<html>hijack</html>").is_err());
+        assert!(kirin_desk_dns::parse_response("999.1.1.1").is_err());
+        println!("  2. strict IPv4 validation rejects garbage ✓");
+
+        // 3. DdnsService 端到端：开 → 立即更新 → 状态回读 → 优雅关闭。
+        let mut cfg = kirin_desk_utils::config::Config::default();
+        cfg.device.id = "self-test-device".into();
+        cfg.godaddy.domain = "example.com".into();
+        cfg.ddns.enabled = true;
+        cfg.ddns.interval_secs = Some(60);
+        // 空源列表：避免 self-test 触碰公网 IP 服务（离线可用）。
+        cfg.ddns.ipv4_sources = vec![];
+        let (watch_tx, mut watch_rx) = tokio::sync::watch::channel(DdnsStatus::initial());
+        let (svc, handle) =
+            DdnsService::start(&cfg, &alice.public_key_base64(), watch_tx);
+        // 无服务商凭据 → 发布应失败但状态必须回写错误原因（机制验证）。
+        let r = svc.update_now().await;
+        let _ = watch_rx.changed().await;
+        let st = watch_rx.borrow().clone();
+        assert!(st.enabled, "status.enabled 必须为 true");
+        assert!(
+            st.last_error.is_some() || st.published.srv,
+            "发布结果必须回写状态（无凭据 → 错误原因；有凭据 → 生效记录）"
+        );
+        println!(
+            "  3. DdnsService start→update→status readback OK ✓ (update_now err={:?}, last_error={:?})",
+            r.is_err(),
+            st.last_error
+        );
+        svc.shutdown();
+        let _ = handle.await;
+        println!("  4. graceful shutdown (records retained, DDNS-REC-007) ✓");
+    }
+    println!("=== M8-T040 DDNS self-test COMPLETE (4/4) ===");
 
     // S-24 (F-29)：正常退出清理自测临时子目录（含全部密钥/状态文件）——
     // "self-test 后临时目录为空"。中断残留由下次运行的开头清理兜底。

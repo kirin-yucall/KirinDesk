@@ -110,8 +110,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path $dist | Out-Null
           Copy-Item "target-ci/release/kirin-desk-ui.exe" "$dist/KirinDesk.exe"
           Copy-Item "config/default.toml" "$dist/default.toml"
-          Copy-Item "ffmpeg/ffmpeg-8.1.2-full_build-shared/bin/*.dll" "$dist/ffmpeg/" -ErrorAction SilentlyContinue
-          Copy-Item "ffmpeg/ffmpeg-8.1.2-full_build-shared/LICENSE" "$dist/ffmpeg/LICENSE" -ErrorAction SilentlyContinue
+          Copy-Item "ffmpeg/ffmpeg-8.1.1-full_build-shared/bin/*.dll" "$dist/ffmpeg/" -ErrorAction SilentlyContinue
+          Copy-Item "ffmpeg/ffmpeg-8.1.1-full_build-shared/LICENSE" "$dist/ffmpeg/LICENSE" -ErrorAction SilentlyContinue
           Compress-Archive -Path "$dist/*" -DestinationPath "KirinDesk-${{ steps.ver.outputs.version }}-windows-x86_64.zip" -Force
           # 独立 exe 资产：updater 按平台选 asset 时优先 .exe（M14-T005）
           Copy-Item "$dist/KirinDesk.exe" "KirinDesk-${{ steps.ver.outputs.version }}-windows-x86_64.exe"

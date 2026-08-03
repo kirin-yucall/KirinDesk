@@ -21,7 +21,7 @@
 //! # FFmpeg 8.x 音频编码要点
 //!
 //! - libopus 经 avcodec 支持 **s16 / packed float32**（`AV_SAMPLE_FMT_FLT`，
-//!   8.1.2 捆绑构建实测）；**不支持** planar float32 `AV_SAMPLE_FMT_FLTP`——
+//!   8.1.1 捆绑构建实测）；**不支持** planar float32 `AV_SAMPLE_FMT_FLTP`——
 //!   曾用 `avcodec_find_encoder(AV_CODEC_ID_OPUS)` + 强制 fltp，open2 报
 //!   EINVAL（修复计划 2026-08-03 P1）。现显式 `avcodec_find_encoder_by_name
 //!   ("libopus")` 钉死实现，帧格式与捕获侧 packed f32 直接对齐，**无需
@@ -249,7 +249,7 @@ impl OpusEncoder {
         let _ = ffmpeg::av_opt_set(obj, "ch_layout", "stereo");
         let _ = ffmpeg::av_opt_set_int(obj, "b", BIT_RATE);
         let _ = ffmpeg::av_opt_set_int(obj, "bit_rate", BIT_RATE);
-        // libopus 支持 s16 / packed float32（flt）；**不支持 fltp**（8.1.2
+        // libopus 支持 s16 / packed float32（flt）；**不支持 fltp**（8.1.1
         // 捆绑构建实测，强制 fltp → open2 EINVAL，见修复计划 2026-08-03 P1）。
         // 捕获侧即 packed f32，帧格式对齐 flt，无需 deinterleave。
         let _ = ffmpeg::av_opt_set_int(obj, "sample_fmt", ffmpeg::AV_SAMPLE_FMT_FLT as i64);

@@ -92,5 +92,5 @@ gh release upload v0.2.0 release/KirinDesk.exe release/KirinDesk.exe.sha256
 - **敏感信息**：发布资产（exe/zip）不得内含真实 `api_key` / `api_secret`——`default.toml` 模板字段保持空串，配置加密密钥不入库（R-13）；
 - **签名 tag**：`--no-sign` 仅降级为普通 annotated tag，不影响 Release 创建；正式签名在 CI/供应链审计更有利；
 - **每资产一个侧车**：只传 `checksums.txt` 不够，updater 只认 `<asset>.sha256`；
-- **Windows 本地发布时**：`release/ffmpeg/`（FFmpeg 8.1.2 DLL）与 `release/default.toml` 需随包部署（install.bat 处理；zip 由 CI 打包）；
+- **Windows 本地发布时**：`release/ffmpeg/`（FFmpeg 8.1.1 DLL）与 `release/default.toml` 需随包部署（install.bat 处理；zip 由 CI 打包）；
 - **仓库大小写**：全部链路（git remote / updater GITHUB_REPO / publish.sh 链接）统一 `KirinDesk`。

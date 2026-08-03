@@ -872,6 +872,13 @@ pub fn bind_dual_stack_tcp_listener(port: u16) -> std::io::Result<tokio::net::Tc
                 .bind(&SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port)).into())
                 .is_ok();
         if dual_ok {
+            // R-28 修复（transport_degrade 挂起根因）：socket2 创建的 socket
+            // **默认阻塞**；tokio/mio 的 `from_std` 在 Windows 上**不检查也不
+            // 设置**非阻塞（tokio issue #7172 已知限制）——漏掉此行会把阻塞
+            // accept 带进异步 runtime，无连接时 `std accept` 永久占住 tokio
+            // worker，runtime drop 时 `workers.join` 无限等待（挂起）。
+            // v4 兜底路径（下方）已有 `set_nonblocking(true)`，此处补齐。
+            socket.set_nonblocking(true)?;
             socket.listen(128)?;
             return tokio::net::TcpListener::from_std(socket.into());
         }
@@ -1012,17 +1019,26 @@ async fn connect_tcp_transport(
         .await
         .map_err(tcp_err_to_transport)?;
 
-    let ch = core_handshake::client_handshake_generic(
-        stream,
-        client_identity,
-        client_id,
-        client_domain,
-        client_device_type,
-        server_id,
-        server_pin,
-        challenge,
+    // R-28（审计 §4-1）：握手读必须带超时——`client_handshake_generic` 内部
+    // 无任何 timeout 包裹（服务端侧有 `server_read_init_with_timeout`，客户端
+    // 侧无对称实现），对端不响应即无限等待。与 QUIC 分支同模式：
+    // `tokio::time::timeout(connect_timeout, …)`，超时 → 清理连接资源返回
+    // `Timeout`（重拨任务由降级等待超时兜底结束会话，不再死等）。
+    let ch = tokio::time::timeout(
+        connect_timeout,
+        core_handshake::client_handshake_generic(
+            stream,
+            client_identity,
+            client_id,
+            client_domain,
+            client_device_type,
+            server_id,
+            server_pin,
+            challenge,
+        ),
     )
     .await
+    .map_err(|_| TransportError::Timeout)?
     .map_err(|e| TransportError::Handshake(e.to_string()))?;
 
     let transport = TcpMediaTransport::new(secure_channel_from_generic(ch));

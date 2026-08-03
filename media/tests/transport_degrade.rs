@@ -391,8 +391,20 @@ async fn run_degrade_scenario(tag: &str, hold_after_resume: Duration) {
 
     // ── 5) 结束并校验 ────────────────────────────────────────────
     stop.store(true, Ordering::Relaxed);
-    let client_stats: ClientSessionStats = client_handle.await.expect("client join");
-    let server_stats: ServerSessionStats = server_handle.await.expect("server join");
+    // R-28：join 带超时断言——会话任一侧异常卡死时明确失败而非挂起
+    // （审计 §4-1：degrade_mid_session/degrade_no_upgrade 死等 >60s 复现；
+    // 根因已修：`bind_dual_stack_tcp_listener` v6 路径漏 set_nonblocking，
+    // 阻塞 accept 占住 tokio worker → runtime drop 无限等待）。
+    let client_stats: ClientSessionStats =
+        tokio::time::timeout(Duration::from_secs(15), client_handle)
+            .await
+            .expect("client session join timed out")
+            .expect("client join");
+    let server_stats: ServerSessionStats =
+        tokio::time::timeout(Duration::from_secs(15), server_handle)
+            .await
+            .expect("server session join timed out")
+            .expect("server join");
 
     assert!(
         frames_before >= 5,
