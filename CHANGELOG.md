@@ -7,6 +7,45 @@
 ## [Unreleased]
 
 ### Added
+- M8-T039 Tunnel 内网穿透独立页 + Server 多监听 + Token ✏️📋 + 通用工具化：
+  - 独立页（P3）：`Tab::Tunnel`（🚇 标签，Connect 与 Settings 之间）；Settings
+    页「Tunnel (内网穿透)」分组与保存分支整体移除（`settings.tunnel.*` 10 键随删，
+    防死键）；Tunnel 页自带「保存」（落盘 mode/server_addr/token/bind_addrs/
+    bind_port/port_range/proxies，**不写 `enabled`**）+ 定位文案改为「通用 TCP
+    反向代理」口径（发布个人网站示例 + 明文流量提示）；i18n 新分区
+    `ui/src/i18n/tunnel.rs`（`tunnel.*` 键，P4 `tunnel.server.*` / P5 `tunnel.run.*`
+    表尾追加）
+  - 配置基建（P1）：`TunnelConfig` 新增 `bind_addrs`（逗号分隔多地址，默认
+    `"0.0.0.0,::"`，serde 缺省兜底）+ `auto_start`（GUI 最后运行状态，默认 false，
+    CLI 不读、与 `enabled` 语义独立）；`parse_bind_addr_list`（纯 std，GUI 校验 +
+    CLI 组装共用）与 `generate_random_token`（32 字节 OsRng → 64 hex，TNL-SEC-009）；
+    `config/default.toml [tunnel]` 追加两字段默认值与注释（GUI 可编辑，Linux 仍可
+    改文件 + CLI 完整部署）
+  - relay 多监听器（P2）：`TunnelServerConfig.bind_addr → bind_addrs: Vec<SocketAddr>`
+    （破坏性变更，使用点全仓 3 处可控：self-test 迁移 / serve 走默认 / relay-server
+    零改动自动兼容）；空列表 = 旧默认双栈回退（语义零变化）；多地址每地址独立
+    `TcpListener`、**IPv6 一律 `set_only_v6(true)`**（与 v4 显式监听并存，规避平台
+    双栈差异与 Linux 下 `::` 先占 v4 的 EADDRINUSE 冲突）；`run()` 每 listener 一个
+    accept 任务（JoinSet 汇合）；`tunnel serve` 可选读取 `bind_addrs`（非法值
+    fail-closed 拒绝启动，默认行为不变）；新增 4 个多地址/v6-only/回退单测
+  - Server 区块（P4）：监听地址（多地址校验：非 IP/空段/域名红边）/ 端口
+    （1-65535）/ 端口范围（`start-end`，复用 cli.rs `parse_tunnel_port_range` 提升
+    `pub(crate)`）输入 + 校验；非法值红边且**禁用保存**（`tunnel_save_allowed` 挂
+    表单校验，与渲染红边同源）；`::` 单地址弱色提示补 `0.0.0.0`；Token 行
+    **✏️📋 仅 Server 区块**：✏️ 生成 64 hex 高熵 Token 并**立即落盘**，📋 复用
+    `copy_button`（空 token 禁用）；Client 区块 Token 行保持现状（密文 + 👁，无 ✏️📋）
+  - GUI 运行能力（P5）：Tunnel 页「▶ 启动 / ■ 停止」（`TunnelRuntimeState` 静态槽
+    仿 `ServerRuntimeState`，自建 tokio runtime 后台运行，进程内 `TunnelClient`/
+    `TunnelServer`）；启动 = fail-closed 校验（server 空 token 拒绝 / 短 token 警告；
+    client 校验 server_addr）→ 自动落盘当前表单 → `auto_start=true` 落盘 → 后台
+    运行；停止 = `auto_start=false` 落盘 + 优雅关闭（client `stop()` / server
+    `shutdown_handle()` 广播）；**启动失败保留 intent**（`auto_start` 不回位，状态行
+    「启动失败: <原因>（配置保持启用，下次启动将自动重试）」）；首帧自动恢复
+    （`auto_start=true` → 按上次模式自动启动，失败跨帧展示原因）；状态行
+    「● 运行中 :port (addrs) / ○ 已停止」；GUI 启停不写 `enabled`（CLI 设备注册
+    语义零变化）
+  - 门禁：`cargo check --workspace --all-targets` 全绿；utils 118 + relay 91（含
+    新增 4）+ ui 110（含 i18n 重复键断言）全过；`--cli self-test` 回归通过
 - M8-T038 连接状态迁移 + 语言选项与文案统一：
   - 连接状态迁移（P1）：Connect 页移除顶部状态点行与表单内 3 处 Stepper 渲染
     （保留 step/busy 推导驱动按钮禁用/⏳）、删除 3 处进度快照类表单反馈写入；
