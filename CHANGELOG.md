@@ -237,6 +237,72 @@
 - **打包线程上限 8 → 4（用户要求 2026-08-04）**：`release/package.bat`
   `CARGO_BUILD_JOBS=8 → 4`；`.cargo/config.toml` `jobs = 8 → 4`（大小核机器
   超限并行会死机，工作区所有 cargo 命令统一上限 4）
+- **配置加密接线（R-13b，审计 §2-P2-9 / §4-9 / §6.6）**：`utils/src/secure.rs`
+  （ChaCha20Poly1305 密文 `{v: base64(nonce‖ciphertext)}` + DPAPI/macOS
+  Keychain/`KIRIN_CONFIG_KEY` 主密钥分层 + AAD 上下文绑定）由零调用点接线到
+  配置存取全链路：
+  - S1 存取：`Config::save_to` 保存前加密敏感字段（`[godaddy]` api_key/
+    api_secret、`[tunnel]` token、`device` challenge_code、`[dns.providers.*]`
+    敏感 key——api_key/api_secret/api_token/token/secret_key 等 13 个，与
+    `dns_providers` 注册表 secret 字段 drift 测试守护）；`Config::load_from`
+    加载后解密为内存明文；AAD 绑定配置段上下文（`godaddy.api_key`、
+    `dns.providers.<name>.<key>`），防跨字段替换（`utils/src/config.rs`）
+  - S2 迁移：旧明文敏感字段首次加载自动加密重写（幂等，二次加载不重写）；
+    解密失败（主密钥变更/丢失/密文篡改）→ 加载 fail-closed
+    （`ConfigError::Decrypt`，不把密文当凭据用）；写回失败显式告警且
+    `write_private` 原子替换保证不半写坏配置；`[godaddy]`→`[dns.providers]`
+    旧迁移同步加密落盘
+  - S3 脱敏：`config show` 输出配置加密状态（密钥源 + 启用与否）与隧道
+    令牌掩码；密钥/令牌不进 CLI 输出（`ui/src/cli.rs` cmd_config 区）；
+    `[ddns]`/`[dns.security]` 评估结论：无凭据（公网 IP/公开端点/超时参数）
+    → 不入加密域，保持明文（审计 §6.6）
+  - S4 密钥环缺失：无密钥源（Linux 无桌面密钥环且未设 `KIRIN_CONFIG_KEY`）
+    → fail-open 明文 + 醒目告警一次，不阻断开发使用；密钥提供者按配置目录
+    进程内缓存（`secure::key_provider_for`），无密文文件加载不触碰密钥环
+    （模板/新配置零副作用）
+  - 新增单测 14 项：密文往返/落盘无明文/迁移自动重写/幂等/fail-closed
+    （错误密钥、损坏密文）/注册表 drift 守护/密钥源缓存等（utils 145 项
+    全绿）；Readme 宣称恢复"已实现"表述由波次 3 R-25b 按证据定稿
+- **打洞两端缝合（R-08b，审计 §4-4 / §2-P2-12）**：P1 打洞由"库内就绪、
+  运行时无路径"缝合为真实部署形态：
+  - S1 帧分发（`relay/src/server.rs` 帧分发区）：`run_session` 新增
+    `PunchResult` / `PathProbe` / `PathProbeAck` 匹配分支（与既有
+    `CandidateRegister` 路径并列），不再落入 `_ =>` 忽略——经进程内
+    rendezvous 打洞处理（透传对端 + 审计）；`CandidateRegister`（session_id=Some）
+    并行接入 rendezvous（隧道控制连接成为打洞会话参与者，登记/互转/限速/
+    审计复用 PUNCH-006）；无 rendezvous 挂载时打洞帧解码校验后审计丢弃
+    （不静默忽略），坏帧判死（TNL-PROTO-007）；会话清理同步移除打洞会话表
+    槽位（PUNCH-003 无残留）
+  - S2 部署入口（`relay-server/src/main.rs`）：新增 `--rendezvous-port`
+    （默认 7001）与 `--no-rendezvous`，进程内启动 `RendezvousServer`（登记/
+    互转/限速/审计复用）；非法值（非数字/0）、`--no-rendezvous` 与
+    `--rendezvous-port` 矛盾、与 `--bind-port` 同号 → 一律 fail-closed
+    exit(2)（对齐 `--bind-addrs` 口径）；`RendezvousServer::serve` 连接任务
+    JoinSet 跟踪，优雅关闭中止全部连接任务（无残留协程）
+  - S3 验证与文档：`release/server/README.md` 更新 `--rendezvous-port`/
+    `--no-rendezvous` 参数表与防火墙放行口径（7000 + 7001 + 端口范围）；
+    新增 relay 库内 e2e 3 项（打洞端口候选交换+优雅关闭 / 隧道控制连接
+    打洞互转+透传+无残留 / 无 rendezvous 审计丢弃+坏帧判死）+ relay-server
+    二进制部署 e2e 1 项（真实进程 → 打洞候选交换 → 审计 stdout 输出）+ 
+    main.rs 参数解析单测 4 项（relay 94 / relay-server 13 项全绿）
+- **TCP_NODELAY 全仓接入（R-31，审计 §4-3 / O4）**：Windows 默认 Nagle
+  开启下大视频帧后紧跟的小包（音频/键鼠）被滞留（在途未 ACK 时小段不
+  立即发出），对交互延迟影响大于帧路径选择——全仓 TCP 连接建立后统一
+  关闭 Nagle：
+  - `core/src/network/tcp.rs` 新增 `set_nodelay` 辅助（追加式，R-19b 波次 2
+    accept 事件视图区不受影响），`TcpServer::accept` 侧接入；新增 2 项单测
+    （helper 生效 / accept 侧 nodelay 读回）
+  - core 客户端连接点：`connect_peer` TCP 建立后接入
+    （`core/src/connection/client.rs`）
+  - relay 隧道连接建立处：主 accept 循环 + `proxy_listener` work 公网连接
+    （`relay/src/server.rs` 连接建立 nodelay 区，与 R-08b 帧分发区互不越界；
+    relay 为叶子 crate 不依赖 core，直接调 `TcpStream::set_nodelay`）
+  - media TCP transport：客户端 `connect_tcp_transport` + 服务端
+    `accept_tcp_transport` 两处接入（`media/src/transport/transport.rs`）
+  - grep `set_nodelay` 全仓 6 调用点（core 连接/accept + relay 隧道×2 +
+    media TCP×2）；失败不致命（连接仍可用，仅延迟优化失效，告警处理）；
+    全量回归 1537 项全绿 + `--cli self-test` 全过；小包频繁发送的流量开销
+    变化并入 R-26b A 组延迟实测项
 
 ## [v0.1.0] - 2026-07-31
 
