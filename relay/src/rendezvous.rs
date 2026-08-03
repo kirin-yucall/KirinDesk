@@ -17,7 +17,7 @@
 
 use crate::audit::{AuditSink, NoopAudit, TunnelAuditEvent};
 use crate::protocol::{
-    decode_extension, read_frame, write_frame, Candidate, CandidateKind, CandidateRegister,
+    decode_extension, read_frame, wrap_frame, Candidate, CandidateKind, CandidateRegister,
     PathProbe, PathProbeAck, PeerCandidates, PunchResult, TYPE_CANDIDATE_REGISTER,
     TYPE_PATH_PROBE, TYPE_PATH_PROBE_ACK, TYPE_PEER_CANDIDATES, TYPE_PUNCH_RESULT,
 };
@@ -26,6 +26,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
@@ -45,8 +46,8 @@ struct PeerSlot {
     device_id: String,
     /// 含服务器观察地址的候选列表。
     candidates: Vec<Candidate>,
-    /// 该连接的发帧通道（writer task 独占消费）。
-    tx: mpsc::UnboundedSender<(u8, Vec<u8>)>,
+    /// 该连接的发帧通道（**完整帧**；writer task / 隧道会话控制通道独占消费）。
+    tx: mpsc::UnboundedSender<Vec<u8>>,
 }
 
 /// 打洞会话（session_id 关联双端，双端齐才互转）。
@@ -117,6 +118,15 @@ pub struct RendezvousServer {
     next_conn_id: AtomicU64,
 }
 
+impl std::fmt::Debug for RendezvousServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 仅输出监听地址（其余为运行时状态，不参与 Debug）。
+        f.debug_struct("RendezvousServer")
+            .field("local_addr", &self.local_addr())
+            .finish_non_exhaustive()
+    }
+}
+
 impl RendezvousServer {
     /// 绑定监听（`[::]:port` 优先，失败回退 `0.0.0.0`，对齐 M8-T025 双栈模式）。
     /// `port = 0` 由系统分配（测试用），经 [`Self::local_addr`] 查询。
@@ -159,13 +169,48 @@ impl RendezvousServer {
         self.listener.local_addr().expect("bound listener addr")
     }
 
+    /// 分配进程内唯一连接标识（R-08b S1：隧道服控制会话接入打洞会话表用；
+    /// 与自身监听连接共用同一 id 空间，杜绝会话表槽位冲突）。
+    pub fn alloc_conn_id(&self) -> u64 {
+        self.next_conn_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// R-08b S1：外部会话（隧道服控制连接）打洞帧接入入口 —— 与自身
+    /// 监听连接共用同一套登记/互转/限速/审计（PUNCH-006 / PUNCH-SEC-002）。
+    /// `conn_id` 由 [`Self::alloc_conn_id`] 分配（调用方缓存复用）；
+    /// `send` 为调用方回写通道（**完整帧**，如会话 `control_tx`）。
+    /// 返回 `false` = 帧无法处理（调用方应判死，对齐 TNL-PROTO-007）。
+    pub async fn handle_external_frame(
+        &self,
+        conn_id: u64,
+        peer: SocketAddr,
+        ty: u8,
+        payload: &[u8],
+        send: &mpsc::UnboundedSender<Vec<u8>>,
+    ) -> bool {
+        self.dispatch(conn_id, peer, ty, payload, send).await
+    }
+
+    /// R-08b S1：外部会话（隧道会话）结束时的清理入口 —— 从打洞会话表
+    /// 移除槽位与 conn→session 关联（PUNCH-003 无状态残留）。
+    pub fn remove_external_conn(&self, conn_id: u64) {
+        self.cleanup_conn(conn_id);
+    }
+
     /// 接受连接直至 `stop` 置位。每连接一个 task（读侧 + writer task）。
+    ///
+    /// R-08b S2（优雅关闭无泄漏）：连接任务经 `JoinSet` 跟踪，退出前
+    /// 全部中止并汇合 —— 不残留协程（部署进程 `Ctrl+C` 后可干净退出）。
     pub async fn serve(self: Arc<Self>, mut stop: watch::Receiver<bool>) -> std::io::Result<()> {
+        let mut conns = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
                 _ = stop.changed() => {
                     if *stop.borrow() {
-                        debug!("RendezvousServer stopped");
+                        let alive = conns.len();
+                        conns.abort_all();
+                        while conns.join_next().await.is_some() {}
+                        debug!("RendezvousServer stopped ({alive} conns aborted)");
                         return Ok(());
                     }
                 }
@@ -177,7 +222,8 @@ impl RendezvousServer {
                             continue;
                         }
                     };
-                    tokio::spawn(Self::handle_conn(Arc::clone(&self), stream, peer));
+                    let srv = Arc::clone(&self);
+                    conns.spawn(async move { Self::handle_conn(srv, stream, peer).await });
                 }
             }
         }
@@ -187,12 +233,12 @@ impl RendezvousServer {
     async fn handle_conn(self: Arc<Self>, stream: TcpStream, peer: SocketAddr) {
         let conn_id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
         let (mut reader, mut writer) = stream.into_split();
-        let (tx, mut rx) = mpsc::unbounded_channel::<(u8, Vec<u8>)>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
-        // writer task：独占消费发帧通道，避免跨 task 持锁等待写
+        // writer task：独占消费发帧通道（完整帧），避免跨 task 持锁等待写
         let writer_task = tokio::spawn(async move {
-            while let Some((ty, payload)) = rx.recv().await {
-                if write_frame(&mut writer, ty, &payload).await.is_err() {
+            while let Some(frame) = rx.recv().await {
+                if writer.write_all(&frame).await.is_err() {
                     break; // 对端关闭 → 停止
                 }
             }
@@ -225,7 +271,7 @@ impl RendezvousServer {
         peer: SocketAddr,
         ty: u8,
         payload: &[u8],
-        tx: &mpsc::UnboundedSender<(u8, Vec<u8>)>,
+        tx: &mpsc::UnboundedSender<Vec<u8>>,
     ) -> bool {
         match ty {
             TYPE_CANDIDATE_REGISTER => {
@@ -270,7 +316,7 @@ impl RendezvousServer {
                 // 其余已知 type（P2 区/控制消息）→ 扩展点；未知 type 判死
                 if let Some(ext) = &self.extension {
                     if let Some(reply) = ext.on_frame(ty, payload, peer, conn_id) {
-                        let _ = tx.send((ty, reply));
+                        let _ = tx.send(wrap_frame(ty, &reply));
                         return true;
                     }
                 }
@@ -285,7 +331,7 @@ impl RendezvousServer {
         conn_id: u64,
         peer: SocketAddr,
         msg: CandidateRegister,
-        tx: &mpsc::UnboundedSender<(u8, Vec<u8>)>,
+        tx: &mpsc::UnboundedSender<Vec<u8>>,
     ) {
         if msg.candidates.len() > MAX_CANDIDATES {
             warn!(
@@ -382,11 +428,11 @@ impl RendezvousServer {
                     drop(sessions);
                     let msg_a = PeerCandidates { session_id: sid, candidates: b_cands };
                     if let Ok(payload) = bincode::serialize(&msg_a) {
-                        let _ = a_tx.send((TYPE_PEER_CANDIDATES, payload));
+                        let _ = a_tx.send(wrap_frame(TYPE_PEER_CANDIDATES, &payload));
                     }
                     let msg_b = PeerCandidates { session_id: sid, candidates: a_cands };
                     if let Ok(payload) = bincode::serialize(&msg_b) {
-                        let _ = b_tx.send((TYPE_PEER_CANDIDATES, payload));
+                        let _ = b_tx.send(wrap_frame(TYPE_PEER_CANDIDATES, &payload));
                     }
                     info!("rendezvous session {sid:02x?} paired: {a_id} <-> {b_id}");
                     self.audit.record(TunnelAuditEvent::PunchForwarded {
@@ -432,7 +478,7 @@ impl RendezvousServer {
         };
         let tx = other.tx.clone();
         drop(sessions);
-        if tx.send((ty, payload.to_vec())).is_err() {
+        if tx.send(wrap_frame(ty, payload)).is_err() {
             debug!("{what}: peer conn of {conn_id} closed");
         }
     }

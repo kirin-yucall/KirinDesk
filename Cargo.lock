@@ -4175,6 +4175,7 @@ version = "0.1.0"
 dependencies = [
  "kirin-desk-relay",
  "kirin-desk-utils",
+ "serde",
  "tokio",
  "tracing",
  "tracing-subscriber",

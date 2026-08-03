@@ -14,16 +14,18 @@ use crate::audit::{AuditSink, TunnelAuditEvent};
 use crate::auth::{constant_time_eq, random_nonce};
 use crate::protocol::{
     decode_control, decode_extension, decode_work_header, encode_control, encode_extension,
-    read_frame, CandidateRegister, ControlMsg, ResolveDevice, TunnelConn, TunnelHeader,
-    TunnelResp, WorkConnHeader, TYPE_CANDIDATE_REGISTER, TYPE_CONTROL, TYPE_DEVICE_INFO,
-    TYPE_RESOLVE_DEVICE, TYPE_TUNNEL_CONN, TYPE_TUNNEL_HEADER, TYPE_TUNNEL_RESP,
-    TYPE_WORK_HEADER,
+    read_frame, CandidateRegister, ControlMsg, PathProbe, PathProbeAck, PunchResult,
+    ResolveDevice, TunnelConn, TunnelHeader, TunnelResp, WorkConnHeader,
+    TYPE_CANDIDATE_REGISTER, TYPE_CONTROL, TYPE_DEVICE_INFO, TYPE_PATH_PROBE,
+    TYPE_PATH_PROBE_ACK, TYPE_PUNCH_RESULT, TYPE_RESOLVE_DEVICE, TYPE_TUNNEL_CONN,
+    TYPE_TUNNEL_HEADER, TYPE_TUNNEL_RESP, TYPE_WORK_HEADER,
 };
 use crate::rate_limit::{
     RateLimitDecision, RateLimiter, RateLimiterConfig, DEFAULT_MAX_PENDING_PER_TARGET,
     DEFAULT_MAX_PENDING_TUNNELS,
 };
 use crate::registry::{RegisterOutcome, Registry, RegistryError};
+use crate::rendezvous::RendezvousServer;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -86,6 +88,10 @@ pub struct TunnelServerConfig {
     /// M8-T026-P2 (ID-SEC-001)：服务器 Ed25519 密钥路径（None = 默认
     /// `~/.kirin_desk/relay_server_key.pem`；测试注入临时路径避免污染真实目录）。
     pub server_key_path: Option<std::path::PathBuf>,
+    /// R-08b (S1/S2)：进程内打洞 rendezvous 服务（None = 不挂载 ——
+    /// 隧道控制连接上的打洞帧解码校验后丢弃审计，不静默忽略）。
+    /// relay-server 经 `--rendezvous-port` 注入；库内独立使用默认不挂载。
+    pub rendezvous: Option<Arc<RendezvousServer>>,
 }
 
 impl Default for TunnelServerConfig {
@@ -105,6 +111,7 @@ impl Default for TunnelServerConfig {
             max_pending_per_target: DEFAULT_MAX_PENDING_PER_TARGET,
             audit: None,
             server_key_path: None,
+            rendezvous: None,
         }
     }
 }
@@ -143,6 +150,10 @@ struct ClientSession {
     tasks: Mutex<Vec<AbortHandle>>,
     /// M8-T026-P2 (ID-001)：本会话注册的设备 ID（None = 纯穿透/纯解析会话）。
     device_id: Mutex<Option<String>>,
+    /// R-08b (S1)：本会话在进程内 rendezvous 打洞会话表中的连接标识
+    /// （首次打洞帧时经 [`RendezvousServer::alloc_conn_id`] 分配并缓存；
+    /// 会话清理时同步移除，PUNCH-003 无状态残留）。
+    punch_conn: Mutex<Option<u64>>,
 }
 
 /// 单个代理条目（TNL-SERVER-003）。
@@ -182,6 +193,8 @@ struct ServerShared {
     pending_by_target: Mutex<HashMap<String, usize>>,
     /// M8-T026-P2 (ID-002)：设备在线表（注册/解析/中继配对）。
     registry: Arc<Registry>,
+    /// R-08b (S1)：进程内打洞 rendezvous 服务（隧道控制连接打洞帧接入点）。
+    rendezvous: Option<Arc<RendezvousServer>>,
     /// 优雅关闭：置位后 accept 循环停止（`TunnelServer::shutdown`）。
     shutting_down: AtomicBool,
     /// 优雅关闭广播：会话控制任务收到 → 级联清理退出（TNL-SERVER-006 扩展）。
@@ -294,6 +307,8 @@ impl TunnelServer {
             key_path.display(),
             &registry.server_public_key_base64()[..std::cmp::min(16, registry.server_public_key_base64().len())]
         );
+        // R-08b (S1)：进程内打洞 rendezvous 挂载（config 注入，见 §S2）。
+        let shared_rz = cfg.rendezvous.clone();
         let shared = Arc::new(ServerShared {
             cfg: Arc::new(cfg),
             sessions: Mutex::new(HashMap::new()),
@@ -305,6 +320,7 @@ impl TunnelServer {
             pending_tunnels: AtomicUsize::new(0),
             pending_by_target: Mutex::new(HashMap::new()),
             registry,
+            rendezvous: shared_rz,
             shutting_down: AtomicBool::new(false),
             shutdown_tx: broadcast::channel(64).0,
         });
@@ -377,6 +393,13 @@ impl TunnelServer {
                             continue;
                         }
                     };
+                    // R-31（审计 §4-3）：隧道连接建立后关闭 Nagle —— relay 为
+                    // 叶子 crate 不依赖 core，直接调 tokio std 方法；控制/
+                    // 数据面（含 work 回连、隧道配对流）共用本 accept 出口。
+                    // 失败不致命（连接仍可用，仅延迟优化失效）。
+                    if let Err(e) = stream.set_nodelay(true) {
+                        warn!("tunnel accept set_nodelay failed: {e}");
+                    }
                     let shared = shared.clone();
                     tokio::spawn(async move {
                         let _ = handle_incoming(shared, stream, addr).await;
@@ -748,6 +771,7 @@ async fn start_session(
         last_activity: Mutex::new(Instant::now()),
         tasks: Mutex::new(Vec::new()),
         device_id: Mutex::new(None),
+        punch_conn: Mutex::new(None),
     });
     shared.sessions.lock().unwrap().insert(session.id.clone(), session.clone());
     info!(
@@ -920,11 +944,50 @@ async fn run_session(shared: Arc<ServerShared>, session: Arc<ClientSession>, mut
                                     );
                                 }
                                 Some(_) => {
-                                    if !shared.registry.update_candidates(&reg.device_id, reg.candidates).await {
+                                    if !shared.registry.update_candidates(&reg.device_id, reg.candidates.clone()).await {
                                         warn!("tunnel session {} candidate register for unknown device '{}'", session.id, reg.device_id);
+                                    }
+                                    // R-08b (S1)：P1 打洞候选（session_id=Some）
+                                    // 并行接入进程内 rendezvous —— 隧道控制
+                                    // 连接成为打洞会话参与者（登记/互转/限速/
+                                    // 审计复用，PUNCH-006 / PUNCH-SEC-002）；
+                                    // 无 rendezvous 挂载时保持原语义（仅注册表刷新）。
+                                    if reg.session_id.is_some() {
+                                        if let Some(rz) = &shared.rendezvous {
+                                            let conn_id = *session
+                                                .punch_conn
+                                                .lock()
+                                                .unwrap()
+                                                .get_or_insert_with(|| rz.alloc_conn_id());
+                                            if !rz
+                                                .handle_external_frame(
+                                                    conn_id,
+                                                    session.addr,
+                                                    TYPE_CANDIDATE_REGISTER,
+                                                    &payload,
+                                                    &session.control_tx,
+                                                )
+                                                .await
+                                            {
+                                                warn!(
+                                                    "tunnel session {} rendezvous rejected candidate register",
+                                                    session.id
+                                                );
+                                            }
+                                        }
                                     }
                                 }
                             }
+                        }
+                    }
+                    // R-08b (S1)：P1 打洞帧（PunchResult / PathProbe /
+                    // PathProbeAck）→ 进程内 rendezvous 打洞处理（结果/探测
+                    // 透传对端 + 审计，PUNCH-PROTO-005/006）；与既有
+                    // CandidateRegister 路径并列，不再落入 `_ =>` 忽略。
+                    TYPE_PUNCH_RESULT | TYPE_PATH_PROBE | TYPE_PATH_PROBE_ACK => {
+                        if !handle_punch_frame(shared.clone(), session.clone(), ty, &payload).await
+                        {
+                            break; // 坏帧 → 判死（对齐 rendezvous dispatch / TNL-PROTO-007）
                         }
                     }
                     // P1 打洞预留帧（PunchResult 等）→ 交 rendezvous（P1 并行开发）。
@@ -952,6 +1015,56 @@ async fn run_session(shared: Arc<ServerShared>, session: Arc<ClientSession>, mut
         }
     }
     cleanup_session(shared, session).await;
+}
+
+/// R-08b (S1)：隧道控制连接上的 P1 打洞帧（PunchResult / PathProbe /
+/// PathProbeAck）处理 —— 有进程内 rendezvous 挂载 → 交其打洞处理
+/// （透传对端 + 审计，PUNCH-PROTO-005/006；会话以 `punch_conn_id` 参与
+/// 打洞会话表，与 rendezvous 自身监听连接共用 id 空间）；无挂载（库内
+/// 独立使用）→ 解码校验 + 审计丢弃，**不静默忽略**。
+///
+/// 返回 `false` = 坏帧（调用方应判死，对齐 rendezvous dispatch / TNL-PROTO-007）。
+async fn handle_punch_frame(
+    shared: Arc<ServerShared>,
+    session: Arc<ClientSession>,
+    ty: u8,
+    payload: &[u8],
+) -> bool {
+    // 帧内容校验（对齐 rendezvous dispatch：PUNCH-PROTO-005/006 结构）。
+    let valid = match ty {
+        TYPE_PUNCH_RESULT => {
+            decode_extension::<PunchResult>(ty, payload, TYPE_PUNCH_RESULT).is_ok()
+        }
+        TYPE_PATH_PROBE => decode_extension::<PathProbe>(ty, payload, TYPE_PATH_PROBE).is_ok(),
+        TYPE_PATH_PROBE_ACK => {
+            decode_extension::<PathProbeAck>(ty, payload, TYPE_PATH_PROBE_ACK).is_ok()
+        }
+        _ => return true, // 不应到达（调用方只传三种打洞帧）
+    };
+    if !valid {
+        warn!("tunnel session {} bad punch frame 0x{ty:02x}", session.id);
+        return false;
+    }
+    let Some(rz) = &shared.rendezvous else {
+        // 无 rendezvous 挂载：打洞帧无路由目标 → 审计 + 丢弃（不静默忽略）。
+        shared.audit(TunnelAuditEvent::PunchUnknownSession {
+            client: session.addr,
+            session_id: format!("no-rendezvous 0x{ty:02x}"),
+        });
+        warn!(
+            "tunnel session {} punch frame 0x{ty:02x} dropped (no rendezvous attached)",
+            session.id
+        );
+        return true;
+    };
+    // 会话首次打洞帧时分配进程内唯一 rendezvous 连接标识（此后复用）。
+    let conn_id = *session
+        .punch_conn
+        .lock()
+        .unwrap()
+        .get_or_insert_with(|| rz.alloc_conn_id());
+    rz.handle_external_frame(conn_id, session.addr, ty, payload, &session.control_tx)
+        .await
 }
 
 /// M8-T026-P2 (ID-010 / ID-SEC-002)：设备解析 —— 限速 + 在线表查询 +
@@ -1394,6 +1507,11 @@ async fn proxy_listener(
             Ok(x) => x,
             Err(_) => break,
         };
+        // R-31（审计 §4-3）：work 公网连接同样关闭 Nagle（小包不被大帧
+        // 滞留；relay 不依赖 core，直接调 tokio std 方法）。失败不致命。
+        if let Err(e) = public.set_nodelay(true) {
+            warn!("tunnel proxy accept set_nodelay failed: {e}");
+        }
         // 并发上限（TNL-STAB-005：防放大攻击）。
         if proxy.conn_count.load(Ordering::SeqCst) >= shared.cfg.max_concurrent_work {
             warn!(
@@ -1610,6 +1728,12 @@ async fn cleanup_session(shared: Arc<ServerShared>, session: Arc<ClientSession>)
         });
     }
     // 3. control_tx drop（writer 任务结束 → 控制连接关闭）。
+    // R-08b (S1)：会话结束 → 从进程内 rendezvous 打洞会话表移除
+    // （PUNCH-003 无状态残留）。
+    if let (Some(rz), Some(conn_id)) = (&shared.rendezvous, *session.punch_conn.lock().unwrap())
+    {
+        rz.remove_external_conn(conn_id);
+    }
 }
 
 /// 完成某代理的全部 pending：从索引移除 + 发送 Err（监听侧关闭公网连接）。

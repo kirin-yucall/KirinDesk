@@ -14,3 +14,8 @@ kirin-desk-utils = { path = "../utils" }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+# R-08b (S3): relay-server 二进制部署形态 e2e（打洞候选交换）集成测试。
+[dev-dependencies]
+tokio.workspace = true
+serde.workspace = true

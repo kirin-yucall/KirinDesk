@@ -10,12 +10,15 @@ use crate::client::{ProxySpec, TunnelClient, TunnelClientConfig};
 use crate::id_client::IdClientError;
 use crate::protocol::{
     decode_control, decode_extension, encode_control, encode_extension, read_frame, Candidate,
-    CandidateKind, CandidateRegister, ControlMsg, DeviceInfo, ResolveDevice, TunnelConn,
-    TunnelResp, PROTOCOL_VERSION, TYPE_CANDIDATE_REGISTER, TYPE_DEVICE_INFO,
-    TYPE_RESOLVE_DEVICE, TYPE_TUNNEL_CONN, TYPE_TUNNEL_RESP,
+    CandidateKind, CandidateRegister, ControlMsg, DeviceInfo, PeerCandidates, PunchResult,
+    ResolveDevice, TunnelConn, TunnelResp, PROTOCOL_VERSION, TYPE_CANDIDATE_REGISTER,
+    TYPE_DEVICE_INFO, TYPE_PEER_CANDIDATES, TYPE_PUNCH_RESULT, TYPE_RESOLVE_DEVICE,
+    TYPE_TUNNEL_CONN, TYPE_TUNNEL_RESP,
 };
 use crate::rate_limit::RateLimiterConfig;
+use crate::rendezvous::RendezvousServer;
 use crate::server::{TunnelServer, TunnelServerConfig};
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -103,6 +106,8 @@ fn server_cfg_on(
                 uuid::Uuid::new_v4()
             )),
         ),
+        // R-08b (S1)：默认不挂载 rendezvous（打洞帧测试用例显式注入）。
+        rendezvous: None,
     }
 }
 
@@ -1581,5 +1586,266 @@ async fn bind_empty_falls_back_dual_stack() {
     let _ = TcpStream::connect(("127.0.0.1", port))
         .await
         .expect("默认双栈下 v4 回环应连通");
+    srv_task.abort();
+}
+
+// ════════════════════════════════════════════════════════════════
+// R-08b（S1/S2）：打洞两端缝合 —— 帧分发 + rendezvous 部署形态
+// ════════════════════════════════════════════════════════════════
+
+/// R-08b 组合部署辅助：进程内装配 TunnelServer + RendezvousServer
+/// （对齐 relay-server 二进制形态）。返回 (tunnel 控制端口, rendezvous)。
+async fn spawn_composed(audit: Arc<AuditCollector>) -> (u16, Arc<RendezvousServer>) {
+    let rz = Arc::new(
+        RendezvousServer::bind(0)
+            .await
+            .unwrap()
+            .with_audit(Arc::clone(&audit) as Arc<dyn AuditSink>),
+    );
+    let mut cfg = server_cfg("secret", Some(audit));
+    cfg.rendezvous = Some(rz.clone());
+    let server = TunnelServer::bind(cfg).await.unwrap();
+    let port = server.port();
+    tokio::spawn(server.run());
+    (port, rz)
+}
+
+/// R-08b：带 session_id（P1 打洞）的候选登记帧（隧道控制连接 / rendezvous 连接通用）。
+async fn send_punch_register(
+    stream: &mut TcpStream,
+    device_id: &str,
+    session_id: [u8; 16],
+    candidates: Vec<Candidate>,
+) -> bool {
+    let reg = CandidateRegister {
+        device_id: device_id.to_string(),
+        session_id: Some(session_id),
+        candidates,
+    };
+    match encode_extension(TYPE_CANDIDATE_REGISTER, &reg) {
+        Ok(frame) => stream.write_all(&frame).await.is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// R-08b：读一帧并断言为指定类型，返回解码负载。
+async fn read_expect<T: for<'de> serde::Deserialize<'de>>(
+    stream: &mut TcpStream,
+    ty_expect: u8,
+) -> T {
+    let (ty, payload) = tokio::time::timeout(Duration::from_secs(2), read_frame(stream))
+        .await
+        .expect("等待帧超时")
+        .expect("连接关闭");
+    assert_eq!(ty, ty_expect, "帧类型应为 0x{ty_expect:02x}");
+    decode_extension(ty, &payload, ty_expect).unwrap()
+}
+
+#[tokio::test]
+async fn test_punch_rendezvous_port_candidate_exchange() {
+    // R-08b (S2/S3) 部署形态：独立 rendezvous 监听（对齐 relay-server
+    // --rendezvous-port）—— 双端候选登记 → 互转 PeerCandidates（含服务器
+    // 观察地址）→ PunchResult 透传对端 + 审计；优雅关闭无残留。
+    let audit = Arc::new(AuditCollector::default());
+    let rz = Arc::new(
+        RendezvousServer::bind(0)
+            .await
+            .unwrap()
+            .with_audit(Arc::clone(&audit) as Arc<dyn AuditSink>),
+    );
+    let mut addr = rz.local_addr();
+    if addr.ip().is_unspecified() {
+        addr = SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, addr.port()));
+    }
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let rz_task = tokio::spawn(rz.clone().serve(stop_rx));
+
+    let mut a = TcpStream::connect(addr).await.unwrap();
+    let mut b = TcpStream::connect(addr).await.unwrap();
+    let cand = Candidate {
+        addr: "10.1.2.3:4444".parse().unwrap(),
+        kind: CandidateKind::Udp,
+        priority: 120,
+    };
+    assert!(send_punch_register(&mut a, "dev-a", [7; 16], vec![cand.clone()]).await);
+    assert!(send_punch_register(&mut b, "dev-b", [7; 16], vec![cand.clone()]).await);
+
+    // 双端互转：候选含服务器观察地址（对端 TCP 地址）+ 自有候选。
+    let pc_a: PeerCandidates = read_expect(&mut a, TYPE_PEER_CANDIDATES).await;
+    let pc_b: PeerCandidates = read_expect(&mut b, TYPE_PEER_CANDIDATES).await;
+    assert_eq!(pc_a.session_id, [7; 16]);
+    let b_peer = b.local_addr().unwrap();
+    let a_peer = a.local_addr().unwrap();
+    assert!(
+        pc_a.candidates.iter().any(|c| c.addr == b_peer),
+        "A 应收到 B 的观察地址"
+    );
+    assert!(
+        pc_b.candidates.iter().any(|c| c.addr == a_peer),
+        "B 应收到 A 的观察地址"
+    );
+
+    // PunchResult 透传对端（PUNCH-PROTO-005）。
+    let result = PunchResult {
+        session_id: [7; 16],
+        ok: true,
+        path: Some(CandidateKind::Udp),
+    };
+    a.write_all(&encode_extension(TYPE_PUNCH_RESULT, &result).unwrap())
+        .await
+        .unwrap();
+    let got: PunchResult = read_expect(&mut b, TYPE_PUNCH_RESULT).await;
+    assert_eq!(got, result);
+
+    // 审计事件：候选登记 x2 + 互转/透传。
+    assert!(
+        wait_for(
+            || audit.count(|e| matches!(e, TunnelAuditEvent::PunchCandidateRegistered { .. })) >= 2,
+            Duration::from_secs(2)
+        )
+        .await
+    );
+    assert!(
+        audit.count(|e| matches!(e, TunnelAuditEvent::PunchForwarded { .. })) >= 2
+    );
+
+    // 优雅关闭（S2 验收）：stop 置位 → serve 任务干净返回，连接任务中止。
+    let _ = stop_tx.send(true);
+    let res = tokio::time::timeout(Duration::from_secs(2), rz_task)
+        .await
+        .expect("rendezvous serve 应在 stop 后退出")
+        .expect("serve 任务不应 panic");
+    assert!(res.is_ok(), "serve 应返回 Ok(())");
+}
+
+#[tokio::test]
+async fn test_punch_frames_over_tunnel_control() {
+    // R-08b (S1)：隧道控制连接上的打洞帧 —— CandidateRegister(session_id=Some)
+    // 接入进程内 rendezvous（与既有注册表刷新路径并列），PunchResult /
+    // PathProbe 不再落入 `_ =>` 忽略：双端互转 + 透传 + 审计。
+    let audit = Arc::new(AuditCollector::default());
+    let (server_port, _rz) = spawn_composed(audit.clone()).await;
+
+    let mut dev_a = raw_login_any(server_port, "secret", Some("pc-a"))
+        .await
+        .expect("pc-a 登录应成功");
+    let mut dev_b = raw_login_any(server_port, "secret", Some("pc-b"))
+        .await
+        .expect("pc-b 登录应成功");
+
+    let cand = Candidate {
+        addr: "10.9.8.7:9999".parse().unwrap(),
+        kind: CandidateKind::Udp,
+        priority: 100,
+    };
+    assert!(send_punch_register(&mut dev_a, "pc-a", [9; 16], vec![cand.clone()]).await);
+    assert!(send_punch_register(&mut dev_b, "pc-b", [9; 16], vec![cand.clone()]).await);
+
+    // 互转：经隧道控制连接收到对端候选（打洞会话配对成功）。
+    let pc_a: PeerCandidates = read_expect(&mut dev_a, TYPE_PEER_CANDIDATES).await;
+    let pc_b: PeerCandidates = read_expect(&mut dev_b, TYPE_PEER_CANDIDATES).await;
+    assert_eq!(pc_a.session_id, [9; 16]);
+    assert_eq!(pc_b.session_id, [9; 16]);
+
+    // PunchResult：A → 服务器 → B（透传 + PunchForwarded 审计）。
+    let result = PunchResult {
+        session_id: [9; 16],
+        ok: false,
+        path: None,
+    };
+    dev_a
+        .write_all(&encode_extension(TYPE_PUNCH_RESULT, &result).unwrap())
+        .await
+        .unwrap();
+    let got: PunchResult = read_expect(&mut dev_b, TYPE_PUNCH_RESULT).await;
+    assert_eq!(got, result);
+    assert!(
+        wait_for(
+            || audit.count(|e| matches!(e, TunnelAuditEvent::PunchForwarded { .. })) >= 1,
+            Duration::from_secs(2)
+        )
+        .await,
+        "PunchResult 透传应产生 PunchForwarded 审计"
+    );
+
+    // 会话结束 → rendezvous 打洞会话表无残留（新会话同 session_id 可重建配对）。
+    drop(dev_a);
+    drop(dev_b);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let mut dev_c = raw_login_any(server_port, "secret", Some("pc-c"))
+        .await
+        .expect("pc-c 登录应成功");
+    let mut dev_d = raw_login_any(server_port, "secret", Some("pc-d"))
+        .await
+        .expect("pc-d 登录应成功");
+    assert!(send_punch_register(&mut dev_c, "pc-c", [9; 16], vec![cand.clone()]).await);
+    assert!(send_punch_register(&mut dev_d, "pc-d", [9; 16], vec![cand.clone()]).await);
+    let _: PeerCandidates = read_expect(&mut dev_c, TYPE_PEER_CANDIDATES).await;
+    let _: PeerCandidates = read_expect(&mut dev_d, TYPE_PEER_CANDIDATES).await;
+}
+
+#[tokio::test]
+async fn test_punch_frame_without_rendezvous_audited_not_ignored() {
+    // R-08b (S1)：无 rendezvous 挂载（库内独立使用）→ 打洞帧解码校验后
+    // 审计丢弃（PunchUnknownSession），不静默忽略、连接不判死。
+    let audit = Arc::new(AuditCollector::default());
+    let server = TunnelServer::bind(server_cfg("secret", Some(audit.clone())))
+        .await
+        .unwrap();
+    let server_port = server.port();
+    let srv_task = tokio::spawn(server.run());
+
+    let mut dev = raw_login_any(server_port, "secret", Some("pc-a"))
+        .await
+        .expect("pc-a 登录应成功");
+    let result = PunchResult {
+        session_id: [3; 16],
+        ok: true,
+        path: Some(CandidateKind::Tcp),
+    };
+    dev.write_all(&encode_extension(TYPE_PUNCH_RESULT, &result).unwrap())
+        .await
+        .unwrap();
+    assert!(
+        wait_for(
+            || {
+                audit.count(|e| {
+                    matches!(
+                        e,
+                        TunnelAuditEvent::PunchUnknownSession { .. }
+                    )
+                }) >= 1
+            },
+            Duration::from_secs(2)
+        )
+        .await,
+        "无 rendezvous 时打洞帧应产生 PunchUnknownSession 审计"
+    );
+    // 连接未判死：仍可 Pong 心跳。
+    dev.write_all(&encode_control(&ControlMsg::Ping { ts: 1 }).unwrap())
+        .await
+        .unwrap();
+    let (ty, payload) = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut dev))
+        .await
+        .expect("Pong 应应答")
+        .expect("连接不应被关闭");
+    assert!(matches!(
+        decode_control(ty, &payload).unwrap(),
+        ControlMsg::Pong { ts: 1 }
+    ));
+
+    // 坏帧（bincode 解码失败）→ 判死关闭（对齐 rendezvous dispatch / TNL-PROTO-007）。
+    let mut dev2 = raw_login_any(server_port, "secret", Some("pc-b"))
+        .await
+        .expect("pc-b 登录应成功");
+    dev2.write_all(&crate::protocol::wrap_frame(TYPE_PUNCH_RESULT, b"garbage"))
+        .await
+        .unwrap();
+    let closed = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut dev2)).await;
+    assert!(
+        matches!(closed, Ok(Err(_))),
+        "坏打洞帧应导致会话判死关闭，实际 {closed:?}"
+    );
+
     srv_task.abort();
 }

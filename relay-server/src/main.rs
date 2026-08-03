@@ -2,10 +2,13 @@
 //!
 //! 薄壳包装 [`kirin_desk_relay::server::TunnelServer`]：
 //! - CLI 参数：`--bind-addrs` / `--bind-port` / `--token` / `--port-range` /
-//!   `--server-key` / `--max-proxies` / `--max-work-conns`；
+//!   `--server-key` / `--max-proxies` / `--max-work-conns` /
+//!   `--rendezvous-port` / `--no-rendezvous`（R-08b S2）；
 //! - 控制台日志（`RUST_LOG`，默认 `info`）+ 审计事件输出（stdout，
 //!   TNL-SEC-003 全部事件 + P1/P2 打洞/设备事件）；
-//! - Ctrl+C / SIGTERM 优雅关闭（TNL-SERVER-006）；
+//! - 进程内启动打洞 rendezvous 服务（R-08b S2：默认 7001，`--no-rendezvous`
+//!   关闭；候选登记/互转/限速/审计复用 [`kirin_desk_relay::rendezvous`]）；
+//! - Ctrl+C / SIGTERM 优雅关闭（TNL-SERVER-006，双服务无残留协程）；
 //! - 启动时打印服务器 Ed25519 公钥——ID 模式客户端须预置
 //!   `[tunnel] server_pubkey`（ID-SEC-001）。
 //!
@@ -14,11 +17,14 @@
 
 use kirin_desk_relay::audit::{AuditSink, TunnelAuditEvent};
 use kirin_desk_relay::rate_limit::RateLimiterConfig;
+use kirin_desk_relay::rendezvous::RendezvousServer;
 use kirin_desk_relay::server::{TunnelServer, TunnelServerConfig};
 use std::sync::Arc;
+use std::time::Duration;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_BIND_PORT: u16 = 7000;
+const DEFAULT_RENDEZVOUS_PORT: u16 = 7001;
 const DEFAULT_MAX_PROXIES: usize = 32;
 const DEFAULT_MAX_WORK_CONNS: usize = 100;
 
@@ -32,6 +38,10 @@ struct Config {
     server_key: Option<std::path::PathBuf>,
     max_proxies: usize,
     max_work_conns: usize,
+    /// R-08b (S2)：打洞 rendezvous 端口（默认 7001）。
+    rendezvous_port: u16,
+    /// R-08b (S2)：打洞 rendezvous 启用（`--no-rendezvous` 关闭）。
+    rendezvous_enabled: bool,
 }
 
 fn print_usage() {
@@ -53,6 +63,10 @@ fn print_usage() {
     println!("                        （默认 ~/.kirin_desk/relay_server_key.pem，不存在则自动生成）");
     println!("  --max-proxies <N>     每会话代理数量上限（默认 {DEFAULT_MAX_PROXIES}）");
     println!("  --max-work-conns <N>  每代理并发 work 连接上限（默认 {DEFAULT_MAX_WORK_CONNS}）");
+    println!("  --rendezvous-port <P> 打洞 rendezvous 端口（默认 {DEFAULT_RENDEZVOUS_PORT}；");
+    println!("                        打洞候选登记/互转/限速/审计，P1 打洞用；");
+    println!("                        须与 --bind-port 不同）");
+    println!("  --no-rendezvous       关闭打洞 rendezvous（不监听 --rendezvous-port）");
     println!("  --help                显示本帮助");
     println!("  --version             显示版本");
 }
@@ -89,7 +103,12 @@ impl Config {
             server_key: None,
             max_proxies: DEFAULT_MAX_PROXIES,
             max_work_conns: DEFAULT_MAX_WORK_CONNS,
+            rendezvous_port: DEFAULT_RENDEZVOUS_PORT,
+            rendezvous_enabled: true,
         };
+        // R-08b (S2)：`--rendezvous-port` 是否被显式给出（与 `--no-rendezvous`
+        // 互斥校验用）。
+        let mut rendezvous_port_explicit = false;
         while let Some(arg) = args.next() {
             let (key, inline) = match arg.split_once('=') {
                 Some((k, v)) => (k.to_string(), Some(v.to_string())),
@@ -136,8 +155,39 @@ impl Config {
                         .parse()
                         .map_err(|_| format!("invalid --max-work-conns '{v}'"))?;
                 }
+                // R-08b (S2)：打洞 rendezvous 端口（0 拒绝 —— 部署语义上
+                // 须为固定端口，对齐 --port-range 的 0 拒绝口径）。
+                "--rendezvous-port" => {
+                    let v = next_value(&mut args, &inline, "--rendezvous-port")?;
+                    let p: u16 = v
+                        .parse()
+                        .map_err(|_| format!("invalid --rendezvous-port '{v}'"))?;
+                    if p == 0 {
+                        return Err(format!(
+                            "invalid --rendezvous-port '0' (ports must be 1-65535)"
+                        ));
+                    }
+                    cfg.rendezvous_port = p;
+                    rendezvous_port_explicit = true;
+                }
+                "--no-rendezvous" => {
+                    cfg.rendezvous_enabled = false;
+                }
                 _ => return Err(format!("unknown option '{key}'")),
             }
+        }
+        // R-08b (S2)：fail-closed 冲突校验（对齐 --bind-addrs 非法值 exit(2) 模式）。
+        if !cfg.rendezvous_enabled && rendezvous_port_explicit {
+            return Err(
+                "conflicting options: --no-rendezvous cannot be combined with --rendezvous-port"
+                    .to_string(),
+            );
+        }
+        if cfg.rendezvous_enabled && cfg.rendezvous_port == cfg.bind_port {
+            return Err(format!(
+                "conflicting options: --rendezvous-port {} equals --bind-port (must differ)",
+                cfg.rendezvous_port
+            ));
         }
         Ok(cfg)
     }
@@ -332,6 +382,54 @@ mod config_parse_tests {
         let cfg = parse(&["--bind-addrs", "0.0.0.0,,::"]).unwrap();
         assert!(cfg.parse_bind_addrs().is_err());
     }
+
+    // R-08b (S2)：--rendezvous-port / --no-rendezvous 解析与冲突 fail-closed。
+    #[test]
+    fn test_rendezvous_defaults() {
+        // 默认：启用 + 端口 7001（不传参数即打洞可用）。
+        let cfg = parse(&[]).unwrap();
+        assert!(cfg.rendezvous_enabled);
+        assert_eq!(cfg.rendezvous_port, 7001);
+    }
+
+    #[test]
+    fn test_rendezvous_port_forms_and_validation() {
+        // 两种写法等价。
+        let cfg = parse(&["--rendezvous-port", "8001"]).unwrap();
+        assert_eq!(cfg.rendezvous_port, 8001);
+        let cfg = parse(&["--rendezvous-port=9001"]).unwrap();
+        assert_eq!(cfg.rendezvous_port, 9001);
+        // 非法值 / 0 / 缺值 → Err（调用方 exit(2)）。
+        assert!(parse(&["--rendezvous-port", "abc"]).is_err());
+        assert!(parse(&["--rendezvous-port", "0"]).is_err());
+        assert!(parse(&["--rendezvous-port"]).is_err());
+        // 越界（u16 溢出）。
+        assert!(parse(&["--rendezvous-port", "70000"]).is_err());
+    }
+
+    #[test]
+    fn test_no_rendezvous_disables() {
+        let cfg = parse(&["--no-rendezvous"]).unwrap();
+        assert!(!cfg.rendezvous_enabled);
+        // 关闭时端口保留默认值（不生效）。
+        assert_eq!(cfg.rendezvous_port, 7001);
+    }
+
+    #[test]
+    fn test_rendezvous_conflicts_fail_closed() {
+        // --no-rendezvous 与 --rendezvous-port 矛盾 → Err。
+        let err = parse(&["--no-rendezvous", "--rendezvous-port", "8001"]).unwrap_err();
+        assert!(err.contains("conflicting options"), "{err}");
+        // rendezvous 端口 == 控制端口 → Err（同端口双监听必然失败）。
+        let err = parse(&["--bind-port", "7001", "--rendezvous-port", "7001"]).unwrap_err();
+        assert!(err.contains("conflicting options"), "{err}");
+        // 显式相同值（= 写法）同样拒绝。
+        let err = parse(&["--bind-port=7000", "--rendezvous-port=7000"]).unwrap_err();
+        assert!(err.contains("conflicting options"), "{err}");
+        // --no-rendezvous 下与 --bind-port 同号不冲突（rendezvous 未启用）。
+        let cfg = parse(&["--no-rendezvous", "--bind-port", "7001"]).unwrap();
+        assert!(!cfg.rendezvous_enabled);
+    }
 }
 
 /// 等待关闭信号：Ctrl+C（全平台）+ SIGTERM（Unix，systemd 停止用）。
@@ -400,6 +498,25 @@ async fn main() {
             std::process::exit(2);
         }
     };
+    // R-08b (S2)：进程内打洞 rendezvous 服务（登记/互转/限速/审计复用，
+    // PUNCH-006 / PUNCH-SEC-002）。绑定失败 → fail-closed 拒绝启动
+    // （对齐 TunnelServer 绑定失败 exit(1) 口径）；--no-rendezvous 关闭。
+    let rendezvous = if cfg.rendezvous_enabled {
+        let rz = match RendezvousServer::bind(cfg.rendezvous_port).await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!(
+                    "error: rendezvous bind failed on port {}: {e}",
+                    cfg.rendezvous_port
+                );
+                std::process::exit(1);
+            }
+        }
+        .with_audit(Arc::new(ConsoleAudit));
+        Some(Arc::new(rz))
+    } else {
+        None
+    };
     let srv_cfg = TunnelServerConfig {
         bind_port: cfg.bind_port,
         bind_addrs,
@@ -410,6 +527,8 @@ async fn main() {
         rate_limit: RateLimiterConfig::default(),
         audit: Some(Arc::new(ConsoleAudit)),
         server_key_path: Some(key_path.clone()),
+        // R-08b (S2)：进程内打洞 rendezvous 挂载（隧道控制连接打洞帧接入）。
+        rendezvous: rendezvous.clone(),
         ..Default::default()
     };
 
@@ -446,14 +565,40 @@ async fn main() {
         server.server_public_key_base64()
     );
     println!("    ^ 客户端 ID 模式须将上面 pubkey 预置到 [tunnel] server_pubkey");
+    println!(
+        "  Rendezvous:    {}",
+        if cfg.rendezvous_enabled {
+            format!("enabled on port {}", cfg.rendezvous_port)
+        } else {
+            "disabled (--no-rendezvous)".to_string()
+        }
+    );
     println!("  Press Ctrl+C to stop.");
 
     let handle = server.shutdown_handle();
     let srv_task = tokio::spawn(server.run());
 
+    // R-08b (S2)：打洞 rendezvous 服务任务（stop watch 优雅关闭）。
+    let rendezvous_task = match &rendezvous {
+        Some(rz) => {
+            let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+            let rz = Arc::clone(rz);
+            Some((stop_tx, tokio::spawn(rz.serve(stop_rx))))
+        }
+        None => None,
+    };
+
     wait_shutdown_signal().await;
     tracing::info!("shutdown signal received — graceful stop (TNL-SERVER-006)");
     handle.shutdown();
     let _ = srv_task.await;
+    if let Some((stop_tx, task)) = rendezvous_task {
+        let _ = stop_tx.send(true);
+        match tokio::time::timeout(Duration::from_secs(3), task).await {
+            Ok(Ok(_)) => tracing::info!("rendezvous server stopped"),
+            Ok(Err(e)) => tracing::warn!("rendezvous serve task error: {e}"),
+            Err(_) => tracing::warn!("rendezvous serve task did not stop in 3s"),
+        }
+    }
     tracing::info!("relay-server stopped");
 }
