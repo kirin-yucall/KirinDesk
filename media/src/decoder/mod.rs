@@ -223,6 +223,28 @@ pub fn frame_id_to_pts(frame_id: u64, target_fps: u32) -> u64 {
 }
 
 // ════════════════════════════════════════════════════════════════
+// 客户端解码能力协商（R-32，M13-T002 阶段 B）
+// ════════════════════════════════════════════════════════════════
+
+/// 客户端**可解码** codec 列表（握手 `supported_codecs` 用，按优先级）。
+///
+/// 服务端据此从自身可编码 codec 中挑选（[`core::crypto::handshake`] 的
+/// `negotiate_codec_*`），保证选中的编码标准客户端一定可解。判定口径与
+/// 编码侧 [`crate::encoder::detect_supported_codecs`] 对称：按解码器回退链
+/// 存在性过滤（FFmpeg DLL 缺失/解码器缺失 → 不广告）；无 DLL 环境（CI）
+/// 返回全量列表（保持协商链形状，不阻断编译）。
+pub fn client_supported_codecs() -> Vec<String> {
+    let mut out = Vec::new();
+    for codec in [Codec::AV1, Codec::H265, Codec::H264] {
+        // detect_supported_decoders 在无 DLL 时返回完整链形状 → 视为可解码。
+        if !crate::decoder::factory::detect_supported_decoders(codec).is_empty() {
+            out.push(codec.as_str().to_string());
+        }
+    }
+    out
+}
+
+// ════════════════════════════════════════════════════════════════
 // Tests（P2A §T1.1：接口层 5 例）
 // ════════════════════════════════════════════════════════════════
 
@@ -276,8 +298,7 @@ mod tests {
     fn test_decode_error_display() {
         assert!(DecodeError::InitFailed("dll".into())
             .to_string()
-            .contains("init failed"));
-        assert!(DecodeError::CodecNotFound("h264".into())
+            .contains("init failed"));        assert!(DecodeError::CodecNotFound("h264".into())
             .to_string()
             .contains("codec not found"));
         assert!(DecodeError::AvError(crate::ffmpeg::AvError::NullPtr("ctx"))
@@ -324,5 +345,23 @@ mod tests {
         assert_eq!(frame_id_to_pts(1, 30), 33);
         // fps=0 防御：不 panic，返回 0。
         assert_eq!(frame_id_to_pts(100, 0), 0);
+    }
+
+    /// R-32：客户端可解码列表按优先级 [av1, h265, h264] 且非空（无 DLL
+    /// 环境返回全量形状；有 DLL 环境至少含软解可用的 codec）。
+    #[test]
+    fn test_client_supported_codecs() {
+        let codecs = client_supported_codecs();
+        assert!(!codecs.is_empty(), "可解码列表不应为空");
+        // 去重 + 均在已知集合内。
+        for c in &codecs {
+            assert!(matches!(c.as_str(), "h264" | "h265" | "av1"), "{c}");
+        }
+        // 优先级：av1 在前（若广告了 av1，它必须排在 h264 之前）。
+        if let Some(pos_av1) = codecs.iter().position(|c| c == "av1") {
+            if let Some(pos_h264) = codecs.iter().position(|c| c == "h264") {
+                assert!(pos_av1 < pos_h264, "av1 应优先于 h264");
+            }
+        }
     }
 }

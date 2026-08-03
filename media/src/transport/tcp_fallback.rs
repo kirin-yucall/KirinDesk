@@ -40,11 +40,17 @@ pub struct TcpMediaTransport {
     audio_rx: Option<std::sync::mpsc::Receiver<crate::decoder::AudioPacket>>,
     /// R-04：音频接收是否启用（`take_audio_receiver` 置 true；false → 丢弃）。
     audio_buffering: bool,
+    /// R-32（M13-T002 阶段 B）：握手协商选中的编码标准（`channel.selected_codec`；
+    /// 未知/空 → H.264 兜底，兼容旧对端）。
+    negotiated: crate::encoder::Codec,
 }
 
 impl TcpMediaTransport {
     /// 包装已握手的 SecureChannel（对称 transport.rs 的 SecureChannelTransport::new）。
     pub fn new(channel: SecureChannel) -> Self {
+        // R-32：在 channel 拆分前读取协商结果（into_split 后字段不可用）。
+        let negotiated = crate::encoder::Codec::from_str(&channel.selected_codec)
+            .unwrap_or(crate::encoder::Codec::H264);
         // R-04：音频缓冲通道随传输创建（传输 drop → 发送端关闭 → 音频线程退出）。
         let (audio_tx, audio_rx) = std::sync::mpsc::channel();
         Self {
@@ -52,6 +58,7 @@ impl TcpMediaTransport {
             audio_tx: Some(audio_tx),
             audio_rx: Some(audio_rx),
             audio_buffering: false,
+            negotiated,
         }
     }
 
@@ -95,6 +102,10 @@ impl MediaTransport for TcpMediaTransport {
 
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
         Some(self)
+    }
+
+    fn negotiated_codec(&self) -> crate::encoder::Codec {
+        self.negotiated
     }
 
     // R-04：音频包 → tag=Audio 走 SecureChannel 既有通道（wire 格式与

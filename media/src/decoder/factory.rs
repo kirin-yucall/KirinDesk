@@ -110,15 +110,23 @@ pub const DECODER_FALLBACK_CHAIN_H265: &[&str] = &[
     "hevc",
 ];
 
+/// AV1 回退链（R-32，M13-T002 阶段 B）：软解 `av1`（native 解码器，FFmpeg
+/// full build 恒带）兜底。暂不并入 av1_qsv/av1_cuvid 等 HW 后端——与
+/// h264_qsv 同族 MFX 驱动损坏风险（本机 -9 实测，FFmpeg 失败路径偶发堆
+/// 损坏原生崩溃，见 [`hw_decode_disabled`]），且 HW AV1 解码为后续增强
+/// （R-15b 零拷贝桥之后评估）。
+pub const DECODER_FALLBACK_CHAIN_AV1: &[&str] = &["av1"];
+
 /// 按 codec 取对应回退链。
 pub fn fallback_chain_for(codec: Codec) -> &'static [&'static str] {
     match codec {
         Codec::H264 => DECODER_FALLBACK_CHAIN,
         Codec::H265 => DECODER_FALLBACK_CHAIN_H265,
+        Codec::AV1 => DECODER_FALLBACK_CHAIN_AV1,
     }
 }
 
-/// 软件解码器名（回退链兜底项："h264" | "hevc"）。
+/// 软件解码器名（回退链兜底项："h264" | "hevc" | "av1"）。
 ///
 /// [`VideoDecoderPipeline`] 据此区分硬件/软解后端：链中等于此名的项走
 /// `ffmpeg_sw`，其余走 `ffmpeg_hw`。
@@ -126,6 +134,7 @@ pub fn software_decoder_name(codec: Codec) -> &'static str {
     match codec {
         Codec::H264 => "h264",
         Codec::H265 => "hevc",
+        Codec::AV1 => "av1",
     }
 }
 
@@ -162,6 +171,12 @@ pub fn detect_supported_decoders_cached(codec: Codec) -> Vec<&'static str> {
             static CACHE_H265: OnceLock<Vec<&'static str>> = OnceLock::new();
             CACHE_H265
                 .get_or_init(|| detect_supported_decoders(Codec::H265))
+                .clone()
+        }
+        Codec::AV1 => {
+            static CACHE_AV1: OnceLock<Vec<&'static str>> = OnceLock::new();
+            CACHE_AV1
+                .get_or_init(|| detect_supported_decoders(Codec::AV1))
                 .clone()
         }
     }
@@ -229,6 +244,33 @@ mod tests {
         assert_eq!(chain.last().copied(), Some("hevc"));
         assert_eq!(chain[0], "hevc_qsv");
         assert_eq!(software_decoder_name(Codec::H265), "hevc");
+    }
+
+    /// R-32：AV1 回退链 = 软解 `av1`（native 解码器兜底）；软解名/创建路径可用。
+    #[test]
+    fn test_detect_av1() {
+        assert_eq!(software_decoder_name(Codec::AV1), "av1");
+        assert_eq!(
+            fallback_chain_for(Codec::AV1),
+            DECODER_FALLBACK_CHAIN_AV1
+        );
+        let chain = detect_supported_decoders(Codec::AV1);
+        assert!(!chain.is_empty(), "AV1 回退链不应为空");
+        assert_eq!(chain.last().copied(), Some("av1"));
+        assert_eq!(detect_supported_decoders_cached(Codec::AV1), chain);
+        // 创建路径（无 DLL 环境 Err 而非 panic；有 DLL 环境落软解 av1）。
+        match create_video_decoder(Codec::AV1) {
+            Ok(dec) => {
+                assert_eq!(dec.codec(), Codec::AV1);
+                if !dec.is_hardware() {
+                    assert_eq!(dec.name(), "av1");
+                }
+            }
+            Err(DecodeError::InitFailed(_)) | Err(DecodeError::CodecNotFound(_)) => {
+                eprintln!("create_video_decoder(AV1): unavailable (no FFmpeg DLLs)");
+            }
+            Err(other) => panic!("期望 Ok 或 InitFailed/CodecNotFound，实际: {other}"),
+        }
     }
 
     /// 全硬件不可用 → 返回软解实例（mock 探测语义：静态链驱动）。

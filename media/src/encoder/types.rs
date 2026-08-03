@@ -133,13 +133,18 @@ impl TileRegion {
 // Codec / PacketKind / EncodedPacket
 // ════════════════════════════════════════════════════════════════
 
-/// 编码标准（H.264 默认 / H.265 协商）。
+/// 编码标准（H.264 默认 / H.265 协商 / AV1（R-32，M13-T002 阶段 B））。
 ///
 /// 注意：与旧 `encoder::Codec`（含 `Jpeg`）并存于不同模块路径；P1C 合并。
+/// 新增变体走**字符串协商**（[`as_str`](Self::as_str) / [`from_str`](Self::from_str)），
+/// 不触碰既有 wire 格式（握手/控制消息均为字符串，向后兼容）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Codec {
     H264,
     H265,
+    /// AV1（SVT-AV1 软编；协商存在，运行时不可用时由
+    /// [`crate::encoder::factory::create_video_encoder`] 自动回退 H.264）。
+    AV1,
 }
 
 impl Codec {
@@ -148,6 +153,29 @@ impl Codec {
         match self {
             Codec::H264 => "libx264",
             Codec::H265 => "libx265",
+            // R-32（M13-T002）：SVT-AV1 为 FFmpeg full build 默认 AV1 软编
+            // （av1_probe 已验证链路；libaom_av1/librav1e 为回退链候补）。
+            Codec::AV1 => "libsvtav1",
+        }
+    }
+
+    /// 握手/控制消息协商字符串（wire 格式，与既有 `CODEC_H264="h264"` /
+    /// `CODEC_H265="h265"` 同族）：`"h264"` | `"h265"` | `"av1"`。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Codec::H264 => "h264",
+            Codec::H265 => "h265",
+            Codec::AV1 => "av1",
+        }
+    }
+
+    /// 从协商字符串解析；未知/空串 → `None`（调用方按 H.264 兜底）。
+    pub fn from_str(s: &str) -> Option<Codec> {
+        match s {
+            "h264" => Some(Codec::H264),
+            "h265" => Some(Codec::H265),
+            "av1" => Some(Codec::AV1),
+            _ => None,
         }
     }
 }
@@ -353,6 +381,24 @@ mod tests {
     fn test_codec_sw_name() {
         assert_eq!(Codec::H264.ffmpeg_sw_name(), "libx264");
         assert_eq!(Codec::H265.ffmpeg_sw_name(), "libx265");
+        // R-32（M13-T002 阶段 B）：AV1 软编名 = SVT-AV1。
+        assert_eq!(Codec::AV1.ffmpeg_sw_name(), "libsvtav1");
+    }
+
+    /// R-32（S1 验收）：AV1 枚举序列化兼容——协商字符串往返 + 未知回退。
+    #[test]
+    fn test_codec_wire_string_roundtrip() {
+        assert_eq!(Codec::H264.as_str(), "h264");
+        assert_eq!(Codec::H265.as_str(), "h265");
+        assert_eq!(Codec::AV1.as_str(), "av1");
+        // 往返：所有变体 as_str → from_str 恒等。
+        for c in [Codec::H264, Codec::H265, Codec::AV1] {
+            assert_eq!(Codec::from_str(c.as_str()), Some(c), "{c:?} roundtrip");
+        }
+        // 未知/空串 → None（调用方按 H.264 兜底，不 panic）。
+        assert_eq!(Codec::from_str(""), None);
+        assert_eq!(Codec::from_str("vp9"), None);
+        assert_eq!(Codec::from_str("AV1"), None); // 大小写敏感（与既有 h264 一致）
     }
 
     #[test]

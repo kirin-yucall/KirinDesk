@@ -48,6 +48,15 @@ pub const CODEC_FALLBACK_CHAIN_H265: &[&str] = &[
     "libx265",
 ];
 
+/// AV1 回退链（R-32，M13-T002 阶段 B）：SVT-AV1 优先，libaom/rav1e 候补。
+///
+/// 均软编（AV1 HW 编码器 av1_nvenc/av1_qsv/av1_amf 依赖 GPU 内核/驱动，
+/// 与既有 h264 HW 链同族，待 R-15b 零拷贝桥就绪后再并入）。链尾无兜底项
+/// ——跨 codec 兜底（AV1 不可用 → H.264/libx264）由
+/// [`create_video_encoder`] 的协商路径实现（R-32 验收：无 AV1 编码器 →
+/// 自动回退 H264 且无报错）。
+pub const CODEC_FALLBACK_CHAIN_AV1: &[&str] = &["libsvtav1", "libaom_av1", "librav1e"];
+
 /// 探测本机可用的硬件编码器（FFmpeg avcodec 探测，in-process）。
 ///
 /// 顺序：nvenc → amf → qsv → videotoolbox → vaapi → libx264。
@@ -83,16 +92,35 @@ pub fn fallback_chain_for(pref: Codec) -> &'static [&'static str] {
     match pref {
         Codec::H264 => CODEC_FALLBACK_CHAIN,
         Codec::H265 => CODEC_FALLBACK_CHAIN_H265,
+        Codec::AV1 => CODEC_FALLBACK_CHAIN_AV1,
+    }
+}
+
+/// 跨 codec 兜底顺序（R-32，M13-T002 阶段 B 回退链）：请求 codec 全链失败
+/// → H.264（libx264 兜底）。H.264/H.265 保持原语义（无跨 codec 回退，
+/// 避免改变既有协商行为）。
+fn cross_fallback_chain(pref: Codec) -> &'static [Codec] {
+    match pref {
+        Codec::AV1 => &[Codec::AV1, Codec::H264],
+        Codec::H264 => &[Codec::H264],
+        Codec::H265 => &[Codec::H265],
     }
 }
 
 /// 创建视频编码器实例：按回退链逐个尝试，返回第一个可用的。
 ///
-/// **P1B↔P1C 接驳（2026-07-31）**：`kernel` 可选。当 `kernel.is_linked()` 时
-/// **HW 优先**（`FfmpegHwEncoder::create` 先尝试，零拷贝 hwframes 路径就绪）；
-/// 失败再回退软编。kernel 为 `None` / 未链接时保持**软编优先**（已验证可真实
-/// 出码流 + decode roundtrip；HW 编码器虽能 open2 但 CPU NV12 帧输入路径不产
-/// 出包，真正零拷贝需 P1B `kgpu_hw_upload` 桥接）。
+/// **R-32（M13-T002 阶段 B）协商回退链**：请求 `Codec::AV1` 时，AV1 全链
+/// （libsvtav1 → libaom_av1 → librav1e）不可用 → 自动回退 H.264（libx264
+/// 兜底），**返回 Ok 而非报错**（验收：无 AV1 编码器 → 自动回退 H264 且无
+/// 报错）。H.264/H.265 行为不变（无跨 codec 回退）。
+///
+/// # P1B↔P1C 接驳（2026-07-31）
+///
+/// `kernel` 可选。当 `kernel.is_linked()` 时**HW 优先**（`FfmpegHwEncoder::create`
+/// 先尝试，零拷贝 hwframes 路径就绪）；失败再回退软编。kernel 为 `None` /
+/// 未链接时保持**软编优先**（已验证可真实出码流 + decode roundtrip；HW
+/// 编码器虽能 open2 但 CPU NV12 帧输入路径不产出包，真正零拷贝需 P1B
+/// `kgpu_hw_upload` 桥接）。
 ///
 /// **macOS 例外（M12-MAC MAC-T004，2026-08-01）**：无 D3D11 GPU 内核，
 /// 但 `h264_videotoolbox` 不依赖该内核（FFmpeg 层接受 NV12 CPU 帧）→ macOS
@@ -108,6 +136,29 @@ pub fn create_video_encoder(
     pref: Codec,
     kernel: Option<&dyn GpuKernel>,
 ) -> Result<Box<dyn VideoEncoder>, EncodeError> {
+    let mut last_err: Option<EncodeError> = None;
+    for attempt in cross_fallback_chain(pref) {
+        if attempt != &pref {
+            tracing::warn!(
+                "create_video_encoder: {pref:?} unavailable ({}); falling back to {attempt:?} (libx264 兜底, R-32)",
+                last_err.as_ref().map(|e| e.to_string()).unwrap_or_default()
+            );
+        }
+        match create_video_encoder_single(*attempt, kernel) {
+            Ok(enc) => return Ok(enc),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        EncodeError::Unsupported("no video encoder available (all codec chains failed)".into())
+    }))
+}
+
+/// [`create_video_encoder`] 的单 codec 实现（不跨 codec 回退）。
+fn create_video_encoder_single(
+    pref: Codec,
+    kernel: Option<&dyn GpuKernel>,
+) -> Result<Box<dyn VideoEncoder>, EncodeError> {
     // macOS（M12-MAC MAC-T004）：无 D3D11 GPU 内核（libkirin_gpu 为 Windows
     // 专用 C++ 内核），但 `h264_videotoolbox` 硬件编码**不依赖**该内核 ——
     // FFmpeg 层接受 NV12 CPU 帧（内部拷贝进 CVPixelBuffer），故 macOS 上
@@ -118,7 +169,13 @@ pub fn create_video_encoder(
     #[cfg(not(target_os = "macos"))]
     let hw_first = kernel.map(|k| k.is_linked()).unwrap_or(false);
 
-    if hw_first {
+    // R-32（M13-T002 阶段 B）：AV1 暂不接 HW——`FfmpegHwEncoder::create` 的
+    // 候选名表（h264_*/hevc_* 系）与 AV1 不匹配（pref=AV1 会误开 h264 HW
+    // 编码器 → codec() 报 AV1 但码流实为 H.264）。AV1 走软编（SVT-AV1），
+    // HW AV1（av1_nvenc/av1_qsv/av1_amf）待 R-15b 零拷贝桥 + AV1 HW 链并入。
+    let hw_capable = pref != Codec::AV1;
+
+    if hw_first && hw_capable {
         // HW 优先（P1B 零拷贝桥就绪）：失败再回退软编。
         if let Ok(hw) = FfmpegHwEncoder::create(pref, kernel) {
             return Ok(Box::new(hw));
@@ -127,12 +184,14 @@ pub fn create_video_encoder(
             return Ok(Box::new(sw));
         }
     } else {
-        // 软编优先（已验证出码流）：HW 作兜底。
+        // 软编优先（已验证出码流）：HW 作兜底（AV1 无 HW 兜底，见上）。
         if let Ok(sw) = FfmpegSwEncoder::create(pref) {
             return Ok(Box::new(sw));
         }
-        if let Ok(hw) = FfmpegHwEncoder::create(pref, kernel) {
-            return Ok(Box::new(hw));
+        if hw_capable {
+            if let Ok(hw) = FfmpegHwEncoder::create(pref, kernel) {
+                return Ok(Box::new(hw));
+            }
         }
     }
     Err(EncodeError::Unsupported(
@@ -161,6 +220,49 @@ mod tests {
         let h265 = fallback_chain_for(Codec::H265);
         assert_eq!(h265.last().copied(), Some("libx265"));
         assert_eq!(h265[0], "hevc_nvenc");
+    }
+
+    /// R-32（S1/S2）：AV1 回退链形状 + 跨 codec 兜底顺序。
+    #[test]
+    fn test_av1_fallback_chain_and_cross_fallback() {
+        // AV1 链：SVT-AV1 优先，libaom/rav1e 候补（软编；无链尾兜底——跨
+        // codec 兜底由 create_video_encoder 协商路径负责）。
+        let av1 = fallback_chain_for(Codec::AV1);
+        assert_eq!(av1, CODEC_FALLBACK_CHAIN_AV1);
+        assert_eq!(av1[0], "libsvtav1");
+        assert_eq!(av1.last().copied(), Some("librav1e"));
+        // 跨 codec 兜底：AV1 → H.264（libx264 兜底）；H.264/H.265 无跨 codec。
+        assert_eq!(cross_fallback_chain(Codec::AV1), &[Codec::AV1, Codec::H264]);
+        assert_eq!(cross_fallback_chain(Codec::H264), &[Codec::H264]);
+        assert_eq!(cross_fallback_chain(Codec::H265), &[Codec::H265]);
+    }
+
+    /// R-32 验收：请求 AV1 无报错——本机有 SVT-AV1 → AV1 编码器；无 AV1
+    /// 编码器（老构建/无 DLL）→ 自动回退 H.264（libx264 兜底），仍返回 Ok。
+    #[test]
+    fn test_create_av1_falls_back_without_error() {
+        match create_video_encoder(Codec::AV1, None) {
+            Ok(enc) => {
+                if enc.codec() == Codec::AV1 {
+                    // AV1 编码器可用：SVT-AV1 优先（本机捆绑 8.1.1 full build
+                    // 含 libsvtav1，静态编入 avcodec-62.dll）。
+                    assert!(
+                        matches!(enc.name(), "libsvtav1" | "libaom_av1" | "librav1e"),
+                        "AV1 encoder name unexpected: {}",
+                        enc.name()
+                    );
+                    assert!(!enc.is_hardware(), "AV1 当前走软编（SVT-AV1）");
+                } else {
+                    // 回退链生效：无 AV1 编码器 → H.264 兜底，无报错。
+                    assert_eq!(enc.codec(), Codec::H264);
+                }
+            }
+            Err(EncodeError::Unsupported(_)) => {
+                // 无 FFmpeg DLL / 全链不可用环境：Unsupported（不是 panic）。
+                eprintln!("create_video_encoder(AV1): Unsupported (no FFmpeg DLLs/encoders)");
+            }
+            Err(other) => panic!("期望 Ok 或 Unsupported，实际: {other}"),
+        }
     }
 
     /// P1C Tests：全硬件不可用 → 回退 libx264（软编）。无 DLL 环境返回

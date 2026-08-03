@@ -319,6 +319,33 @@ impl FfmpegSwEncoder {
         }
 
         let mut packets = Vec::new();
+        self.drain_receive(&mut packets, ts)?;
+        // R-32（M13-T002 阶段 B）：SVT-AV1 为异步多线程编码器（lookahead 缓冲），
+        // 刚送入的帧可能尚未产出包（EAGAIN 空结果）——短等待重试排空，保证
+        // 单帧调用也能及时取回已排队的包（x264/x265 zerolatency 立即出包，
+        // 不触发等待，无额外延迟）。
+        if packets.is_empty() && self.codec_kind == Codec::AV1 {
+            for _ in 0..25 {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                self.drain_receive(&mut packets, ts)?;
+                if !packets.is_empty() {
+                    break;
+                }
+            }
+        }
+        Ok(packets)
+    }
+
+    /// 排空 `avcodec_receive_packet` 队列到 `packets`（首包前置 extradata）。
+    ///
+    /// 返回 `true` 表示至少收到一个包；EAGAIN（编码器忙）/ EOF 结束排空，
+    /// 不丢帧（下次调用继续）。
+    fn drain_receive(
+        &mut self,
+        packets: &mut Vec<EncodedPacket>,
+        ts: Timestamp,
+    ) -> Result<bool, EncodeError> {
+        let mut received = false;
         loop {
             match ffmpeg::avcodec_receive_packet(self.ctx, self.packet) {
                 Ok(()) => {
@@ -359,6 +386,7 @@ impl FfmpegSwEncoder {
                         data: buf,
                         is_key,
                     });
+                    received = true;
                 }
                 Err(ffmpeg::AvError::Code(ffmpeg::AVERROR_EAGAIN)) => break,
                 Err(ffmpeg::AvError::Code(ffmpeg::AVERROR_EOF)) => break,
@@ -369,7 +397,7 @@ impl FfmpegSwEncoder {
                 }
             }
         }
-        Ok(packets)
+        Ok(received)
     }
 }
 
@@ -544,17 +572,34 @@ fn open_with_dict(
     // 2) 其它顶层 int（AVOption 表里有，flag=0 搜 obj 自身）。
     let obj = ctx as *mut c_void;
     let _ = ffmpeg::av_opt_set_int_self(obj, "b", SW_DEFAULT_BITRATE);
-    let _ = ffmpeg::av_opt_set_int_self(obj, "maxrate", SW_DEFAULT_BITRATE);
+    // R-32（M13-T002 阶段 B）：SVT-AV1 的 `maxrate` 仅支持 CRF 模式（VBR 下
+    // open2 报 "Max Bitrate only supported with CRF"，av1_probe 实测）→ AV1
+    // 只设 b（VBR），跳过 maxrate。
+    if codec_kind != Codec::AV1 {
+        let _ = ffmpeg::av_opt_set_int_self(obj, "maxrate", SW_DEFAULT_BITRATE);
+    }
     let _ = ffmpeg::av_opt_set_int_self(obj, "refs", 1);
     let _ = ffmpeg::av_opt_set_int_self(obj, "threads", SW_THREADS);
     let _ = ffmpeg::av_opt_set_int_self(obj, "max_b_frames", 0);
     let _ = ffmpeg::av_opt_set_int_self(obj, "rc-lookahead", 0);
-    // 3) 编解码器私有选项（子选项，SEARCH_CHILDREN）。
-    let _ = ffmpeg::av_opt_set(obj, "preset", "ultrafast");
-    let _ = ffmpeg::av_opt_set(obj, "tune", "zerolatency");
+    // 3) 编解码器私有选项（子选项，SEARCH_CHILDREN）。best-effort：不支持的
+    //    选项被编码器忽略（av_opt_set 报错被吞）。
+    //    R-32：AV1（SVT-AV1）用数值 preset（0~13，8 为速度/质量均衡档，
+    //    av1_probe 实测路径）；无 zerolatency tune（SVT 只有 0~3 指标 tune，
+    //    低延迟由 lookahead 语义保证，见 encode_inner 的 EAGAIN 排空）。
+    let (preset, tune) = match codec_kind {
+        Codec::H264 | Codec::H265 => ("ultrafast", Some("zerolatency")),
+        Codec::AV1 => ("8", None),
+    };
+    let _ = ffmpeg::av_opt_set(obj, "preset", preset);
+    if let Some(t) = tune {
+        let _ = ffmpeg::av_opt_set(obj, "tune", t);
+    }
     let profile_str = match codec_kind {
         Codec::H264 => "baseline",
         Codec::H265 => "main",
+        // SVT-AV1 profile 名（main/high/professional）；失败被忽略。
+        Codec::AV1 => "main",
     };
     let _ = ffmpeg::av_opt_set(obj, "profile", profile_str);
     // 4) open2（plain；opts 字典路径实测会让 send_frame 报 -542398533，故用 plain）。
@@ -658,5 +703,112 @@ mod tests {
             // 窗口边界 flush（与 WindowPipeline 每窗口调用一致）。
             enc.flush_buffers();
         }
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // R-32（M13-T002 阶段 B）：SVT-AV1 码流合法性 + 解码回读
+    // ════════════════════════════════════════════════════════════
+
+    /// R-32 验收：AV1 编码器（libsvtav1）出码流合法（Annex B 起始码 +
+    /// 关键帧标志）；捆绑 FFmpeg 8.1.1 full build 静态编入 libsvtav1
+    /// （avcodec-62.dll 内），无独立 DLL。老构建无 SVT → 静默跳过。
+    #[test]
+    fn test_sw_encoder_av1_annex_b() {
+        if ffmpeg::ensure_loaded().is_err() {
+            eprintln!("FFmpeg libraries not available; test_sw_encoder_av1_annex_b skipped");
+            return;
+        }
+        let Ok(mut enc) = FfmpegSwEncoder::create(Codec::AV1) else {
+            eprintln!("libsvtav1 not in this FFmpeg build; skipped");
+            return;
+        };
+        assert_eq!(enc.name(), "libsvtav1");
+        assert_eq!(enc.codec(), Codec::AV1);
+        let w = 320u32;
+        let h = 240u32;
+        let rgba = vec![128u8; (w * h * 4) as usize];
+        enc.set_cpu_frame(&rgba, w, h, true);
+
+        let tex = GpuTexture::new(0x1usize as *mut _, w, h);
+        let decision = EncodeDecision::FullFrame(DirtyTileMap::default());
+        let packets = enc
+            .encode(&tex, Timestamp::now(), decision)
+            .expect("SVT-AV1 encode should succeed (DLL loaded)");
+        assert!(!packets.is_empty(), "SVT-AV1 should produce ≥1 packet");
+        assert!(packets[0].is_key, "first AV1 packet should be keyframe");
+        let first = &packets[0].data;
+        // Annex B 起始码：00 00 00 01 或 00 00 01（SVT 输出 Annex B）。
+        let starts_with_startcode = (first.len() >= 4 && first[0..4] == [0, 0, 0, 1])
+            || (first.len() >= 3 && first[0..3] == [0, 0, 1]);
+        assert!(
+            starts_with_startcode,
+            "expected Annex B start code, got {:02x?}",
+            &first[..first.len().min(8)]
+        );
+    }
+
+    /// R-32 验收：AV1 编码 → **解码回读**（生产解码路径：软解 av1），
+    /// 多帧不同内容全部可解，输出帧尺寸正确。
+    #[test]
+    fn test_sw_encoder_av1_decode_roundtrip() {
+        if ffmpeg::ensure_loaded().is_err() {
+            eprintln!("FFmpeg libraries not available; test_sw_encoder_av1_decode_roundtrip skipped");
+            return;
+        }
+        let Ok(mut enc) = FfmpegSwEncoder::create(Codec::AV1) else {
+            eprintln!("libsvtav1 not in this FFmpeg build; skipped");
+            return;
+        };
+        let (w, h) = (320u32, 240u32);
+        let tex = GpuTexture::new(0x1usize as *mut _, w, h);
+        let mut packets_all: Vec<EncodedPacket> = Vec::new();
+        for idx in 0..4u32 {
+            // 不同内容帧（纯色递进 + 局部方块模拟桌面变化）。
+            let mut rgba = vec![(idx as u8 + 1) * 32; (w * h * 4) as usize];
+            let sq = 48usize;
+            let bx = (idx as usize * 37) % ((w as usize).saturating_sub(sq));
+            let by = (idx as usize * 29) % ((h as usize).saturating_sub(sq));
+            for yy in by..by + sq {
+                for xx in bx..bx + sq {
+                    rgba[(yy * w as usize + xx) * 4] = 200;
+                }
+            }
+            enc.set_cpu_frame(&rgba, w, h, idx == 0);
+            let pkts = enc
+                .encode(
+                    &tex,
+                    Timestamp::now(),
+                    EncodeDecision::FullFrame(DirtyTileMap::default()),
+                )
+                .unwrap_or_else(|e| panic!("AV1 frame {idx} encode must succeed: {e}"));
+            assert!(!pkts.is_empty(), "AV1 frame {idx} must produce ≥1 packet");
+            packets_all.extend(pkts);
+        }
+        // 解码回读（生产解码链：软解 av1）。
+        let mut dec = match crate::decoder::factory::create_software_decoder(Codec::AV1) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("AV1 software decoder unavailable: {e}; skipped");
+                return;
+            }
+        };
+        let mut decoded = 0usize;
+        for (i, pkt) in packets_all.iter().enumerate() {
+            match dec.decode(&crate::decoder::DecoderPacket {
+                pts: i as u64,
+                data: pkt.data.clone(),
+                is_key: pkt.is_key,
+                extradata: None,
+            }) {
+                Ok(frames) => decoded += frames.len(),
+                Err(crate::decoder::DecodeError::NoOutput) => {}
+                Err(e) => panic!("AV1 decode packet {i}: {e}"),
+            }
+        }
+        assert!(
+            decoded > 0,
+            "AV1 bitstream must decode ≥1 frame (got {decoded})"
+        );
+        tracing::info!("AV1 decode roundtrip: {decoded} frames decoded");
     }
 }

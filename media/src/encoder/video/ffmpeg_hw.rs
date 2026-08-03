@@ -360,9 +360,12 @@ impl FfmpegHwEncoder {
         let _ = ffmpeg::av_opt_set_int(obj, "rc-lookahead", 0);
         // profile：H264 → 66 (baseline，兼容性优先；77 main 协商可达)；
         //          H265 → 100 (main)。
+        // R-32：AV1 不接 HW（factory 门控 `hw_capable`），此臂不可达——占位
+        // 保证枚举穷尽；HW AV1 待 AV1 HW 链并入。
         let profile = match self.codec {
             Codec::H264 => 66,
             Codec::H265 => 100,
+            Codec::AV1 => 0,
         };
         let _ = ffmpeg::av_opt_set_int(obj, "profile", profile);
         // preset / tune / zerolatency 因编码器而异（见 T3.2 参数表），best-effort。

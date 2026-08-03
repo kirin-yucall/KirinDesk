@@ -11,9 +11,9 @@
 use kirin_desk_core::connection::temp_mode::TempModeManager;
 use kirin_desk_core::crypto::ed25519::IdentityManager;
 use kirin_desk_core::crypto::handshake::{
-    domain_matches_whitelist, id_matches_whitelist, server_handshake_respond_generic,
-    server_read_init, verify_server_init_with_temp, HandshakeError, SecureChannel,
-    VerifiedDecision,
+    domain_matches_whitelist, id_matches_whitelist, negotiate_codec_by_server_priority,
+    server_handshake_respond_generic, server_read_init, verify_server_init_with_temp,
+    HandshakeError, SecureChannel, VerifiedDecision,
 };
 use kirin_desk_dns::txt::TxtManager;
 use kirin_desk_utils::config::Config;
@@ -193,7 +193,19 @@ pub async fn server_accept_handshake(
     )?;
 
     // 4. 应答 + 建立安全通道。
-    let selected_codec = String::new();
+    // R-32（M13-T002 阶段 B）：编码能力协商——服务端按**自身编码优先级**
+    // （AV1 → H.265 → H.264）从客户端可解码列表（握手 supported_codecs）中
+    // 挑选；交集为空（旧客户端未广告 / 无交集）→ 空串 → 客户端按 H.264 兜底
+    // （与既有行为一致）。服务端编码能力缓存自 media 探测（避免每连接创建
+    // 编码器）。
+    let selected_codec = {
+        let server_caps: Vec<String> =
+            kirin_desk_media::encoder::detect_supported_codecs_cached()
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect();
+        negotiate_codec_by_server_priority(&server_caps, &init.supported_codecs)
+    };
     let g = server_handshake_respond_generic(stream, identity, server_id, &init, &selected_codec)
         .await?;
     Ok(VerifiedDecision::Accepted(SecureChannel {

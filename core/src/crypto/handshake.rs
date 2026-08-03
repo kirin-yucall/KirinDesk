@@ -185,6 +185,27 @@ pub fn negotiate_codec(client_codecs: &[String], server_codecs: &[String]) -> St
     String::new()
 }
 
+/// R-32（M13-T002 阶段 B）：服务端按**服务端编码优先级**从两端交集选 codec。
+///
+/// - `server_codecs`：服务端可编码列表（`media::encoder::detect_supported_codecs`
+///   ，按优先级，如 `["av1","h265","h264"]`）——服务端优先选码率效率高的
+///   AV1（~6×，探索结论），其次 H.265/H.264；
+/// - `client_codecs`：客户端可解码列表（握手 `supported_codecs`）。
+///
+/// 交集为空（含客户端未广告 / 未知字符串）→ 空串，服务端调用方按 **H.264
+/// 兜底**（既有语义，兼容旧握手——旧客户端 supported_codecs 为空）。
+pub fn negotiate_codec_by_server_priority(
+    server_codecs: &[String],
+    client_codecs: &[String],
+) -> String {
+    for server_codec in server_codecs {
+        if client_codecs.iter().any(|cc| cc == server_codec) {
+            return server_codec.clone();
+        }
+    }
+    String::new()
+}
+
 // ---- Generic handshake (works with TcpStream, QuicBiStream, etc.) ----
 
 /// Generic client handshake — works with any AsyncRead + AsyncWrite + Unpin + Send stream.
@@ -212,6 +233,30 @@ pub async fn client_handshake_generic<S: AsyncRead + AsyncWrite + Unpin + Send>(
     .await
 }
 
+/// 带**本端可解码 codec 列表**的客户端握手（R-32，M13-T002 阶段 B）。
+///
+/// 与 [`client_handshake_generic`] 的差异仅在 `supported_codecs` 字段——
+/// 客户端把可解码编码标准（`"h264"`/`"h265"`/`"av1"`，按优先级）写入手
+/// 握 init，服务端据此挑选 `selected_codec`。旧函数传空列表（行为不变，
+/// 服务端按空交集回落 H.264 兜底，见 [`negotiate_codec_by_server_priority`]）。
+pub async fn client_handshake_with_codecs_generic<S: AsyncRead + AsyncWrite + Unpin + Send>(
+    stream: S,
+    client_identity: &IdentityManager,
+    client_id: &str,
+    client_domain: &str,
+    client_device_type: &str,
+    server_id: &str,
+    pin: PinExpectation,
+    challenge: &str,
+    supported_codecs: Vec<String>,
+) -> Result<SecureChannelGeneric<S>, HandshakeError> {
+    client_handshake_with_confirm_and_codecs_generic(
+        stream, client_identity, client_id, client_domain, client_device_type,
+        server_id, pin, None, challenge, supported_codecs,
+    )
+    .await
+}
+
 /// 带信任确认回调的通用客户端握手（CLI-HSK-SEC-003 / CLI-KH-001）。
 ///
 /// 信任策略由 `pin` / `key_confirm` 组合决定（R-02，无"无期望跳过"路径）：
@@ -224,6 +269,30 @@ pub async fn client_handshake_generic<S: AsyncRead + AsyncWrite + Unpin + Send>(
 /// - [`PinExpectation::None`] + [`CoreReason::InternalLoopback`]：loopback 自签
 ///   兜底，以客户端自身公钥强制比对（R-02-S3）。
 pub async fn client_handshake_with_confirm_generic<S: AsyncRead + AsyncWrite + Unpin + Send>(
+    stream: S,
+    client_identity: &IdentityManager,
+    client_id: &str,
+    client_domain: &str,
+    client_device_type: &str,
+    server_id: &str,
+    pin: PinExpectation,
+    key_confirm: Option<Box<dyn Fn(&str) -> bool + Send>>,
+    challenge: &str,
+) -> Result<SecureChannelGeneric<S>, HandshakeError> {
+    client_handshake_with_confirm_and_codecs_generic(
+        stream, client_identity, client_id, client_domain, client_device_type,
+        server_id, pin, key_confirm, challenge, Vec::new(),
+    )
+    .await
+}
+
+/// [`client_handshake_with_confirm_generic`] 的带 codec 列表变体（R-32）。
+///
+/// 与确认回调版唯一差异：`supported_codecs` 写入握 init（空列表 = 旧行为）。
+/// 信任语义（pin/确认回调）完全一致，无新协议安全面。
+pub async fn client_handshake_with_confirm_and_codecs_generic<
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+>(
     mut stream: S,
     client_identity: &IdentityManager,
     client_id: &str,
@@ -233,6 +302,7 @@ pub async fn client_handshake_with_confirm_generic<S: AsyncRead + AsyncWrite + U
     pin: PinExpectation,
     mut key_confirm: Option<Box<dyn Fn(&str) -> bool + Send>>,
     challenge: &str,
+    supported_codecs: Vec<String>,
 ) -> Result<SecureChannelGeneric<S>, HandshakeError> {
     let session = EphemeralSession::new();
     let x25519_pub = session.public_key_bytes();
@@ -240,8 +310,6 @@ pub async fn client_handshake_with_confirm_generic<S: AsyncRead + AsyncWrite + U
 
     let sig_payload = build_sig_payload(&x25519_pub, &nonce, client_id, client_domain, client_device_type);
     let signature = client_identity.sign(&sig_payload);
-
-    let supported_codecs: Vec<String> = Vec::new();
 
     let client_pub_b64 = client_identity.public_key_base64();
     let init_msg = HandshakeInit {
@@ -1781,5 +1849,101 @@ mod tests {
         client.write_all(&u32::MAX.to_be_bytes()).await.unwrap();
         client.flush().await.unwrap();
         server_task.await.unwrap();
+    }
+
+    // ── R-32（M13-T002 阶段 B）：codec 协商 ──────────────────────
+
+    /// 服务端优先级协商：交集命中按服务端顺序（AV1 优先）。
+    #[test]
+    fn test_negotiate_codec_by_server_priority() {
+        let server = vec!["av1".to_string(), "h265".to_string(), "h264".to_string()];
+        // 客户端全支持 → AV1（服务端最优）。
+        let client_all = vec!["h264".to_string(), "h265".to_string(), "av1".to_string()];
+        assert_eq!(
+            negotiate_codec_by_server_priority(&server, &client_all),
+            "av1"
+        );
+        // 客户端不支持 AV1 → h265。
+        let client_no_av1 = vec!["h264".to_string(), "h265".to_string()];
+        assert_eq!(
+            negotiate_codec_by_server_priority(&server, &client_no_av1),
+            "h265"
+        );
+        // 客户端仅 h264 → h264。
+        let client_h264_only = vec!["h264".to_string()];
+        assert_eq!(
+            negotiate_codec_by_server_priority(&server, &client_h264_only),
+            "h264"
+        );
+        // 交集为空（客户端未广告/未知）→ 空串（调用方 H.264 兜底）。
+        assert_eq!(
+            negotiate_codec_by_server_priority(&server, &[]),
+            String::new()
+        );
+        let client_unknown = vec!["vp9".to_string()];
+        assert_eq!(
+            negotiate_codec_by_server_priority(&server, &client_unknown),
+            String::new()
+        );
+        // 服务端空列表 → 空串。
+        assert_eq!(
+            negotiate_codec_by_server_priority(&[], &client_all),
+            String::new()
+        );
+    }
+
+    /// 客户端优先级协商（既有语义回归：按客户端列表顺序）。
+    #[test]
+    fn test_negotiate_codec_client_order() {
+        let client = vec!["h265".to_string(), "h264".to_string()];
+        let server = vec!["h264".to_string(), "h265".to_string()];
+        assert_eq!(negotiate_codec(&client, &server), "h265");
+        // 无交集 → 空串。
+        assert_eq!(negotiate_codec(&client, &[]), String::new());
+    }
+
+    /// R-32：带 codec 列表的客户端握手 → 服务端可读到 supported_codecs 并
+    /// 应答 selected_codec（wire 往返：duplex 真实握手，非手搓消息）。
+    #[tokio::test]
+    async fn test_client_handshake_with_codecs_wire() {
+        let dir = std::env::temp_dir().join("kirin_hs_codecs");
+        let alice = gen_identity(&dir, "alice");
+        let bob = gen_identity(&dir, "bob");
+        let bob_pub = bob.public_key_base64();
+        let alice_pub = alice.public_key_base64();
+        let (client_end, mut server_end) = tokio::io::duplex(65536);
+
+        let client_fut = client_handshake_with_codecs_generic(
+            client_end,
+            &alice,
+            "alice",
+            "alice.local",
+            "desktop",
+            "bob",
+            PinExpectation::exact_from_base64(&bob_pub).expect("bob pubkey"),
+            "",
+            vec!["av1".to_string(), "h265".to_string(), "h264".to_string()],
+        );
+        let server_fut = async move {
+            let init = server_read_init(&mut server_end).await?;
+            // 客户端广告 av1 → 服务端按自身优先级选 av1。
+            let server_caps = vec![
+                "av1".to_string(),
+                "h265".to_string(),
+                "h264".to_string(),
+            ];
+            let selected =
+                negotiate_codec_by_server_priority(&server_caps, &init.supported_codecs);
+            assert_eq!(selected, "av1");
+            let g = server_handshake_respond_generic(server_end, &bob, "bob", &init, &selected)
+                .await?;
+            Ok::<_, HandshakeError>(g)
+        };
+        let (client_res, server_res) = tokio::join!(client_fut, server_fut);
+        assert!(server_res.is_ok(), "server side should succeed");
+        let client_ch = client_res.expect("client handshake with codecs should succeed");
+        // 客户端侧拿到服务端选中的 codec。
+        assert_eq!(client_ch.selected_codec, "av1");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

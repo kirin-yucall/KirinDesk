@@ -60,19 +60,37 @@ pub use audio::{AudioCapture, AudioPcm, AudioPipeline, OpusEncoder};
 /// Codec 字符串常量（握手协商用）。
 pub const CODEC_H264: &str = "h264";
 pub const CODEC_H265: &str = "h265";
+/// R-32（M13-T002 阶段 B）：AV1 协商字符串。
+pub const CODEC_AV1: &str = "av1";
 
 /// 检测本机可用编码（握手用：返回 codec 字符串列表，按优先级）。
 ///
 /// 与 [`factory::detect_supported_codecs`]（返回 FFmpeg 编码器名回退链）
-/// 语义不同——本函数返回**协商用 codec 字符串**（`"h264"` / `"h265"`），
-/// 服务于传输握手。
+/// 语义不同——本函数返回**协商用 codec 字符串**（`"h264"` / `"h265"` /
+/// `"av1"`），服务于传输握手。
+///
+/// R-32：AV1 协商存在性 = 本机 AV1 编码器链可用（`create_video_encoder(AV1)`
+/// 内部已含「AV1 不可用 → 回退 H.264」兜底，此处仅按**实际选中 codec**
+/// 上报——即 AV1 协商成功仅当编码器真的落在 AV1 上）。
 pub fn detect_supported_codecs() -> Vec<&'static str> {
     let mut codecs = Vec::new();
-    if factory::create_video_encoder(Codec::H264, None).is_ok() {
-        codecs.push(CODEC_H264);
+    // 优先级：AV1（码率效率 ~6×，M13-T002 探索结论）→ H.265 → H.264 兜底。
+    if let Ok(enc) = factory::create_video_encoder(Codec::AV1, None) {
+        if enc.codec() == Codec::AV1 {
+            codecs.push(CODEC_AV1);
+        }
     }
     if factory::create_video_encoder(Codec::H265, None).is_ok() {
         codecs.push(CODEC_H265);
     }
+    if factory::create_video_encoder(Codec::H264, None).is_ok() {
+        codecs.push(CODEC_H264);
+    }
     codecs
+}
+
+/// [`detect_supported_codecs`] 的缓存版（服务端每次握手避免重复创建编码器）。
+pub fn detect_supported_codecs_cached() -> Vec<&'static str> {
+    static CACHE: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(detect_supported_codecs).clone()
 }

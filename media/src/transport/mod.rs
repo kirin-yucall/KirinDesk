@@ -197,4 +197,11 @@ pub trait MediaTransport: Send {
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
         None
     }
+
+    /// R-32（M13-T002 阶段 B）：会话协商选中的编码标准（握手
+    /// `selected_codec`）。默认 H.264（未协商/旧对端/桩实现零改动——
+    /// 与既有硬编码行为一致）。
+    fn negotiated_codec(&self) -> crate::encoder::Codec {
+        crate::encoder::Codec::H264
+    }
 }

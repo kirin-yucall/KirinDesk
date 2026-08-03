@@ -3099,6 +3099,11 @@ async fn run_client_session_with_channel(
     // M8-T021 P1: 会话标识（窗口键控状态 key；窗口 id 与之解耦）。
     // R-03：重连续接复用同一 session_id（窗口已存在，键控状态继续有效）。
     let session_id = resume_session_id.unwrap_or_else(next_session_id);
+    // R-32（M13-T002 阶段 B）：握手协商的编码标准——`channel` 随后
+    // `into_split()` 字段不可用，先取出（Copy 枚举，可自由捕获进解码线程）。
+    // 空/未知 → H.264 兜底（未协商/旧服务端场景与既有行为一致）。
+    let negotiated_codec = kirin_desk_media::encoder::Codec::from_str(&channel.selected_codec)
+        .unwrap_or(kirin_desk_media::encoder::Codec::H264);
     // 本机身份（文件会话盐需要公钥；启动时已加载）。
     let Some(client_id) = global_identity().get() else {
         tracing::error!("No device identity loaded, can't start session");
@@ -3335,8 +3340,10 @@ async fn run_client_session_with_channel(
         .name("kirin-video-decode".into())
         .spawn(move || {
             // P2B：VideoDecoderPipeline（回退链 qsv→cuvid→…→软解）。
+            // R-32（M13-T002 阶段 B）：解码标准取握手协商结果
+            // （`negotiated_codec`；空/未知 → H.264 兜底）。
             let mut decoder = match kirin_desk_media::decoder::factory::create_video_decoder(
-                kirin_desk_media::encoder::Codec::H264,
+                negotiated_codec,
             ) {
                 Ok(d) => {
                     tracing::info!("Client decoder: {} (HW={})", d.name(), d.is_hardware());
@@ -7004,8 +7011,18 @@ impl KirinDeskApp {
                     );
                 }
             }
+            // R-32（M13-T002 阶段 B）：编码能力协商——服务端按自身编码优先级
+            // （AV1 → H.265 → H.264，media 探测缓存）从客户端可解码列表挑选；
+            // 交集为空（旧客户端未广告）→ 空串 → 客户端按 H.264 兜底。
+            let server_caps: Vec<String> =
+                kirin_desk_media::encoder::detect_supported_codecs_cached()
+                    .into_iter()
+                    .map(|s| s.to_string())
+                    .collect();
+            let selected_codec =
+                negotiate_codec_by_server_priority(&server_caps, &init.supported_codecs);
             let g =
-                match server_handshake_respond_generic(stream, server_id, &server_name, &init, "")
+                match server_handshake_respond_generic(stream, server_id, &server_name, &init, &selected_codec)
                     .await
                 {
                     Ok(g) => g,
@@ -7027,6 +7044,11 @@ impl KirinDeskApp {
                 peer_device_type: g.peer_device_type,
                 selected_codec: g.selected_codec,
             };
+            // R-32（M13-T002 阶段 B）：协商编码标准在 `ch.into_split()` 前取出
+            // （拆分后字段不可用；Copy 枚举，编码任务闭包自由捕获）。
+            let negotiated_codec =
+                kirin_desk_media::encoder::Codec::from_str(&ch.selected_codec)
+                    .unwrap_or(kirin_desk_media::encoder::Codec::H264);
             audit_record(
                 &mut audit,
                 kirin_desk_utils::audit::AuditEvent::HandshakeSuccess,
@@ -7076,7 +7098,6 @@ impl KirinDeskApp {
             let stop_capture = server_stop_signal();
             tokio::spawn(async move {
                 use kirin_desk_media::capture::create_capture_source;
-                use kirin_desk_media::encoder::types::Codec;
                 use kirin_desk_media::proto::{EncodeConfig, RawFrame, WindowConfig};
                 use kirin_desk_media::window_pipeline::WindowPipeline;
                 use kirin_desk_media::VideoEncoderPipeline;
@@ -7123,7 +7144,14 @@ impl KirinDeskApp {
                         None
                     }
                 };
-                let encoder = match VideoEncoderPipeline::new(Codec::H264, kernel) {
+                let encoder = match VideoEncoderPipeline::new(
+                    // R-32（M13-T002 阶段 B）：编码标准取握手协商结果
+                    // （`negotiated_codec`；空/未知 → H.264 兜底）。AV1 会话 →
+                    // SVT-AV1 软编（factory 内建「AV1 不可用 → 自动回退 H.264」
+                    // 兜底——协商存在但运行时缺编码器也不会报错）。
+                    negotiated_codec,
+                    kernel,
+                ) {
                     Ok(e) => e,
                     Err(e) => {
                         error!("Failed to create video encoder pipeline: {}", e);

@@ -41,7 +41,6 @@ use crate::adaptive::{AdaptiveEngine, FeedbackReport, ReportGenerator};
 use crate::capture::{CaptureError, ScreenCaptureSource};
 use crate::decoder::factory::create_video_decoder;
 use crate::decoder::{frame_id_to_pts, DecoderPacket};
-use crate::encoder::types::Codec;
 use crate::encoder::types::{EncodedPacket, PacketKind, Timestamp};
 use crate::encoder::VideoEncoderPipeline;
 use crate::proto::{EncodeConfig, EncodedWindow, RawFrame, WindowConfig};
@@ -1341,16 +1340,20 @@ where
     // 2. 解码器（回退链：qsv→cuvid→d3d11va→vt→vaapi→软解；P2B 流式管线）。
     //    旧逻辑（hw 打开成功但首帧失败 → 整体回退软解）由新管线的连续错误
     //    → flush + IDR 请求机制取代（P2B §T2.3 IDR 恢复策略）。
-    let mut decoder = match create_video_decoder(Codec::H264) {
+    //    R-32（M13-T002 阶段 B）：按握手协商选中的编码标准创建（AV1 会话 →
+    //    av1 软解链；未协商/旧对端 → H.264 兜底）。
+    let session_codec = slot.negotiated_codec();
+    let mut decoder = match create_video_decoder(session_codec) {
         Ok(d) => {
             info!(
-                "client session: decoder '{}' (hw={})",
+                "client session: decoder '{}' (hw={}, codec={:?})",
                 d.name(),
-                d.is_hardware()
+                d.is_hardware(),
+                session_codec
             );
             d
         }
-        Err(e) => return Err(format!("create H.264 decoder: {e}")),
+        Err(e) => return Err(format!("create {session_codec:?} decoder: {e}")),
     };
 
     let stats = Arc::new(Mutex::new(ClientSessionStats::default()));

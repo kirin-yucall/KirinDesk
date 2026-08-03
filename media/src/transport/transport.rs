@@ -65,6 +65,9 @@ pub struct QuicMediaTransport {
     /// R-04：音频接收是否启用（`take_audio_receiver` 置 true；false → 接收
     /// 循环丢弃音频包，不缓冲——避免无消费者时通道无界增长）。
     audio_buffering: bool,
+    /// R-32（M13-T002 阶段 B）：握手协商选中的编码标准（客户端解码器据此
+    /// 创建；服务端会话亦可查）。默认 H.264（未协商 → 兜底）。
+    negotiated: crate::encoder::Codec,
 }
 
 impl QuicMediaTransport {
@@ -84,7 +87,13 @@ impl QuicMediaTransport {
             audio_tx: Some(audio_tx),
             audio_rx: Some(audio_rx),
             audio_buffering: false,
+            negotiated: crate::encoder::Codec::H264,
         }
+    }
+
+    /// R-32：记录握手协商结果（建连后立即调用；未调用保持 H.264 兜底）。
+    pub fn set_negotiated_codec(&mut self, codec: crate::encoder::Codec) {
+        self.negotiated = codec;
     }
 
     /// 设置控制流通道。
@@ -417,6 +426,10 @@ impl super::MediaTransport for QuicMediaTransport {
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
         Some(self)
     }
+
+    fn negotiated_codec(&self) -> crate::encoder::Codec {
+        self.negotiated
+    }
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -492,7 +505,9 @@ pub async fn connect_quic_transport(
     let (send, recv) = conn.open_bi().await?;
     let stream = QuicBiStream::new(send, recv);
 
-    let ch = core_handshake::client_handshake_generic(
+    // R-32（M13-T002 阶段 B）：客户端握手携带本端可解码 codec 列表
+    // （服务端据此按自身优先级挑选 selected_codec，AV1 优先）。
+    let ch = core_handshake::client_handshake_with_codecs_generic(
         stream,
         client_identity,
         client_id,
@@ -501,6 +516,7 @@ pub async fn connect_quic_transport(
         server_id,
         server_pin,
         challenge,
+        crate::decoder::client_supported_codecs(),
     )
     .await
     .map_err(|e| TransportError::Handshake(e.to_string()))?;
@@ -514,6 +530,11 @@ pub async fn connect_quic_transport(
         .await
         .map_err(|e| TransportError::Quic(format!("control stream ready: {e}")))?;
     let mut transport = QuicMediaTransport::new(conn, MediaCipher::new_from_aead(ch.cipher));
+    // R-32：协商结果存入传输（会话层据此刻画解码器；未知/空 → H.264 兜底）。
+    transport.set_negotiated_codec(
+        crate::encoder::Codec::from_str(&ch.selected_codec)
+            .unwrap_or(crate::encoder::Codec::H264),
+    );
     transport.set_control_streams(ctrl_send, ctrl_recv);
 
     debug!("connect_quic_transport: ready to {addr}");
@@ -541,7 +562,8 @@ pub async fn connect_quic_transport_on(
     let (send, recv) = conn.open_bi().await?;
     let stream = QuicBiStream::new(send, recv);
 
-    let ch = core_handshake::client_handshake_generic(
+    // R-32：打洞路径与 connect_quic_transport 一致，握手携带可解码 codec 列表。
+    let ch = core_handshake::client_handshake_with_codecs_generic(
         stream,
         client_identity,
         client_id,
@@ -550,6 +572,7 @@ pub async fn connect_quic_transport_on(
         server_id,
         server_pin,
         challenge,
+        crate::decoder::client_supported_codecs(),
     )
     .await
     .map_err(|e| TransportError::Handshake(e.to_string()))?;
@@ -563,6 +586,10 @@ pub async fn connect_quic_transport_on(
         .await
         .map_err(|e| TransportError::Quic(format!("control stream ready: {e}")))?;
     let mut transport = QuicMediaTransport::new(conn, MediaCipher::new_from_aead(ch.cipher));
+    transport.set_negotiated_codec(
+        crate::encoder::Codec::from_str(&ch.selected_codec)
+            .unwrap_or(crate::encoder::Codec::H264),
+    );
     transport.set_control_streams(ctrl_send, ctrl_recv);
 
     debug!("connect_quic_transport_on: ready to {addr} (punch path)");
@@ -1032,9 +1059,10 @@ async fn connect_tcp_transport(
     // 侧无对称实现），对端不响应即无限等待。与 QUIC 分支同模式：
     // `tokio::time::timeout(connect_timeout, …)`，超时 → 清理连接资源返回
     // `Timeout`（重拨任务由降级等待超时兜底结束会话，不再死等）。
+    // R-32：与 QUIC 分支一致，握手携带本端可解码 codec 列表。
     let ch = tokio::time::timeout(
         connect_timeout,
-        core_handshake::client_handshake_generic(
+        core_handshake::client_handshake_with_codecs_generic(
             stream,
             client_identity,
             client_id,
@@ -1043,6 +1071,7 @@ async fn connect_tcp_transport(
             server_id,
             server_pin,
             challenge,
+            crate::decoder::client_supported_codecs(),
         ),
     )
     .await
