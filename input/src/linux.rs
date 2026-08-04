@@ -129,7 +129,7 @@ pub fn inject(ev: &PipeEvent, dst_w: u32, dst_h: u32) -> Result<(), InjectError>
     }
 
     // 打开 /dev/uinput：无设备 / 无权限 → UnsupportedPlatform / InjectFailed（不 panic）。
-    let dev = match OpenOptions::new().write(true).open("/dev/uinput") {
+    let mut dev = match OpenOptions::new().write(true).open("/dev/uinput") {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err(InjectError::UnsupportedPlatform(format!(

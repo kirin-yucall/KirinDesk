@@ -164,7 +164,12 @@ fn run_capture_loop(
         .map_err(|e| EncodeError::InitFailed(format!("pw_stream listener: {e}")))?;
 
     // EnumFormat：F32LE / 48000 / 2ch（请求；图不满足时 param_changed 报实际值）。
-    let mut params = build_audio_format_pod()?;
+    // libspa 0.8 `Pod::from_bytes -> Option<&Pod>`（借用）；connect 收 `&mut [&Pod]`
+    // —— 字节 Vec 与 &Pod 引用同域存活（同 pipewire 官方示例范式）。
+    let values = build_audio_format_pod()?;
+    let mut params = [spa::pod::Pod::from_bytes(&values).ok_or_else(|| {
+        EncodeError::InitFailed("Pod::from_bytes: invalid EnumFormat pod".into())
+    })?];
     stream
         .connect(
             spa::utils::Direction::Input,
@@ -221,14 +226,16 @@ fn on_process(stream: &pw::stream::StreamRef, user_data: &mut CaptureUserData) {
     if datas.is_empty() {
         return;
     }
-    let data = &datas[0];
-    let Some(bytes) = data.data() else {
-        return;
-    };
+    // libspa 0.8：`data()` 需 `&mut self`。先取 chunk 信息（不可变借用结束）
+    // 再取字节可变借用，避免 E0502。
+    let data = &mut datas[0];
     let chunk_size = data.chunk().size() as usize;
     if chunk_size == 0 {
         return;
     }
+    let Some(bytes) = data.data() else {
+        return;
+    };
     let src = &bytes[..chunk_size.min(bytes.len())];
 
     let rate = user_data.format.rate();
@@ -335,11 +342,14 @@ pub fn convert_to_48k_stereo(samples: &[f32], src_rate: u32, src_ch: u16) -> Vec
     out
 }
 
-/// EnumFormat POD：F32LE / 48000Hz / 2ch。
+/// EnumFormat POD 的**序列化字节**：F32LE / 48000Hz / 2ch。
+///
+/// 返回原始字节而非 `&Pod`（libspa 0.8 `Pod::from_bytes` 只产生借用），由
+/// 调用方在字节存活域内构造 `&Pod` 传给 `Stream::connect`。
 ///
 /// 属性列表 = MediaType/MediaSubtype（Id 变体）+ AudioInfoRaw 展开
 /// （format/rate/channels；`From<AudioInfoRaw> for Vec<Property>`）。
-fn build_audio_format_pod() -> Result<Vec<spa::pod::Pod>, EncodeError> {
+fn build_audio_format_pod() -> Result<Vec<u8>, EncodeError> {
     use pw::spa::param::audio::AudioFormat;
     use pw::spa::param::format::{FormatProperties, MediaSubtype, MediaType};
 
@@ -358,7 +368,7 @@ fn build_audio_format_pod() -> Result<Vec<spa::pod::Pod>, EncodeError> {
             pw::spa::pod::Value::Id(pw::spa::utils::Id(MediaSubtype::Raw.as_raw())),
         ),
     ];
-    props.extend(info.into());
+    props.extend(<Vec<pw::spa::pod::Property>>::from(info));
     let obj = pw::spa::pod::Object {
         type_: pw::spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
         id: pw::spa::param::ParamType::EnumFormat.as_raw(),
@@ -371,9 +381,7 @@ fn build_audio_format_pod() -> Result<Vec<spa::pod::Pod>, EncodeError> {
     .map_err(|e| EncodeError::InitFailed(format!("serialize EnumFormat pod: {e}")))?
     .0
     .into_inner();
-    Ok(vec![spa::pod::Pod::from_bytes(&values).map_err(|e| {
-        EncodeError::InitFailed(format!("Pod::from_bytes: {e}"))
-    })?])
+    Ok(values)
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -383,6 +391,7 @@ fn build_audio_format_pod() -> Result<Vec<spa::pod::Pod>, EncodeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pw::spa::param::audio::AudioFormat;
 
     /// F32LE 解码：字节 → f32 原样。
     #[test]
@@ -438,15 +447,14 @@ mod tests {
     /// 候选 POD 可序列化并解析为 Audio/Raw。
     #[test]
     fn test_build_audio_format_pod() {
-        let params = build_audio_format_pod().expect("pod");
-        assert_eq!(params.len(), 1);
-        let (mt, ms) = spa::param::format_utils::parse_format(&params[0])
-            .expect("parse_format on our own pod");
+        let values = build_audio_format_pod().expect("pod");
+        let pod = spa::pod::Pod::from_bytes(&values).expect("Pod::from_bytes");
+        let (mt, ms) = spa::param::format_utils::parse_format(pod).expect("parse_format");
         assert_eq!(mt, MediaType::Audio);
         assert_eq!(ms, MediaSubtype::Raw);
         // 完整解析：rate=48000、channels=2。
         let mut info = spa::param::audio::AudioInfoRaw::new();
-        info.parse(&params[0]).expect("parse AudioInfoRaw");
+        info.parse(pod).expect("parse AudioInfoRaw");
         assert_eq!(info.rate(), 48000);
         assert_eq!(info.channels(), 2);
     }

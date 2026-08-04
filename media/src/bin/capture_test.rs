@@ -7,7 +7,10 @@
 //!   cargo run --release --bin capture-test        # monitor 0, 200ms
 //!   cargo run --release --bin capture-test 1 500  # monitor 1, 500ms
 
-#![cfg(target_os = "windows")]
+// 本测试工具仅适用于 Windows（windows-capture 后端）；Linux 走 PipeWire
+// portal（另有集成/手工验证路径）。内联 `#![cfg(windows)]` 会把整个文件
+// 含占位 main 一并剔除（Linux 编译 E0601），故改用 cfg_attr 允许死代码。
+#![cfg_attr(not(target_os = "windows"), allow(dead_code, unused_imports))]
 
 use std::fs;
 use std::path::PathBuf;
@@ -15,6 +18,7 @@ use std::time::Instant;
 
 use kirin_desk_media::capture::ScreenCaptureSource;
 
+#[cfg(target_os = "windows")]
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let monitor_index: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -165,4 +169,12 @@ fn save_rgba_as_bmp(data: &[u8], w: u32, h: u32, path: &PathBuf) -> std::io::Res
     }
 
     Ok(())
+}
+
+/// 非 Windows 占位 main：本测试工具仅适用于 windows-capture 后端
+/// （Linux 走 PipeWire portal，另有集成/手工验证路径）。
+#[cfg(not(target_os = "windows"))]
+fn main() {
+    eprintln!("capture-test 仅支持 Windows（windows-capture 后端）");
+    std::process::exit(1);
 }

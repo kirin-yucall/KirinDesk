@@ -47,6 +47,7 @@
 #![cfg(target_os = "linux")]
 
 use std::collections::HashMap;
+use std::os::fd::{FromRawFd, IntoRawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -58,7 +59,9 @@ use zbus::zvariant::{OwnedFd, OwnedObjectPath, OwnedValue, Value};
 use pipewire as pw;
 use pw::spa;
 
-use crate::capture::{CaptureError, CaptureFrame, DirtyRect, MonitorInfo, ScreenCaptureSource};
+use crate::capture::{
+    CaptureError, CaptureFrame, DirtyRect, MonitorInfo, PipeWireFrame, ScreenCaptureSource,
+};
 
 // ════════════════════════════════════════════════════════════════
 // Portal 常量（org.freedesktop.portal.ScreenCast D-Bus 接口）
@@ -103,18 +106,20 @@ pub struct PipeWireCapturedFrame {
 /// 返回的 fd 为 dup 副本，所有权归调用方（`std::os::fd::OwnedFd`）。
 fn create_portal_session(conn: &Connection) -> Result<std::os::fd::OwnedFd, CaptureError> {
     // 1. CreateSession(s parent_window, a{sv} options) → (o session_handle,)。
+    // 注：zbus 3.15 `call_method` 的 path 参数为 `TryInto<ObjectPath>`，
+    // 传 `&str` 本体（非 `Some(...)`）；iface 为 `Option<I>`。
     let reply = conn
         .call_method(
             Some(PORTAL_DEST),
-            Some(PORTAL_PATH),
+            PORTAL_PATH,
             Some(PORTAL_IFACE),
             "CreateSession",
             &(("", HashMap::<&str, Value>::new()),),
         )
         .map_err(|e| CaptureError::Capture(format!("portal CreateSession: {e}")))?;
+    // zbus 3.15 `Message::body<B>() -> Result<B>` 直接反序列化（无 `.deserialize()`）。
     let (session,): (OwnedObjectPath,) = reply
         .body()
-        .deserialize()
         .map_err(|e| CaptureError::Capture(format!("portal CreateSession reply: {e}")))?;
 
     // 2. SelectSources(o session, s parent, a{sv} options)。
@@ -127,7 +132,7 @@ fn create_portal_session(conn: &Connection) -> Result<std::os::fd::OwnedFd, Capt
     let _ = conn
         .call_method(
             Some(PORTAL_DEST),
-            Some(PORTAL_PATH),
+            PORTAL_PATH,
             Some(PORTAL_IFACE),
             "SelectSources",
             &((&session, "", opts),),
@@ -140,7 +145,7 @@ fn create_portal_session(conn: &Connection) -> Result<std::os::fd::OwnedFd, Capt
     let reply = conn
         .call_method(
             Some(PORTAL_DEST),
-            Some(PORTAL_PATH),
+            PORTAL_PATH,
             Some(PORTAL_IFACE),
             "Start",
             &((&session, "", opts),),
@@ -148,7 +153,6 @@ fn create_portal_session(conn: &Connection) -> Result<std::os::fd::OwnedFd, Capt
         .map_err(|e| CaptureError::Capture(format!("portal Start: {e}")))?;
     let (streams,): (Vec<(OwnedFd, HashMap<String, OwnedValue>)>,) = reply
         .body()
-        .deserialize()
         .map_err(|e| CaptureError::Capture(format!("portal Start reply: {e}")))?;
 
     let (fd, props) = streams
@@ -284,7 +288,15 @@ impl LinuxPipewireBackend {
             .map_err(|e| CaptureError::Capture(format!("pw_stream listener: {e}")))?;
 
         // 4. 连接（EnumFormat 候选：RGBx/BGRx/BGRA）。
-        let mut params = build_enum_format_pods()?;
+        // libspa 0.8 `Pod::from_bytes -> Option<&Pod>`（借用序列化字节）；
+        // `Stream::connect` 收 `&mut [&Pod]` —— 字节 Vec 与 &Pod 引用同域存活。
+        let raw_pods = build_enum_format_pods()?;
+        let mut pod_refs: Vec<&spa::pod::Pod> = Vec::with_capacity(raw_pods.len());
+        for raw in &raw_pods {
+            pod_refs.push(spa::pod::Pod::from_bytes(raw).ok_or_else(|| {
+                CaptureError::Capture("Pod::from_bytes: invalid EnumFormat pod".into())
+            })?);
+        }
         stream
             .connect(
                 spa::utils::Direction::Input,
@@ -292,7 +304,7 @@ impl LinuxPipewireBackend {
                 pw::stream::StreamFlags::AUTOCONNECT
                     | pw::stream::StreamFlags::MAP_BUFFERS
                     | pw::stream::StreamFlags::RT_PROCESS,
-                &mut params,
+                &mut pod_refs,
             )
             .map_err(|e| CaptureError::Capture(format!("pw_stream_connect: {e}")))?;
 
@@ -451,7 +463,7 @@ fn on_param_changed(user_data: &mut CaptureUserData, id: u32, param: Option<&spa
         rect.width,
         rect.height,
         rate.num,
-        rate.den
+        rate.denom
     );
 }
 
@@ -466,12 +478,11 @@ fn on_process(stream: &pw::stream::StreamRef, user_data: &mut CaptureUserData) {
     if datas.is_empty() {
         return;
     }
-    let data = &datas[0];
-    let Some(bytes) = data.data() else {
-        return;
-    };
+    // libspa 0.8：`data()` 需 `&mut self`；`stride` 挂在 Chunk 上（非 Data）。
+    // 先取 chunk 信息（不可变借用结束），再取字节可变借用，避免 E0502。
+    let data = &mut datas[0];
     let chunk_size = data.chunk().size() as usize;
-    let stride = data.stride().max(0) as usize;
+    let stride = data.chunk().stride().max(0) as usize;
 
     let rect = user_data.format.size();
     let w = rect.width;
@@ -480,6 +491,9 @@ fn on_process(stream: &pw::stream::StreamRef, user_data: &mut CaptureUserData) {
     if w == 0 || h == 0 || stride == 0 || chunk_size == 0 {
         return; // 未协商完成 / 空帧。
     }
+    let Some(bytes) = data.data() else {
+        return;
+    };
     let src = &bytes[..chunk_size.min(bytes.len())];
     let rgba = frame_to_rgba(src, stride, w, h, fmt);
     // 投递失败（backend 已销毁）→ 忽略。
@@ -537,12 +551,16 @@ fn frame_to_rgba(
     out
 }
 
-/// 构造 EnumFormat 候选 POD 列表（RGBx → BGRx → BGRA 优先级）。
+/// 构造 EnumFormat 候选的**序列化字节**（RGBx → BGRx → BGRA 优先级）。
+///
+/// 返回原始字节而非 `&Pod`：libspa 0.8 的 `Pod::from_bytes` 只产生借用
+/// （`Option<&Pod>`），由调用方在字节存活域内构造 `&Pod` 引用数组传给
+/// `Stream::connect`（同 pipewire 官方 `streams.rs` 示例范式）。
 ///
 /// 每个候选一个 EnumFormat 对象（SpaTypes::ObjectParamFormat）；PipeWire
 /// 图会选第一个它支持的格式。尺寸/帧率留空 → 接受图的实际输出
 /// （param_changed 时读回）。
-fn build_enum_format_pods() -> Result<Vec<spa::pod::Pod>, CaptureError> {
+fn build_enum_format_pods() -> Result<Vec<Vec<u8>>, CaptureError> {
     use pw::spa::param::format::FormatProperties;
     use pw::spa::param::format::{MediaSubtype, MediaType};
     use pw::spa::param::video::VideoFormat;
@@ -564,10 +582,7 @@ fn build_enum_format_pods() -> Result<Vec<spa::pod::Pod>, CaptureError> {
         .map_err(|e| CaptureError::Capture(format!("serialize EnumFormat pod: {e}")))?
         .0
         .into_inner();
-        params.push(
-            spa::pod::Pod::from_bytes(&values)
-                .map_err(|e| CaptureError::Capture(format!("Pod::from_bytes: {e}")))?,
-        );
+        params.push(values);
     }
     Ok(params)
 }
@@ -601,6 +616,7 @@ pub fn enumerate_monitors() -> Result<Vec<MonitorInfo>, CaptureError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pw::spa::param::video::VideoFormat;
 
     /// RGBx → RGBA 直拷（第 4 字节占位忽略）。
     #[test]
@@ -666,12 +682,12 @@ mod tests {
     /// 候选 POD：3 个 EnumFormat（RGBx/BGRx/BGRA），可序列化反解析。
     #[test]
     fn test_build_enum_format_pods() {
-        let params = build_enum_format_pods().expect("pods");
-        assert_eq!(params.len(), 3, "RGBx/BGRx/BGRA 三个候选");
+        let raw_pods = build_enum_format_pods().expect("pods");
+        assert_eq!(raw_pods.len(), 3, "RGBx/BGRx/BGRA 三个候选");
         // 每个 POD 可被 format_utils 解析为 Video/Raw。
-        for p in &params {
-            let (mt, ms) =
-                spa::param::format_utils::parse_format(p).expect("parse_format on our own pod");
+        for raw in &raw_pods {
+            let p = spa::pod::Pod::from_bytes(raw).expect("Pod::from_bytes");
+            let (mt, ms) = spa::param::format_utils::parse_format(p).expect("parse_format");
             assert_eq!(mt, spa::param::format::MediaType::Video);
             assert_eq!(ms, spa::param::format::MediaSubtype::Raw);
         }

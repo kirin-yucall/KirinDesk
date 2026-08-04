@@ -72,7 +72,7 @@ impl AudioPlayback for PipeWirePlayback {
         let handle = thread::Builder::new()
             .name("kirin-audio-render".into())
             .spawn(move || {
-                if let Err(e) = run_playback_loop(&stop_flag, &src) {
+                if let Err(e) = run_playback_loop(&stop_flag, src) {
                     tracing::warn!("PipeWire playback thread exiting: {e}");
                 }
             })
@@ -121,7 +121,7 @@ struct PlaybackUserData {
 
 fn run_playback_loop(
     stop_flag: &Arc<AtomicBool>,
-    src: &mpsc::Receiver<AudioPcm>,
+    src: mpsc::Receiver<AudioPcm>,
 ) -> Result<(), DecodeError> {
     let thread_loop =
         unsafe { pw::thread_loop::ThreadLoop::new(Some("kirin-audio-playback"), None) }
@@ -142,7 +142,7 @@ fn run_playback_loop(
 
     let user_data = PlaybackUserData {
         format: spa::param::audio::AudioInfoRaw::new(),
-        src: src.clone(),
+        src,
         pending: Vec::with_capacity(FRAME_INTERLEAVED * 16),
         max_pending: FRAME_INTERLEAVED * 64,
     };
@@ -153,7 +153,12 @@ fn run_playback_loop(
         .register()
         .map_err(|e| DecodeError::InitFailed(format!("pw_stream listener: {e}")))?;
 
-    let mut params = build_audio_format_pod()?;
+    // libspa 0.8 `Pod::from_bytes -> Option<&Pod>`（借用）；connect 收 `&mut [&Pod]`
+    // —— 字节 Vec 与 &Pod 引用同域存活（同 pipewire 官方示例范式）。
+    let values = build_audio_format_pod()?;
+    let mut params = [spa::pod::Pod::from_bytes(&values).ok_or_else(|| {
+        DecodeError::InitFailed("Pod::from_bytes: invalid EnumFormat pod".into())
+    })?];
     stream
         .connect(
             spa::utils::Direction::Output,
@@ -210,9 +215,8 @@ fn on_process(stream: &pw::stream::StreamRef, user_data: &mut PlaybackUserData) 
         return;
     }
     let data = &mut datas[0];
-    let Some(out_bytes) = data.data() else {
-        return;
-    };
+    // 先取 chunk 容量（不可变借用结束）再取字节可变借用；写回 chunk.size 放在
+    // 字节借用作用域之后，避免 E0502。
     let capacity = data.chunk().size() as usize; // 可写字节数（maxsize）。
     if capacity == 0 {
         return;
@@ -235,11 +239,13 @@ fn on_process(stream: &pw::stream::StreamRef, user_data: &mut PlaybackUserData) 
     let ch = fmt.channels().max(1) as u16;
     let bytes = pcm_to_device(&user_data.pending, rate, ch, fmt.format(), capacity);
     let n = bytes.len().min(capacity);
-    if n > 0 {
-        out_bytes[..n].copy_from_slice(&bytes[..n]);
-    }
-    if capacity > n {
-        out_bytes[n..capacity].fill(0);
+    if let Some(out) = data.data() {
+        if n > 0 {
+            out[..n].copy_from_slice(&bytes[..n]);
+        }
+        if capacity > n {
+            out[n..capacity].fill(0);
+        }
     }
     // 已写帧数记回 chunk（PipeWire 按 chunk.size 播放）。
     *data.chunk_mut().size_mut() = capacity as u32;
@@ -343,8 +349,12 @@ fn resample_stereo(stereo: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
     out
 }
 
-/// EnumFormat POD：F32LE / 48000Hz / 2ch（请求；图不满足时报实际值）。
-fn build_audio_format_pod() -> Result<Vec<spa::pod::Pod>, DecodeError> {
+/// EnumFormat POD 的**序列化字节**：F32LE / 48000Hz / 2ch（请求；图不满足时
+/// 报实际值）。
+///
+/// 返回原始字节而非 `&Pod`（libspa 0.8 `Pod::from_bytes` 只产生借用），由
+/// 调用方在字节存活域内构造 `&Pod` 传给 `Stream::connect`。
+fn build_audio_format_pod() -> Result<Vec<u8>, DecodeError> {
     use pw::spa::param::audio::AudioFormat;
     use pw::spa::param::format::{FormatProperties, MediaSubtype, MediaType};
 
@@ -363,7 +373,7 @@ fn build_audio_format_pod() -> Result<Vec<spa::pod::Pod>, DecodeError> {
             pw::spa::pod::Value::Id(pw::spa::utils::Id(MediaSubtype::Raw.as_raw())),
         ),
     ];
-    props.extend(info.into());
+    props.extend(<Vec<pw::spa::pod::Property>>::from(info));
     let obj = pw::spa::pod::Object {
         type_: pw::spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
         id: pw::spa::param::ParamType::EnumFormat.as_raw(),
@@ -376,9 +386,7 @@ fn build_audio_format_pod() -> Result<Vec<spa::pod::Pod>, DecodeError> {
     .map_err(|e| DecodeError::InitFailed(format!("serialize EnumFormat pod: {e}")))?
     .0
     .into_inner();
-    Ok(vec![spa::pod::Pod::from_bytes(&values).map_err(|e| {
-        DecodeError::InitFailed(format!("Pod::from_bytes: {e}"))
-    })?])
+    Ok(values)
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -388,6 +396,7 @@ fn build_audio_format_pod() -> Result<Vec<spa::pod::Pod>, DecodeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pw::spa::param::audio::AudioFormat;
 
     /// 48k/2ch/F32LE → 直通字节。
     #[test]
@@ -451,13 +460,13 @@ mod tests {
     /// 候选 POD 可解析为 Audio/Raw（rate=48000、channels=2）。
     #[test]
     fn test_build_audio_format_pod() {
-        let params = build_audio_format_pod().expect("pod");
-        let (mt, ms) = spa::param::format_utils::parse_format(&params[0])
-            .expect("parse_format on our own pod");
+        let values = build_audio_format_pod().expect("pod");
+        let pod = spa::pod::Pod::from_bytes(&values).expect("Pod::from_bytes");
+        let (mt, ms) = spa::param::format_utils::parse_format(pod).expect("parse_format");
         assert_eq!(mt, MediaType::Audio);
         assert_eq!(ms, MediaSubtype::Raw);
         let mut info = spa::param::audio::AudioInfoRaw::new();
-        info.parse(&params[0]).expect("parse AudioInfoRaw");
+        info.parse(pod).expect("parse AudioInfoRaw");
         assert_eq!(info.rate(), 48000);
         assert_eq!(info.channels(), 2);
     }
