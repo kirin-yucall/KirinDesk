@@ -22,8 +22,8 @@ use crate::protocol::{
     TYPE_PATH_PROBE, TYPE_PATH_PROBE_ACK, TYPE_PEER_CANDIDATES, TYPE_PUNCH_RESULT,
 };
 use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
@@ -38,7 +38,26 @@ pub const DEFAULT_PUNCH_RATE_LIMIT: usize = 10;
 /// 候选列表上限（PUNCH-PROTO-002：≤ 16 条）。
 pub const MAX_CANDIDATES: usize = 16;
 /// 服务器观察地址作为候选时的优先级（高于本地候选，是打洞关键信息）。
-const OBSERVED_PRIORITY: u8 = 200;
+pub const OBSERVED_PRIORITY: u8 = 200;
+
+// ── 安全审计 R-1：RendezvousServer 资源上限与源 IP 限速加固 ──────────────
+// 默认部署即暴露的 7001 端口此前完全无认证且无资源上限：单连接/多连接
+// 直接打瘫（无界 task/fd、四张无上限 HashMap）。以下硬上限 + 空闲超时 +
+// 源 IP 限速使攻击面受控（打洞是轻量登记/互转协议，合法流量远低于上限）。
+/// 并发连接硬上限（防空连永久占用 reader+writer 双 task / fd）。
+pub const MAX_RENDEZVOUS_CONNS: usize = 1024;
+/// 单连接空闲超时（无帧即关闭，防空连无限驻留）。
+pub const RENDEZVOUS_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// 打洞会话表硬上限（防唯一 session_id 撑爆 sessions 表；LRU 淘汰最旧）。
+pub const MAX_RENDEZVOUS_SESSIONS: usize = 8192;
+/// 注册表候选表（session_id=None 路径）硬上限（满则淘汰任意键）。
+pub const MAX_RENDEZVOUS_DEVICE_CANDIDATES: usize = 4096;
+/// 限速表（rate/ip_rate）键数硬上限（LRU 淘汰最旧）。
+pub const MAX_RENDEZVOUS_RATE_KEYS: usize = 4096;
+/// 每源 IP（/24·/64 聚合，复用 `rate_limit::bucket_key`）限速窗口。
+pub const DEFAULT_IP_RATE_WINDOW: Duration = Duration::from_secs(30);
+/// 每源 IP 每窗口候选交换上限（防 device_id 旋转绕过设备级限速）。
+pub const DEFAULT_IP_RATE_LIMIT: usize = 30;
 
 /// 会话一侧的登记信息。
 struct PeerSlot {
@@ -55,13 +74,29 @@ struct PeerSlot {
 /// 版本号语义（PUNCH-004 重打洞竞态防护）：每次登记/刷新递增本端版本；
 /// 仅当**双端都刷新过**（各自版本 > 上次互转版本）才互转——避免把对端
 /// 尚未刷新的旧候选（NAT 老化前的失效地址）转发给对方。
-#[derive(Default)]
+///
+/// `last_activity`（安全审计 R-1）：会话表 LRU 淘汰依据（表满时淘汰最久
+/// 未活跃会话，防唯一 session_id 撑爆 sessions 表）。
 struct PunchSessionState {
     a: Option<PeerSlot>,
     b: Option<PeerSlot>,
     a_version: u64,
     b_version: u64,
     forwarded_version: u64,
+    last_activity: Instant,
+}
+
+impl Default for PunchSessionState {
+    fn default() -> Self {
+        Self {
+            a: None,
+            b: None,
+            a_version: 0,
+            b_version: 0,
+            forwarded_version: 0,
+            last_activity: Instant::now(),
+        }
+    }
 }
 
 impl PunchSessionState {
@@ -113,9 +148,13 @@ pub struct RendezvousServer {
     device_candidates: Mutex<HashMap<String, Vec<Candidate>>>,
     /// 每设备滑动窗口限速（PUNCH-006）。
     rate: Mutex<HashMap<String, Vec<Instant>>>,
+    /// 每源 IP（/24·/64 聚合）滑动窗口限速（安全审计 R-1：device_id 旋转兜底）。
+    ip_rate: Mutex<HashMap<IpAddr, Vec<Instant>>>,
     audit: Arc<dyn AuditSink>,
     extension: Option<Arc<dyn RendezvousExtension>>,
     next_conn_id: AtomicU64,
+    /// 并发连接计数（安全审计 R-1：连接硬上限维护，accept 出口增减）。
+    active_conns: AtomicUsize,
 }
 
 impl std::fmt::Debug for RendezvousServer {
@@ -146,9 +185,11 @@ impl RendezvousServer {
             conn_session: Mutex::new(HashMap::new()),
             device_candidates: Mutex::new(HashMap::new()),
             rate: Mutex::new(HashMap::new()),
+            ip_rate: Mutex::new(HashMap::new()),
             audit: Arc::new(NoopAudit),
             extension: None,
             next_conn_id: AtomicU64::new(1),
+            active_conns: AtomicUsize::new(0),
         })
     }
 
@@ -222,6 +263,17 @@ impl RendezvousServer {
                             continue;
                         }
                     };
+                    // 安全审计 R-1：连接硬上限（每连接占 reader+writer 双 task
+                    // + fd + 通道；无上限时单点空连可打瘫整个 relay-server）。
+                    let prev = self.active_conns.fetch_add(1, Ordering::Relaxed);
+                    if prev >= MAX_RENDEZVOUS_CONNS {
+                        self.active_conns.fetch_sub(1, Ordering::Relaxed);
+                        warn!(
+                            "rendezvous connection cap reached ({MAX_RENDEZVOUS_CONNS}), dropping {peer}"
+                        );
+                        drop(stream);
+                        continue;
+                    }
                     let srv = Arc::clone(&self);
                     conns.spawn(async move { Self::handle_conn(srv, stream, peer).await });
                 }
@@ -245,16 +297,25 @@ impl RendezvousServer {
         });
 
         loop {
-            match read_frame(&mut reader).await {
-                Ok((ty, payload)) => {
+            // 安全审计 R-1：空闲超时——空连不再永久占用 reader+writer 双 task
+            // （此前无任何超时，`nc` 空连可无限驻留耗尽 fd/内存）。
+            match tokio::time::timeout(RENDEZVOUS_IDLE_TIMEOUT, read_frame(&mut reader)).await {
+                Ok(Ok((ty, payload))) => {
                     if !self.dispatch(conn_id, peer, ty, &payload, &tx).await {
                         // 未知 type / 无法处理 → 判死关闭（TNL-PROTO-007）
                         warn!("rendezvous conn {conn_id} ({peer}): unhandled type 0x{ty:02x}, closing");
                         break;
                     }
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     debug!("rendezvous conn {conn_id} ({peer}) closed: {e}");
+                    break;
+                }
+                Err(_) => {
+                    debug!(
+                        "rendezvous conn {conn_id} ({peer}) idle timeout \
+                         ({RENDEZVOUS_IDLE_TIMEOUT:?}), closing"
+                    );
                     break;
                 }
             }
@@ -262,6 +323,8 @@ impl RendezvousServer {
         drop(tx);
         writer_task.abort();
         self.cleanup_conn(conn_id);
+        // 归还连接额度（serve 停止时的 abort 路径不归还，属进程退出语义）。
+        self.active_conns.fetch_sub(1, Ordering::Relaxed);
     }
 
     /// 分发一帧；返回 `false` = 连接应判死关闭。
@@ -333,6 +396,17 @@ impl RendezvousServer {
         msg: CandidateRegister,
         tx: &mpsc::UnboundedSender<Vec<u8>>,
     ) {
+        // 安全审计 R-1：device_id 复用注册表校验（非空、≤128 字节、
+        // 字母数字 + `:_-`）——此前无任何长度/字符集限制，超长 device_id
+        // 直接进表/限速键，攻击者可撑爆内存与限速表。
+        if !crate::registry::Registry::validate_device_id(&msg.device_id) {
+            warn!("candidate register from {peer} rejected: invalid device_id");
+            self.audit.record(TunnelAuditEvent::RateLimited {
+                client: peer,
+                reason: "invalid device_id".into(),
+            });
+            return;
+        }
         if msg.candidates.len() > MAX_CANDIDATES {
             warn!(
                 "candidate register from {} rejected: {} > {MAX_CANDIDATES} candidates",
@@ -366,7 +440,23 @@ impl RendezvousServer {
                 // 同一连接重登记 = 候选刷新（PUNCH-004 重打洞：NAT 映射变化
                 // 后重新候选交换，**更新**既有槽位，不当作第三端）。
                 let mut sessions = self.sessions.lock().unwrap();
+                // 安全审计 R-1：会话表硬上限——新 session 且表满时 LRU 淘汰
+                // 最久未活跃会话（防唯一 session_id 撑爆 sessions 表）。
+                if !sessions.contains_key(&sid) && sessions.len() >= MAX_RENDEZVOUS_SESSIONS {
+                    if let Some(oldest) = sessions
+                        .iter()
+                        .min_by_key(|(_, s)| s.last_activity)
+                        .map(|(k, _)| *k)
+                    {
+                        sessions.remove(&oldest);
+                        warn!(
+                            "rendezvous sessions table full ({MAX_RENDEZVOUS_SESSIONS}); \
+                             evicted oldest {oldest:02x?}"
+                        );
+                    }
+                }
                 let session = sessions.entry(sid).or_default();
+                session.last_activity = Instant::now();
                 let is_refresh = session
                     .a
                     .as_ref()
@@ -443,10 +533,16 @@ impl RendezvousServer {
             }
             None => {
                 // P2 ID-005 注册表候选刷新：仅存最新候选，不转发
-                self.device_candidates
-                    .lock()
-                    .unwrap()
-                    .insert(msg.device_id, candidates);
+                let mut dc = self.device_candidates.lock().unwrap();
+                // 安全审计 R-1：表硬上限——满则淘汰任意键（本条路径为
+                // 无消费方的候选刷新，保底防无限增长）。
+                if !dc.contains_key(&msg.device_id) && dc.len() >= MAX_RENDEZVOUS_DEVICE_CANDIDATES
+                {
+                    if let Some(k) = dc.keys().next().cloned() {
+                        dc.remove(&k);
+                    }
+                }
+                dc.insert(msg.device_id, candidates);
                 debug!("device candidate refresh from {peer}");
             }
         }
@@ -462,8 +558,8 @@ impl RendezvousServer {
             });
             return;
         };
-        let sessions = self.sessions.lock().unwrap();
-        let Some(session) = sessions.get(&sid) else {
+        let mut sessions = self.sessions.lock().unwrap();
+        let Some(session) = sessions.get_mut(&sid) else {
             drop(sessions);
             self.audit.record(TunnelAuditEvent::PunchUnknownSession {
                 client: peer,
@@ -471,6 +567,8 @@ impl RendezvousServer {
             });
             return;
         };
+        // 安全审计 R-1：会话活跃时间戳（LRU 淘汰依据）。
+        session.last_activity = Instant::now();
         let Some(other) = session.other_slot(conn_id) else {
             drop(sessions);
             debug!("{what}: peer of {conn_id} not registered yet");
@@ -483,26 +581,69 @@ impl RendezvousServer {
         }
     }
 
-    /// 限速（PUNCH-006：每设备每窗口 ≤ 上限）；超限 → 拒绝 + 审计。
+    /// 限速（PUNCH-006：每设备每窗口 ≤ 上限；安全审计 R-1：另加每源 IP
+    /// /24·/64 聚合限速 + 限速表键数硬上限）。超限 → 拒绝 + 审计。
     fn allow_rate(&self, device_id: &str, peer: SocketAddr) -> bool {
         let now = Instant::now();
-        let mut rate = self.rate.lock().unwrap();
-        let window = rate.entry(device_id.to_string()).or_default();
-        window.retain(|t| now.duration_since(*t) < DEFAULT_PUNCH_RATE_WINDOW);
-        if window.len() >= DEFAULT_PUNCH_RATE_LIMIT {
+        // 1. 设备级（键 = 自报 device_id——攻击者可旋转绕过，IP 级兜底见下）。
+        {
+            let mut rate = self.rate.lock().unwrap();
+            // 表键数硬上限：满且为新键 → LRU 淘汰最久未活跃键。
+            if !rate.contains_key(device_id) && rate.len() >= MAX_RENDEZVOUS_RATE_KEYS {
+                if let Some(oldest) = rate
+                    .iter()
+                    .min_by_key(|(_, v)| v.last().copied())
+                    .map(|(k, _)| k.clone())
+                {
+                    rate.remove(&oldest);
+                }
+            }
+            let window = rate.entry(device_id.to_string()).or_default();
+            window.retain(|t| now.duration_since(*t) < DEFAULT_PUNCH_RATE_WINDOW);
+            if window.len() >= DEFAULT_PUNCH_RATE_LIMIT {
+                warn!(
+                    "rendezvous rate limit hit: {device_id} from {peer} \
+                     (>{DEFAULT_PUNCH_RATE_LIMIT} per {DEFAULT_PUNCH_RATE_WINDOW:?})"
+                );
+                self.audit.record(TunnelAuditEvent::RateLimited {
+                    client: peer,
+                    reason: format!("punch rate limit: {device_id}"),
+                });
+                return false;
+            }
+            window.push(now);
+        }
+        // 2. 源 IP 级（/24·/64 聚合，复用 rate_limit::bucket_key；对齐 F-10
+        //    语义）。device_id 旋转不再能绕过限速，跨租户 DoS 收口。
+        //    先 canonical_ip 归一 v4-mapped（双栈监听下 IPv4 客户端呈
+        //    `::ffff:` 形态，不归一将全部 IPv4 坍缩进同一桶——R-2 同类）。
+        let ip_key =
+            crate::rate_limit::bucket_key(crate::rate_limit::canonical_ip(peer.ip()));
+        let mut ip_rate = self.ip_rate.lock().unwrap();
+        if !ip_rate.contains_key(&ip_key) && ip_rate.len() >= MAX_RENDEZVOUS_RATE_KEYS {
+            if let Some(oldest) = ip_rate
+                .iter()
+                .min_by_key(|(_, v)| v.last().copied())
+                .map(|(k, _)| *k)
+            {
+                ip_rate.remove(&oldest);
+            }
+        }
+        let window = ip_rate.entry(ip_key).or_default();
+        window.retain(|t| now.duration_since(*t) < DEFAULT_IP_RATE_WINDOW);
+        if window.len() >= DEFAULT_IP_RATE_LIMIT {
             warn!(
-                "rendezvous rate limit hit: {device_id} from {peer} \
-                 (>{DEFAULT_PUNCH_RATE_LIMIT} per {DEFAULT_PUNCH_RATE_WINDOW:?})"
+                "rendezvous IP rate limit hit: {peer} \
+                 (>={DEFAULT_IP_RATE_LIMIT} per {DEFAULT_IP_RATE_WINDOW:?})"
             );
             self.audit.record(TunnelAuditEvent::RateLimited {
                 client: peer,
-                reason: format!("punch rate limit: {device_id}"),
+                reason: "punch IP rate limit".into(),
             });
-            false
-        } else {
-            window.push(now);
-            true
+            return false;
         }
+        window.push(now);
+        true
     }
 
     /// 连接关闭清理：移除 conn→session 关联与会话槽（PUNCH-003 无状态残留）。
@@ -742,6 +883,87 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, TunnelAuditEvent::RateLimited { .. })),
             "11th registration should be rate limited"
+        );
+    }
+
+    // 安全审计 R-1：非法 device_id（空/含空白/超长）→ 拒绝 + 审计，不建会话。
+    #[tokio::test]
+    async fn test_invalid_device_id_rejected() {
+        let audit = Arc::new(Collect::default());
+        let server = Arc::new(
+            RendezvousServer::bind(0)
+                .await
+                .unwrap()
+                .with_audit(Arc::clone(&audit) as Arc<dyn AuditSink>),
+        );
+        let addr = test_conn_addr(&server);
+        let srv = Arc::clone(&server);
+        tokio::spawn(async move {
+            let _ = srv.serve(watch::channel(false).1).await;
+        });
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        for bad in ["", "has space", &"x".repeat(200)] {
+            let reg = CandidateRegister {
+                device_id: bad.to_string(),
+                session_id: Some([9; 16]),
+                candidates: candidates(),
+            };
+            c.write_all(&encode_extension(TYPE_CANDIDATE_REGISTER, &reg).unwrap())
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let events = audit.0.lock().unwrap();
+        let rate_limited = events
+            .iter()
+            .filter(|e| matches!(e, TunnelAuditEvent::RateLimited { .. }))
+            .count();
+        assert!(rate_limited >= 3, "3 个非法 device_id 均应被拒: {rate_limited}");
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, TunnelAuditEvent::PunchCandidateRegistered { .. })),
+            "非法 device_id 不得登记会话"
+        );
+    }
+
+    // 安全审计 R-1：每源 IP（/24·/64 聚合）限速——唯一 device_id 旋转
+    // 不能绕过 IP 级限速；第 (DEFAULT_IP_RATE_LIMIT+1) 次登记被拒 + 审计。
+    #[tokio::test]
+    async fn test_source_ip_rate_limit() {
+        let audit = Arc::new(Collect::default());
+        let server = Arc::new(
+            RendezvousServer::bind(0)
+                .await
+                .unwrap()
+                .with_audit(Arc::clone(&audit) as Arc<dyn AuditSink>),
+        );
+        let addr = test_conn_addr(&server);
+        let srv = Arc::clone(&server);
+        tokio::spawn(async move {
+            let _ = srv.serve(watch::channel(false).1).await;
+        });
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        for i in 0..DEFAULT_IP_RATE_LIMIT + 1 {
+            let reg = CandidateRegister {
+                device_id: format!("dev-ip-{i}"),
+                session_id: None,
+                candidates: candidates(),
+            };
+            c.write_all(&encode_extension(TYPE_CANDIDATE_REGISTER, &reg).unwrap())
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let events = audit.0.lock().unwrap();
+        let rate_limited = events
+            .iter()
+            .filter(|e| matches!(e, TunnelAuditEvent::RateLimited { .. }))
+            .count();
+        assert!(
+            rate_limited >= 1,
+            "第 {} 次登记应触发源 IP 限速: {rate_limited}",
+            DEFAULT_IP_RATE_LIMIT + 1
         );
     }
 

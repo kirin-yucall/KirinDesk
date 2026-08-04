@@ -187,6 +187,31 @@
 
 ### Fixed
 
+- **安全审计 2026-08-04 R-1~R-4（relay-server 部署面 + 源码加固；实机 Ubuntu 24.04 验证）**：
+  - **R-1 RendezvousServer（7001）资源上限与源 IP 限速**（`relay/src/rendezvous.rs`）：
+    连接硬上限 1024（`active_conns` 计数 + accept 出口丢弃）、单连接空闲超时 120s
+    （空连不再永久占用 reader+writer 双 task）、会话表上限 8192（LRU 淘汰最旧）、
+    注册表候选表上限 4096、限速表键数上限 4096、**每源 IP（/24·/64 聚合）限速
+    30/30s**（复用 `rate_limit::bucket_key`，device_id 旋转不再能绕过）、
+    `device_id` 复用 `Registry::validate_device_id` 校验（此前无长度/字符集限制，
+    超长 device_id 可撑爆表/内存）。新增单测：非法 device_id 拒绝、源 IP 限速、
+    `canonical_ip` v4-mapped 归一
+  - **R-2 双栈监听下 IPv4 限速坍缩修复**（`relay/src/server.rs` + `rate_limit.rs`）：
+    accept 出口统一 `canonical_ip` 归一 `::ffff:` v4-mapped 地址为真实 IPv4
+    （对齐 core `map_addr`）——此前全部 IPv4 客户端坍缩进同一 `::`/`::ffff:` 桶，
+    任意来源 3 次/30s 尝试共享额度、5 次失败即全局封禁全部 IPv4（跨租户 DoS）
+  - **R-3 relay-server 空 token fail-closed**（`relay-server/src/main.rs`）：空 token
+    默认拒绝启动（对齐 CLI `cmd_tunnel_serve` TNL-SEC-008），`--allow-empty-token`
+    显式放行；新增 `--allow-empty-token` 解析单测
+  - **R-4 DNS 构造器 panic 凭据脱敏**（route53/azure/dnspod 三处）：`panic!`
+    消息不再打印 `{other:?}` 完整凭据对象（对齐 godaddy 同型 panic）
+  - **Linux 实机构建修复**（`utils/src/fsutil.rs`）：`read_private` unix 分支补
+    `use std::io::Read`（Windows 裁剪该分支故本地编译不报错，Linux 构建暴露）
+  - 实机验证（Ubuntu 24.04 测试机，脆弱版 vs 修复版对比）：R-3 空 token 零凭据
+    登录复现 → 修复版拒绝启动；R-2 跨 /24 登录第 4 次被限速/封禁全局 → 修复版
+    桶隔离；R-1 空连 fd 无界增长（300 连 → fd 11→311）→ 修复版 120s 超时回收 +
+    1024 连接上限 + 30/30s 源 IP 限速 + 非法 device_id 拒绝
+
 - **R-15b hw_bridge 零拷贝真实实现（审计 §4-5 / §2-P1-5，修复计划 2026-08-04 WBS 3.3）**：
   `libkirin_gpu/src/hw_bridge.cpp` 的 `kgpu_hw_upload` 由桩（恒 NULL）替换为
   **真实实现**——NV12 纹理经 `AVD3D11FrameDescriptor` 零拷贝直绑

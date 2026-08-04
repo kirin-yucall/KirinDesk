@@ -56,8 +56,8 @@ impl AzureClient {
                 DEFAULT_ENDPOINT,
                 None,
             ),
-            other => panic!(
-                "azure 构造器收到非 Azure 凭据: {other:?}（注册表仅以 Azure 凭据调用本工厂）"
+            _ => panic!(
+                "azure 构造器收到非 Azure 凭据变体（注册表仅以 Azure 凭据调用本工厂）"
             ),
         }
     }

@@ -393,6 +393,14 @@ impl TunnelServer {
                             continue;
                         }
                     };
+                    // 安全审计 R-2（F-10 在 relay 侧的真实失效）：双栈监听
+                    // （`set_only_v6(false)`）下 IPv4 客户端在 accept 呈现为
+                    // `::ffff:a.b.c.d` v4-mapped 地址，若直接喂 `bucket_key`
+                    // 会按 IPv6 取前 4 段 → 全部 IPv4 坍缩进同一限速桶（群体
+                    // 共享额度 + 跨租户封禁）。此处与 core 侧
+                    // `core::network::tcp::map_addr` 对齐，accept 出口统一
+                    // 归一为真实 IPv4，下游限速/审计/观察地址一致。
+                    let addr = canonical_peer_addr(addr);
                     // R-31（审计 §4-3）：隧道连接建立后关闭 Nagle —— relay 为
                     // 叶子 crate 不依赖 core，直接调 tokio std 方法；控制/
                     // 数据面（含 work 回连、隧道配对流）共用本 accept 出口。
@@ -414,6 +422,17 @@ impl TunnelServer {
             }
         }
         Ok(())
+    }
+}
+
+/// 安全审计 R-2：v4-mapped 地址（`::ffff:a.b.c.d`）归一为真实 IPv4。
+/// 双栈监听（`set_only_v6(false)`）下 IPv4 客户端在 accept 呈现为 IPv6
+/// 形态，归一后限速 `bucket_key`（IPv4 取 /24）与审计/观察地址语义正确。
+/// 与 core 侧 `core::network::tcp::map_addr` 行为对齐。
+fn canonical_peer_addr(addr: SocketAddr) -> SocketAddr {
+    match crate::rate_limit::canonical_ip(addr.ip()) {
+        std::net::IpAddr::V4(v4) => SocketAddr::new(std::net::IpAddr::V4(v4), addr.port()),
+        std::net::IpAddr::V6(v6) => SocketAddr::new(std::net::IpAddr::V6(v6), addr.port()),
     }
 }
 

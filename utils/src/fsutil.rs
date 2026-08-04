@@ -70,6 +70,9 @@ pub fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
 pub fn read_private(path: &Path) -> std::io::Result<Vec<u8>> {
     #[cfg(unix)]
     {
+        // 实机 Linux 构建修复：read_to_end 需要 Read trait 入作用域
+        // （Windows 裁剪此分支，本地编译不报错——实机构建暴露）。
+        use std::io::Read;
         use std::os::unix::fs::OpenOptionsExt;
         let mut opts = std::fs::OpenOptions::new();
         opts.read(true).custom_flags(libc::O_NOFOLLOW);

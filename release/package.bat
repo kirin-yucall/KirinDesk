@@ -52,6 +52,13 @@ exit /b %RC%
 :: ==========================================
 set "CARGO_BUILD_JOBS=4"
 
+:: ==========================================
+:: 2026-08-04: release opt-level=3 编译 ui/src/lib.rs(R-32 AV1 等新代码)时
+:: rustc codegen 线程栈溢出崩溃(STATUS_ACCESS_VIOLATION 0xc0000005)，
+:: 加大线程栈为已知 workaround；缺失会稳定复现，勿删。
+:: ==========================================
+set "RUST_MIN_STACK=33554432"
+
 echo [1/3] Building release binary...
 where cargo >nul 2>&1
 if errorlevel 1 (

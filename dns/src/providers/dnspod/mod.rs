@@ -115,7 +115,8 @@ pub fn register(registry: &mut ProviderRegistry) {
                     secret_key,
                 } => Box::new(DnspodProvider::new(secret_id.clone(), secret_key.clone())),
                 // 注册表按 name 分发，凭据变体不匹配仅可能因配置层 bug——显式 panic 暴露。
-                other => panic!("dnspod 注册表构造器收到非 Dnspod 凭据变体: {other:?}"),
+                // 不打印凭据内容（凭据不参与日志输出，对齐 godaddy 同型 panic）。
+                _ => panic!("dnspod 注册表构造器收到非 Dnspod 凭据变体"),
             }
         } as fn(&Credential) -> Box<dyn Provider>,
     );

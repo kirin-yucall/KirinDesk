@@ -42,6 +42,8 @@ struct Config {
     rendezvous_port: u16,
     /// R-08b (S2)：打洞 rendezvous 启用（`--no-rendezvous` 关闭）。
     rendezvous_enabled: bool,
+    /// 安全审计 R-3：空 token 时是否显式放行启动（默认 fail-closed 拒绝）。
+    allow_empty_token: bool,
 }
 
 fn print_usage() {
@@ -67,6 +69,8 @@ fn print_usage() {
     println!("                        打洞候选登记/互转/限速/审计，P1 打洞用；");
     println!("                        须与 --bind-port 不同）");
     println!("  --no-rendezvous       关闭打洞 rendezvous（不监听 --rendezvous-port）");
+    println!("  --allow-empty-token   显式允许空 token 启动（默认空 token 拒绝启动，");
+    println!("                        对齐 CLI cmd_tunnel_serve 的 TNL-SEC-008 fail-closed 口径）");
     println!("  --help                显示本帮助");
     println!("  --version             显示版本");
 }
@@ -105,6 +109,7 @@ impl Config {
             max_work_conns: DEFAULT_MAX_WORK_CONNS,
             rendezvous_port: DEFAULT_RENDEZVOUS_PORT,
             rendezvous_enabled: true,
+            allow_empty_token: false,
         };
         // R-08b (S2)：`--rendezvous-port` 是否被显式给出（与 `--no-rendezvous`
         // 互斥校验用）。
@@ -172,6 +177,9 @@ impl Config {
                 }
                 "--no-rendezvous" => {
                     cfg.rendezvous_enabled = false;
+                }
+                "--allow-empty-token" => {
+                    cfg.allow_empty_token = true;
                 }
                 _ => return Err(format!("unknown option '{key}'")),
             }
@@ -415,6 +423,18 @@ mod config_parse_tests {
         assert_eq!(cfg.rendezvous_port, 7001);
     }
 
+    // 安全审计 R-3：--allow-empty-token 解析（默认 false，fail-closed 兜底在 main()）。
+    #[test]
+    fn test_allow_empty_token_flag() {
+        assert!(!parse(&[]).unwrap().allow_empty_token);
+        assert!(parse(&["--allow-empty-token"]).unwrap().allow_empty_token);
+        // 与 --token 不冲突（显式 token 时开关无实际影响）。
+        let cfg = parse(&["--token", "x", "--allow-empty-token"]).unwrap();
+        assert!(cfg.allow_empty_token);
+        // = 写法同样生效。
+        assert!(parse(&["--allow-empty-token=true"]).unwrap().allow_empty_token);
+    }
+
     #[test]
     fn test_rendezvous_conflicts_fail_closed() {
         // --no-rendezvous 与 --rendezvous-port 矛盾 → Err。
@@ -470,6 +490,19 @@ async fn main() {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
+
+    // 安全审计 R-3：空 token 默认 fail-closed 拒绝启动（对齐 CLI
+    // cmd_tunnel_serve 的 TNL-SEC-008；零凭据控制面 = 任意公网客户端可登录）。
+    // `--allow-empty-token` 显式放行（仍告警，见下）。
+    if cfg.token.is_empty() && !cfg.allow_empty_token {
+        eprintln!(
+            "error: empty token — refusing to start (zero-credential control plane). \
+             Use --token <TOKEN> or environment KIRIN_RELAY_TOKEN, \
+             or pass --allow-empty-token to explicitly allow it."
+        );
+        print_usage();
+        std::process::exit(2);
+    }
 
     // R-10 (M15-T006): panic hook——panic 消息 + backtrace 落 stderr（控制台）
     // 与今日日志文件（~/.kirin_desk/logs/）；无 GUI，不弹窗。

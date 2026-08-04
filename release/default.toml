@@ -1,31 +1,151 @@
 [device]
-id = "default-device"
+# M8-T031: 留空 = 自动（系统盘硬盘 UUID，Windows 卷序列号 `HD-XXXXXXXX`；
+# Linux machine-id / macOS IOPlatformUUID；全部失败兜底主机名）。
+# 旧占位 `default-device` 视为未填写（同样自动生成）。
+id = ""
 name = "My Device"
 nickname = ""
+# S-01 (F-1): 挑战码 —— **必填（安全）**，服务端核心凭据。为空（默认）时
+# 服务端 fail-closed：CLI `shell`/`serve` 拒绝启动（除非显式
+# --allow-no-challenge，不推荐）；零凭据连接（未知客户端 + 无挑战码）一律
+# 拒绝；GUI 旁路（IP/Temp mode）要求「固定码或激活窗口」至少其一。
 challenge_code = ""
 
+# R-13 (M15-T005): 敏感字段（api_key / api_secret / tunnel token 等）以
+# ChaCha20Poly1305 密文存储（格式 `{v: base64(nonce‖ciphertext)}`），
+# 配置文件内**无明文**（此处空串为占位默认值，填入后首次保存即加密）。
+# 主密钥来源分层：Windows DPAPI / macOS Keychain；无密钥环平台可设环境变量
+# `KIRIN_CONFIG_KEY`（口令，经 PBKDF2 派生）启用加密；均不可用则明文 +
+# 启动醒目警告（fail-open，不阻断开发使用）。详见 Readme_CN「配置加密」。
 [godaddy]
 api_key = ""
 api_secret = ""
 domain = "example.com"
 api_url = "https://api.godaddy.com"
 
+# M8-T035: DNS 域名维护服务商（Settings → DNS 组 ComboBox 写入；
+# 值 = utils dns_providers 注册表中已实现服务商 id，未知值自动回退 "godaddy"）。
+# `[godaddy]` 段为 GoDaddy 客户端实际使用的字段，结构不变（CLI 直接读写）。
+[dns]
+provider = "godaddy"
+
+# M8-T040: 域名模式加密 DNS 强制（服务端 + 客户端，需求 §5.2）。
+# 域名模式下全部 DNS 解析必须走 DoH/DoT，fail-closed（DDNS-DOH-003）；
+# mode = "off" 显式关闭强制（仅限 IP 模式；域名模式将无法解析 → 提示不可用）。
+[dns.security]
+mode = "enforce"               # enforce（默认）| off
+# DoH 端点优先序（application/dns-json，GET，强制 HTTPS + 证书校验）
+doh = [
+  "https://cloudflare-dns.com/dns-query",
+  "https://dns.google/resolve",
+  "https://dns.alidns.com/resolve",
+]
+# DoT 端点优先序（TLS TCP 853）
+dot = [
+  "1.1.1.1:853",
+  "8.8.8.8:853",
+  "2400:3200::1:853",
+]
+resolve_timeout_ms = 5000       # 单端点超时
+cache_ttl_secs = 50             # 解析缓存 TTL（沿用 discovery 缓存语义）
+
+# M8-T040: DDNS 域名自动更新维护（域名页「DDNS 维护」卡读写，需求 §5.1）。
+# IPv4 自动 = 公网出口 IP（非本机网卡地址）；IPv6 自动 = 本机全局单播；
+# 手动模式地址心跳永不覆盖（仅刷新 TTL）。
+[ddns]
+enabled = false                # 总开关（默认关）
+interval_secs = 300            # 更新周期（默认 300s；下限 60s，低于下限收敛；
+                               # 未设置回退 [network] heartbeat_interval）
+ipv4_mode = "auto"             # auto（公网出口 IP）| manual（固定地址）
+ipv4_manual = ""               # 手动固定 IPv4（固定出口/静态映射场景；心跳永不覆盖）
+ipv4_sources = ["ipify", "ip.sb", "icanhazip"]   # 公网 IP 服务优先序（全部 HTTPS）
+ipv6_mode = "auto"             # auto（本机全局单播 IPv6）| manual（上游固定/转发场景）
+ipv6_manual = ""               # 手动固定 IPv6（心跳永不覆盖）
+publish_srv = true             # 自动维护 SRV（远控端口）
+publish_txt = true             # 自动维护 TXT（签名/DeviceMeta）
+publish_a = true               # 自动维护 A 记录
+publish_aaaa = true            # 自动维护 AAAA 记录
+
 [network]
 port = 3389
 heartbeat_interval = 30
 dns_ttl = 600
+# M8-T017: 临时连接窗口时长（秒，范围 60–3600，默认 300 = 5 分钟）
+temp_mode_ttl_secs = 300
+# M8-T027: 设备 ID 白名单（按握手 client_id 精确匹配，大小写敏感；
+# 与域名白名单 OR 生效。GUI Settings / `whitelist add-id` 写入，无需手改）
+# allowed_ids = []            # 永久条目（精确；`office-*` = 前缀通配）
+# id_whitelist = []           # 带过期条目（`whitelist add-id <id> <RFC3339>`）
 
 [media]
 encoder = "auto"
 framerate = 30
 bitrate = 5000
 
+# M8-T030: 单 GPU 硬件加速与虚拟设备过滤
+# prefer: auto(默认,第一个真实硬件适配器) | intel | nvidia | amd | luid:0x…(调试)
+# 开发机双 GPU 调试：切 intel 验 QSV / 切 nvidia 验 NVENC
+# （也可用环境变量 KIRIN_GPU_PREFER 覆盖，不动配置文件）
+[media.gpu]
+prefer = "auto"
+filter_virtual = true        # 过滤虚拟驱动（适配器 + 显示器）
+virtual_keywords = []        # 覆盖默认黑名单（空 = 默认表，见 M8-T030 §3.3）
+
 [logging]
 level = "info"
 format = "text"
 
-[unattended]
-# 无人值守模式：开机自启 + 自动开启服务端 + 受信任设备自动接受连接（PTY/远控）
-enabled = false
-auto_start_on_boot = false
-auto_start_server = true
+# M8-T025 P5-4: 传输设置（QUIC 优先 → TCP 优雅降级；CLI --transport/--ip-family 覆盖）
+[transport]
+mode = "auto"                 # auto | quic | tcp（B1：auto = QUIC 优先，失败回退 TCP）
+ip_family = "auto"            # auto | ipv4 | ipv6（A4：auto = IPv6 优先，无 v6 用 v4）
+quic_connect_timeout_ms = 3000  # QUIC 建连/握手超时（B1）
+graceful_degrade = true       # 会话中途降级开关（B2：QUIC 失效自动 TCP 重建续传）
+tcp_mode_feedback_interval_ms = 500  # TCP 模式反馈上报周期（§3.5）
+
+[file_transfer]
+# M13-T006: 接收文件落盘目录（留空 = 默认 ~/Downloads/KirinDesk）
+download_dir = ""
+# 单文件大小上限（字节，默认 4 GiB）
+max_file_size = 4294967296
+
+# M8-T026: 内网穿透设置（FRP 式通用 TCP 反向代理）。
+# 默认关闭——可选兜底能力，与 P2P 直连并存；开启仅在有公网 relay 服务器时。
+# 客户端核心字段（server_addr / token / proxies）可在 GUI Settings 页
+# 「Tunnel (内网穿透)」分组编辑；本段为完整配置与默认值。
+[tunnel]
+enabled = false               # 总开关（默认关闭）
+mode = "client"               # client（frpc 等价，默认）| server（frps 等价）
+server_addr = ""              # relay 服务器地址：域名 / IPv4 / IPv6，支持 :port 后缀
+# M8-T026-P3（TNL-CFG-005）：认证口令 —— 挑战-响应加密验证（HMAC-SHA256，
+# 口令永不明文上线，TNL-SEC-006）；server 模式必填（空口令拒绝启动，
+# TNL-SEC-008）；建议 ≥32 字节高熵随机串（TNL-SEC-009）；不写日志；
+# R-13 起密文存储，格式同 [godaddy] 段说明）
+token = ""
+# --- 以下为 server 模式 / 稳定性参数（GUI Tunnel 页可编辑（M8-T039）） ---
+bind_port = 7000              # server 控制端口
+bind_addrs = "0.0.0.0,::"     # server 监听地址（逗号分隔可多个，IPv4/IPv6 均可；
+                              # 默认 IPv4+IPv6 双监听；空 = relay 回退 [::] 优先 + 0.0.0.0 回退）
+port_range = "60000-61000"    # remote_port=0 时自动分配区间（start-end）
+heartbeat_interval = 10       # 心跳间隔秒
+heartbeat_timeout = 30        # 心跳超时秒（连续 3 周期无响应判死）
+pool_count = 0                # 连接池预建 work 连接数（P1 增强，0=关闭）
+max_pool_count = 5            # server 每代理池上限（P1 增强）
+# GUI 最后运行状态（仅 GUI 写；CLI 不读；与 enabled 语义独立；默认 false）
+auto_start = false
+# --- M8-T026-P2 设备 ID 模式（ID 注册/解析/中继） ---
+device_id = ""                # 注册设备 ID（留空 = 由本机身份公钥指纹派生，ID-001）
+server_pubkey = ""            # relay 服务器 Ed25519 公钥（base64；`connect --id` 验签必需，
+                              # 首次 `tunnel serve` 启动时输出，ID-SEC-001）
+extra_candidates = []         # 额外连接候选："ip:port" 列表（ID-005；服务器自动附加观察地址）
+# 代理列表：把内网 TCP 服务映射到公网端口（GUI 中每行一条
+# "name|local_addr:port|remote_port"，remote_port 留空 = 服务端分配）
+# [[tunnel.proxies]]
+# name = "ssh"
+# local_addr = "127.0.0.1"
+# local_port = 22
+# remote_port = 6022
+
+# R-07-S4: 自动更新（[update] 段）。
+[update]
+channel = "release"          # 更新通道：release = 正式版（默认）/ beta = 预发布

@@ -103,6 +103,20 @@ pub fn bucket_key(ip: IpAddr) -> IpAddr {
     }
 }
 
+/// 安全审计 R-2 同类：v4-mapped 地址（`::ffff:a.b.c.d`）归一为真实 IPv4。
+/// 双栈监听（`set_only_v6(false)`）下 IPv4 客户端在 accept/登记路径呈现为
+/// IPv6 形态；归一后 `bucket_key`（IPv4 取 /24）与审计语义正确，否则全部
+/// IPv4 会坍缩进同一 `::`/`::ffff:` 桶（跨租户共享额度 + 群体封禁）。
+pub fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => ip,
+        },
+        _ => ip,
+    }
+}
+
 /// 连续封禁时长指数递增：1x → 2x → 4x（即 15m → 30m → 1h），封顶 4x。
 fn escalate_ban_duration(base: Duration, ban_count: u32) -> Duration {
     let factor = 1u32 << ban_count.min(2);
@@ -382,6 +396,29 @@ mod tests {
             bucket_key(v6(9, 9)),
             IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0))
         );
+    }
+
+    // 安全审计 R-2：v4-mapped 归一（::ffff:1.2.3.4 → 1.2.3.4，桶键取 /24）
+    #[test]
+    fn test_canonical_ip_v4_mapped() {
+        let mapped = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x0102, 0x0304));
+        assert_eq!(
+            canonical_ip(mapped),
+            IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))
+        );
+        // 归一后与真实 v4 同 /24 桶；不同 /24 隔离（未归一则全部坍缩进 ::ffff: 桶）
+        assert_eq!(
+            bucket_key(canonical_ip(mapped)),
+            bucket_key(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 99)))
+        );
+        assert_ne!(
+            bucket_key(canonical_ip(mapped)),
+            bucket_key(IpAddr::V4(Ipv4Addr::new(1, 2, 4, 1)))
+        );
+        // 真实 IPv6 与 v4 原样透传
+        let v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
+        assert_eq!(canonical_ip(v6), v6);
+        assert_eq!(canonical_ip(IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9))), IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)));
     }
 
     #[test]

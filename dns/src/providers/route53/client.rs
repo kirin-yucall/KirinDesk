@@ -87,8 +87,8 @@ impl Route53Client {
                 region,
                 DEFAULT_ENDPOINT,
             ),
-            other => panic!(
-                "route53 构造器收到非 Route53 凭据: {other:?}（注册表仅以 Route53 凭据调用本工厂）"
+            _ => panic!(
+                "route53 构造器收到非 Route53 凭据变体（注册表仅以 Route53 凭据调用本工厂）"
             ),
         }
     }
