@@ -19,7 +19,16 @@ VERSION="${1:?usage: release/publish_local.sh <X.Y.Z>}"
 [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "error: 版本号须为 X.Y.Z" >&2; exit 1; }
 TAG="v${VERSION}"
 
-[ -n "$(git status --porcelain)" ] && { echo "error: 工作区有未提交改动，先提交/stash：" >&2; git status --porcelain >&2; exit 1; }
+# 工作区清洁度：仅允许 Cargo.toml/Cargo.lock 脏（版本 bump 属 release commit 内容）。
+DIRTY="$(git status --porcelain)"
+if [ -n "${DIRTY}" ]; then
+    OTHER="$(printf '%s\n' "${DIRTY}" | grep -vE '^.. Cargo\.(toml|lock)$' || true)"
+    if [ -n "${OTHER}" ]; then
+        echo "error: 工作区有未提交改动（除 Cargo.toml/Cargo.lock 版本 bump）：" >&2
+        printf '%s\n' "${DIRTY}" >&2
+        exit 1
+    fi
+fi
 git tag -l "${TAG}" | grep -q . && { echo "error: tag ${TAG} 已存在" >&2; exit 1; }
 
 # 1. CHANGELOG 归档（同 publish.sh 2b 片段）
