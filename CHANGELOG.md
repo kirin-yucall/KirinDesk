@@ -4,7 +4,8 @@
 版本语义遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 里程碑（M1–M15）与任务状态见 `task_docs/M0-完整路线图M1-M15.md`。
 
-## [Unreleased]
+## [v0.2.0] - 2026-08-04
+
 
 ### Added
 - M9-DNS000 多服务商 DNS 域名维护客户端（M9-DNS001~024，20 家服务商全量落地）：
@@ -503,6 +504,12 @@
   合入，内容完整经复核——该混合提交同时携带代码（R-15b hw_bridge 零拷贝等）
   与 Readme/文档修正，未拆分改写历史，逐项核对无遗漏、无冲突
 
+## [Unreleased]
+
+### Added
+
+（开发中功能，发布时移入版本段）
+
 ## [v0.1.0] - 2026-07-31
 
 ### Added
@@ -525,3 +532,4 @@
 
 [Unreleased]: https://github.com/kirin-yucall/kirin_desk/compare/v0.1.0...HEAD
 [v0.1.0]: https://github.com/kirin-yucall/kirin_desk/releases/tag/v0.1.0
+[v0.2.0]: https://github.com/kirin-yucall/KirinDesk/releases/tag/v0.2.0
