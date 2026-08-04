@@ -78,11 +78,12 @@ else
 fi
 echo "==> tag: ${TAG}"
 
-# 5. 侧车 + 清单（全部 release/dist 产物）
+# 5. 侧车 + 清单（全部 release/dist 产物；跳过 checksums.txt 与已有 *.sha256）
 DIST="${ROOT}/release/dist"
 if [ -d "${DIST}" ]; then
   HASH_TOOL=(sha256sum); command -v sha256sum >/dev/null 2>&1 || HASH_TOOL=(shasum -a 256)
-  : > "${DIST}/checksums.txt"
+  find "${DIST}" -maxdepth 1 -type f -name '*.sha256' -delete
+  rm -f "${DIST}/checksums.txt"
   for f in "${DIST}"/*; do
     [ -f "${f}" ] || continue
     base="$(basename "${f}")"
