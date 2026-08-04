@@ -30,3 +30,5 @@ Thumbs.db
 
 # S-28 (F-33): 发布二进制移出版控 —— 发布走 CI artifacts（GitHub Releases + checksums.txt），本地保留文件供 install.bat 使用
 release/KirinDesk.exe
+# 本地发布暂存目录（zip/exe/deb/dmg/侧车/checksums，由 publish_local.sh 与 CI 产物汇聚）
+release/dist/
