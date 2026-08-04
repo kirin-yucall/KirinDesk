@@ -3,7 +3,7 @@ chcp 65001 >nul
 title KirinDesk Package
 
 echo ============================================
-echo    KirinDesk v0.1.0 - One-Click Package
+echo    KirinDesk v0.2.0 - One-Click Package
 echo ============================================
 echo.
 
@@ -47,15 +47,16 @@ exit /b %RC%
 
 :main
 :: ==========================================
-:: Limit Cargo parallel build jobs to 4 (2026-08-04 用户要求：打包线程上限 4，
-:: 原 8 超限并行会导致大小核机器死机)
+:: Limit Cargo parallel build jobs to 2 (2026-08-04: original 8 caused freezes
+:: on big.LITTLE machines; 4 + RUST_MIN_STACK=32MB crashed rustc codegen on
+:: full rebuild of kirin-desk-core (0xc0000005); jobs=2 is stable. Cap = 8.)
 :: ==========================================
-set "CARGO_BUILD_JOBS=4"
+set "CARGO_BUILD_JOBS=2"
 
 :: ==========================================
-:: 2026-08-04: release opt-level=3 编译 ui/src/lib.rs(R-32 AV1 等新代码)时
-:: rustc codegen 线程栈溢出崩溃(STATUS_ACCESS_VIOLATION 0xc0000005)，
-:: 加大线程栈为已知 workaround；缺失会稳定复现，勿删。
+:: 2026-08-04: release opt-level=3 building ui/src/lib.rs (R-32 AV1 new code)
+:: crashed rustc codegen with thread stack overflow (STATUS_ACCESS_VIOLATION
+:: 0xc0000005); enlarging thread stack is the known workaround; do not remove.
 :: ==========================================
 set "RUST_MIN_STACK=33554432"
 
