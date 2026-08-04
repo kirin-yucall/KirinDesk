@@ -19,6 +19,17 @@ VERSION="${1:?usage: release/publish_local.sh <X.Y.Z>}"
 [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "error: 版本号须为 X.Y.Z" >&2; exit 1; }
 TAG="v${VERSION}"
 
+# Python 探测：Windows 上 python3/python 可能是 Store 别名（--version 无输出
+# 且静默失败），只接受真实输出版本的解释器；py launcher 的 `-` stdin 模式可用。
+PY=""
+for c in python3 python py; do
+    if command -v "${c}" >/dev/null 2>&1; then
+        v="$("${c}" --version 2>&1 | head -1)" || true   # Store 空壳退出非零，勿让 set -e 终止
+        if [ -n "${v}" ]; then PY="${c}"; break; fi
+    fi
+done
+[ -n "${PY}" ] || { echo "error: 需要 python3/python（用于 CHANGELOG 归档）" >&2; exit 1; }
+
 # 工作区清洁度：仅允许 Cargo.toml/Cargo.lock 脏（版本 bump 属 release commit 内容）。
 DIRTY="$(git status --porcelain)"
 if [ -n "${DIRTY}" ]; then
@@ -32,7 +43,7 @@ fi
 git tag -l "${TAG}" | grep -q . && { echo "error: tag ${TAG} 已存在" >&2; exit 1; }
 
 # 1. CHANGELOG 归档（同 publish.sh 2b 片段）
-python3 - "${VERSION}" "${TAG}" <<'EOF'
+$PY - "${VERSION}" "${TAG}" <<'EOF'
 import re, sys, datetime
 version, tag = sys.argv[1], sys.argv[2]
 date = datetime.date.today().isoformat()
@@ -50,9 +61,9 @@ open(p, "w", encoding="utf-8").write(text)
 print(f"CHANGELOG.md: [Unreleased] -> [{tag}] - {date}")
 EOF
 
-# 2. 刷新 Cargo.lock（对齐 workspace 版本）
-echo "==> cargo check --workspace（刷新 Cargo.lock）..."
-cargo check --workspace --quiet
+# 2. 刷新 Cargo.lock（对齐 workspace 版本）；jobs=2 上限（大小核死机约束）。
+echo "==> cargo check --workspace（刷新 Cargo.lock，jobs=2）..."
+CARGO_BUILD_JOBS=2 cargo check --workspace --quiet
 
 # 3. commit
 git add Cargo.toml Cargo.lock CHANGELOG.md
