@@ -1,4 +1,4 @@
-use chacha20poly1305::AeadInPlace;
+﻿use chacha20poly1305::AeadInPlace;
 use chacha20poly1305::KeyInit;
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -36,7 +36,7 @@ pub enum Ed25519Error {
     KeyStore(#[from] KeyStoreError),
 }
 
-/// 自定义加密存储格式（R-20b：**非 PKCS#8**，宣称与实现一致）。
+/// 自定义加密存储格式（：**非 PKCS#8**，宣称与实现一致）。
 ///
 /// 这是本项目自有的「自定义加密存储（AEAD + AAD 上下文）」格式，**不实现
 /// 真 PKCS#8**（避免无谓复杂度，审计方案①）：
@@ -59,7 +59,7 @@ struct EncryptedPrivateKey {
 /// The private key is stored via the [`KeyStore`] backend（S-05：系统钥匙串 /
 /// DPAPI / secret-tool，兜底为随机主密钥文件）；`key_path` 保留为旧格式
 /// 文件路径（迁移检测与配发标记定位用）。公钥上传至 DNS TXT 记录供对端验证。
-// R-03 (R03-S1): Clone 供重连上下文（Arc<IdentityManager>）与原连接路径复用。
+//  (R03-S1): Clone 供重连上下文（Arc<IdentityManager>）与原连接路径复用。
 #[derive(Clone)]
 pub struct IdentityManager {
     /// Ed25519 signing key (private key).
@@ -344,7 +344,7 @@ impl IdentityManager {
     }
 
     /// 迁移向导：检测旧格式（JSON `{nonce,ciphertext}`，ChaCha20Poly1305 +
-    /// device_id 派生密钥，R-20 命名：自定义加密存储）并迁移到新后端，
+    /// device_id 派生密钥， 命名：自定义加密存储）并迁移到新后端，
     /// 返回解出的私钥字节。
     ///
     /// 顺序（计划 §5 风险 3：失败回退不覆盖原文件）：
@@ -809,7 +809,7 @@ mod tests {
         let dir = s05_temp_dir("migrate");
         let path = dir.join("ed25519.json");
 
-        // 构造旧格式文件（R-20 格式：JSON nonce+ciphertext）
+        // 构造旧格式文件（ 格式：JSON nonce+ciphertext）
         let original = IdentityManager::generate(path.clone()).unwrap();
         let orig_pub = original.public_key_base64();
         original.save(&derive_identity_key("dev-1")).unwrap();

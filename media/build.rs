@@ -1,9 +1,9 @@
-//! media crate build script（P1B §T2.4）。
+﻿//! media crate build script（P1B §T2.4）。
 //!
 //! 职责：仅在启用 `gpu-kernel` feature 且工具链可用时，构建并链接根级
 //! `libkirin_gpu/`（静态库）；否则降级为 CPU-only。
 //!
-//! 设计目标（与 task_docs 一致）：**默认 `cargo build` 不依赖任何 C++
+//! 设计目标：**默认 `cargo build` 不依赖任何 C++
 //! 工具链**——`gpu-kernel` feature 关闭时本脚本几乎是空操作，仅 emit
 //! `rerun-if-changed`，保证全仓构建清洁。
 //!
@@ -54,7 +54,7 @@ fn main() {
     emit_sck_cfg();
 }
 
-/// R-61：macOS target 探测目标 SDK 是否含 ScreenCaptureKit.framework，
+/// ：macOS target 探测目标 SDK 是否含 ScreenCaptureKit.framework，
 /// 有则 emit `kirin_sck_sdk`（zed-scap/ScreenCaptureKit 捕获路径启用），
 /// 无（如 Mojave 10.14 CLT-only SDK）则不 emit —— `capture::zed_scap`
 /// 编译为降级桩（`ZedScapBackend::new` 恒 Err、`enumerate_monitors`
@@ -62,7 +62,7 @@ fn main() {
 /// scap/SC* 符号（未引用的 rlib 对象不会被链接器拉入），配合
 /// third_party/screencapturekit-sys 的 SDK 门控链接，Mojave 全量构建
 /// 可过。非 macOS target / 非 mac 宿主交叉 check 不影响（恒视为有 SDK，
-/// 保持 check 口径与 R-60 一致）。
+/// 保持 check 口径与  一致）。
 fn emit_sck_cfg() {
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
@@ -148,7 +148,7 @@ fn build_and_link(kgpu_dir: &Path) -> Result<(), String> {
     cfg.arg("-S").arg(kgpu_dir);
     cfg.arg("-B").arg(&build_dir);
     cfg.arg("-DCMAKE_BUILD_TYPE=Release");
-    // FFmpeg 头（hw_bridge 真实实现，R-15b）：默认自动探测仓库内
+    // FFmpeg 头（hw_bridge 真实实现，）：默认自动探测仓库内
     // ffmpeg/ffmpeg-8.1.1-full_build-shared/ 的 dev 头（与捆绑 DLL 同版本
     // 的 GyanD 8.1.1 shared build，含 include/ + lib/）；显式 env
     // KIRIN_GPU_FFMPEG_INCLUDE_DIR 优先（可指向其它路径）。
@@ -158,7 +158,7 @@ fn build_and_link(kgpu_dir: &Path) -> Result<(), String> {
             // 仓库内默认：<workspace>/ffmpeg/ffmpeg-8.1.1-full_build-shared/include。
             // workspace_root 是 main() 的局部变量，build_and_link 仅接收
             // kgpu_dir（= workspace_root/libkirin_gpu）——由 kgpu_dir.parent()
-            // 推导即 workspace_root（R-15b 最终修法，2026-08-04）。
+            // 推导即 workspace_root（ 最终修法，2026-08-04）。
             let ws_root = kgpu_dir.parent().unwrap_or(Path::new("."));
             let root = ws_root
                 .join("ffmpeg")

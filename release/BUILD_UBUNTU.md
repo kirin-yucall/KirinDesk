@@ -1,4 +1,4 @@
-# KirinDesk - Ubuntu Build Guide
+﻿# KirinDesk - Ubuntu Build Guide
 
 ## Requirements
 
@@ -13,7 +13,7 @@ sudo apt install build-essential libssl-dev pkg-config \
     libpulse-dev libudev-dev ffmpeg libavcodec-dev
 ```
 
-> 说明（R-14，M12-T001/T003/M13-T001 Linux 侧）：
+> 说明（，M12-T001/T003/M13-T001 Linux 侧）：
 > - `libpipewire-0.3-dev`：**必需**——屏幕捕获（screen-cast portal 帧流）与
 >   音频捕获/播放（`pw_stream`）均经 PipeWire；pipewire crate（=0.8.0）
 >   编译期经 system-deps 探测它。
@@ -25,7 +25,7 @@ sudo apt install build-essential libssl-dev pkg-config \
 >   门户。
 > - D-Bus 客户端为纯 Rust（zbus），无额外系统包。
 
-## 获取 FFmpeg 运行库（R-50）
+## 获取 FFmpeg 运行库（）
 
 KirinDesk 的 H.264/AV1 编解码**动态加载** FFmpeg 共享库（libavcodec.so.62 /
 libavutil.so.60 / libswscale.so.9 等 7 个）。**注意**：Ubuntu 24.04 发行版自带的

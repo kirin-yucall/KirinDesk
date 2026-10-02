@@ -1,15 +1,19 @@
-//! 跨平台屏幕捕获抽象层。
+﻿//! 跨平台屏幕捕获抽象层。
 //!
-//! # 后端（与 docs 设计一致，M8-T008 §Step 1）
+//! # 后端（M8-T008 §Step 1）
 //!
 //! | 平台 | 后端 | 状态 |
 //! |------|------|------|
 //! | Windows | `windows-capture` crate（唯一后端，无 WGC/DXGI/GDI 回退链） | ✅ 已实现 |
 //! | macOS | `zed-scap` crate（ScreenCaptureKit，M12-MAC MAC-T001） | ✅ 已实现 |
+//! | Linux | `linux_pipewire`（PipeWire screen-cast portal，X11/Wayland 统一，M12-T001 / ） | ✅ 已实现 |
 //!
 //! 旧后端（wgc/dxgi/gdi/pipewire）已按 M8-T008 设计删除。
 
 pub mod factory;
+
+///  段A：受控端本 OS 光标移除 —— 三平台采集面光标开关矩阵（全平台编译）。
+pub(crate) mod cursor_matrix;
 
 #[cfg(target_os = "windows")]
 pub mod windows_capture;
@@ -185,6 +189,7 @@ pub struct MonitorInfo {
     pub width: u32,
     pub height: u32,
     pub is_primary: bool,
+    /// M8-T030（）：虚拟显示器标记（名称关键词命中，GPU-FR-007）。
     /// Windows 默认过滤（`filter_virtual` 可关）；macOS/兜底恒 false。
     pub is_virtual: bool,
 }
@@ -210,10 +215,11 @@ pub trait ScreenCaptureSource: Send {
         self.wait_for_frame()
     }
 
+    /// （流畅优先）：非阻塞取走**已排队帧中最新的**一帧（其余丢弃）。
     ///
     /// 用途：编码慢于捕获率时（软编高分辨率/低配机），编码期间 DXGI 积压的
     /// 陈旧帧不再逐帧补编码（延迟雪崩根因），直接跳到最新帧——宁可丢帧也
-    /// 不涨延迟（用户基调：流畅优先）。无积压返回 `None`（调用方继续
+    /// 不涨延迟（甲方基调：流畅优先）。无积压返回 `None`（调用方继续
     /// `wait_for_frame_timeout` 阻塞等待）。
     fn drain_latest_frame(&mut self) -> Option<CaptureFrame> {
         None

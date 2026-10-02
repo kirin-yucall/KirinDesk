@@ -1,4 +1,4 @@
-//! macOS 屏幕捕获后端 — `zed-scap` crate（ScreenCaptureKit 封装，macOS 12+）。
+﻿//! macOS 屏幕捕获后端 — `zed-scap` crate（ScreenCaptureKit 封装，macOS 12+）。
 //!
 //! M12-MAC（MAC-T001，设计依据：`远控服务端_需求文档.md §3.2.3`）：
 //! - 使用 `zed-scap = "=0.0.8-zed"`（crates.io 上 zed-industries/scap 的发布版，
@@ -24,6 +24,7 @@
 
 #![cfg(target_os = "macos")]
 
+// ：ScreenCaptureKit framework macOS 12.3+ 才随 SDK 提供。目标 SDK
 // 无该框架时（如 Mojave 10.14 CLT-only，由 media/build.rs 探测）不编
 // scap 路径 —— 以下真实实现整体门控在 `cfg(kirin_sck_sdk)` 的 `live`
 // 模块中，`stub` 模块提供同名 API 的降级实现（恒 Err / false），
@@ -90,7 +91,10 @@ impl ZedScapBackend {
 
         let options = Options {
             fps: 30,
-            show_cursor: true,
+            //  段A：受控端本 OS 光标不进采集画面（同族 Windows
+            // WithoutCursor / Linux pipewire cursor_mode=0）——远控画面仅呈现
+            // 主控端投射光标（mouse_move 注入远端本地 OS 光标，链路零改动）。
+            show_cursor: false,
             show_highlight: false,
             target: target.cloned(),
             crop_area: None,
@@ -214,6 +218,7 @@ pub fn enumerate_monitors() -> Result<Vec<MonitorInfo>, CaptureError> {
                 width: 0,
                 height: 0,
                 is_primary: i == 0, // ScreenCaptureKit 首个 display 为主显示器
+                // M8-T030（）：macOS 无虚拟屏概念，恒 false。
                 is_virtual: false,
             });
         }
@@ -228,6 +233,7 @@ pub fn enumerate_monitors() -> Result<Vec<MonitorInfo>, CaptureError> {
 #[cfg(kirin_sck_sdk)]
 pub use live::{ZedScapBackend, enumerate_monitors};
 
+///  降级桩：目标 SDK 无 ScreenCaptureKit（macOS < 12.3 SDK，如
 /// Mojave 10.14 CLT-only）时替代真实后端。API 与 `live` 完全一致，
 /// `factory.rs` 调用点零改动：屏幕捕获不可用（`new` / `enumerate_monitors`
 /// 恒 Err、`request_permission` 恒 false），其余功能不受影响。

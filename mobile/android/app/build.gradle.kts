@@ -19,9 +19,8 @@ android {
     }
 
     // 签名口径（P1-B）：release 优先正式签名——keystore 位于仓库外
-    // D:\kirin_rd\secrets\kirindesk-release.jks（RSA-4096，.gitignore 全局
-    // /secrets/ 双保险），口令经环境变量注入，**缺失任意一项即回退 debug
-    // 签名**（构建永不因口令缺失而断）：
+    // （RSA-4096，.gitignore 全局排除），口令经环境变量注入，
+    // **缺失任意一项即回退 debug 签名**（构建永不因口令缺失而断）：
     //   KIRIN_STORE_FILE      keystore 路径
     //   KIRIN_STORE_PASSWORD  store 口令
     //   KIRIN_KEY_ALIAS       key 别名（kirindesk）

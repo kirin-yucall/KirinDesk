@@ -1,4 +1,4 @@
-//! Network module: IPv4/IPv6 address detection and TCP wrappers
+﻿//! Network module: IPv4/IPv6 address detection and TCP wrappers
 pub mod ipv4;
 pub mod ipv6;
 pub mod rate_limit;
@@ -8,7 +8,7 @@ pub use ipv4::{get_global_ipv4, get_global_ipv4_addrs, is_global_unicast_ipv4, I
 pub use ipv6::{get_global_ipv6, get_global_ipv6_addrs, is_global_unicast_ipv6, Ipv6Error};
 pub use rate_limit::{RateLimitDecision, RateLimiter, RateLimiterConfig};
 
-/// R-45: 本机地址可达性三态（Dashboard 网络状态卡 IPv4/IPv6 判定用）。
+/// : 本机地址可达性三态（Dashboard 网络状态卡 IPv4/IPv6 判定用）。
 ///
 /// 纯本机地址分类（getifaddrs/系统接口信息），**不引入网络探测开销
 /// （GUI 每帧）也不外呼外部 IP 服务**（项目无遥测红线）。

@@ -1,4 +1,4 @@
-//! R-137-10b（甲方第五轮复测第 14 项③，PM 裁定授权扩沿）：本机 OS 类型
+﻿//! （甲方第五轮复测第 14 项③，PM 裁定授权扩沿）：本机 OS 类型
 //! 枚举 + 探测。
 //!
 //! 用途：握手 `HandshakeInit.client_os` / `HandshakeResponse.server_os`

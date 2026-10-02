@@ -1,4 +1,4 @@
-//! Linux PipeWire screen-cast portal 捕获后端（M12-T001 / R-14-S1）。
+﻿//! Linux PipeWire screen-cast portal 捕获后端（M12-T001 / ）。
 //!
 //! # 方案
 //!
@@ -73,8 +73,12 @@ const PORTAL_IFACE: &str = "org.freedesktop.portal.ScreenCast";
 
 /// SelectSources 的 `types` 位：1 = Monitor（整屏捕获；窗口捕获 = 2）。
 const SCREENCAST_TYPE_MONITOR: u32 = 1;
-/// cursor_mode：1 = 嵌入光标（桌面远控需要光标位置可见）。
-const SCREENCAST_CURSOR_EMBEDDED: u32 = 1;
+/// cursor_mode：0 = 不嵌入光标（ 段A：受控端本 OS 光标不进采集画面；
+/// 主控端投射光标 = mouse_move 注入远端本地 OS 光标，链路零改动）。
+/// portal 契约（freedesktop ScreenCast Start）：cursor_mode 0 = 不显示光标，
+/// 1 = 嵌入光标，2 = 仅光标帧（本用法 0/1）。`pub(crate)` 供
+/// `cursor_matrix` 矩阵测试同源断言（字面量漂移即矩阵翻红）。
+pub(crate) const SCREENCAST_CURSOR_DISABLED: u32 = 0;
 
 /// 默认显示器兜底尺寸（portal 协商前；协商后更新）。
 const DEFAULT_W: u32 = 1920;
@@ -141,7 +145,7 @@ fn create_portal_session(conn: &Connection) -> Result<std::os::fd::OwnedFd, Capt
 
     // 3. Start(o session, s parent, a{sv} options) → (a(ha{sv}) streams,)。
     let mut opts = HashMap::<&str, Value>::new();
-    opts.insert("cursor_mode", Value::U32(SCREENCAST_CURSOR_EMBEDDED));
+    opts.insert("cursor_mode", Value::U32(SCREENCAST_CURSOR_DISABLED));
     let reply = conn
         .call_method(
             Some(PORTAL_DEST),
@@ -190,7 +194,7 @@ struct CaptureUserData {
 // 后端
 // ════════════════════════════════════════════════════════════════
 
-/// Linux PipeWire screen-cast portal 捕获源（M12-T001 / R-14-S1）。
+/// Linux PipeWire screen-cast portal 捕获源（M12-T001 / ）。
 pub struct LinuxPipewireBackend {
     /// 从捕获线程（pw_thread_loop 内部线程）接收帧。
     frame_rx: mpsc::Receiver<PipeWireCapturedFrame>,

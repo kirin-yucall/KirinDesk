@@ -1,4 +1,4 @@
-//! M8-T025 P4 端到端 TCP 媒体闭环集成测试（tcp_fallback_loopback.rs）。
+﻿//! M8-T025 P4 端到端 TCP 媒体闭环集成测试（tcp_fallback_loopback.rs）。
 //!
 //! 纯 TCP 端到端（无 QUIC）：服务端 accept → 握手 → `TcpMediaTransport`；
 //! 客户端 connect → 握手 → 构造。服务端发 3 个窗口（含超 `MAX_PACKET_PAYLOAD`
@@ -44,7 +44,7 @@ async fn run_server(
         peer_domain: g.peer_domain,
         peer_device_type: g.peer_device_type,
         selected_codec: g.selected_codec,
-        // R-137-10b: 对端 OS 通告值（字段一一对应搬运）。
+        // : 对端 OS 通告值（字段一一对应搬运）。
         peer_os: g.peer_os,
     };
     let mut transport = TcpMediaTransport::new(channel);
@@ -110,7 +110,7 @@ async fn run_client(
         peer_domain: ch.peer_domain,
         peer_device_type: ch.peer_device_type,
         selected_codec: ch.selected_codec,
-        // R-137-10b: 对端 OS 通告值（字段一一对应搬运）。
+        // : 对端 OS 通告值（字段一一对应搬运）。
         peer_os: ch.peer_os,
     };
     let mut transport = TcpMediaTransport::new(channel);

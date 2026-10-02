@@ -1,4 +1,4 @@
-//! AWS Route 53 服务商适配（M9-DNS005）
+﻿//! AWS Route 53 服务商适配（M9-DNS005）
 //!
 //! - 认证：AWS SigV4（手写实现，[`sign`]）
 //! - 序列化：XML 手写解析/构造（[`xml`]）
@@ -42,7 +42,7 @@ impl Route53Provider {
     }
 
     /// 测试用：注入自定义端点的客户端。
-    // R-33: 仅测试模块调用（mock 端点注入）——保留接口并标注，避免 dead_code。
+    // : 仅测试模块调用（mock 端点注入）——保留接口并标注，避免 dead_code。
     #[allow(dead_code)]
     pub(crate) fn with_client(client: Route53Client) -> Self {
         Self { client }

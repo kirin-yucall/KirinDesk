@@ -1,4 +1,4 @@
-//! M8-T026: 内网穿透（通用 TCP 反向代理，FRP 式）。
+﻿//! M8-T026: 内网穿透（通用 TCP 反向代理，FRP 式）。
 //!
 //! 极轻量级 crate（TNL-NF-004）：仅 tokio / serde / bincode / thiserror /
 //! tracing / uuid（M8-T026-P2 追加 ed25519-dalek / rand / base64 /
@@ -26,7 +26,7 @@ pub mod audit;
 pub mod auth;
 pub mod client;
 pub mod id_client;
-pub mod lan_candidates; // R-63：LAN 候选分类/优先级/超时纯函数
+pub mod lan_candidates; // ：LAN 候选分类/优先级/超时纯函数
 pub mod protocol;
 pub mod rate_limit;
 pub mod registry;

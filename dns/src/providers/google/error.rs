@@ -1,4 +1,4 @@
-//! Google Cloud DNS 错误 → 统一 `ProviderError` 映射（M9-DNS007 §三 错误码映射表）。
+﻿//! Google Cloud DNS 错误 → 统一 `ProviderError` 映射（M9-DNS007 §三 错误码映射表）。
 //!
 //! 映射规则（以 HTTP 状态码为主）：
 //! - 401/403 → `Auth`（invalid_grant / PermissionDenied 等）
@@ -30,7 +30,7 @@ struct GoogleErrorBody {
 
 #[derive(Deserialize)]
 struct GoogleError {
-    /// R-33: 反序列化保留（Google 错误体契约字段，调试/日志用），
+    /// : 反序列化保留（Google 错误体契约字段，调试/日志用），
     /// 当前仅消费 message——标注避免 dead_code。
     #[serde(default)]
     #[allow(dead_code)]

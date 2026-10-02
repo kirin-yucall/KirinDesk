@@ -4,8 +4,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// 注意：客户端捕获格式（本文件）与服务端注入管线格式
 /// （[`crate::injector::InputEvent`]）是两套并列结构；本函数用于客户端
-/// 捕获侧（测试/本地持久化等），**线上传输统一走 injector 格式**（见
-/// `task_docs/共享层/M9_远程输入注入.md` 决策说明）。
+/// 捕获侧（测试/本地持久化等），**线上传输统一走 injector 格式**。
 pub fn serialize_input(event: &InputEvent) -> Result<Vec<u8>, bincode::Error> {
     bincode::serialize(event)
 }

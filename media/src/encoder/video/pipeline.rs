@@ -1,4 +1,4 @@
-//! 视频编码入口：决策分发 + 时间戳（P1C §T3.7）。
+﻿//! 视频编码入口：决策分发 + 时间戳（P1C §T3.7）。
 //!
 //! [`VideoEncoderPipeline`] 是 capture 层与具体编码后端的接合点：
 //! - 持有一个 [`VideoEncoder`]（经 [`factory::create_video_encoder`] 选出）
@@ -37,7 +37,7 @@ pub struct VideoEncoderPipeline {
     /// 帧序号（Incremental 包 [frame_id] 用）。
     frame_id: u32,
     // ── CPU RGBA 适配（windows_capture 当前产 RGBA，非 GpuTexture 句柄） ──
-    // M8-T030（R-06，GPU-FR-008）：CPU tile-hash 兜底需要帧像素 ——
+    // M8-T030（，GPU-FR-008）：CPU tile-hash 兜底需要帧像素 ——
     // `pending_rgba` 由 set_cpu_frame 存留，classify_cpu 消费（非死拷贝；
     // M13-T004 曾因无消费方移除，现恢复消费）。
     pending_rgba: Vec<u8>,
@@ -102,7 +102,7 @@ impl VideoEncoderPipeline {
         self.encoder.flush_buffers();
     }
 
-    /// R-68-A：码率覆盖（慢网络降档/恢复，转发到内部编码器）。
+    /// ：码率覆盖（慢网络降档/恢复，转发到内部编码器）。
     ///
     /// `None` = 回到 [`rate_ladder`](crate::encoder::video::rate_ladder) 按
     /// 分辨率取档。编码器在下一帧按新码率重开（重开点自动 IDR）。
@@ -113,7 +113,7 @@ impl VideoEncoderPipeline {
     /// 喂入 CPU RGBA（适配 `windows_capture`：当前捕获后端无 GPU 句柄）。
     /// 调用方在 [`on_frame`](Self::on_frame) 前调用本方法把当前帧 RGBA 喂入。
     ///
-    /// M8-T030（R-06）：本层保留一份 RGBA 副本供 CPU tile-hash 兜底
+    /// M8-T030（）：本层保留一份 RGBA 副本供 CPU tile-hash 兜底
     /// （`classify_cpu` 消费；GPU 内核可用时仍只转发编码器 + 缓存尺寸）。
     pub fn set_cpu_frame(&mut self, rgba: &[u8], w: u32, h: u32, force_idr: bool) {
         self.encoder.set_cpu_frame(rgba, w, h, force_idr);

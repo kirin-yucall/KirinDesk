@@ -1,4 +1,4 @@
-//! GoDaddy Domains API HTTP 客户端（M9-DNS001）。
+﻿//! GoDaddy Domains API HTTP 客户端（M9-DNS001）。
 //!
 //! 由旧 `dns/src/godaddy/client.rs` 迁移改造：请求执行 / 429 指数退避重试 /
 //! S-14a HTTPS 强制 / S-14b 域名与记录名校验 / F-19 响应体与 record data 上限
@@ -36,7 +36,7 @@ pub struct GodaddyClient {
     /// 内部 reqwest 客户端。
     client: reqwest::Client,
     /// 认证处理（sso-key）。
-    // R-33: 生产路径经 `client` 请求头注入，仅测试直接读取该句柄——
+    // : 生产路径经 `client` 请求头注入，仅测试直接读取该句柄——
     // 保留字段（认证句柄生命周期归属）并标注，避免 dead_code。
     #[allow(dead_code)]
     auth: Arc<Auth>,

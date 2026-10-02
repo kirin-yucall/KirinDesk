@@ -1,4 +1,4 @@
-//! QUIC 最小端点封装。
+﻿//! QUIC 最小端点封装。
 //!
 //! 仅用于 quinn 的 DATAGRAM + 流能力，**不参与安全决策**。
 //! 自签名 Ed25519 证书仅满足 quinn API 要求，不验证证书链。
@@ -9,7 +9,7 @@
 //! 本模块的 rustls 客户端校验 [`SkipServerVerification`] 全放行是**有意设计**
 //! （仅协议合规；自签名证书无链可验，本层不做证书校验）——安全完全依赖上层
 //! Ed25519 握手：客户端 `connect_quic_transport` 的 `server_pin: PinExpectation`
-//! 强制校验服务端身份（R-02 强类型化，无"无期望跳过"路径），服务端
+//! 强制校验服务端身份（ 强类型化，无"无期望跳过"路径），服务端
 //! `accept_quic_transport` 经 `server_handshake_verified_with_nickname_generic`
 //! 做白名单/审批/挑战码策略层校验。
 //!
@@ -70,7 +70,7 @@ pub fn generate_quic_cert(device_id: &str) -> Result<(Vec<u8>, Vec<u8>), Transpo
 // "修复"（补齐证书校验属职责外，徒增维护负担且不构成真实防护）。
 //
 // 客户端侧服务端身份校验由握手层承担：`connect_quic_transport` 的
-// `server_pin: PinExpectation`（R-02 强类型化——旧的 `_server_pubkey_base64`
+// `server_pin: PinExpectation`（ 强类型化——旧的 `_server_pubkey_base64`
 // 占位参数已取消，不存在"空串 = 跳过 pin 比对"的路径）。任何接入主流程的
 // 改动禁止绕过该校验（S-17 接线门禁，详见 transport/mod.rs）。
 

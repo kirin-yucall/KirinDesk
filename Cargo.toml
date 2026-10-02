@@ -1,4 +1,6 @@
+﻿# : 发布体积优化（甲方要求便于传播）。strip 等价 PM 实测的手工 strip（48.5MB→33.6MB）；
 # thin LTO + codegen-units=16 进一步压缩（预计再省 5-10%）。
+# 注意：panic="abort" 不采用（依赖 catch/unwind 优雅退出路径，）。
 [profile.release]
 strip = "symbols"
 lto = "thin"
@@ -21,7 +23,7 @@ members = [
 
 [workspace.package]
 edition = "2021"
-version = "0.2.0"
+version = "0.2.1"
 authors = ["KirinDesk Team"]
 license = "Apache-2.0"
 
@@ -49,6 +51,7 @@ chrono = { version = "0.4", features = ["serde"] }
 # S-13 (F-16): CLI connect 挑战码交互输入（不回显，避免落进程命令行）
 rpassword = "7"
 
+# ：screencapturekit-sys 上游无条件强链接 ScreenCaptureKit framework
 # （macOS 12.3+ SDK 才有），Mojave 10.14 CLT-only 环境链接失败
 # （`ld: framework not found ScreenCaptureKit`）。以本地 vendored 副本
 # （third_party/screencapturekit-sys，源码与 0.2.8 一致，仅 build.rs 加

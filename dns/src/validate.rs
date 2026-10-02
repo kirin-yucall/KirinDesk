@@ -1,4 +1,4 @@
-//! 输入校验（S-14：GoDaddy 调用护栏）
+﻿//! 输入校验（S-14：GoDaddy 调用护栏）
 //!
 //! 审计证据 `安全审计报告_2026-08-02.md`：
 //! - **F-17**：`api_url` 无 https 强制 → 由 `GoDaddyClient::try_new` 强制（见 client.rs）
@@ -9,14 +9,14 @@
 //! - `validate_hostname` —— **RFC 1123** 主机名（domain / SRV target），容忍单个结尾点
 //!   （FQDN 形式，SRV target 以 `.` 结尾）
 //! - `validate_record_name` —— DNS 记录名（标签字符集含 `_`，SRV 服务名 `_remote._tcp` 需要）
-//! - `validate_device_id` —— 与 relay 侧 `Registry::validate_device_id`（R-01 成果）
+//! - `validate_device_id` —— 与 relay 侧 `Registry::validate_device_id`（ 成果）
 //!   规则对齐：非空、≤ 128 字符、仅 `[a-zA-Z0-9:_-]`。拒绝 `.` —— F-18 的核心注入点
 //!   （`device_id` 含 `.` 可把记录写到任意子域）。
 //!
 //! > **走查项（登记，不阻塞）**：relay 侧字符集（含 `:`/`_`）并非严格 RFC 1123；
 //! > `:` 型 device_id（如公钥指纹派生 `a1b2:c3d4:eeee`）无法作为 DNS 记录名/主机名，
 //! > dns 侧在 `validate_record_name`/`validate_hostname` 处拒绝（上游 GoDaddy 同样 422）。
-//! > 待 relay 侧 R-01 改造稳定后统一口径（见任务文档 §7）。
+//! > 待 relay 侧  改造稳定后统一口径（见任务文档 §7）。
 
 /// 主机名总长上限（RFC 1035 §2.3.4：≤ 253）。
 pub const MAX_HOSTNAME_LEN: usize = 253;

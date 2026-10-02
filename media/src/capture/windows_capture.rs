@@ -1,4 +1,4 @@
-//! Windows Capture 后端 — 使用 `windows-capture` crate。
+﻿//! Windows Capture 后端 — 使用 `windows-capture` crate。
 //!
 //! Windows 唯一后端（M8-T008 §Step 1，无 WGC/DXGI/GDI 回退链）。
 //!
@@ -198,10 +198,12 @@ pub fn enumerate_monitors() -> Result<Vec<MonitorInfo>, CaptureError> {
 }
 
 // ════════════════════════════════════════════════════════════════
+// ：显示器捕获启动（关闭 WGC 系统黄框 + 老系统回退）
 // ════════════════════════════════════════════════════════════════
 
 /// 启动显示器捕获，返回 (控制句柄, 帧接收端, 停止信号)。
 ///
+/// ：被控端屏幕四周的黄框是 Windows.Graphics.Capture（WGC）的**系统隐私指示**。
 /// `DrawBorderSettings::WithoutBorder` → `GraphicsCaptureSession.IsBorderRequired = false`
 /// （Win10 21H1 (2104)+ / Win11 支持；部分系统首次设置会弹一次系统授权，用户允许后记住；
 /// Linux PipeWire / macOS ScreenCaptureKit 无此边框，零改动）。
@@ -224,7 +226,14 @@ fn start_monitor_capture(
         let stop_flag = Arc::new(AtomicBool::new(false));
         let settings = Settings::new(
             wc_monitor,
-            CursorCaptureSettings::Default,
+            //  段A：受控端本 OS 光标不再进采集画面——
+            // WithoutCursor → `GraphicsCaptureSession.IsCursorCaptureEnabled = false`
+            // （Win10 21H1 (2104)+ 支持；windows-capture v2.0.0 在老系统不支持该
+            // 属性时 start 报错，本函数无回退链，老系统 = 既有启动失败面，
+            // 不在本段扩面）。主控端投射光标 = 受控端收到 mouse_move 后注入
+            // 远端本地 OS 光标（injector），链路零改动——远控画面最终仅呈现
+            // 主控端投射的这一个光标。
+            CursorCaptureSettings::WithoutCursor,
             border,
             SecondaryWindowSettings::Default,
             MinimumUpdateIntervalSettings::Default,
@@ -238,10 +247,12 @@ fn start_monitor_capture(
     let (settings, frame_rx, stop_flag) = build_settings(DrawBorderSettings::WithoutBorder);
     match WcHandler::start_free_threaded(settings) {
         Ok(capture_control) => Ok((capture_control, frame_rx, stop_flag)),
+        //  老系统回退：此错误 = 系统缺少 IsBorderRequired 属性（Win10 <21H1）。
         Err(windows_capture::capture::GraphicsCaptureApiError::GraphicsCaptureApiError(
             windows_capture::graphics_capture_api::Error::BorderConfigUnsupported,
         )) => {
             tracing::warn!(
+                ": 系统不支持关闭 WGC 边框（Win10 <21H1?），回退系统默认边框（黄框仍在，捕获不失败）"
             );
             let (settings, frame_rx, stop_flag) = build_settings(DrawBorderSettings::Default);
             let capture_control = WcHandler::start_free_threaded(settings).map_err(|e| {
@@ -267,6 +278,7 @@ pub struct WindowsCaptureBackend {
     stop_flag: Arc<AtomicBool>,
     /// 显示器列表
     monitors: Vec<MonitorInfo>,
+    /// M8-T030（）：过滤后索引 → windows-capture 1-based 全量索引映射
     /// （虚拟屏剔除后 `Monitor::from_index` 必须用全量索引，否则列表错位）。
     real_indices: Vec<usize>,
     /// 当前显示器索引
@@ -300,6 +312,7 @@ impl WindowsCaptureBackend {
             .height()
             .unwrap_or(monitors[monitor_index].height);
 
+        // 3-5. 启动捕获（：关闭 WGC 系统黄框 = 屏幕四周系统隐私指示；
         //      WithoutBorder → IsBorderRequired=false，Win10 21H1(2104)+/Win11 支持，
         //      部分系统首次设置弹一次系统授权、用户允许后记住；
         //      老 Win10 <21H1 不支持该属性时回退系统默认黄框：黄框仍在，捕获不失败）
@@ -384,6 +397,7 @@ impl ScreenCaptureSource for WindowsCaptureBackend {
         (self.width, self.height)
     }
 
+    /// ：非阻塞排空已排队帧，仅保留最新一帧（编码积压时跳陈旧帧）。
     fn drain_latest_frame(&mut self) -> Option<CaptureFrame> {
         let mut latest: Option<CapturedFrame> = None;
         while let Ok(f) = self.frame_rx.try_recv() {
@@ -423,6 +437,7 @@ impl ScreenCaptureSource for WindowsCaptureBackend {
         let w = wc_monitor.width().unwrap_or(self.monitors[index].width);
         let h = wc_monitor.height().unwrap_or(self.monitors[index].height);
 
+        // 启动新捕获（：同 new()——关闭 WGC 系统黄框 = 屏幕四周系统隐私指示，
         //      IsBorderRequired=false，Win10 21H1(2104)+/Win11，老系统回退默认黄框不失败）
         let (capture_control, frame_rx, stop_flag) = start_monitor_capture(wc_monitor)?;
 

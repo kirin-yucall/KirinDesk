@@ -1,4 +1,4 @@
-//! M8-T026-P1 (PUNCH-001 / PATH-004): 打洞路径 → 媒体传输桥。
+﻿//! M8-T026-P1 (PUNCH-001 / PATH-004): 打洞路径 → 媒体传输桥。
 //!
 //! core 的 `PunchSession` 只负责打通 UDP 路径（交还 socket）；本模块把
 //! **打洞 socket 上的 QUIC 媒体传输**建起来：
@@ -54,7 +54,7 @@ pub struct PunchMediaCreds {
     pub device_type: String,
     /// 对端设备 ID。
     pub peer_device_id: String,
-    /// 对端公钥 pin（R-02 强类型：known_hosts / DNS TXT 来源 `Exact`；
+    /// 对端公钥 pin（ 强类型：known_hosts / DNS TXT 来源 `Exact`；
     /// 回环自签 `None(InternalLoopback)`——无"空串跳过"形态）。
     pub peer_pin: PinExpectation,
     /// 挑战码。
@@ -103,7 +103,7 @@ pub async fn accept_punch_transport(
 ) -> Result<(QuicEndpoint, Box<QuicMediaTransport>), TransportError> {
     let endpoint =
         QuicEndpoint::from_socket(socket, creds.cert_der.clone(), creds.key_der.clone()).await?;
-    // 服务端角色：pin 解析为客户端公钥 base64（R-02：`Exact` 编码回 base64；
+    // 服务端角色：pin 解析为客户端公钥 base64（：`Exact` 编码回 base64；
     // `InternalLoopback` 取本端自身公钥——自签；`UserConfirmRequired` 无服务端路径）。
     let client_key_b64 = creds
         .peer_pin

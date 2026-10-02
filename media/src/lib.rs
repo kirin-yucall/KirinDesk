@@ -1,4 +1,4 @@
-//! KirinDesk 媒体模块。
+﻿//! KirinDesk 媒体模块。
 //!
 //! # 架构
 //!
@@ -29,7 +29,7 @@ pub mod adaptive;
 pub mod capture;
 pub mod encoder;
 pub mod ffmpeg;
-// M8-T030（修复任务 R-06）：单 GPU 适配器选择 + 虚拟设备过滤。
+// M8-T030（修复任务 ）：单 GPU 适配器选择 + 虚拟设备过滤。
 // 运行时枚举本机真实 GPU（DXGI），按偏好选一个绑定到 FFmpeg HW 编解码；
 // 虚拟显示器从捕获列表剔除（含索引一致性）；详见 gpu/mod.rs。
 pub mod gpu;
@@ -48,7 +48,7 @@ pub use capture::{
     ScreenCaptureSource,
 };
 
-// M8-T030（R-06）：重新导出 GPU 类型与偏好注入入口（设计文档 §3.1）。
+// M8-T030（）：重新导出 GPU 类型与偏好注入入口（设计文档 §3.1）。
 pub use gpu::{
     apply_preferences, hwdevice_candidates, AdapterInfo, AdapterKind, GpuPreference,
     GpuPreferences,

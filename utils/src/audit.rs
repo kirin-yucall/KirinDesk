@@ -1,4 +1,4 @@
-//! M15-T002: 审计日志 — 所有安全事件写入 `~/.kirin_desk/logs/audit.log`。
+﻿//! M15-T002: 审计日志 — 所有安全事件写入 `~/.kirin_desk/logs/audit.log`。
 //!
 //! 路径经 `dirs` crate 跨平台解析（复用 `logging::default_log_dir()` 约定，
 //! 同 M1-T002 路径解析策略）。行格式（S-16c 消毒后恒为单行）：
@@ -132,7 +132,7 @@ pub enum AuditEvent {
     /// 备份后重新生成身份；或后端已有身份、忽略损坏旧文件）。
     /// detail 含路径、label 与处置，如
     /// `path=...\ed25519.json label=kirindesk.identity.G7KJ2MNQ4X backup=...\ed25519.json.corrupt.1234`
-    /// （label 尾段 = 设备 ID；R-86-3 新格式 10 位数字字母混合，旧格式 HD-XXXX 存量仍合法）。
+    /// （label 尾段 = 设备 ID； 新格式 10 位数字字母混合，旧格式 HD-XXXX 存量仍合法）。
     IdentityRecovered,
 }
 

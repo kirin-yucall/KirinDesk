@@ -1,4 +1,4 @@
-[package]
+﻿[package]
 name = "kirin-desk-core"
 version.workspace = true
 edition.workspace = true
@@ -15,7 +15,7 @@ aes-gcm.workspace = true
 chacha20poly1305.workspace = true
 rand.workspace = true
 sha2.workspace = true
-# CX-1（R-205 协议 4）：挑战-响应应答 HMAC-SHA256 派生（challenge_derive_from_key）
+# CX-1（ 协议 4）：挑战-响应应答 HMAC-SHA256 派生（challenge_derive_from_key）
 hmac.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
