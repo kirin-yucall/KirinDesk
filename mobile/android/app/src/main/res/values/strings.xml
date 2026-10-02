@@ -1,0 +1,173 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="tab_ip_mode">IP connect</string>
+    <string name="tab_id_mode">ID connect</string>
+    <string name="tab_domain_mode">Domain</string>
+    <string name="subtitle_direct">Direct connection by address (no device ID needed)</string>
+    <string name="subtitle_id_mode">Connect via relay using the device ID</string>
+    <string name="subtitle_domain_mode">Discover the device by its domain over encrypted DNS (SRV/TXT/A)</string>
+
+    <string name="field_device_id">Device ID (fingerprint, short code or custom)</string>
+    <string name="device_id_hint">a1b2c3d4e5 / a1b2:c3d4:… / pc-abc123</string>
+    <string name="field_server_addr">Server address:port</string>
+    <string name="server_addr_hint">192.168.1.10:59990</string>
+    <string name="field_nickname">Nickname</string>
+    <string name="field_server_nickname">Controlled device nickname</string>
+    <string name="server_nickname_hint">Must match the nickname configured on the controlled device\'s Dashboard (a handshake credential, paired with the challenge code)</string>
+    <string name="field_challenge">Challenge code (shown on the controlled device)</string>
+    <string name="field_domain_host">Device domain</string>
+    <string name="domain_host_hint">device.example.com</string>
+    <string name="domain_mode_hint">The controlled device must run in domain mode (SRV + TXT + A/AAAA published). Discovery and resolution go through encrypted DNS (DoH/DoT) only; plaintext DNS is never used.</string>
+
+    <string name="advanced_show">Relay / ID mode (advanced)</string>
+    <string name="advanced_hide">Hide relay settings</string>
+    <string name="relay_addr">Relay server address</string>
+    <string name="relay_addr_hint">relay.example.com:7000</string>
+    <string name="relay_token">Relay token</string>
+    <string name="relay_pubkey">Relay server public key (base64)</string>
+    <string name="relay_hint">Required for ID mode. Copy all three values from the Tunnel page on the controlled device: server address, token, public key. An empty public key is refused (fail-closed).</string>
+
+    <string name="connect">Connect</string>
+    <string name="connecting">Connecting…</string>
+
+    <string name="footer_tofu">First connection asks to confirm the device fingerprint; a mismatch is always refused.</string>
+
+    <!-- Session screen (P1-B) -->
+    <string name="session_audio_on">Sound on</string>
+    <string name="session_audio_off">Sound off</string>
+
+    <!-- TOFU first-connect fingerprint confirmation -->
+    <string name="trust_title">Verify device fingerprint</string>
+    <string name="trust_body">First connection to this device. Compare the fingerprint below character by character with the one shown on the controlled device\'s Dashboard, and confirm only on an exact match.</string>
+    <string name="trust_challenge_label">Challenge code: %1$s</string>
+    <string name="trust_short_code_warning">A matching short code does NOT prove identity — always compare the full 79-character fingerprint.</string>
+    <string name="trust_fingerprint_label">Device fingerprint (79 characters)</string>
+    <string name="trust_mitm_warning">An unexpected fingerprint may indicate a man-in-the-middle attack. Decline unless you can verify it through another channel.</string>
+    <string name="trust_accept">Trust and connect</string>
+    <string name="trust_decline">Cancel</string>
+
+    <!-- Validation errors -->
+    <string name="err_device_id_empty">Enter the device ID</string>
+    <string name="err_challenge_empty">Enter the challenge code</string>
+    <string name="err_nickname_empty">Enter your nickname (required by the controlled device)</string>
+    <string name="err_server_addr_empty">Enter the server address</string>
+    <string name="err_relay_addr_empty">Enter the relay server address</string>
+    <string name="err_relay_token_empty">Enter the relay token (required for ID mode)</string>
+    <string name="err_relay_pubkey_empty">Enter the relay server public key (required for ID mode)</string>
+    <string name="err_domain_empty">Enter the device domain (e.g. device.example.com)</string>
+
+    <string name="domain_err_invalid_host">Invalid device domain — use a hostname like device.example.com (no port, no IP)</string>
+    <string name="domain_err_nxdomain">Domain does not exist (DNS NXDOMAIN) — check the domain spelling</string>
+    <string name="domain_err_no_records">Domain exists but has no usable records — the device may be offline or not published for domain mode</string>
+    <string name="domain_err_no_srv">No SRV record found — the device is not published for domain mode (the controlled device must run in domain mode)</string>
+    <string name="domain_err_no_txt">No TXT record with an Ed25519 public key — identity cannot be verified, connection refused</string>
+    <string name="domain_err_timeout">Encrypted DNS resolution timed out — check the network and retry</string>
+    <string name="domain_err_dns_unavailable">Encrypted DNS (DoH/DoT) is unavailable — domain mode never falls back to plaintext DNS</string>
+
+    <string name="settings_title">Settings</string>
+    <string name="settings_back">Back</string>
+    <string name="settings_section_relay">Relay server (ID mode)</string>
+    <string name="settings_relay_hint">Shared with the relay section on the connect page (single data source). Copy the three values from the Tunnel page on the controlled device.</string>
+    <string name="settings_section_prefs">Connection preferences</string>
+    <string name="settings_resolution_hint">Remote stream resolution preference (applies to the next connection; the server may still reduce it under load)</string>
+    <string name="settings_resolution_720">720p (smooth)</string>
+    <string name="settings_resolution_1080">1080p</string>
+    <string name="settings_resolution_native">Native</string>
+    <string name="settings_section_device">This device</string>
+    <string name="settings_device_id_label">Device ID</string>
+    <string name="settings_device_unavailable">Identity unavailable (not generated yet)</string>
+    <string name="settings_section_language">Language</string>
+    <string name="settings_language_system">Follow system</string>
+    <string name="settings_language_zh">中文</string>
+    <string name="settings_language_en">English</string>
+    <string name="settings_section_about">About</string>
+    <string name="settings_about_version">App version: %1$s\nNative library: %2$s</string>
+    <string name="settings_log_export">Export log</string>
+    <string name="settings_log_missing">Log file not found yet (created after the first connection attempt)</string>
+    <string name="settings_log_shared">Log (%1$d bytes) handed to the share sheet</string>
+
+    <string name="server_entry">Share this phone (controlled mode)</string>
+    <string name="server_title">Screen sharing (controlled mode)</string>
+    <string name="server_subtitle">This phone is the controlled device. A computer connects with the nickname + challenge code to watch this screen.</string>
+    <string name="server_status_running">Sharing · port %1$d · viewers %2$d</string>
+    <string name="server_status_idle">Not sharing</string>
+    <string name="server_id_registered">ID mode: registered to relay</string>
+    <string name="server_id_pending">ID mode: not registered</string>
+    <string name="server_section_config">Share settings</string>
+    <string name="server_field_nickname">Nickname (viewer credential)</string>
+    <string name="server_viewers_hint">Viewers must enter this nickname exactly to connect (case-sensitive)</string>
+    <string name="server_field_challenge">Challenge code (viewer credential)</string>
+    <string name="server_field_port">Port (0 = temporary port)</string>
+    <string name="server_advanced_show">Relay / ID mode (optional)</string>
+    <string name="server_advanced_hide">Hide relay settings</string>
+    <string name="server_relay_hint">Optional; filling all three enables ID mode (register to relay, reachable across the internet). A missing public key is refused (fail-closed). Shares the same storage as the relay section on the connect page.</string>
+    <string name="server_start">Start screen sharing</string>
+    <string name="server_starting">Starting…</string>
+    <string name="server_stop">Stop sharing</string>
+    <string name="server_err_nickname_empty">Enter a nickname (required for viewers to connect)</string>
+    <string name="server_err_port_invalid">Port must be a number between 0 and 65535</string>
+    <string name="server_err_relay_partial">Relay mode needs all three values (address, token, public key)</string>
+    <string name="server_err_denied">Screen sharing was not authorized in the system dialog</string>
+    <string name="server_err_timeout">Sharing did not start within 60 seconds (authorization pending?)</string>
+    <string name="server_notif_channel">Screen sharing in progress</string>
+    <string name="server_notif_title">KirinDesk is sharing this screen</string>
+    <string name="server_notif_text">Screen sharing in progress</string>
+    <string name="server_notif_stop">Stop</string>
+
+    <string name="server_section_remote">Remote control (mouse &amp; keyboard)</string>
+    <string name="server_remote_enabled">Accessibility service enabled — remote input ready</string>
+    <string name="server_remote_disabled">Accessibility service not enabled</string>
+    <string name="server_remote_hint">Enable KirinDesk in system accessibility settings to allow remote mouse &amp; keyboard control. It only injects gestures and submits remote-typed text to the focused input field; screen content is never read.</string>
+    <string name="server_remote_open_settings">Open accessibility settings</string>
+    <!-- Accessibility service list entry (system settings; privacy wording per PM ruling) -->
+    <string name="accessibility_service_label">KirinDesk remote input</string>
+    <string name="accessibility_service_description">Used only to perform remote mouse and keyboard gestures (tap, drag, scroll) and to submit remote-typed text into the currently focused input field. Screen content is never read and no accessibility events are processed.</string>
+
+    <string name="ft_title">File transfer</string>
+    <string name="ft_files">Files (%1$d)</string>
+    <string name="ft_send">Send file</string>
+    <string name="ft_empty">No transfers</string>
+    <string name="ft_dir_send">Sending</string>
+    <string name="ft_dir_recv">Receiving</string>
+    <string name="ft_state_queued">Queued</string>
+    <string name="ft_state_waiting_accept">Waiting for the other side to accept</string>
+    <string name="ft_state_offer_pending">Awaiting your decision</string>
+    <string name="ft_state_sending">Sending</string>
+    <string name="ft_state_receiving">Receiving</string>
+    <string name="ft_state_completed">Completed</string>
+    <string name="ft_state_failed">Failed</string>
+    <string name="ft_state_cancelled">Cancelled</string>
+    <string name="ft_cancel">Cancel</string>
+    <string name="ft_share">Share</string>
+    <string name="ft_source">Source: %1$s</string>
+    <string name="ft_source_remote">Remote device</string>
+    <string name="ft_viewer">Viewer %1$d</string>
+    <string name="ft_offer_title">Incoming file transfer</string>
+    <string name="ft_offer_accept">Accept</string>
+    <string name="ft_offer_reject">Reject</string>
+    <string name="ft_offer_dir_error">The receive directory could not be prepared — tap Accept to retry</string>
+    <string name="ft_staging">Preparing %1$s for transfer…</string>
+    <string name="ft_error_no_file">No file selected</string>
+    <string name="ft_error_too_large">File exceeds the 4 GiB transfer limit</string>
+    <string name="ft_error_copy">Failed to stage the file for transfer</string>
+    <string name="ft_error_start">Failed to start the transfer</string>
+    <string name="ft_error_share">Sharing is not available for this file</string>
+    <string name="ft_notif_channel">File transfers</string>
+    <string name="ft_notif_recv">File received</string>
+    <string name="ft_notif_sent">File sent</string>
+    <string name="ft_notif_failed">File transfer failed</string>
+    <string name="ft_notif_cancelled">Transfer cancelled</string>
+    <string name="ft_notif_action_share">Share</string>
+    <string name="ft_size">%1$s %2$s</string>
+    <string name="ft_speed">%1$s %2$s</string>
+    <string name="ft_progress">%1$d%%</string>
+    <string name="ft_u_b">B</string>
+    <string name="ft_u_kb">KB</string>
+    <string name="ft_u_mb">MB</string>
+    <string name="ft_u_gb">GB</string>
+    <string name="ft_u_bps">B/s</string>
+    <string name="ft_u_kbps">KB/s</string>
+    <string name="ft_u_mbps">MB/s</string>
+    <string name="ft_u_gbps">GB/s</string>
+</resources>
+

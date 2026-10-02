@@ -1,0 +1,16 @@
+[Unit]
+Description=KirinDesk P2P Remote Desktop Server
+Documentation=https://github.com/kirin-yucall/kirin_desk
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/kirindesk serve 3389
+Restart=on-failure
+RestartSec=5
+# 无头服务器：跳过白名单审批弹窗（无 GUI 时必需），等价于 CLI 的 Temp Mode。
+Environment=KIRINDESK_HEADLESS=1
+
+[Install]
+WantedBy=multi-user.target

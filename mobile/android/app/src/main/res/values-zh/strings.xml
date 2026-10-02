@@ -1,0 +1,173 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="tab_ip_mode">IP 连接</string>
+    <string name="tab_id_mode">ID 连接</string>
+    <string name="tab_domain_mode">域名</string>
+    <string name="subtitle_direct">按地址直连（无需设备 ID）</string>
+    <string name="subtitle_id_mode">经中继按设备 ID 连接</string>
+    <string name="subtitle_domain_mode">按设备域名经加密 DNS 发现对端（SRV/TXT/A 记录）</string>
+
+    <string name="field_device_id">设备 ID（指纹 / 短码 / 自定义）</string>
+    <string name="device_id_hint">a1b2c3d4e5 / a1b2:c3d4:… / pc-abc123</string>
+    <string name="field_server_addr">服务器地址:端口</string>
+    <string name="server_addr_hint">192.168.1.10:59990</string>
+    <string name="field_nickname">昵称（备注）</string>
+    <string name="field_server_nickname">被控端昵称</string>
+    <string name="server_nickname_hint">须与被控端 Dashboard 配置的昵称一致（握手凭据，与挑战码成对）</string>
+    <string name="field_challenge">挑战码（被控端显示）</string>
+    <string name="field_domain_host">设备域名</string>
+    <string name="domain_host_hint">device.example.com</string>
+    <string name="domain_mode_hint">被控端须以域名模式发布（SRV + TXT + A/AAAA 记录）。发现与解析仅走加密 DNS（DoH/DoT），绝不回退明文。</string>
+
+    <string name="advanced_show">中继 / ID 模式（高级）</string>
+    <string name="advanced_hide">收起中继设置</string>
+    <string name="relay_addr">中继服务器地址</string>
+    <string name="relay_addr_hint">relay.example.com:7000</string>
+    <string name="relay_token">中继 token</string>
+    <string name="relay_pubkey">中继服务器公钥（base64）</string>
+    <string name="relay_hint">ID 模式必填。三项取值来自被控端 Tunnel 页：服务器地址 / token / 公钥；公钥留空将被拒连（fail-closed）。</string>
+
+    <string name="connect">连接</string>
+    <string name="connecting">连接中…</string>
+
+    <string name="footer_tofu">首连需确认设备指纹；指纹不一致一律拒连。</string>
+
+    <!-- 会话页（P1-B） -->
+    <string name="session_audio_on">声音开</string>
+    <string name="session_audio_off">声音关</string>
+
+    <!-- TOFU 首连指纹确认 -->
+    <string name="trust_title">核对设备指纹</string>
+    <string name="trust_body">首次连接该设备。请将下方指纹与被控端 Dashboard 显示的指纹逐字核对，完全一致才确认。</string>
+    <string name="trust_challenge_label">挑战码：%1$s</string>
+    <string name="trust_short_code_warning">短码一致不能证明身份——请务必核对完整 79 位指纹。</string>
+    <string name="trust_fingerprint_label">设备指纹（79 位）</string>
+    <string name="trust_mitm_warning">指纹不一致可能意味着中间人攻击。无法带外核实时请拒绝。</string>
+    <string name="trust_accept">信任并连接</string>
+    <string name="trust_decline">取消</string>
+
+    <!-- 校验错误 -->
+    <string name="err_device_id_empty">请填写设备 ID</string>
+    <string name="err_challenge_empty">请填写挑战码</string>
+    <string name="err_nickname_empty">请填写昵称（被控端必填校验）</string>
+    <string name="err_server_addr_empty">请填写服务器地址</string>
+    <string name="err_relay_addr_empty">请填写中继服务器地址</string>
+    <string name="err_relay_token_empty">请填写中继 token（ID 模式必填）</string>
+    <string name="err_relay_pubkey_empty">请填写中继服务器公钥（ID 模式必填）</string>
+    <string name="err_domain_empty">请填写设备域名（如 device.example.com）</string>
+
+    <string name="domain_err_invalid_host">设备域名格式不正确——请填 device.example.com 形态主机名（不带端口/IP）</string>
+    <string name="domain_err_nxdomain">域名不存在（DNS NXDOMAIN）——请检查域名拼写</string>
+    <string name="domain_err_no_records">域名存在但无可用记录——设备可能离线或未按域名模式发布</string>
+    <string name="domain_err_no_srv">无 SRV 记录——对端未按域名模式发布（被控端需以域名模式运行）</string>
+    <string name="domain_err_no_txt">无带 Ed25519 公钥的 TXT 记录——无法核验对端身份，拒连</string>
+    <string name="domain_err_timeout">加密 DNS 解析超时——请检查网络后重试</string>
+    <string name="domain_err_dns_unavailable">加密 DNS（DoH/DoT）不可用——域名模式绝不回退明文 DNS</string>
+
+    <string name="settings_title">设置</string>
+    <string name="settings_back">返回</string>
+    <string name="settings_section_relay">中继服务器（ID 模式）</string>
+    <string name="settings_relay_hint">与连接页中继区共用同一存储（单一数据源）。三项取值来自被控端 Tunnel 页。</string>
+    <string name="settings_section_prefs">连接偏好</string>
+    <string name="settings_resolution_hint">远控画面分辨率档位（下次连接生效；服务端高负载时可能自动降档）</string>
+    <string name="settings_resolution_720">720p（流畅）</string>
+    <string name="settings_resolution_1080">1080p</string>
+    <string name="settings_resolution_native">原生</string>
+    <string name="settings_section_device">本机信息</string>
+    <string name="settings_device_id_label">设备 ID</string>
+    <string name="settings_device_unavailable">身份信息不可用（尚未生成）</string>
+    <string name="settings_section_language">语言</string>
+    <string name="settings_language_system">跟随系统</string>
+    <string name="settings_language_zh">中文</string>
+    <string name="settings_language_en">English</string>
+    <string name="settings_section_about">关于</string>
+    <string name="settings_about_version">应用版本：%1$s\n原生库：%2$s</string>
+    <string name="settings_log_export">导出日志</string>
+    <string name="settings_log_missing">日志文件尚未生成（首次连接尝试后创建）</string>
+    <string name="settings_log_shared">日志（%1$d 字节）已交给系统分享面板</string>
+
+    <string name="server_entry">共享本机（被控模式）</string>
+    <string name="server_title">屏幕共享（被控端）</string>
+    <string name="server_subtitle">本机作为被控端——电脑端凭昵称 + 挑战码连接后查看本机屏幕。</string>
+    <string name="server_status_running">共享中 · 端口 %1$d · 观众 %2$d</string>
+    <string name="server_status_idle">未共享</string>
+    <string name="server_id_registered">ID 模式：已注册 relay</string>
+    <string name="server_id_pending">ID 模式：未注册</string>
+    <string name="server_section_config">共享设置</string>
+    <string name="server_field_nickname">昵称（观众连接凭据）</string>
+    <string name="server_viewers_hint">观众须逐字一致输入该昵称方可连接（大小写敏感）</string>
+    <string name="server_field_challenge">挑战码（观众连接凭据）</string>
+    <string name="server_field_port">端口（0 = 临时端口）</string>
+    <string name="server_advanced_show">中继 / ID 模式（选填）</string>
+    <string name="server_advanced_hide">收起中继设置</string>
+    <string name="server_relay_hint">选填；三项全填启用 ID 模式（注册 relay，跨网可达）。公钥缺失将被拒注册（fail-closed）。与连接页中继区共用同一存储。</string>
+    <string name="server_start">开始屏幕共享</string>
+    <string name="server_starting">启动中…</string>
+    <string name="server_stop">停止共享</string>
+    <string name="server_err_nickname_empty">请填写昵称（观众连接必填）</string>
+    <string name="server_err_port_invalid">端口须为 0–65535 的整数</string>
+    <string name="server_err_relay_partial">启用 relay 需三件套齐全（地址 / token / 公钥）</string>
+    <string name="server_err_denied">系统弹窗未授予屏幕共享授权</string>
+    <string name="server_err_timeout">60 秒内未启动成功（是否未完成系统授权？）</string>
+    <string name="server_notif_channel">屏幕共享中</string>
+    <string name="server_notif_title">KirinDesk 正在共享本机屏幕</string>
+    <string name="server_notif_text">屏幕共享中</string>
+    <string name="server_notif_stop">停止</string>
+
+    <string name="server_section_remote">远程控制（键鼠）</string>
+    <string name="server_remote_enabled">无障碍服务已启用——远端键鼠输入就绪</string>
+    <string name="server_remote_disabled">无障碍服务未启用</string>
+    <string name="server_remote_hint">请在系统无障碍设置中启用 KirinDesk 以允许远端键鼠控制。仅注入手势并向当前焦点输入框提交远端键入的文本，不读取屏幕内容。</string>
+    <string name="server_remote_open_settings">打开无障碍设置</string>
+    <!-- 无障碍服务列表条目（系统设置；隐私口径文案） -->
+    <string name="accessibility_service_label">KirinDesk 远端输入</string>
+    <string name="accessibility_service_description">仅用于执行远端键鼠手势（点按/拖动/滚动），并将远端键入的文本提交到当前焦点输入框。不读取屏幕内容，不处理任何无障碍事件。</string>
+
+    <string name="ft_title">文件传输</string>
+    <string name="ft_files">文件（%1$d）</string>
+    <string name="ft_send">发送文件</string>
+    <string name="ft_empty">暂无传输</string>
+    <string name="ft_dir_send">发送</string>
+    <string name="ft_dir_recv">接收</string>
+    <string name="ft_state_queued">排队中</string>
+    <string name="ft_state_waiting_accept">等待对方接受</string>
+    <string name="ft_state_offer_pending">等待你决断</string>
+    <string name="ft_state_sending">发送中</string>
+    <string name="ft_state_receiving">接收中</string>
+    <string name="ft_state_completed">已完成</string>
+    <string name="ft_state_failed">失败</string>
+    <string name="ft_state_cancelled">已取消</string>
+    <string name="ft_cancel">取消</string>
+    <string name="ft_share">分享</string>
+    <string name="ft_source">来源：%1$s</string>
+    <string name="ft_source_remote">远端设备</string>
+    <string name="ft_viewer">观众 %1$d</string>
+    <string name="ft_offer_title">收到文件传输请求</string>
+    <string name="ft_offer_accept">接受</string>
+    <string name="ft_offer_reject">拒绝</string>
+    <string name="ft_offer_dir_error">接收目录准备失败——可点「接受」重试</string>
+    <string name="ft_staging">正在暂存 %1$s…</string>
+    <string name="ft_error_no_file">未选择文件</string>
+    <string name="ft_error_too_large">文件超过 4 GiB 传输上限</string>
+    <string name="ft_error_copy">文件暂存失败</string>
+    <string name="ft_error_start">启动传输失败</string>
+    <string name="ft_error_share">该文件暂不可分享</string>
+    <string name="ft_notif_channel">文件传输</string>
+    <string name="ft_notif_recv">已接收文件</string>
+    <string name="ft_notif_sent">文件已发送</string>
+    <string name="ft_notif_failed">文件传输失败</string>
+    <string name="ft_notif_cancelled">传输已取消</string>
+    <string name="ft_notif_action_share">分享</string>
+    <string name="ft_size">%1$s%2$s</string>
+    <string name="ft_speed">%1$s%2$s</string>
+    <string name="ft_progress">%1$d%%</string>
+    <string name="ft_u_b">B</string>
+    <string name="ft_u_kb">KB</string>
+    <string name="ft_u_mb">MB</string>
+    <string name="ft_u_gb">GB</string>
+    <string name="ft_u_bps">B/s</string>
+    <string name="ft_u_kbps">KB/s</string>
+    <string name="ft_u_mbps">MB/s</string>
+    <string name="ft_u_gbps">GB/s</string>
+</resources>
+

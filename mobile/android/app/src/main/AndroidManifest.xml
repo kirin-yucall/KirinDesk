@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+         POST_NOTIFICATIONS（API 33+）= 共享通知可见性；拒绝仅通知不可见，
+         共享本身不受影响（运行前链式请求，不强制）。 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <application
+        android:label="KirinDesk"
+        android:hasCode="true"
+        android:theme="@style/Theme.KirinDesk">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:screenOrientation="portrait"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+             分发；读权限按 URI 粒度授予，不暴露 filesDir 全目录）。 -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
+             ImageReader 喂帧 → nativeServer*；启动/停止顺序纪律见类注释）。 -->
+        <service
+            android:name=".server.ScreenShareService"
+            android:exported="false"
+            android:foregroundServiceType="mediaProjection" />
+
+             焦点文本提交；onServiceConnected 置 nativeSetInputCallbackEnabled(true)。
+             隐私口径见 res/xml/accessibility_service_config.xml 注释与
+             @string/accessibility_service_description：不监听任何无障碍
+             事件，仅注入远端输入。 -->
+        <service
+            android:name=".server.AccessibilityInputService"
+            android:exported="false"
+            android:label="@string/accessibility_service_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
+    </application>
+</manifest>

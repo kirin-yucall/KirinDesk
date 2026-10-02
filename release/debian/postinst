@@ -1,0 +1,12 @@
+#!/bin/sh
+# KirinDesk postinst — M14-T003
+# 注册并启用 systemd 服务；设置 KIRINDESK_NO_SERVICE=1 可跳过。
+set -e
+
+if [ -z "${KIRINDESK_NO_SERVICE:-}" ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload
+    systemctl enable kirindesk.service >/dev/null 2>&1 || true
+    systemctl start kirindesk.service >/dev/null 2>&1 || true
+fi
+
+exit 0

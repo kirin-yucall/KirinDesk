@@ -1,0 +1,21 @@
+[package]
+name = "kirin-desk-updater"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+reqwest.workspace = true
+sha2.workspace = true
+tracing.workspace = true
+# 提取 7 个 DLL），gyan.dev 备源为 .7z（sevenz-rust 纯 Rust 解压，无系统
+# 7-Zip 依赖）。均为最小特性集。
+zip = { version = "2", default-features = false, features = ["deflate"] }
+sevenz-rust = { version = "0.6", default-features = false }
+# S-06c: 安装侧弃用 bat 脚本拼装 → Win32 MoveFileExW（exe 换装，无注入面）。
+# 仅 Windows 使用；windows-sys 0.59 已在 lockfile（arboard 等引入），无新增下载。
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }

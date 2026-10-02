@@ -1,0 +1,42 @@
+# Rust / Cargo build artifacts
+/target*/
+!mobile/ffmpeg-android/prebuilt/
+**/node_modules/
+ui/frontend/dist/
+
+# FFmpeg binary distribution (see release/download-ffmpeg.*)
+ffmpeg/
+release/ffmpeg/
+
+# Build outputs and release staging
+release/*.exe
+release/*.exe.bak-*
+release/*.apk
+release/*.apk.sha256
+release/*.zip
+release/*.zip.sha256
+release/bench_results*.json
+release/dist/
+release/package.log
+*.log
+*.tmp
+*.bak
+
+# Local publishing secrets (keystore etc., never commit)
+/secrets/
+
+# Android local build state
+mobile/android/.gradle/
+mobile/android/app/build/
+mobile/android/build/
+mobile/android/local.properties
+mobile/jniLibs/
+mobile/ffmpeg-android/.cache/
+mobile/ffmpeg-android/prebuilt/arm64-v8a/pkgconfig/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp

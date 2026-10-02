@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- M14-T004 基础字段 -->
+    <key>CFBundleIdentifier</key>
+    <string>com.kirindesk.app</string>
+    <key>CFBundleName</key>
+    <string>KirinDesk</string>
+    <key>CFBundleDisplayName</key>
+    <string>KirinDesk</string>
+    <key>CFBundleExecutable</key>
+    <string>kirindesk</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>0.1.0</string>
+    <key>CFBundleIconFile</key>
+    <string>icon.icns</string>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+    <key>NSHumanReadableCopyright</key>
+    <string>© KirinDesk Team</string>
+
+    <!-- M12-MAC MAC-T005 补充字段（共享层/M12-MAC_macOS支持.md） -->
+    <key>LSMinimumSystemVersion</key>
+    <string>12.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+
+    <!-- 权限声明（SRV-CAP-MAC-002 屏幕录制 / M14-T004 相机） -->
+    <key>NSDesktopCaptureUsageDescription</key>
+    <string>KirinDesk 需要屏幕录制权限以远程查看和控制您的屏幕（System Settings → Privacy &amp; Security → Screen Recording）。</string>
+    <key>NSCameraUsageDescription</key>
+    <string>KirinDesk 使用摄像头画面进行远程查看（可选功能）。</string>
+
+    <!-- 麦克风声明（音频捕获为系统输出环回，通常无需麦克风权限；
+         保留声明以备后续输入设备捕获，见 M12-MAC MAC-T003 注释） -->
+    <key>NSMicrophoneUsageDescription</key>
+    <string>KirinDesk 需要麦克风权限以进行远程音频（可选功能）。</string>
+</dict>
+</plist>

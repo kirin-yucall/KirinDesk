@@ -1,0 +1,27 @@
+# crates.io/screencapturekit-sys，源码未改；仅 build.rs 增加 SDK 探测）。
+# 经根 Cargo.toml [patch.crates-io] 生效；仅 macOS target 会被构建
+# （zed-scap 的 macos target 依赖），Windows/Linux 构建零影响。
+[package]
+name = "screencapturekit-sys"
+version = "0.2.8"
+description = "Unsafe FFI bindings for Apple's ScreenCaptureKit (KirinDesk vendored: SDK-gated ScreenCaptureKit link)"
+categories = ["external-ffi-bindings", "multimedia", "multimedia::video", "os::macos-apis"]
+repository = "https://github.com/svtlabs/screencapturekit-rs/tree/main/screencapturekit-sys"
+authors = ["svtlabs"]
+license = "MIT"
+edition = "2021"
+rust-version = "1.71"
+
+[lib]
+path = "./src/lib.rs"
+
+[features]
+ci = []
+
+[dependencies]
+objc = { version = "0.2", features = ["exception"] }
+objc_id = "0.1"
+objc-foundation = "0.1"
+block = "0.1"
+dispatch = "0.2"
+once_cell = "1"

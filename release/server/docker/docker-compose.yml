@@ -1,0 +1,65 @@
+#
+# 用法（离线一键部署包）：
+#   1. docker load -i kirin-relay-server-v0.2.0-x86_64.tar.gz   # 导入离线镜像
+#   2. cp .env.example .env  并填入高熵 token（或运行 deploy.sh 自动生成）
+#   3. docker compose up -d   （或直接运行同目录 deploy.sh）
+#   4. docker compose logs -f # 查看启动信息（含 Server pubkey，客户端
+#                             # ID 模式需预置到 [tunnel] server_pubkey）
+#   5. docker compose down    # 停止（密钥卷保留，pubkey 不变）
+#
+# relay 类纯 TCP 服务（frps 等价）在 Linux 公网服务器上是标准做法：无每端口
+# docker-proxy 进程开销（bridge 全量发布 1001 端口 ≈ 2008 个 proxy 进程）、
+# restart/down 秒级、内存占用低、端口直接绑定主机。
+# 小规格公网实例实证（阿里云 ECS 2vCPU/1.6G，Docker 29.7.2 + Compose v5.4.0）：
+# bridge 全量发布 60000-61000 触发 docker-proxy 进程风暴（load 峰值 28+、
+# sshd 无法派生会话、compose up 20+ 分钟不返回、主机失联约 1 小时），
+# 2C1.6G 实测 bridge 全端口发布不可行。
+#
+# 防火墙（host 网络下端口直接绑主机，无需 ports 映射）：主机直开
+# 60000-61000/tcp（UDP 无需，纯 TCP 隧道；打洞数据面为双端直连）。
+
+services:
+  relay-server:
+    # 维护者自建镜像用（需仓库根作 build 上下文，解注释以下 build 段并
+    # 注释 image 行，然后 `docker compose up -d --build`）：
+    #   build:
+    #     context: ../..              # 仓库根（workspace，含 relay/relay-server）
+    #     dockerfile: release/server/docker/Dockerfile
+    image: kirin-relay-server:0.2.0
+    container_name: kirin-relay-server
+    restart: unless-stopped
+    # 服务器服务的 Linux 标准做法；无 docker-proxy 开销、restart/down 秒级、
+    # 内存占用低、端口直接绑主机（防火墙主机直开即可）。
+    network_mode: host
+    # bridge 可移植变体（Docker Desktop / macOS / 需要端口隔离的场景）：
+    #   1. 删除上面 `network_mode: host` 一行
+    #   2. 取消注释下方 `ports:` 块即可切换
+    #   3. ⚠️ 小规格实例警示：bridge 全量发布 60000-61000（1001 端口）为
+    #      每端口一个 docker-proxy 进程，开销极大——需 ≥2G 内存，且
+    #      restart/down 慢（1001 端口 proxy 拆除/重建以分钟计）；2C1.6G
+    #      公网小规格实例实测不可行（进程风暴、主机失联，见文件头）。
+    #   ports:
+    #     - "7000:7000/tcp"                 # 控制端口（可用环境变量覆盖，见下）
+    #     - "60000-61000:60000-61000/tcp"   # 自动分配端口范围（与 [tunnel] port_range 默认值一致）
+    # 子进程、防 PID1 僵尸；与 relay-server 内建 SIGTERM/SIGINT 优雅退出
+    # 双保险，`docker restart` / `docker compose down` 数秒内快速完成。
+    init: true
+    environment:
+      # 缺少时会直接报错退出，防止空 token 上线（fail-closed，TNL-SEC-006）
+      - KIRIN_RELAY_TOKEN=${KIRIN_RELAY_TOKEN:?请在 .env 设置 KIRIN_RELAY_TOKEN（高熵 ≥32 字节）}
+      - RUST_LOG=${RUST_LOG:-info}
+    volumes:
+      # Ed25519 服务器密钥持久化：容器重建后 pubkey 不变，
+      # 客户端预置的 server_pubkey 无需同步更新
+      - relay-server-key:/home/relay/.kirin_desk
+
+volumes:
+  relay-server-key:
+
+# 自定义端口示例（host 网络下无需端口映射，直接改 command 参数即可）：
+#   command: ["--bind-port", "9000", "--port-range", "50000-50099"]
+# 显式多监听示例（IPv4+IPv6 双监听，v6 一律 v6-only；host 网络下直接绑定
+# 主机网卡地址，无需端口映射；一般公网 v4 场景用默认即可）：
+#   command: ["--bind-addrs", "0.0.0.0,::", "--bind-port", "9000", "--port-range", "50000-50099"]
+# 关闭打洞 rendezvous（可选）：
+#   command: ["--bind-port", "7000", "--port-range", "60000-61000", "--no-rendezvous"]

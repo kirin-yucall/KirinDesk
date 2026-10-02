@@ -1,0 +1,60 @@
+# thin LTO + codegen-units=16 进一步压缩（预计再省 5-10%）。
+[profile.release]
+strip = "symbols"
+lto = "thin"
+codegen-units = 16
+
+[workspace]
+resolver = "2"
+members = [
+    "core",
+    "dns",
+    "media",
+    "mobile",
+    "input",
+    "relay",
+    "relay-server",
+    "ui",
+    "updater",
+    "utils",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.2.0"
+authors = ["KirinDesk Team"]
+license = "Apache-2.0"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+bincode = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+ed25519-dalek = { version = "2", features = ["pkcs8"] }
+x25519-dalek = { version = "2" }
+hkdf = "0.12"
+aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
+rand = "0.8"
+sha2 = "0.10"
+hmac = "0.12"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+# S-13 (F-16): CLI connect 挑战码交互输入（不回显，避免落进程命令行）
+rpassword = "7"
+
+# （macOS 12.3+ SDK 才有），Mojave 10.14 CLT-only 环境链接失败
+# （`ld: framework not found ScreenCaptureKit`）。以本地 vendored 副本
+# （third_party/screencapturekit-sys，源码与 0.2.8 一致，仅 build.rs 加
+# SDK 探测：SDK 无该框架时不链接，由 media 层 cfg(kirin_sck_sdk) 降级）
+# 替换 crates.io 版本。该 crate 仅 macOS target 被构建（zed-scap 的
+# macos target 依赖），Windows/Linux 构建零影响。
+[patch.crates-io]
+screencapturekit-sys = { path = "third_party/screencapturekit-sys" }
+

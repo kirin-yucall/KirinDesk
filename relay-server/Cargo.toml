@@ -1,0 +1,36 @@
+[package]
+name = "relay-server"
+version.workspace = true
+edition.workspace = true
+
+# M8-T026: 内网穿透服务端独立二进制（frps 等价）。
+# 薄壳包装 kirin-desk-relay lib：CLI 参数（bind-port/token/port-range/
+# server-key）+ 控制台日志/审计 + 优雅退出，便于部署在公网 VPS。
+# relay lib 自身保持 TNL-NF-004 轻量约束，日志/CLI 全部收在本 crate。
+[dependencies]
+kirin-desk-relay = { path = "../relay" }
+kirin-desk-utils = { path = "../utils" }
+# X25519 ECDH/AES-256-GCM 会话/fingerprint 79 字符口径；零新原语 P3）。
+# 依赖方向 relay-server → core 单向（core → relay 既有，无环）。
+kirin-desk-core = { path = "../core" }
+# 缺失 → 加**第一方** kirin-desk-dns（零外部新依赖，申报面）：互认握手
+# 拉取方 SRV/TXT/A/AAAA 解析（Resolver trait + SecureResolver DoH/DoT）。
+kirin-desk-dns = { path = "../dns" }
+# bundled = 自带 sqlite 源码编译，Dockerfile builder 既有 gcc/libc6-dev 直接可用）。
+rusqlite = { version = "0.31", features = ["bundled"] }
+ed25519-dalek.workspace = true
+base64 = "0.22"
+bincode.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+rand.workspace = true
+# 互认帧 Resolver 注入面（mock 测试实现 trait；与 core/dns 侧同版本）。
+async-trait = "0.1"
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+serde.workspace = true

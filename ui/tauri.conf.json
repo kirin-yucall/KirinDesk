@@ -1,0 +1,48 @@
+{
+  "build": {
+    "beforeBuildCommand": "cd frontend && npm run build",
+    "beforeDevCommand": "cd frontend && npm run dev",
+    "devPath": "http://localhost:5173",
+    "distDir": "../frontend/dist"
+  },
+  "package": {
+    "productName": "IP6Desk",
+    "version": "0.1.0"
+  },
+  "tauri": {
+    "allowlist": {
+      "all": false,
+      "shell": { "all": true },
+      "dialog": { "all": true },
+      "fs": { "all": true },
+      "path": { "all": true },
+      "process": { "all": true }
+    },
+    "bundle": {
+      "active": true,
+      "identifier": "com.ip6desk.app",
+      "icon": [
+        "icons/32x32.png",
+        "icons/128x128.png",
+        "icons/128x128@2x.png",
+        "icons/icon.icns",
+        "icons/icon.ico"
+      ],
+      "targets": ["msi", "nsis"]
+    },
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'"
+    },
+    "windows": [
+      {
+        "fullscreen": false,
+        "height": 800,
+        "resizable": true,
+        "title": "IP6Desk — P2P Remote Desktop",
+        "width": 1200,
+        "minWidth": 800,
+        "minHeight": 600
+      }
+    ]
+  }
+}

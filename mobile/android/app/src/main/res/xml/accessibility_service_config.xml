@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+
+  隐私口径（与系统设置展示文案一致）：
+  - canPerformGestures=true：远端键鼠手势注入（dispatchGesture：tap/drag/
+    long press/双指滚动）；
+  - canRetrieveWindowContent=true：仅用于读取当前焦点输入框的现有文本以
+    做「追加/删尾」提交——不读取、不上报、不落盘任何屏幕内容；
+  - accessibilityEventTypes=typeAllMask（通配，仅为兼容各 ROM 的启用
+    校验）；onAccessibilityEvent 为空实现，零消费——不订阅、不处理任何
+    TYPE_* 事件。
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeAllMask"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagDefault"
+    android:canPerformGestures="true"
+    android:canRetrieveWindowContent="true"
+    android:description="@string/accessibility_service_description" />

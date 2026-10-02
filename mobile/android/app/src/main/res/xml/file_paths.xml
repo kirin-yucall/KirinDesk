@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+     （Rust nativeInit 落该路径；files-path path="." = filesDir 根）。
+     权限；「分享」动作与接收完成通知经 FileProvider 按 URI 粒度授权）。 -->
+<paths>
+    <files-path name="logs" path="." />
+    <external-files-path name="received" path="Kirindesk/" />
+</paths>

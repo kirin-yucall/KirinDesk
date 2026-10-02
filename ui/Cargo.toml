@@ -1,0 +1,61 @@
+[package]
+name = "kirin-desk-ui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+# M8-T040 (WBS 8.2): self-test mock PubIpSource / Resolver 实现（dns 侧同版本）
+async-trait = "0.1"
+kirin-desk-core = { path = "../core" }
+kirin-desk-dns = { path = "../dns" }
+kirin-desk-input = { path = "../input" }
+kirin-desk-media = { path = "../media" }
+kirin-desk-relay = { path = "../relay" }
+kirin-desk-updater = { path = "../updater" }
+kirin-desk-utils = { path = "../utils" }
+tokio = { workspace = true, features = ["rt", "macros", "process", "io-util", "net"] }
+bincode.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+dirs-next = "2.0"
+egui = "0.28"
+eframe = "0.28"
+# 分支；**内建** TaskbarCreated 广播重挂〔explorer 重启图标丢失自愈，含提权 UIPI
+# 放行 + 首挂失败等信号自愈〕+ 内建 Drop 清理〔NIM_DELETE + DestroyWindow，消息
+# （tray.rs 6906 行整删）。
+tray-icon = "0.25"
+# handle 0.6 = eframe 0.28 同版依赖，锁内既有 0.6.2，零新锁条目仅加一条 ui 依赖
+raw-window-handle = "0.6"
+
+# M11: 远程 Shell PTY 模式 — ANSI 解析/终端模拟器 + CLI raw mode
+vt100 = "0.16"
+crossterm = "0.29"
+
+# M13-T003: 剪贴板共享（客户端 ⇄ 服务端）
+arboard = "3.4"
+# winuser=剪贴板 API、shellapi=DragQueryFileW——设计依赖行「shell32」勘误：
+# winapi 0.3.9 无 shell32 feature/module，DragQueryFileW 实际位于
+# winapi::um::shellapi（feature "shellapi"，crate 源码亲证）；size/is_dir 走
+# std::fs::metadata 零额外 feature（设计点名 GetFileAttributesExW 需 fileapi
+# feature，超出设计依赖行；std 等价语义，零额外依赖面）。
+# 0.3.9 已在 Cargo.lock（input 同版先例 input/Cargo.toml:18，仅 ui 增一条依赖边）。
+winapi = { version = "0.3", features = ["winuser", "shellapi"] }
+# S-13 (F-16): connect 挑战码 stdin 交互输入（不回显；挑战码不再落命令行）
+rpassword.workspace = true
+
+# image 编 PNG / 读图（仅 png 特性）+ rqrr 纯 Rust 解码；rfd 原生文件对话框
+# （导出 PNG 选保存位置 / Connect 页选择二维码图片文件）。依赖面最小化
+qrcode = { version = "0.14", default-features = false }
+image = { version = "0.25", default-features = false, features = ["png"] }
+rqrr = "0.7"
+rfd = "0.15"
+
+[lints.rust]
+# 门控（#[cfg(kirin_gpu_linked)] 回退 None），声明为已知以消除 unexpected_cfgs
+# 告警（与 media/Cargo.toml 同配置）。
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kirin_gpu_linked)"] }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true, features = ["env-filter"] }

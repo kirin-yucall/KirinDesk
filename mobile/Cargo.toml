@@ -1,0 +1,49 @@
+[package]
+name = "kirin-desk-mobile"
+# cdylib → libkirin_desk_mobile.so（cargo-ndk 产 jniLibs）；rlib → 宿主机单测。
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# core：resolve_peer / connect_peer 握手建链（connection::client）+ ID 模式
+#   编排（connection::id_mode：resolve 验签 + 直连/打洞/中继三级，P1-A）
+#   经 core 传递本已编译进依赖树（core→dns，reqwest workspace 口径
+#   rustls-tls 无 OpenSSL，Android 可编译——既有 .so 为证），直接依赖以
+#   复用类型，不复制逻辑，同 P1-A relay 直接依赖先例）
+# media：SecureChannel 收发半 + EncodedPacket/EncodedWindow + FFmpeg 解码
+# input：InputEvent wire（capture.rs，与桌面 viewer 同语义，服务端零改动）
+# relay：协议常量/形态判定（短码长度、指纹形态；经 core 传递本已编译，
+#   P1-A 直接依赖以复用判定，不复制逻辑）
+# utils：KIRIN_DATA_DIR（T04）+ known_hosts（TOFU 三态）+ devices.json（历史）
+kirin-desk-core = { path = "../core" }
+kirin-desk-dns = { path = "../dns" }
+kirin-desk-media = { path = "../media" }
+kirin-desk-input = { path = "../input" }
+kirin-desk-relay = { path = "../relay" }
+kirin-desk-utils = { path = "../utils" }
+
+tokio = { workspace = true, features = [
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "sync",
+    "time",
+    "macros",
+] }
+bincode.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# JNI 桥仅在 Android target 编译（桌面/宿主测试零 JNI 依赖）。
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+
+[dev-dependencies]
+async-trait = "0.1"

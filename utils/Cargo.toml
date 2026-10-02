@@ -1,0 +1,46 @@
+[package]
+name = "kirin-desk-utils"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["json", "env-filter"] }
+thiserror.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+anyhow.workspace = true
+sha2.workspace = true
+dirs-next = "2.0"
+
+# 零 core 依赖约定，不抽共享 crypto-util；仅新增轻量加密依赖）。
+# ChaCha20Poly1305 密文格式 `{v: base64(nonce ‖ ciphertext)}`；KIRIN_CONFIG_KEY
+# 口令经 PBKDF2-HMAC-SHA256 派生主密钥。
+chacha20poly1305.workspace = true
+rand.workspace = true
+hmac.workspace = true
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+base64 = "0.22"
+# S-07a: write_private 的 O_NOFOLLOW（unix open flag；0.2.186 已在 lockfile）
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
+# （blob 存 `config_dir/kirin_config_key.dpapi`，当前用户级保护）。
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+    "Win32_System_Memory",
+    # M8-T038 (P2): 跟随系统语言（GetUserDefaultUILanguage）。
+    "Win32_Globalization",
+] }
+# M8-T031: 卷序列号取系统盘——dlopen kernel32 GetVolumeInformationW
+# （架构红线：不静态链接系统库；与 macOS 段同版本）。
+libloading = "0.8"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# 链接系统框架；镜像 core/src/crypto/macos_keychain.rs 的 MAC-T006 模式）。
+libloading = "0.8"

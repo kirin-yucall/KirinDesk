@@ -1,0 +1,13 @@
+# 编译/测试/打包线程上限：4（2026-08-04 用户最新要求：大小核机器线程过多
+# 会死机，原 8 下调至 4；等价命令行写法 `--jobs 4`）。
+# 适用于本工作区所有 cargo 命令（check/test/build/package 等）。
+[build]
+jobs = 4
+
+# 链接失败——mingw ld 自动导出全部 Rust 符号触发 "export ordinal too large"
+# （>65535 个符号无 .def）。宿主上的该 dll 无人消费（Android 才用 .so），
+# 排除全部导出即可链接通过；bin/exe 目标不受影响（默认不导出）。
+# 仅对 x86_64-pc-windows-gnu（本机工具链）；android target 走 NDK lld，不经过。
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "link-args=-Wl,--exclude-all-symbols"]
+

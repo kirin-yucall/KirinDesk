@@ -1,0 +1,13 @@
+# KirinDesk Debian control 模板 — M14-T003
+# build_deb.sh 会将 %VERSION% / %ARCH% 替换为实际值。
+Package: kirin-desk
+Version: %VERSION%
+Architecture: %ARCH%
+Maintainer: KirinDesk Team <team@kirindesk.local>
+Section: net
+Priority: optional
+Depends: libssl3 | libssl3t64, libx11-6, libxkbcommon0, libwayland-client0, ffmpeg
+Description: P2P Remote Desktop - IPv6 + Zero Trust
+ Secure direct P2P remote desktop with Ed25519 zero-trust security
+ and DNS domain discovery. Headless server mode with systemd service.
+Homepage: https://github.com/kirin-yucall/kirin_desk
