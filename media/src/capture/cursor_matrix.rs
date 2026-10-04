@@ -1,4 +1,4 @@
-//! R-217 段A：受控端本 OS 光标移除 —— 采集面光标开关矩阵测试。
+//! 受控端本 OS 光标移除 —— 采集面光标开关矩阵测试。
 //!
 //! 需求口径：远控画面仅保留**主控端投射光标**（mouse_move → 远端本地 OS
 //! 光标注入，链路零改动）；受控端自身 OS 光标不进采集画面。三平台采集
@@ -50,7 +50,7 @@ impl CursorCaptureSwitch {
 
     /// 需求判定（纯函数）：受控端画面是否允许出现**受控端自身** OS 光标。
     ///
-    /// R-217 唯一口径 = 恒 `false`（三平台一律关）。主控端投射光标不受此
+    /// 唯一口径 = 恒 `false`（三平台一律关）。主控端投射光标不受此
     /// 开关影响（它走输入注入链，不经采集面合成）。
     pub fn remote_own_cursor_visible(&self) -> bool {
         false
@@ -105,7 +105,7 @@ mod r217_tests {
         ] {
             assert!(
                 !variant.remote_own_cursor_visible(),
-                "R-217：受控端自身 OS 光标不得进采集画面（{variant:?}）"
+                "受控端自身 OS 光标不得进采集画面（{variant:?}）"
             );
         }
     }
@@ -120,7 +120,7 @@ mod r217_tests {
         ] {
             assert!(
                 variant.projected_cursor_preserved(),
-                "R-217：主控端投射光标必须保留（{variant:?}）"
+                "主控端投射光标必须保留（{variant:?}）"
             );
         }
     }

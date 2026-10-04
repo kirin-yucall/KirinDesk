@@ -40,7 +40,7 @@ pub const MAX_CANDIDATES: usize = 16;
 /// 服务器观察地址作为候选时的优先级（高于本地候选，是打洞关键信息）。
 pub const OBSERVED_PRIORITY: u8 = 200;
 
-// ── 安全审计 R-1：RendezvousServer 资源上限与源 IP 限速加固 ──────────────
+// ── 安全审计：RendezvousServer 资源上限与源 IP 限速加固 ──────────────
 // 默认部署即暴露的 7001 端口此前完全无认证且无资源上限：单连接/多连接
 // 直接打瘫（无界 task/fd、四张无上限 HashMap）。以下硬上限 + 空闲超时 +
 // 源 IP 限速使攻击面受控（打洞是轻量登记/互转协议，合法流量远低于上限）。
@@ -75,7 +75,7 @@ struct PeerSlot {
 /// 仅当**双端都刷新过**（各自版本 > 上次互转版本）才互转——避免把对端
 /// 尚未刷新的旧候选（NAT 老化前的失效地址）转发给对方。
 ///
-/// `last_activity`（安全审计 R-1）：会话表 LRU 淘汰依据（表满时淘汰最久
+/// `last_activity`（安全审计）：会话表 LRU 淘汰依据（表满时淘汰最久
 /// 未活跃会话，防唯一 session_id 撑爆 sessions 表）。
 struct PunchSessionState {
     a: Option<PeerSlot>,
@@ -148,12 +148,12 @@ pub struct RendezvousServer {
     device_candidates: Mutex<HashMap<String, Vec<Candidate>>>,
     /// 每设备滑动窗口限速（PUNCH-006）。
     rate: Mutex<HashMap<String, Vec<Instant>>>,
-    /// 每源 IP（/24·/64 聚合）滑动窗口限速（安全审计 R-1：device_id 旋转兜底）。
+    /// 每源 IP（/24·/64 聚合）滑动窗口限速（安全审计：device_id 旋转兜底）。
     ip_rate: Mutex<HashMap<IpAddr, Vec<Instant>>>,
     audit: Arc<dyn AuditSink>,
     extension: Option<Arc<dyn RendezvousExtension>>,
     next_conn_id: AtomicU64,
-    /// 并发连接计数（安全审计 R-1：连接硬上限维护，accept 出口增减）。
+    /// 并发连接计数（安全审计：连接硬上限维护，accept 出口增减）。
     active_conns: AtomicUsize,
 }
 
@@ -259,7 +259,7 @@ impl RendezvousServer {
                             continue;
                         }
                     };
-                    // 安全审计 R-1：连接硬上限（每连接占 reader+writer 双 task
+                    // 安全审计：连接硬上限（每连接占 reader+writer 双 task
                     // + fd + 通道；无上限时单点空连可打瘫整个 relay-server）。
                     let prev = self.active_conns.fetch_add(1, Ordering::Relaxed);
                     if prev >= MAX_RENDEZVOUS_CONNS {
@@ -293,7 +293,7 @@ impl RendezvousServer {
         });
 
         loop {
-            // 安全审计 R-1：空闲超时——空连不再永久占用 reader+writer 双 task
+            // 安全审计：空闲超时——空连不再永久占用 reader+writer 双 task
             // （此前无任何超时，`nc` 空连可无限驻留耗尽 fd/内存）。
             match tokio::time::timeout(RENDEZVOUS_IDLE_TIMEOUT, read_frame(&mut reader)).await {
                 Ok(Ok((ty, payload))) => {
@@ -392,7 +392,7 @@ impl RendezvousServer {
         msg: CandidateRegister,
         tx: &mpsc::UnboundedSender<Vec<u8>>,
     ) {
-        // 安全审计 R-1：device_id 复用注册表校验（非空、≤128 字节、
+        // 安全审计：device_id 复用注册表校验（非空、≤128 字节、
         // 字母数字 + `:_-`）——此前无任何长度/字符集限制，超长 device_id
         // 直接进表/限速键，攻击者可撑爆内存与限速表。
         if !crate::registry::Registry::validate_device_id(&msg.device_id) {
@@ -436,7 +436,7 @@ impl RendezvousServer {
                 // 同一连接重登记 = 候选刷新（PUNCH-004 重打洞：NAT 映射变化
                 // 后重新候选交换，**更新**既有槽位，不当作第三端）。
                 let mut sessions = self.sessions.lock().unwrap();
-                // 安全审计 R-1：会话表硬上限——新 session 且表满时 LRU 淘汰
+                // 安全审计：会话表硬上限——新 session 且表满时 LRU 淘汰
                 // 最久未活跃会话（防唯一 session_id 撑爆 sessions 表）。
                 if !sessions.contains_key(&sid) && sessions.len() >= MAX_RENDEZVOUS_SESSIONS {
                     if let Some(oldest) = sessions
@@ -530,7 +530,7 @@ impl RendezvousServer {
             None => {
                 // P2 ID-005 注册表候选刷新：仅存最新候选，不转发
                 let mut dc = self.device_candidates.lock().unwrap();
-                // 安全审计 R-1：表硬上限——满则淘汰任意键（本条路径为
+                // 安全审计：表硬上限——满则淘汰任意键（本条路径为
                 // 无消费方的候选刷新，保底防无限增长）。
                 if !dc.contains_key(&msg.device_id) && dc.len() >= MAX_RENDEZVOUS_DEVICE_CANDIDATES
                 {
@@ -563,7 +563,7 @@ impl RendezvousServer {
             });
             return;
         };
-        // 安全审计 R-1：会话活跃时间戳（LRU 淘汰依据）。
+        // 安全审计：会话活跃时间戳（LRU 淘汰依据）。
         session.last_activity = Instant::now();
         let Some(other) = session.other_slot(conn_id) else {
             drop(sessions);
@@ -577,7 +577,7 @@ impl RendezvousServer {
         }
     }
 
-    /// 限速（PUNCH-006：每设备每窗口 ≤ 上限；安全审计 R-1：另加每源 IP
+    /// 限速（PUNCH-006：每设备每窗口 ≤ 上限；安全审计：另加每源 IP
     /// /24·/64 聚合限速 + 限速表键数硬上限）。超限 → 拒绝 + 审计。
     fn allow_rate(&self, device_id: &str, peer: SocketAddr) -> bool {
         let now = Instant::now();
@@ -612,7 +612,7 @@ impl RendezvousServer {
         // 2. 源 IP 级（/24·/64 聚合，复用 rate_limit::bucket_key；对齐 F-10
         //    语义）。device_id 旋转不再能绕过限速，跨租户 DoS 收口。
         //    先 canonical_ip 归一 v4-mapped（双栈监听下 IPv4 客户端呈
-        //    `::ffff:` 形态，不归一将全部 IPv4 坍缩进同一桶——R-2 同类）。
+        //    `::ffff:` 形态，不归一将全部 IPv4 坍缩进同一桶——安全审计同类）。
         let ip_key =
             crate::rate_limit::bucket_key(crate::rate_limit::canonical_ip(peer.ip()));
         let mut ip_rate = self.ip_rate.lock().unwrap();
@@ -882,7 +882,7 @@ mod tests {
         );
     }
 
-    // 安全审计 R-1：非法 device_id（空/含空白/超长）→ 拒绝 + 审计，不建会话。
+    // 安全审计：非法 device_id（空/含空白/超长）→ 拒绝 + 审计，不建会话。
     #[tokio::test]
     async fn test_invalid_device_id_rejected() {
         let audit = Arc::new(Collect::default());
@@ -923,7 +923,7 @@ mod tests {
         );
     }
 
-    // 安全审计 R-1：每源 IP（/24·/64 聚合）限速——唯一 device_id 旋转
+    // 安全审计：每源 IP（/24·/64 聚合）限速——唯一 device_id 旋转
     // 不能绕过 IP 级限速；第 (DEFAULT_IP_RATE_LIMIT+1) 次登记被拒 + 审计。
     #[tokio::test]
     async fn test_source_ip_rate_limit() {

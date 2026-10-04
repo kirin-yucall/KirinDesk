@@ -1,14 +1,14 @@
 ﻿//! 跨平台屏幕捕获抽象层。
 //!
-//! # 后端（M8-T008 §Step 1）
+//! # 后端
 //!
 //! | 平台 | 后端 | 状态 |
 //! |------|------|------|
 //! | Windows | `windows-capture` crate（唯一后端，无 WGC/DXGI/GDI 回退链） | ✅ 已实现 |
 //! | macOS | `zed-scap` crate（ScreenCaptureKit，M12-MAC MAC-T001） | ✅ 已实现 |
-//! | Linux | `linux_pipewire`（PipeWire screen-cast portal，X11/Wayland 统一，M12-T001 / ） | ✅ 已实现 |
+//! | Linux | `linux_pipewire`（PipeWire screen-cast portal，X11/Wayland 统一） | ✅ 已实现 |
 //!
-//! 旧后端（wgc/dxgi/gdi/pipewire）已按 M8-T008 设计删除。
+//! 旧后端（wgc/dxgi/gdi/pipewire）已删除。
 
 pub mod factory;
 
@@ -82,7 +82,7 @@ impl CaptureFrame {
     /// windows-capture 的 `Frame::dirty_regions()` 提供 dirty rects；
     /// zed-scap（ScreenCaptureKit）与 linux_pipewire（portal/PW 无脏区信息）
     /// 恒空列表（捕获层无完整 dirty rects 信息 → Tile-Hash Diff 仍是前置
-    /// 优化层，见 M8-T008 §Step 1）。
+     /// 优化层）。
     pub fn dirty_rects(&self) -> &[DirtyRect] {
         match self {
             CaptureFrame::WindowsCapture(f) => &f.dirty_rects,
@@ -189,7 +189,7 @@ pub struct MonitorInfo {
     pub width: u32,
     pub height: u32,
     pub is_primary: bool,
-    /// M8-T030（）：虚拟显示器标记（名称关键词命中，GPU-FR-007）。
+    /// 虚拟显示器标记（名称关键词命中）。
     /// Windows 默认过滤（`filter_virtual` 可关）；macOS/兜底恒 false。
     pub is_virtual: bool,
 }
@@ -205,7 +205,7 @@ pub trait ScreenCaptureSource: Send {
     /// - windows-capture 模式：后台线程回调推帧，此处阻塞接收。
     fn wait_for_frame(&mut self) -> Result<CaptureFrame, CaptureError>;
 
-    /// M8-T018（MON-NF-002）：带超时的等待——静默屏幕（长时间无画面变化）
+    /// 带超时的等待——静默屏幕（长时间无画面变化）
     /// 时，上层可定期醒来处理显示器切换命令；超时返回 [`CaptureError::Timeout`]。
     /// 默认实现等价旧行为（无限等待）；Windows 后端用 `recv_timeout` 实现。
     fn wait_for_frame_timeout(

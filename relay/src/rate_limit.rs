@@ -103,7 +103,7 @@ pub fn bucket_key(ip: IpAddr) -> IpAddr {
     }
 }
 
-/// 安全审计 R-2 同类：v4-mapped 地址（`::ffff:a.b.c.d`）归一为真实 IPv4。
+/// 安全审计同类：v4-mapped 地址（`::ffff:a.b.c.d`）归一为真实 IPv4。
 /// 双栈监听（`set_only_v6(false)`）下 IPv4 客户端在 accept/登记路径呈现为
 /// IPv6 形态；归一后 `bucket_key`（IPv4 取 /24）与审计语义正确，否则全部
 /// IPv4 会坍缩进同一 `::`/`::ffff:` 桶（跨租户共享额度 + 群体封禁）。
@@ -398,7 +398,7 @@ mod tests {
         );
     }
 
-    // 安全审计 R-2：v4-mapped 归一（::ffff:1.2.3.4 → 1.2.3.4，桶键取 /24）
+    // 安全审计：v4-mapped 归一（::ffff:1.2.3.4 → 1.2.3.4，桶键取 /24）
     #[test]
     fn test_canonical_ip_v4_mapped() {
         let mapped = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x0102, 0x0304));

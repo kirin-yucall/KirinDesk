@@ -508,7 +508,7 @@ impl TunnelServer {
                             continue;
                         }
                     };
-                    // 安全审计 R-2（F-10 在 relay 侧的真实失效）：双栈监听
+                    // 安全审计（F-10 在 relay 侧的真实失效）：双栈监听
                     // （`set_only_v6(false)`）下 IPv4 客户端在 accept 呈现为
                     // `::ffff:a.b.c.d` v4-mapped 地址，若直接喂 `bucket_key`
                     // 会按 IPv6 取前 4 段 → 全部 IPv4 坍缩进同一限速桶（群体
@@ -552,7 +552,7 @@ impl TunnelServer {
     }
 }
 
-/// 安全审计 R-2：v4-mapped 地址（`::ffff:a.b.c.d`）归一为真实 IPv4。
+/// 安全审计：v4-mapped 地址（`::ffff:a.b.c.d`）归一为真实 IPv4。
 /// 双栈监听（`set_only_v6(false)`）下 IPv4 客户端在 accept 呈现为 IPv6
 /// 形态，归一后限速 `bucket_key`（IPv4 取 /24）与审计/观察地址语义正确。
 /// 与 core 侧 `core::network::tcp::map_addr` 行为对齐。

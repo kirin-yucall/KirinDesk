@@ -37,7 +37,7 @@ pub struct VideoEncoderPipeline {
     /// 帧序号（Incremental 包 [frame_id] 用）。
     frame_id: u32,
     // ── CPU RGBA 适配（windows_capture 当前产 RGBA，非 GpuTexture 句柄） ──
-    // M8-T030（，GPU-FR-008）：CPU tile-hash 兜底需要帧像素 ——
+    // M8-T030（GPU-FR-008）：CPU tile-hash 兜底需要帧像素 ——
     // `pending_rgba` 由 set_cpu_frame 存留，classify_cpu 消费（非死拷贝；
     // M13-T004 曾因无消费方移除，现恢复消费）。
     pending_rgba: Vec<u8>,

@@ -59,7 +59,7 @@ struct Config {
     relay_db: std::path::PathBuf,
     dns_doh: String,
     dns_dot: String,
-    /// 安全审计 R-3：空 token 时是否显式放行启动（默认 fail-closed 拒绝）。
+    /// 安全审计：空 token 时是否显式放行启动（默认 fail-closed 拒绝）。
     allow_empty_token: bool,
     dir_ip_quota: usize,
     push_repush_interval: u64,
@@ -962,7 +962,7 @@ mod config_parse_tests {
         assert_eq!(cfg.rendezvous_port, 7001);
     }
 
-    // 安全审计 R-3：--allow-empty-token 解析（默认 false，fail-closed 兜底在 main()）。
+    // 安全审计：--allow-empty-token 解析（默认 false，fail-closed 兜底在 main()）。
     #[test]
     fn test_allow_empty_token_flag() {
         assert!(!parse_ok(&[]).allow_empty_token);
@@ -1865,7 +1865,7 @@ async fn tokio_main(args: Vec<String>) {
         }
     }
 
-    // 安全审计 R-3：空 token 默认 fail-closed 拒绝启动（对齐 CLI
+    // 安全审计：空 token 默认 fail-closed 拒绝启动（对齐 CLI
     // cmd_tunnel_serve 的 TNL-SEC-008；零凭据控制面 = 任意公网客户端可登录）。
     // `--allow-empty-token` 显式放行（仍告警，见下）。
     if cfg.token.is_empty() && !cfg.allow_empty_token {
