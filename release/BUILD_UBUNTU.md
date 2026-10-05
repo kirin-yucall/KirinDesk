@@ -25,7 +25,7 @@ sudo apt install build-essential libssl-dev pkg-config \
 >   门户。
 > - D-Bus 客户端为纯 Rust（zbus），无额外系统包。
 
-## 获取 FFmpeg 运行库（）
+## 获取 FFmpeg 运行库
 
 KirinDesk 的 H.264/AV1 编解码**动态加载** FFmpeg 共享库（libavcodec.so.62 /
 libavutil.so.60 / libswscale.so.9 等 7 个）。**注意**：Ubuntu 24.04 发行版自带的

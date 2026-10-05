@@ -144,7 +144,7 @@ cd ../..
 2. 解压后**整个目录放到** `ffmpeg/ffmpeg-8.1.1-full_build-shared/`(zip 内目录名一致,无需改名)——加载器按此目录名搜索(见 `media/src/ffmpeg/dlls.rs`);
 3. 自检:确认 `bin/` 下存在 `avcodec-62.dll`(libavcodec 62.28.101)、`avutil-60.dll`、`swscale-9.dll` 等共享库(缺库加载会直接失败)。
 
-> **为何用 8.1.1 而非 8.1.2**:8.1.2 构建捆绑 ffnvcodec 13.1 头,`h264_nvenc` 要求 NVIDIA 驱动 ≥610.00;8.1.1 捆绑 13.0 头,兼容 591 系主流驱动(本机 591.86 实测出码流 ✓,2026-08-02)。两者均为 libavcodec 62,硬编码偏移快照(`SNAPSHOT_FFMPEG_MAJOR = 62`)兼容——决策记录见 `docs/共享层/_单GPU硬件加速与虚拟设备过滤_需求设计.md` §5.2。
+> **为何用 8.1.1 而非 8.1.2**:8.1.2 构建捆绑 ffnvcodec 13.1 头,`h264_nvenc` 要求 NVIDIA 驱动 ≥610.00;8.1.1 捆绑 13.0 头,兼容 591 系主流驱动(本机 591.86 实测出码流 ✓,2026-08-02)。两者均为 libavcodec 62,硬编码偏移快照(`SNAPSHOT_FFMPEG_MAJOR = 62`)兼容。
 >
 
 
