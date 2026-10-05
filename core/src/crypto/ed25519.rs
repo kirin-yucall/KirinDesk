@@ -209,7 +209,7 @@ impl IdentityManager {
     /// - 旧格式文件 `ed25519.json` 存在 → 自动迁移到系统钥匙串后端
     ///   （DPAPI / Keychain / secret-tool），**先写新后端并读回验证、再备份原文件**
     ///   （失败回退不覆盖，计划 §5 风险 3）；
-    /// - 文件存在但损坏 / 不可解密 → **M8-T031 未配发残留恢复**：仅当后端无
+    /// - 文件存在但损坏 / 不可解密 → **未配发残留恢复**：仅当后端无
     ///   身份且从未配发（无 `identity.provisioned` 标记）时，备份损坏文件为
     ///   `ed25519.json.corrupt.<ts>` 后全新生成（与"全新安装"同语义）；
     ///   曾配发或后端已有身份 → 维持 fail-closed / 后端优先（S-05 不放松）；
@@ -246,7 +246,7 @@ impl IdentityManager {
                     ensure_marker_has_label(&marker, &label)?;
                     return Self::from_secret(secret, key_path);
                 }
-                // M8-T031: 迁移失败（损坏/不可解密）→ 评估"未配发残留恢复"：
+                // 迁移失败（损坏/不可解密）→ 评估"未配发残留恢复"：
                 // 后端已有身份 → 忽略损坏旧文件，用后端身份继续（警告 + 审计）；
                 // 曾配发过 → 保持 fail-closed，不生成；
                 // 从未配发（无后端条目 + 无标记）→ 备份残留文件后走全新生成路径
@@ -264,7 +264,7 @@ impl IdentityManager {
                                 target: "identity",
                                 "legacy identity file {key_path:?} is unusable but keystore \
                                  backend already holds {label:?}; ignoring stale legacy file \
-                                 (M8-T031)"
+                                 "
                             );
                             audit_identity_recovered(&format!(
                                 "path={key_path:?} label={label:?} action=used_keystore_identity"
@@ -302,7 +302,7 @@ impl IdentityManager {
                     tracing::warn!(
                         target: "identity",
                         "undecryptable legacy identity file {key_path:?} is an unprovisioned \
-                         leftover (M8-T031); backed up to {backup:?} and generating a new identity"
+                         leftover; backed up to {backup:?} and generating a new identity"
                     );
                     audit_identity_recovered(&format!(
                         "path={key_path:?} label={label:?} action=generated_new backup={backup:?}"
@@ -353,7 +353,7 @@ impl IdentityManager {
     /// 3. 原文件先置 0600 再改名为 `ed25519.json.bak.<ts>`（备份保留，可删）。
     /// 任何一步失败 → 原文件原样保留，下次启动重试。
     ///
-    /// M8-T031: 失败返回**普通错误**（不在此 fail-closed）——是否 fail-closed
+    /// 失败返回**普通错误**（不在此 fail-closed）——是否 fail-closed
     /// 由 `load_or_generate_with` 依据"是否曾配发"统一裁决。
     fn try_migrate_legacy(
         key_path: &Path,
@@ -462,7 +462,7 @@ fn legacy_backup_path(key_path: &Path) -> PathBuf {
     backup_path(key_path, "bak")
 }
 
-/// M8-T031: 未配发残留备份路径：`<name>.corrupt.<unix_ts>`（损坏文件备份
+/// 未配发残留备份路径：`<name>.corrupt.<unix_ts>`（损坏文件备份
 /// 保留，可删；时间戳避免覆盖历史备份）。
 fn corrupt_backup_path(key_path: &Path) -> PathBuf {
     backup_path(key_path, "corrupt")
@@ -481,7 +481,7 @@ fn backup_path(key_path: &Path, tag: &str) -> PathBuf {
     key_path.with_file_name(format!("{name}.{tag}.{ts}"))
 }
 
-/// M8-T031: 身份凭证恢复审计（AuditLogger 独立打开；失败仅 warn，
+/// 身份凭证恢复审计（AuditLogger 独立打开；失败仅 warn，
 /// 不影响主流程——恢复是罕见一次性事件，开销可忽略）。
 fn audit_identity_recovered(detail: &str) {
     use kirin_desk_utils::audit::{AuditEvent, AuditLogger};
@@ -693,7 +693,7 @@ mod tests {
 
     #[test]
     fn s05_garbage_file_unprovisioned_recovers() {
-        // M8-T031: 垃圾文件 + 从未配发（无后端条目、无标记）= 过期残留 →
+        // 垃圾文件 + 从未配发（无后端条目、无标记）= 过期残留 →
         // 恢复（备份损坏文件后全新生成），不再 fail-closed。
         let dir = s05_temp_dir("garbage");
         let path = dir.join("ed25519.json");
@@ -720,7 +720,7 @@ mod tests {
 
     #[test]
     fn s05_undecryptable_legacy_unprovisioned_recovers() {
-        // M8-T031: 旧格式文件不可解密（device_id 变动）+ 从未配发 → 恢复：
+        // 旧格式文件不可解密（device_id 变动）+ 从未配发 → 恢复：
         // 备份损坏文件 → 全新生成身份（等价全新安装），不再 fail-closed。
         let dir = s05_temp_dir("undecryptable");
         let path = dir.join("ed25519.json");
@@ -752,7 +752,7 @@ mod tests {
 
     #[test]
     fn s05_undecryptable_legacy_provisioned_fails_closed() {
-        // M8-T031 安全边界: 曾配发过（marker 含 label）+ 后端条目丢失 + 旧文件
+        // 安全边界: 曾配发过（marker 含 label）+ 后端条目丢失 + 旧文件
         // 不可解密 → 维持 fail-closed（不生成新身份、不动损坏文件）。
         let dir = s05_temp_dir("provisioned");
         let ks = MemoryKeyStore::new();
@@ -787,7 +787,7 @@ mod tests {
 
     #[test]
     fn s05_keystore_entry_with_corrupt_legacy_uses_backend() {
-        // M8-T031: 后端已有身份 + 旧文件损坏 → 忽略损坏文件，用后端身份继续。
+        // 后端已有身份 + 旧文件损坏 → 忽略损坏文件，用后端身份继续。
         let dir = s05_temp_dir("ks_backend");
         let ks = MemoryKeyStore::new();
 

@@ -1,11 +1,11 @@
-//! M8-T026-P2: 服务端设备在线表（ID-001~005 / ID-SEC-001~003）+ 设备级中继配对（§8.1）。
+//! 服务端设备在线表（ID-001~005 / ID-SEC-001~003）+ 设备级中继配对（§8.1）。
 //!
 //! 职责对照：
 //! - ID-001 设备注册：`Login` 携带 `device_id`（显式配置或公钥指纹派生，两者都接受）
 //!   后调用 [`Registry::register`]；
 //! - ID-002 在线表：`device_id → { candidates（含服务器观察地址）, ed25519_pub, last_seen }`
 //!   内存表（`RwLock<HashMap>` + 空闲清理），单服务器容量目标 ≥ 10 万设备；
-//! - ID-003 在线状态：心跳复用 M8-T026 控制连接 `Ping/Pong`，30s 无心跳 →
+//! - ID-003 在线状态：心跳复用 控制连接 `Ping/Pong`，30s 无心跳 →
 //!   [`Registry::sweep_idle`] 离线（标记 + 审计由调用方完成）；控制连接断开即
 //!   [`Registry::unregister`]；
 //! - ID-004 ID 唯一性：同 ID 不同公钥 → 后到者拒绝（`RegisterError::DeviceConflict`）；

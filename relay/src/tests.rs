@@ -1,4 +1,4 @@
-//! M8-T026 T004: 端到端测试（本机回环 TCP + fake 本地服务）。
+//! T004: 端到端测试（本机回环 TCP + fake 本地服务）。
 //!
 //! 覆盖验收标准（主文档 §6）：字节流一致 / 并发精确配对 / 心跳判死 /
 //! 退避重连 + 全量重注册 / 级联清理 / token 拒绝 / 速率限制封禁 /
@@ -72,7 +72,7 @@ async fn spawn_echo_service() -> u16 {
 
 /// 测试服务端配置（控制端口 0 = 系统分配；短心跳/短 work 超时）。
 ///
-/// 端口范围随机化（M8-T026-P2 起）：多个 e2e 测试并发运行时共享固定
+/// 端口范围随机化（起）：多个 e2e 测试并发运行时共享固定
 /// `(40000, 40200)` 会互相抢端口导致 flaky —— 每实例取随机 256 端口子范围。
 fn server_cfg(token: &str, audit: Option<Arc<dyn AuditSink>>) -> TunnelServerConfig {
     server_cfg_on(0, token, audit)
@@ -99,7 +99,7 @@ fn server_cfg_on(
         max_pending_tunnels: 256,
         max_pending_per_target: 16,
         audit,
-        // M8-T026-P2 (ID-SEC-001)：测试用临时服务器密钥，不污染真实 ~/.kirin_desk。
+        // (ID-SEC-001)：测试用临时服务器密钥，不污染真实 ~/.kirin_desk。
         server_key_path: Some(
             std::env::temp_dir().join(format!(
                 "kirin_relay_test_key_{}.der",
@@ -223,7 +223,7 @@ async fn finish_reg_challenge(
     }
 }
 
-/// 手工认证（复用既有流，M8-T026-P3 探测流程）：
+/// 手工认证（复用既有流，探测流程）：
 /// 探测 Login#1（auth_nonce，token 恒为空）→ 服务器挑战 → 证明 Login#2
 /// （auth_digest）→ LoginResp。返回 `(ok, client_nonce, server_nonce, digest)`
 /// 供重放等用例捕获；服务器直接应答（legacy / 版本拒绝 / 探测拒绝）→
@@ -689,7 +689,7 @@ async fn raw_register_then_close(server_port: u16) -> Option<u16> {
 
 
 
-/// M8-T025 打包验收：`[::]` 监听须接受 IPv4 客户端。
+/// 打包验收：`[::]` 监听须接受 IPv4 客户端。
 /// Windows 裸 AF_INET6 socket 默认 v6-only（bind 成功后 IPv4 连接被拒），
 /// `bind_reuseaddr` 已显式 `set_only_v6(false)`；本测试在任何平台验证
 /// 双栈可达（若环境禁用 IPv6 走 v4 回退监听，同样可连）。
@@ -740,7 +740,7 @@ async fn test_shutdown_completes_when_idle() {
 }
 
 // ════════════════════════════════════════════════════════════
-// M8-T026-P3：挑战-响应认证 e2e（TNL-SEC-006~010）
+// 挑战-响应认证 e2e（TNL-SEC-006~010）
 // ════════════════════════════════════════════════════════════
 
 #[tokio::test]
@@ -1778,7 +1778,7 @@ async fn test_candidate_register_same_device_accepted() {
 }
 
 // ════════════════════════════════════════════════════════════════
-// M8-T039 (P2): 多地址多监听器 / v6-only / 回退语义 单测
+// (P2): 多地址多监听器 / v6-only / 回退语义 单测
 // ════════════════════════════════════════════════════════════════
 
 /// 取一个空闲端口（测试用；drop 后可能被并发测试复用，仅用于同批次内）。
@@ -1791,7 +1791,7 @@ async fn pick_free_port() -> u16 {
 
 #[tokio::test]
 async fn bind_multi_addrs_same_port() {
-    // M8-T039 P6/P8：多地址同端口监听 —— `0.0.0.0` 与 `[::]` 两个 listener
+    // P6/P8：多地址同端口监听 —— `0.0.0.0` 与 `[::]` 两个 listener
     // 并存（v6-only 与 v4 显式监听互不冲突，无 EADDRINUSE）；`port()` 取
     // 首个监听器端口且非 0。数据面：IPv4 客户端走 v4 监听器、IPv6 客户端
     // 走 v6 监听器（本机回环双链路连通）。
@@ -1820,7 +1820,7 @@ async fn bind_multi_addrs_same_port() {
 
 #[tokio::test]
 async fn v6_only_isolated() {
-    // M8-T039 P6/P8：set_only_v6 断言 —— 仅绑 `[::1]:0` 时 IPv4 回环连接
+    // P6/P8：set_only_v6 断言 —— 仅绑 `[::1]:0` 时 IPv4 回环连接
     // 必须失败（v6 监听不收 IPv4），IPv6 回环必须连通。
     let mut cfg = server_cfg("secret", None);
     cfg.bind_addrs = vec!["[::1]:0".parse().unwrap()];
@@ -1861,7 +1861,7 @@ async fn bind_single_127_regression() {
 
 #[tokio::test]
 async fn bind_empty_falls_back_dual_stack() {
-    // M8-T039 P7：bind_addrs 空列表 → 旧默认双栈路径（`[::]` 优先 +
+    // P7：bind_addrs 空列表 → 旧默认双栈路径（`[::]` 优先 +
     // `0.0.0.0` 回退，语义零变化）；v4 回环连通（本机无 v6 环境时该断言
     // 即够，按平台能力取 v4 断言）。
     let server = TunnelServer::bind(server_cfg("secret", None))

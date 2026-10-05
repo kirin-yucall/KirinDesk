@@ -1,4 +1,4 @@
-//! M8-T026-P1 (PATH-004 / PUNCH-NF-002): QUIC 连接迁移 —— `Endpoint::rebind`
+//! (PATH-004 / PUNCH-NF-002): QUIC 连接迁移 —— `Endpoint::rebind`
 //! 换本地 socket 后数据续流（quinn 服务端自动迁移，**无重握手**），
 //! 中断 < 200ms。
 //!

@@ -502,7 +502,7 @@ pub(crate) fn tier_bitrate_for(base_bps: u64, tier: u32) -> u64 {
 ///
 /// 捕获启动恒置 0（fail = 常态阶梯）；观众会话建立/点选时客户端推送当前
 /// 显示模式档（app 级静态记忆，`ui::display_mode()`）。多观众共享编码器
-/// = **最后推送者生效**（与 M8-T018 DisplaySelect 共享捕获热切换同语义
+/// = **最后推送者生效**（与 DisplaySelect 共享捕获热切换同语义
 fn r126b_quality_high() -> &'static AtomicU8 {
     static M: OnceLock<AtomicU8> = OnceLock::new();
     M.get_or_init(|| AtomicU8::new(0))
@@ -697,7 +697,7 @@ pub(crate) fn lag_skip_decision(lagging: bool, is_key: bool) -> LagSkip {
 
 ///
 /// 根因（79 实机 17:11:07.419→17:11:10.655 3.2s 窗口零日志落点）：修复前
-/// `server_audio_allowed`（默认关，M8-T035）兼作**任务 spawn 门控**——
+/// `server_audio_allowed`（默认关）兼作**任务 spawn 门控**——
 /// `run_capture_once` 只在捕获任务启动时判一次（修复前本文件该 if 条件含
 /// `&& crate::server_audio_allowed()`）。默认关 ⇒ 会话建立时开关为关的
 /// 会话里音频任务从未被 spawn；会话中途开开关只写原子量 + setter 日志
@@ -1863,7 +1863,7 @@ async fn run_capture_once(gen: u64, codec: Codec, max_width: u32) {
 
     // 广播给全部观众（每观众发送任务独立加密/分流）。
     //
-    // 子开关 `server_audio_allowed`（默认关，M8-T035）是**运行时**开关——由
+    // 子开关 `server_audio_allowed`（默认关）是**运行时**开关——由
     // 任务内状态机（[`AudioToggleMachine`]，纯逻辑核心可单测）逐轮读取
     // （空闲轮询 50ms）驱动捕获启停：会话中途开/关 ≤100ms 生效（PM 口径 a：
     // 目标 ≤2s），且日志三落点必达（尝试 INFO〔端点+格式〕/ 成功 INFO /

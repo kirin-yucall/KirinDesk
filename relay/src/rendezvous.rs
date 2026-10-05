@@ -1,4 +1,4 @@
-//! M8-T026-P1 (PUNCH-006 / PUNCH-PROTO-001~007): 打洞 rendezvous 服务端。
+//! (PUNCH-006 / PUNCH-PROTO-001~007): 打洞 rendezvous 服务端。
 //!
 //! 职责边界（PUNCH-006 / PUNCH-SEC-002，红线）：**只登记与转发候选 + 限速 +
 //! 审计**，不进入数据面、不落盘流量。打洞探测（`PunchProbe`）为双端在打洞
@@ -167,7 +167,7 @@ impl std::fmt::Debug for RendezvousServer {
 }
 
 impl RendezvousServer {
-    /// 绑定监听（`[::]:port` 优先，失败回退 `0.0.0.0`，对齐 M8-T025 双栈模式）。
+    /// 绑定监听（`[::]:port` 优先，失败回退 `0.0.0.0`，对齐双栈模式）。
     /// `port = 0` 由系统分配（测试用），经 [`Self::local_addr`] 查询。
     pub async fn bind(port: u16) -> std::io::Result<Self> {
         let listener = match TcpListener::bind(format!("[::]:{port}")).await {

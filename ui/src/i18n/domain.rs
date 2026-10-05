@@ -1,5 +1,5 @@
-//! M8-T038 (P5): Domain 页（domain_panel.rs）键值表（zh 基线 + en 全量）。
-//! 本分区文件由 M8-T038_P5 独占认领。
+//! (P5): Domain 页（domain_panel.rs）键值表（zh 基线 + en 全量）。
+//! 本分区文件由 独占认领。
 //!
 //! zh 为基线语言包；en 全量翻译（不得留空串）。
 //! 动态文案模板使用 `{0}`/`{1}` 位置参数，zh/en 占位符一一对应。
@@ -141,7 +141,7 @@ pub static TABLE: &[(&str, &str, &str)] = &[
     ("domain.edit.adding", "添加 {0} {1} …", "Adding {0} {1} …"),
     ("domain.edit.updating", "更新 {0} {1} …", "Updating {0} {1} …"),
 
-    // ── M8-T040 (W3-A): DDNS 维护卡（DDNS-UI-001~006，键统一 ddns.* 前缀）──
+    // ── (W3-A): DDNS 维护卡（DDNS-UI-001~006，键统一 ddns.* 前缀）──
     ("ddns.card.title", "DDNS 维护", "DDNS Maintenance"),
     ("ddns.card.desc", "自动更新域名解析记录（A/AAAA + SRV + TXT）", "Automatically maintain DNS records (A/AAAA + SRV + TXT)"),
     ("ddns.enabled", "自动更新", "Auto-update"),

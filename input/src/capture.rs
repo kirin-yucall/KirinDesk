@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-/// 序列化捕获事件（bincode wire 格式，M9-T001）。
+/// 序列化捕获事件（bincode wire 格式）。
 ///
 /// 注意：客户端捕获格式（本文件）与服务端注入管线格式
 /// （[`crate::injector::InputEvent`]）是两套并列结构；本函数用于客户端

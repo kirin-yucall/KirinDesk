@@ -1,5 +1,5 @@
 //!
-//! M8-T038 (P2): 键值表由单一 `TABLE` 拆为**按页面分区的静态表文件**
+//! (P2): 键值表由单一 `TABLE` 拆为**按页面分区的静态表文件**
 //! （`common/settings/connect/dashboard/devices/domain/session/widgets`），
 //! 波次 2 各文案任务独占自己的分区文件 → 并发加键零冲突；
 //! [`ALL`] 汇总并配重复键断言单测（撞车即测试失败）。
@@ -79,7 +79,7 @@ impl Lang {
     /// `zh*` → 中文，`en*` → 英文，其余/缺失 → 中文基线）。
     ///
     /// 注：GUI 场景个别平台（如 Windows 桌面）可能不导出 `LANG`，此时回落
-    /// 中文基线——M8-T038 起上层优先经 [`system()`]（含系统 API 兜底）。
+    /// 中文基线——上层优先经 [`system()`]（含系统 API 兜底）。
     #[allow(dead_code)]
     pub fn from_env() -> Lang {
         env_lang().unwrap_or(Lang::Zh)
@@ -196,7 +196,7 @@ macro_rules! t {
 
 /// 按当前语言取文案并填入位置参数（`{0}`/`{1}`…，zh/en 模板占位符一一对应）。
 ///
-/// `format!` 要求格式串为字面量，无法直接 `format!(t!(key), …)` —— M8-T038
+/// `format!` 要求格式串为字面量，无法直接 `format!(t!(key), …)` —— 
 /// 动态文案统一经本函数做 `{0}`/`{1}` 顺序替换（参数经 `to_string()` 归一）。
 pub fn tr_fmt(key: &'static str, args: &[String]) -> String {
     let mut s = tr(key).to_string();
@@ -318,7 +318,7 @@ mod tests {
         assert_eq!(Lang::from_env(), Lang::Zh); // 无环境 → 中文基线
     }
 
-    // ---------- M8-T038 (P2): set_lang_code / system() / 重复键断言 ----------
+    // ---------- set_lang_code / system() / 重复键断言 ----------
 
     #[test]
     fn set_lang_code_cases() {

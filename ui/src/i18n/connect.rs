@@ -1,5 +1,5 @@
-//! M8-T038 (P4): Connect 页键值表（zh 基线 + en 全量）。
-//! 本分区文件由 M8-T038_P4 独占认领。
+//! (P4): Connect 页键值表（zh 基线 + en 全量）。
+//! 本分区文件由 独占认领。
 //!
 //! zh 为基线语言包（当前界面文案统一后的中文版本）；en 全量翻译（不得留空串）。
 //! 动态文案模板使用 `{0}`/`{1}` 位置参数，zh/en 占位符一一对应。
@@ -300,7 +300,7 @@ pub static TABLE: &[(&str, &str, &str)] = &[
     ("connect.devices.title", "连接过的设备:", "Previously connected devices:"),
     ("connect.devices.empty", "暂无记录 — 连接成功后自动保存", "No records yet — saved automatically after a successful connection"),
 
-    // ── M8-T040 (W3-A): 域名模式加密 DNS 解析状态行（DDNS-UI-007）──
+    // ── (W3-A): 域名模式加密 DNS 解析状态行（DDNS-UI-007）──
     ("connect.dnssec.resolving", "加密 DNS 解析中（DoH/DoT）…", "Resolving via encrypted DNS (DoH/DoT)…"),
     ("connect.dnssec.resolved", "加密 DNS 解析完成（{0}）", "Encrypted DNS resolved ({0})"),
     ("connect.dnssec.no_records", "加密 DNS 解析完成：无记录（沿用发现地址连接）", "Encrypted DNS resolved: no records (connecting via discovered address)"),

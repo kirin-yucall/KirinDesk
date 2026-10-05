@@ -1,4 +1,4 @@
-//! 音频流水线（M8-T008 P1D）。
+//! 音频流水线（P1D）。
 //!
 //! 三件套：
 //! - [`AudioCapture`] trait + 平台实现：系统声音环回捕获（Windows WASAPI
@@ -135,7 +135,7 @@ pub fn create_default_capture() -> Result<Box<dyn AudioCapture>, EncodeError> {
     }
 }
 
-/// M8-T032：创建本机默认麦克风捕获器（客户端 talkback 回传）。
+/// 创建本机默认麦克风捕获器（客户端 talkback 回传）。
 ///
 /// - Windows：WASAPI `eCapture`/`eCommunications`（默认通话麦克风，无 loopback）。
 /// - macOS/Linux：暂未实现 → `Err(Unsupported)`（优雅降级：捕获初始化失败 →
@@ -148,7 +148,7 @@ pub fn create_mic_capture() -> Result<Box<dyn AudioCapture>, EncodeError> {
     #[cfg(not(target_os = "windows"))]
     {
         tracing::info!(
-            "microphone capture not implemented on {} (M8-T032 TODO: Windows only)",
+            "microphone capture not implemented on {} (TODO: Windows only)",
             std::env::consts::OS
         );
         Err(EncodeError::Unsupported(format!(
@@ -525,7 +525,7 @@ impl AudioPipeline {
         })
     }
 
-    /// M8-T032：创建麦克风捕获流水线（客户端本机麦克风 → 服务端播放，
+    /// 创建麦克风捕获流水线（客户端本机麦克风 → 服务端播放，
     /// talkback）。捕获端为 [`WasapiMicCapture`]（Windows `eCapture`；
     /// 非 Windows 由 [`create_mic_capture`] 返回 `Err(Unsupported)` 优雅降级），
     /// 编码参数与环回完全一致（Opus 48kHz/stereo/64kbps/20ms）。
@@ -867,7 +867,7 @@ mod tests {
         let _ = create_default_capture();
     }
 
-    /// M8-T032 Tests §mic：麦克风捕获创建/析构冒烟——Windows 下
+    /// Tests §mic：麦克风捕获创建/析构冒烟——Windows 下
     /// `create_mic_capture` 不 panic（有麦克风 → Ok，无 → Err(InitFailed)）；
     /// 非 Windows 返回 `Err(Unsupported)`（优雅降级路径）。
     #[test]
@@ -891,7 +891,7 @@ mod tests {
         }
     }
 
-    /// M8-T032 Tests §mic：`AudioPipeline::new_mic` 与环回参数一致
+    /// Tests §mic：`AudioPipeline::new_mic` 与环回参数一致
     /// （48kHz/stereo；Windows 无麦克风 → Err 不 panic）。
     #[test]
     fn test_mic_pipeline_params() {

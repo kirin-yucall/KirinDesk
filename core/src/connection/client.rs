@@ -47,7 +47,7 @@ pub struct DnsConfig {
     /// `dns.provider` 对应条目传给 `default_provider`）。纯内存结构，
     /// 不参与序列化。
     pub credentials: BTreeMap<String, BTreeMap<String, String>>,
-    /// M8-T040：域名模式加密 DNS 解析器（DoH/DoT，fail-closed）。
+    /// 域名模式加密 DNS 解析器（DoH/DoT，fail-closed）。
     /// `None` = 未配置/已关闭（mode=off）→ 域名模式拒绝连接
     /// （`ConnectError::EncryptedDnsRequired`，DDNS-DOH-003/007）。
     /// 测试注入 mock（WBS 5.7）。
@@ -178,11 +178,11 @@ pub enum ConnectError {
     NoTxtKey,
     #[error("ERROR: 设备无可用 IPv4/IPv6 地址（ip_family={0}）")]
     NoConnectAddr(String),
-    /// M8-T040：域名模式强制加密 DNS 不可用 → fail-closed 拒连（DDNS-DOH-003）。
+    /// 域名模式强制加密 DNS 不可用 → fail-closed 拒连（DDNS-DOH-003）。
     /// 文案（DDNS-DOH-003）：「域名模式要求加密 DNS（DoH/DoT），当前不可用」。
     #[error("域名模式要求加密 DNS（DoH/DoT），当前不可用: {0}")]
     EncryptedDnsRequired(String),
-    /// M8-T040：加密 DNS 解析失败（响应畸形等；全端点不可用归
+    /// 加密 DNS 解析失败（响应畸形等；全端点不可用归
     /// [`ConnectError::EncryptedDnsRequired`]）。
     #[error("加密 DNS 解析失败 {host}: {err}")]
     DnsResolveFailed { host: String, err: String },
@@ -281,7 +281,7 @@ pub async fn resolve_peer(opts: &ConnectionOptions) -> Result<ResolvedPeer, Conn
             .target
             .trim_end_matches(&format!(".{}", dns.domain))
             .to_string();
-        // ── M8-T040：域名模式强制加密 DNS（DDNS-DOH-001/003）──
+        // ── 域名模式强制加密 DNS（DDNS-DOH-001/003）──
         // fail-closed 前置检查：未注入加密解析器（未配置 / mode=off）→ 立即
         // 拒连（不落发现调用，绝不回退明文；DDNS-DOH-007）。
         let resolver = dns.resolver.as_ref().ok_or_else(|| {
@@ -420,7 +420,7 @@ pub async fn connect_peer(
     } else {
         opts.client_domain.clone()
     };
-    // M8-T040（红线）：peer.addr 必须是 IP 字面量 —— 先解析为 `SocketAddr`
+    // 红线：peer.addr 必须是 IP 字面量 —— 先解析为 `SocketAddr`
     // 再直连，**禁止字符串形态直连**（`TcpStream::connect(&str)` 会触发系统
     // 明文 DNS，DDNS-SEC-001）。域名模式的地址一律来自加密解析
     // （`resolve_for_connect`，resolve_peer 侧完成）。
@@ -502,7 +502,7 @@ mod tests {
         }
     }
 
-    /// M8-T040：域名模式 + 未注入加密解析器 → fail-closed 拒连
+    /// 域名模式 + 未注入加密解析器 → fail-closed 拒连
     /// （EncryptedDnsRequired，DDNS-DOH-003/007；不落发现调用）。
     #[tokio::test]
     async fn test_domain_mode_without_resolver_fail_closed() {
@@ -524,7 +524,7 @@ mod tests {
         );
     }
 
-    /// M8-T040：域名模式 + 已注入解析器 → 通过前置检查，走到发现
+    /// 域名模式 + 已注入解析器 → 通过前置检查，走到发现
     /// （无凭据 → Provider 错误而非 EncryptedDnsRequired，证明解析器路径生效）。
     #[tokio::test]
     async fn test_domain_mode_with_resolver_proceeds_to_discovery() {

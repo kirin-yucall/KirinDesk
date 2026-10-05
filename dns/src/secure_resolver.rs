@@ -1,4 +1,4 @@
-//! M8-T040 (W1-C / W2-A / WBS 3.2~3.5): DoH/DoT 加密 DNS 解析器。
+//! (W1-C / W2-A / WBS 3.2~3.5): DoH/DoT 加密 DNS 解析器。
 //!
 //! 域名模式（服务端 + 客户端）下**全部** DNS 解析的唯一加密入口（DDNS-DOH-001）：
 //! - **DoH**：`application/dns-json` GET（复用 reqwest，零新依赖；DDNS-DOH-005）；

@@ -9,7 +9,7 @@
 //! - 输出：`Frame::BGRA` → 转换 **RGBA**（与 windows-capture 的 `Rgba8` 输出、
 //!   编码层 `AV_PIX_FMT_RGBA` 源格式一致，见 `ffmpeg_sw.rs`/`ffmpeg_hw.rs`）。
 //! - dirty rects：zed-scap 不暴露脏区信息 → 空列表（由上游 Tile-Hash Diff 前置
-//!   优化层兜底，与 M8-T008 §Step 1 一致）。
+//!   优化层兜底，与 §Step 1 一致）。
 //!
 //! # 线程模型
 //!
@@ -218,7 +218,7 @@ pub fn enumerate_monitors() -> Result<Vec<MonitorInfo>, CaptureError> {
                 width: 0,
                 height: 0,
                 is_primary: i == 0, // ScreenCaptureKit 首个 display 为主显示器
-                // M8-T030（）：macOS 无虚拟屏概念，恒 false。
+                // macOS 无虚拟屏概念，恒 false。
                 is_virtual: false,
             });
         }

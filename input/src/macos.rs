@@ -432,7 +432,7 @@ pub fn mouse_event_type(button_bits: u8) -> Result<(i32, i32), InjectError> {
 
 /// 单块显示器的布局快照（`CGDisplayBounds` 全局原点 + 像素/逻辑尺寸）。
 ///
-/// 坐标映射（M8-T018 CLI-MON-010 / SRV-MON-010）：客户端归一化坐标基数 =
+/// 坐标映射（CLI-MON-010 / SRV-MON-010）：客户端归一化坐标基数 =
 /// **所选显示器像素分辨率**；服务端注入侧把事件缩放到该屏像素空间
 /// （显示器局部坐标），注入时叠加该屏在全局布局中的原点偏移。
 ///
@@ -444,7 +444,7 @@ pub fn mouse_event_type(button_bits: u8) -> Result<(i32, i32), InjectError> {
 pub struct DisplayRect {
     /// 全局坐标空间原点（point）。
     pub origin: CGPoint,
-    /// 像素分辨率宽（注入坐标基数，M8-T018）。
+    /// 像素分辨率宽（注入坐标基数）。
     pub width_px: u32,
     /// 像素分辨率高。
     pub height_px: u32,
@@ -487,7 +487,7 @@ pub fn to_global_point(local_x_px: u32, local_y_px: u32, display: &DisplayRect) 
 
 /// 布局表内选择"选中显示器"：按像素分辨率精确匹配。
 ///
-/// M8-T018：归一化坐标基数 = 所选屏分辨率，注入侧 `dst_w/dst_h` 即所选屏
+/// 归一化坐标基数 = 所选屏分辨率，注入侧 `dst_w/dst_h` 即所选屏
 /// 分辨率（`InputInjector::set_resolution` 在显示器切换时同步更新），由此
 /// 识别目标屏。返回首个精确匹配索引；无匹配 → `None`（调用方回退主屏）。
 /// 同分辨率多屏取首个匹配（注入接口未携带屏索引，分辨率匹配为最小可行
@@ -531,7 +531,7 @@ const MAX_ACTIVE_DISPLAYS: u32 = 32;
 /// - 未知键码/非法参数 → [`InjectError::InvalidEvent`]。
 #[cfg(target_os = "macos")]
 pub fn inject(ev: &PipeEvent, dst_w: u32, dst_h: u32) -> Result<(), InjectError> {
-    // M8-T020 SRV-SKEY-014: 特殊键走独立路径——锁屏（CGSession）在
+    // SRV-SKEY-014: 特殊键走独立路径——锁屏（CGSession）在
     // 分辨率未知时也应可用，先于分辨率校验处理。
     if ev.kind == InputKind::SpecialKey {
         return inject_special_key(ev.combo);
@@ -575,7 +575,7 @@ pub fn inject(_ev: &PipeEvent, _dst_w: u32, _dst_h: u32) -> Result<(), InjectErr
 }
 
 // ════════════════════════════════════════════════════════════════
-// M8-T020 特殊键注入（SRV-SKEY-013/014/016）
+// 特殊键注入（SRV-SKEY-013/014/016）
 // ════════════════════════════════════════════════════════════════
 
 /// 纯函数：`SpecialCombo` → kVK 序列（修饰键按住 → 主键 → 修饰键抬起）。
@@ -800,7 +800,7 @@ fn build_event(
             }
             e
         }
-        // M8-T020: 特殊键由 [`inject`] 提前拦截走 [`inject_special_key`]
+        // 特殊键由 [`inject`] 提前拦截走 [`inject_special_key`]
         // （多事件序列/锁屏调用），不会到达单事件构建；此处为穷尽匹配兜底。
         InputKind::SpecialKey => {
             return Err(InjectError::InvalidEvent(
@@ -834,7 +834,7 @@ fn display_rect(dlls: &CGDlls, id: u32) -> DisplayRect {
 ///
 /// CGEvent 使用 point（逻辑点）：Retina 下 1 point = scale 像素，各屏
 /// scale 独立（`scale = pixels / bounds`）。`dst_w/dst_h` 为**选中显示器**
-/// 分辨率（M8-T018 归一化基数 = 所选屏分辨率）——`CGGetActiveDisplayList`
+/// 分辨率（归一化基数 = 所选屏分辨率）——`CGGetActiveDisplayList`
 /// 枚举活跃显示器布局后按像素分辨率匹配目标屏（[`select_display_by_resolution`]），
 /// 取其全局原点叠加偏移（[`to_global_point`]）：副屏在左/上时注入点为负
 /// 全局坐标、右/下为正。无匹配/枚举失败回退主显示器（`CGMainDisplayID`，
@@ -1041,7 +1041,7 @@ mod tests {
         );
     }
 
-    /// M8-T020 T003: Win 组合 → Cmd 序列（按住→点按→释放，释放步最后）。
+    /// T003: Win 组合 → Cmd 序列（按住→点按→释放，释放步最后）。
     #[test]
     fn test_kvk_sequence_win_combos() {
         let seq = kvk_sequence(SpecialCombo::WinE).unwrap();
@@ -1056,7 +1056,7 @@ mod tests {
         }
     }
 
-    /// M8-T020 T003: Ctrl+Shift+Esc 六步；Alt+F4 → Cmd+W（语义翻译）。
+    /// T003: Ctrl+Shift+Esc 六步；Alt+F4 → Cmd+W（语义翻译）。
     #[test]
     fn test_kvk_sequence_misc() {
         let seq = kvk_sequence(SpecialCombo::CtrlShiftEsc).unwrap();
@@ -1078,7 +1078,7 @@ mod tests {
         assert_eq!(seq[3], (0x3B, false)); // Ctrl up last
     }
 
-    /// M8-T020 T003: AltTab / LockScreen 无 kVK 序列（上层分别返回不支持/走锁屏）。
+    /// T003: AltTab / LockScreen 无 kVK 序列（上层分别返回不支持/走锁屏）。
     #[test]
     fn test_kvk_sequence_unsupported_variants() {
         assert_eq!(kvk_sequence(SpecialCombo::AltTab), None);
@@ -1256,7 +1256,7 @@ mod tests {
         assert_eq!(to_global_point(100, 200, &d), CGPoint::new(100.0, 200.0));
     }
 
-    /// 选中显示器 = 像素分辨率匹配（M8-T018 基数跟随）；无匹配 → None。
+    /// 选中显示器 = 像素分辨率匹配（基数跟随）；无匹配 → None。
     #[test]
     fn test_select_display_by_resolution() {
         // 屏0 主 1920x1080；屏1 右 2560x1440（Retina 逻辑 1280x720）。

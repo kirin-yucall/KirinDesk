@@ -1,4 +1,4 @@
-//! 平台音频播放（M8-T015 P2C T3.3）：跨平台共享渲染，消费 float32 PCM。
+//! 平台音频播放（P2C T3.3）：跨平台共享渲染，消费 float32 PCM。
 //!
 //! - [`AudioPlayback`]：播放抽象 trait（`start` 启动播放线程，从通道消费
 //!   [`AudioPcm`] 帧并写入平台播放设备；`stop` 幂等释放）。

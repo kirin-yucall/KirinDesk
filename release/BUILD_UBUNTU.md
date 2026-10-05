@@ -13,7 +13,7 @@ sudo apt install build-essential libssl-dev pkg-config \
     libpulse-dev libudev-dev ffmpeg libavcodec-dev
 ```
 
-> 说明（，M12-T001/T003/M13-T001 Linux 侧）：
+> 说明（Linux 侧）：
 > - `libpipewire-0.3-dev`：**必需**——屏幕捕获（screen-cast portal 帧流）与
 >   音频捕获/播放（`pw_stream`）均经 PipeWire；pipewire crate（=0.8.0）
 >   编译期经 system-deps 探测它。

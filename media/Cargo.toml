@@ -28,7 +28,7 @@ rand.workspace = true
 quinn = "0.11"
 quinn-proto = "0.11"
 # socket2：QUIC 双栈 bind 需在 bind 前设置 IPV6_V6ONLY=false
-# （std::net::UdpSocket 无 set_only_v6，仅 TcpSocket 有；见 M8-T025_P3）
+# （std::net::UdpSocket 无 set_only_v6，仅 TcpSocket 有）
 socket2 = "0.6"
 # ring feature：rustls 0.23 需要进程级 CryptoProvider（quic.rs ensure_crypto_provider）
 rustls = { version = "0.23", features = ["ring"] }
@@ -40,7 +40,7 @@ time = "0.3"             # QUIC/TLS 握手与证书时间戳处理
 kirin-desk-core = { path = "../core" }
 
 # ══════════════════════════════════════════════════════════════════
-# 跨平台屏幕捕获后端依赖（M8-T008 §Step 1）
+# 跨平台屏幕捕获后端依赖（§Step 1）
 # Windows: windows-capture crate（唯一后端，旧 WGC/DXGI/GDI 已删）
 # macOS: zed-scap（M12-MAC 落地，见 远控服务端_需求文档 §3.2.3）
 # Linux: zed-scap（M12 落地时添加）
@@ -91,7 +91,7 @@ zbus = "=3.15.2"
 # ══════════════════════════════════════════════════════════════════
 # gpu-kernel（默认 off）：构建并链接根级 libkirin_gpu/（C++ D3D11 零拷贝
 #   GPU 内核）。开启后由 build.rs 探测 CMake + MSVC；任一缺失则自动降级为
-#   CPU-only（不阻断 cargo build）。详见 M8-T008_P1B。
+#   CPU-only（不阻断 cargo build）。
 [features]
 default = []
 gpu-kernel = []
@@ -103,7 +103,7 @@ required-features = []
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
-# M8-T026-P1: 打洞路径集成测试（进程内 rendezvous 服务端）。
+# 打洞路径集成测试（进程内 rendezvous 服务端）。
 kirin-desk-relay = { path = "../relay" }
 
 # P1G §T7.1：编码层三场景基准（合成帧驱动，跨平台）。

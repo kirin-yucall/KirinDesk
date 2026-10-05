@@ -1,6 +1,6 @@
 # KirinDesk 内网穿透服务端 — relay-server
 
-frps 等价的独立服务端二进制（M8-T026），部署在**公网服务器**上，
+frps 等价的独立服务端二进制，部署在**公网服务器**上，
 供内网机器通过 `kirin_desk tunnel start`（或独立 client）回连建隧道。
 
 - Windows：直接使用本目录 `relay-server.exe`（已构建）。
@@ -109,7 +109,7 @@ relay-server.exe --bind-addrs 0.0.0.0,:: --bind-port 7000 --token <高熵token�
 启动后控制台会打印服务器 Ed25519 公钥（**客户端 ID 模式须预置
 `[tunnel] server_pubkey`**）与监听地址。`Ctrl+C` 优雅退出。
 
-打洞（P2P 穿透，M8-T026-P1）默认随服务端启用：另开一个监听端口
+打洞（P2P 穿透）默认随服务端启用：另开一个监听端口
 `--rendezvous-port`（默认 `7001`）承载打洞候选登记/互转/限速/审计
 （**只做牵线，不进入数据面**，PUNCH-SEC-002）；不需要时可
 `--no-rendezvous` 关闭：
@@ -174,7 +174,7 @@ remote_port = 0            # 0 = 从服务端 --port-range 自动分配
 - 数据面 V1 为明文管道（设计依据：应用层已加密——SSH/RDP/TLS 等自带加密）；
   穿透明文协议（HTTP 等）时流量裸露，敏感场景请经 KirinDesk SecureChannel。
 - 支持 IPv4/IPv6 双栈客户端（Windows 上显式 `IPV6_V6ONLY=false`，对齐 Linux
-  默认行为；M8-T025）。
+  默认行为）。
 
 
 `token_hash` = hex(sha256(token))〕/ 设备缓存 token / 设备目录条目 /

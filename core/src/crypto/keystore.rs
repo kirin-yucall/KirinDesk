@@ -15,7 +15,7 @@
 //! ```
 //!
 //!
-//! R13-S2（配置加密，M15-T005 密钥来源分层）将复用本模块的 [`KeyStore`] trait
+//! R13-S2（配置加密，密钥来源分层）将复用本模块的 [`KeyStore`] trait
 
 use std::path::{Path, PathBuf};
 

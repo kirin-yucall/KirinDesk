@@ -22,7 +22,7 @@ use tracing::{debug, info, trace};
 /// - "desktop" → remote desktop (screen + input)
 /// - "server"  → remote shell (terminal PTY)
 ///
-/// 并行契约（P5 消费，见 M8-T025_P1）：`ipv6_addr` 保持 `Ipv6Addr` 类型不变，
+/// 并行契约（P5 消费）：`ipv6_addr` 保持 `Ipv6Addr` 类型不变，
 /// IPv4-only 设备以 `Ipv6Addr::UNSPECIFIED`（`::`）哨兵表示"无 IPv6"；
 /// 地址选择一律走 `select_connect_addr`（哨兵在内部消化）。
 #[derive(Debug, Clone)]

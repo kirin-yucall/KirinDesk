@@ -1,6 +1,6 @@
 ﻿//! Windows Capture 后端 — 使用 `windows-capture` crate。
 //!
-//! Windows 唯一后端（M8-T008 §Step 1，无 WGC/DXGI/GDI 回退链）。
+//! Windows 唯一后端（§Step 1，无 WGC/DXGI/GDI 回退链）。
 //!
 //! 使用 `start_free_threaded()` 在后台线程运行捕获事件循环，
 //! 通过 `mpsc` channel 向主线程投递帧数据。
@@ -127,7 +127,7 @@ impl GraphicsCaptureApiHandler for WcHandler {
 // 显示器枚举（windows-capture 唯一后端，替代旧 GDI/DXGI 枚举）
 // ════════════════════════════════════════════════════════════════
 
-/// 显示器名称是否虚拟（M8-T030 §3.3 显示器关键词表；大小写不敏感子串匹配）。
+/// 显示器名称是否虚拟（§3.3 显示器关键词表；大小写不敏感子串匹配）。
 ///
 /// `virtual_keywords`（全局偏好）非空时覆盖默认表（适配器 + 显示器共用开关）。
 fn is_virtual_monitor(name: &str) -> bool {
@@ -140,7 +140,7 @@ fn is_virtual_monitor(name: &str) -> bool {
     }
 }
 
-/// 枚举显示器（M8-T030 过滤虚拟屏），返回过滤后列表 + 索引映射。
+/// 枚举显示器（过滤虚拟屏），返回过滤后列表 + 索引映射。
 ///
 /// `real_indices[i]` = 过滤后索引 `i` → windows-capture **1-based 全量索引**
 /// （设计文档 §3.6，消除"过滤列表索引 vs 全量索引错位"隐患）。
@@ -278,7 +278,7 @@ pub struct WindowsCaptureBackend {
     stop_flag: Arc<AtomicBool>,
     /// 显示器列表
     monitors: Vec<MonitorInfo>,
-    /// M8-T030（）：过滤后索引 → windows-capture 1-based 全量索引映射
+    /// 过滤后索引 → windows-capture 1-based 全量索引映射
     /// （虚拟屏剔除后 `Monitor::from_index` 必须用全量索引，否则列表错位）。
     real_indices: Vec<usize>,
     /// 当前显示器索引
@@ -297,7 +297,7 @@ impl WindowsCaptureBackend {
     ///
     /// `monitor_index`: 0-based 显示器索引（过滤虚拟屏后的位置）。
     pub fn new(monitor_index: usize) -> Result<Self, CaptureError> {
-        // 1. 枚举显示器（M8-T030 过滤虚拟屏；windows-capture 唯一后端）
+        // 1. 枚举显示器（过滤虚拟屏；windows-capture 唯一后端）
         let (monitors, real_indices) = enumerate_monitors_filtered()?;
         if monitor_index >= monitors.len() {
             return Err(CaptureError::InvalidMonitor);
@@ -367,7 +367,7 @@ impl ScreenCaptureSource for WindowsCaptureBackend {
         Ok(frame)
     }
 
-    /// M8-T018（MON-NF-002）：静默屏幕（无帧到达）时按超时醒来——上层借此
+    /// MON-NF-002：静默屏幕（无帧到达）时按超时醒来——上层借此
     /// 处理显示器切换命令，切换延迟与屏幕活动度解耦。
     fn wait_for_frame_timeout(
         &mut self,
@@ -431,7 +431,7 @@ impl ScreenCaptureSource for WindowsCaptureBackend {
         // Stop old capture
         self.stop_capture();
 
-        // Start new capture（M8-T030：经 real_indices 映射全量索引）。
+        // Start new capture（经 real_indices 映射全量索引）。
         let wc_monitor = Monitor::from_index(self.real_indices[index])
             .map_err(|e| CaptureError::Capture(format!("Monitor::from_index: {e}")))?;
         let w = wc_monitor.width().unwrap_or(self.monitors[index].width);

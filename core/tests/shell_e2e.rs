@@ -472,7 +472,7 @@ async fn test_shell_e2e_whitelist_rejects_evil_domain() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
-/// M8-T027 (SRV-IDWL-020 旧接口): 双白名单 OR 语义——域名未命中但设备 ID
+/// (SRV-IDWL-020 旧接口): 双白名单 OR 语义——域名未命中但设备 ID
 /// 命中 → 放行；两维均未命中 → 拒绝（headless 无审批）。
 #[tokio::test]
 async fn test_shell_e2e_id_whitelist_semantics() {

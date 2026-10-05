@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# KirinDesk 版本发布脚本 — M14-T006
+# KirinDesk 版本发布脚本 — 
 #
 # 流程：版本号写入 Cargo.toml → CHANGELOG 归档 → commit → GPG 签名 tag →
 #       push（触发 CI release job 打包）→ gh run watch → 下载产物 → gh release create。

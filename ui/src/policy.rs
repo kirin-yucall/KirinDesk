@@ -21,7 +21,7 @@ use kirin_desk_core::crypto::handshake::{
 use kirin_desk_dns::txt::TxtManager;
 use kirin_desk_utils::config::Config;
 use kirin_desk_utils::known_hosts::KnownClientsStore;
-// M8-T038 (P6): 连接失败引导提示（用户可见，拼入连接状态与日志）走 t!()。
+// (P6): 连接失败引导提示（用户可见，拼入连接状态与日志）走 t!()。
 use crate::t;
 use std::time::Duration;
 
@@ -79,7 +79,7 @@ pub async fn resolve_expected_client_key(
     }
 }
 
-/// 临时连接窗口是否生效（M8-T017 / SRV-TMP-006 统一判断点）。
+/// 临时连接窗口是否生效（SRV-TMP-006 统一判断点）。
 ///
 /// GUI / CLI 服务器共用此实现（不再各自读时间戳文件），仅需在
 /// 白名单跳过判定上 OR 本结果；窗口判定实现（状态文件读取/过期）唯一
@@ -90,7 +90,7 @@ pub fn temp_mode_window_active() -> bool {
         .unwrap_or(false)
 }
 
-/// 激活中的临时连接窗口管理器（M8-T017 / SRV-TMP-HK-001 统一构造点）。
+/// 激活中的临时连接窗口管理器（SRV-TMP-HK-001 统一构造点）。
 ///
 /// 窗口激活 → `Some(manager)`（供握手二态校验 / 白名单跳过）；未激活/不可用
 /// → `None`。调用方（CLI/GUI 服务器）**逐连接**获取并传入
@@ -135,18 +135,18 @@ pub fn response_signature_bind_id(
 /// （SRV-SEC-KH-001/002）；白名单在验证之前判定（headless：不泄露服务器
 /// X25519 公钥/响应签名），`temp_mode` / `temp_window` 可绕过。
 ///
-/// M8-T027 (SRV-IDWL-020)：`allowed_ids` 为设备 ID 白名单（调用方从
+/// (SRV-IDWL-020)：`allowed_ids` 为设备 ID 白名单（调用方从
 /// `cfg.id_whitelist_active_ids(Utc::now())` 取得）；访问控制公式为
 /// **`domain_match || id_match`**（双白名单 OR 语义，域名维度既有行为不变），
 /// temp_mode / temp_window 跳过时两维一并跳过（SRV-IDWL-024）。
 ///
-/// M13-T005（UA-ACCEPT-001/002）：`unattended = true` 时访问控制切换为
+/// UA-ACCEPT-001/002：`unattended = true` 时访问控制切换为
 /// 「自动接受」策略——白名单命中（域名 **或** ID，SRV-IDWL-003）或
 /// known_clients 命中 → 自动允许（无弹窗、无需 temp mode）；两者均未命中 →
 /// 直接拒绝（`Rejected("unattended: ...")`），不存在人工审批路径。调用方应
 /// 保证无人值守下 `temp_mode` 已置 false（UA-ACCEPT-004）。
 ///
-/// M8-T017（SRV-TMP-HK-001/003）：`temp_window` 为激活中的临时连接窗口时，
+/// SRV-TMP-HK-001/003：`temp_window` 为激活中的临时连接窗口时，
 /// 挑战码按二态校验（固定 **或** 临时），且与 `temp_mode` 共同跳过白名单；
 /// `None` = 窗口期外，临时码一律失败，不产生任何旁路。
 ///
@@ -261,7 +261,7 @@ pub async fn server_accept_handshake_ex(
     }
 
     // 2. 访问控制（headless：先白名单后验证，非白名单不泄露信息）。
-    // M8-T027: 双白名单 OR —— 域名命中 **或** 设备 ID 命中即视为白名单命中。
+    // 双白名单 OR —— 域名命中 **或** 设备 ID 命中即视为白名单命中。
     // ① 域名维显式排除 GUI 客户端固定魔值 `gui-client.local`（防用户误加
     //    魔值/能命中它的通配后，任意 IP 客户端凭魔值即免审批）；
     //    域名客户端的 client_id 是自报昵称（弱凭据），对 ID 白名单一律不命中。
@@ -425,7 +425,7 @@ pub fn record_successful_handshake(known: &mut KnownClientsStore, client_id: &st
     }
 }
 
-/// M8-T017-P2 (CLI-TMP-003): 连接失败引导提示。
+/// (CLI-TMP-003): 连接失败引导提示。
 ///
 /// 安全约束：不泄露服务端窗口状态（HK-002/SRV-SEC-WL）——文案对
 /// 「固定码错误 / 临时码过期 / 临时码错误」统一覆盖，不做线上区分；
@@ -444,7 +444,7 @@ pub fn connect_failure_challenge_hint(challenge: &str) -> Option<String> {
         && challenge
             .chars()
             .all(|c| "ABCDEFGHJKLMNPQRSTUVWXYZ23456789".contains(c));
-    // M8-T038 (P6): 文案走 t!()——zh 模板保持现语义逐字（单测断言
+    // (P6): 文案走 t!()——zh 模板保持现语义逐字（单测断言
     // 「固定挑战码错误」「临时连接码格式」等子串），en 补翻译。
     let hint = if temp_like {
         t!("policy.challenge_hint.temp")
@@ -1140,7 +1140,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// M8-T017 (SRV-TMP-HK-001/002 + SRV-TMP-006): 临时连接窗口端到端——
+    /// (SRV-TMP-HK-001/002 + SRV-TMP-006): 临时连接窗口端到端——
     /// 窗口激活（注入隔离状态文件）+ 无白名单：客户端携带临时挑战码 → 握手
     /// 成功（白名单跳过 + 二态校验通过）；携带错码 → 验证失败被拒。
     ///
@@ -1314,7 +1314,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// M8-T017-P2 (CLI-TMP-003): 10 位且全字符属于临时码字符集
+    /// (CLI-TMP-003): 10 位且全字符属于临时码字符集
     /// （A-Z 去 O/I + 2-9 去 0/1）→ 优先提示临时码场景（方案 B 格式判定；
     /// S-20 / F-25：码长 8 → 10）。
     #[test]
@@ -1330,7 +1330,7 @@ mod tests {
         assert!(hint2.contains("临时连接码格式"), "hint: {}", hint2);
     }
 
-    /// M8-T017-P2 (CLI-TMP-003): 长度非 10 或含 0/1/O/I 的码 →
+    /// (CLI-TMP-003): 长度非 10 或含 0/1/O/I 的码 →
     /// 走通用文案（不误判为临时码）。
     #[test]
     fn test_hint_non_temp_format_uses_generic_wording() {
@@ -1348,14 +1348,14 @@ mod tests {
         assert!(hint3.contains("固定挑战码错误"), "hint: {}", hint3);
     }
 
-    /// M8-T017-P2 (CLI-TMP-003): 未提供挑战码 → 无提示（固定码未配置的
+    /// (CLI-TMP-003): 未提供挑战码 → 无提示（固定码未配置的
     /// 免校验连接失败多为网络/白名单问题，不误导）。
     #[test]
     fn test_hint_empty_challenge_returns_none() {
         assert!(connect_failure_challenge_hint("").is_none());
     }
 
-    // ---- M8-T027: 设备 ID 白名单决策表（SRV-IDWL-020/021/023/024） ----
+    // ---- : 设备 ID 白名单决策表（SRV-IDWL-020/021/023/024） ----
 
 
     /// ID 白名单 / 挑战码（挑战码正确与否由调用方控制）。

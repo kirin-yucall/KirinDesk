@@ -1,12 +1,12 @@
 //! M10: 设备列表持久化 — `SavedDevice` 与 `DeviceStore`。
 //!
 //! 连接成功的设备自动保存到 `kirin_desk/devices.json`（路径经 `dirs` crate
-//! 跨平台解析，与 M1-T002 配置路径策略一致，复用 `Config::config_dir()`）。
+//! 跨平台解析，与 配置路径策略一致，复用 `Config::config_dir()`）。
 //!
 //! 按 `id`（DNS 子域标识 `{id}.{domain}`）去重：重复连接只更新记录并刷新
 //! `last_seen`。
 //!
-//! M8-T037: 展示顺序改为**手动排序优先**——列表按 `sort_order` 升序展示；
+//! 展示顺序改为**手动排序优先**——列表按 `sort_order` 升序展示；
 //! `upsert` 新设备追加到末尾（`sort_order = max + 1`，不打乱手动排序）；
 //! 旧数据（`sort_order` 全为默认 0）首次加载按 `last_seen` 降序迁移为连续序号。
 
@@ -48,10 +48,10 @@ pub struct SavedDevice {
     ///   读取点仅 trim 空白归一（[`normalize_legacy_id_nicknames`]）；
     ///   自动保存恒为 `server_id`，不得改动（读取点零触碰）。
     pub nickname: String,
-    /// 备注名（M8-T037：用户本地标注，不参与连接；默认空）。
+    /// 备注名（用户本地标注，不参与连接；默认空）。
     #[serde(default)]
     pub remark: String,
-    /// 挑战码（M8-T037：连接时预填 Connect 表单；默认空 = 无挑战码）。
+    /// 挑战码（连接时预填 Connect 表单；默认空 = 无挑战码）。
     #[serde(default)]
     pub challenge: String,
     /// IPv6 地址（发现结果）。
@@ -66,7 +66,7 @@ pub struct SavedDevice {
     pub last_seen: DateTime<Utc>,
     /// 所在域名（DNS 发现用）。
     pub domain: String,
-    /// 手动排序序号（M8-T037：列表按此升序展示；上移/下移交换相邻项）。
+    /// 手动排序序号（列表按此升序展示；上移/下移交换相邻项）。
     #[serde(default)]
     pub sort_order: u32,
     /// [`DeviceConnMode::Unknown`]，回填/展示回落既有启发式，旧 devices.json
@@ -110,7 +110,7 @@ pub enum DeviceError {
 }
 
 impl DeviceStore {
-    /// 默认设备文件路径: `{config_dir}/kirin_desk/devices.json`（同 M1-T002 策略）。
+    /// 默认设备文件路径: `{config_dir}/kirin_desk/devices.json`（同 策略）。
     pub fn default_path() -> Result<PathBuf, DeviceError> {
         let base = Config::config_dir().map_err(|_| DeviceError::NoConfigDir)?;
         Ok(base.join("devices.json"))
@@ -135,7 +135,7 @@ impl DeviceStore {
                     path: path.to_path_buf(),
                     devices,
                 };
-                // M8-T037: 旧数据迁移——所有记录 sort_order 均为默认 0 时（旧版
+                // 旧数据迁移——所有记录 sort_order 均为默认 0 时（旧版
                 // 无该字段），按 last_seen 降序生成连续序号（保持"最近连接排前"
                 // 既有体验，迁移后由用户手动接管）。
                 if !store.devices.is_empty()
@@ -224,7 +224,7 @@ impl DeviceStore {
     /// - **用户字段（恒保留）**：`remark`/`challenge`/`sort_order`。`id` 为
     ///   匹配键，两侧相等。
     ///
-    /// M8-T037: 新设备追加到列表末尾（`sort_order = max + 1`，全字段写入
+    /// 新设备追加到列表末尾（`sort_order = max + 1`，全字段写入
     /// 入参值——IP 模式自动保存路径 `nickname = server_id`（凭据）落库；
     /// `last_seen` 应填 `Utc::now()`。
     pub fn upsert(&mut self, device: SavedDevice) {
@@ -281,7 +281,7 @@ impl DeviceStore {
     }
 
     /// 编辑设备：备注名 / 地址(IP 或域名) / 端口 / 昵称 / 挑战码，返回是否
-    /// 找到该设备（M8-T037：昵称/挑战码/备注名允许为空——空昵称=展示回退 id，
+    /// 找到该设备（：昵称/挑战码/备注名允许为空——空昵称=展示回退 id，
     /// 空挑战码=无挑战码）。
     ///
     /// 地址解析：`host` 可解析为 IP → 更新 `ipv6` 并清空 `domain`；否则视为
@@ -477,7 +477,7 @@ mod tests {
 
     #[test]
     fn test_new_devices_append_to_end() {
-        // M8-T037: 新设备 sort_order = max + 1，追加列表末尾（手动排序不被新设备打断）。
+        // 新设备 sort_order = max + 1，追加列表末尾（手动排序不被新设备打断）。
         let path = test_dir("append").join("devices_append.json");
         let mut store = DeviceStore::load_from(&path).unwrap();
         store.upsert(sample_device("pc-a", "PC A", Utc::now()));
@@ -546,7 +546,7 @@ mod tests {
 
     #[test]
     fn test_legacy_devices_migrated_by_last_seen() {
-        // M8-T037: 旧格式（无 sort_order/remark/challenge 字段）加载不失败；
+        // 旧格式（无 sort_order/remark/challenge 字段）加载不失败；
         // sort_order 全缺省 → 按 last_seen 降序迁移。
         let dir = test_dir("legacy");
         let path = dir.join("devices_legacy.json");

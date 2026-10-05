@@ -1,12 +1,12 @@
-//! M8-T038 (P3): Settings 页键值表（zh 基线 + en 全量）。
-//! 本分区文件由 M8-T038_P3 独占认领。
+//! (P3): Settings 页键值表（zh 基线 + en 全量）。
+//! 本分区文件由 独占认领。
 //!
 //! zh 为基线语言包（当前界面文案统一后的中文版本）；en 全量翻译（不得留空串）。
 //! 动态文案模板使用 `{0}`/`{1}` 位置参数，zh/en 占位符一一对应。
 
 pub static TABLE: &[(&str, &str, &str)] = &[
     // ── 分组标题 ──
-    // M8-T039: `settings.tunnel.*` 全部键随 Settings Tunnel 分组整体删除——
+    // `settings.tunnel.*` 全部键随 Settings Tunnel 分组整体删除——
     // 内网穿透迁至顶部导航独立页（tunnel.rs 分区，键前缀 `tunnel.*`）。
     ("settings.unattended.title", "无人值守模式", "Unattended Mode"),
     ("settings.identity.title", "身份", "Identity"),

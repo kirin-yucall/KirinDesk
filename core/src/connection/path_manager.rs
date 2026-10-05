@@ -1,7 +1,7 @@
-//! M8-T026-P1 (PATH-001~005/007): PathManager 多路径叠加 —— 路径表 + 状态机 +
+//! (PATH-001~005/007): PathManager 多路径叠加 —— 路径表 + 状态机 +
 //! 通道级分配 + 换路决策 + 中继 standby 语义。
 //!
-//! 设计红线（对齐 `M8-T026_P1_打洞辅助与多路径叠加.md` §1）：
+//! 设计红线（对齐 `_打洞辅助与多路径叠加.md` §1）：
 //! - **叠加止步通道级分配**：媒体/控制按通道走不同路径（对齐 `multiplex.rs`
 //!   四通道 Control/Video/Audio/Input 分类），不做字节级流量聚合；
 //! - 中继兜底保证（PATH-005）：③ 随会话建立，直连/打洞 Active 后转 Standby
@@ -14,7 +14,7 @@
 //! 分配随之让位）；`evaluate()` 产出 [`SwitchAction`]（期望 ≠ 已应用时），
 //! 调用方执行迁移/热替换后调 [`PathManager::on_switch_completed`] 确认并落审计。
 //! P2 的 `IdConnector` 三级路径编排直接复用本 API
-//! （见 `M8-T026_接口交互协调.md` §3.3 冻结签名）。
+//! （见 `_接口交互协调.md` §3.3 冻结签名）。
 
 use kirin_desk_utils::audit::{AuditEvent, AuditLogger};
 use std::collections::HashMap;
@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 pub enum PathKind {
     /// ① P2P 直连 IPv6。
     DirectV6,
-    /// ① P2P 直连 IPv4（M8-T025）。
+    /// ① P2P 直连 IPv4。
     DirectV4,
     /// ② P2P 打洞 UDP（主路径）。
     PunchUdp,
@@ -77,7 +77,7 @@ pub enum PathState {
     Failed,
 }
 
-/// 路径质量指标（PATH-007；对齐 M8-T014 报告结构：rtt/loss/jitter）。
+/// 路径质量指标（PATH-007；对齐 报告结构：rtt/loss/jitter）。
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct PathMetrics {
     /// 往返时延（毫秒）。

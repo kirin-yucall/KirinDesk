@@ -39,7 +39,7 @@ use crate::widgets::{
 /// 维护面板支持的全部记录类型（DNS-MNT-006：A/AAAA/CNAME/MX/TXT/SRV/NS）。
 pub const RECORD_TYPES: [&str; 7] = ["A", "AAAA", "CNAME", "MX", "NS", "SRV", "TXT"];
 
-/// 类型筛选下拉项（"" = 全部；首项按当前语言翻译，M8-T038 P5）。
+/// 类型筛选下拉项（"" = 全部；首项按当前语言翻译，P5）。
 fn filter_items() -> [&'static str; 8] {
     [t!("domain.record.filter_all"), "A", "AAAA", "CNAME", "MX", "NS", "SRV", "TXT"]
 }
@@ -883,7 +883,7 @@ fn parse_mx_data(s: &str) -> Option<(u16, String)> {
 ///
 /// 返回 `true` = 本帧保存了服务商凭据（调用方据此同步 App 内存凭据，
 /// Connect 页 / 状态栏即时生效）。
-/// M8-T040 (WBS 6.1)：Domain 页入口。`ddns` 为 DDNS 卡控制器
+/// (WBS 6.1)：Domain 页入口。`ddns` 为 DDNS 卡控制器
 /// （KirinDeskApp 持有，状态共享槽 + worker 句柄）。
 pub fn show_domain_page(
     ui: &mut egui::Ui,
@@ -899,7 +899,7 @@ pub fn show_domain_page(
     egui::ScrollArea::vertical().show(ui, |ui| {
         saved |= show_provider_card(ui, theme, state);
         ui.add_space(theme.spacing);
-        // M8-T040：DDNS 维护卡（记录管理区上方，需求 §七 草图）。
+        // DDNS 维护卡（记录管理区上方，需求 §七 草图）。
         show_ddns_card(ui, theme, state, ddns);
         ui.add_space(theme.spacing);
         show_domain_card(ui, theme, state);
@@ -925,7 +925,7 @@ pub fn show_domain_page(
 
 /// UI-DNS-002: 凭据动态表单——字段来自 `dns_providers` 注册表定义
 /// （label/secret/mono 由定义驱动），值映射到 `cred_values`（key = 字段 key）。
-/// secret 字段密文输入 + 👁 切换（M15-T008 模式），切换状态记入 `show_secret`。
+/// secret 字段密文输入 + 👁 切换（模式），切换状态记入 `show_secret`。
 fn render_cred_fields(
     ui: &mut egui::Ui,
     theme: &Theme,
@@ -1534,7 +1534,7 @@ fn show_edit_window(ui: &mut egui::Ui, theme: &Theme, state: &mut DomainPanelSta
 }
 
 // ════════════════════════════════════════════════════════════════
-// M8-T040 (W3-A / WBS 6.1~6.2): DDNS 维护卡
+// (W3-A / WBS 6.1~6.2): DDNS 维护卡
 // ════════════════════════════════════════════════════════════════
 
 /// DDNS 维护卡控制器（`KirinDeskApp` 持有；生命周期 + 表单 + 状态共享槽）。

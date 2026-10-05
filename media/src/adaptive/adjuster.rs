@@ -3,7 +3,7 @@
 //! `Adjuster` 根据网络状态和编码耗时，计算下一窗口的编码配置。
 //! 超时保护独立于网络拥塞——编码器性能不足时主动降级。
 //!
-//! # M13-T003 带宽自适应
+//! # 带宽自适应
 //!
 //! 除状态机（丢包率 + RTT）驱动的档位外，`compute_config` 还叠加
 //! **低带宽 / 高延迟**即时降质：
@@ -20,7 +20,7 @@ use crate::adaptive::NetworkSample;
 use crate::adaptive::NetworkState;
 use crate::proto::EncodeConfig;
 
-/// 低带宽阈值（bps）：客户端接收速率低于此值追加降质（M13-T003，<5Mbps）。
+/// 低带宽阈值（bps）：客户端接收速率低于此值追加降质（<5Mbps）。
 pub const LOW_BANDWIDTH_BPS: u64 = 5_000_000;
 
 /// 低带宽追加的 QP 增量。
@@ -139,7 +139,7 @@ impl Adjuster {
         // 4. preset
         let preset = base_preset_for_state(state).to_string();
 
-        // 5. M13-T003 带宽/延迟自适应（叠加降质，上限 QP 35 / 帧率 ≥ 0.1）：
+        // 5. 带宽/延迟自适应（叠加降质，上限 QP 35 / 帧率 ≥ 0.1）：
         //    - 低带宽（<5Mbps）→ 降低码率（QP+2）+ 降低帧率（×0.7）
         //    - 高延迟（RTT ≥ 100ms）→ 同样降质（M13 文档：高延迟降质量/帧率）
         if sample.received_bitrate_bps < LOW_BANDWIDTH_BPS as f64 {
@@ -379,7 +379,7 @@ mod tests {
         assert!((base_frame_ratio_for_state(NetworkState::SevereCongestion) - 0.2).abs() < 1e-6);
     }
 
-    // ── M13-T003：低带宽 / 高延迟降质 ───────────────────────────
+    // ──：低带宽 / 高延迟降质 ───────────────────────────
 
     /// 低带宽（<5Mbps）→ QP+2、帧率 ×0.7。
     #[test]

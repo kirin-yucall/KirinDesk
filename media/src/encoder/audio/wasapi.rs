@@ -1,10 +1,10 @@
-//! Windows WASAPI 环回/麦克风捕获（P1D §T4.1 + M8-T032）。
+//! Windows WASAPI 环回/麦克风捕获（P1D §T4.1 +）。
 //!
 //! 两种捕获共用一个骨架（见 [`run_capture_loop_common`]）：
 //! - **环回**（[`WasapiLoopbackCapture`]，系统声音）：取默认渲染端点
 //!   （`eRender`/`eConsole`），`IAudioClient` 以
 //!   `AUDCLNT_SHAREMODE_SHARED` + `AUDCLNT_STREAMFLAGS_LOOPBACK` 初始化环回捕获；
-//! - **麦克风**（[`WasapiMicCapture`]，M8-T032 客户端 talkback）：取默认
+//! - **麦克风**（[`WasapiMicCapture`]，客户端 talkback）：取默认
 //!   捕获端点（`eCapture`/`eCommunications`，即通话麦克风），**无** loopback
 //!   标志；其余（GetMixFormat → Initialize → GetBuffer 轮询 → 格式适配）共用。
 //!
@@ -147,7 +147,7 @@ impl Drop for WasapiLoopbackCapture {
     }
 }
 
-/// WASAPI 麦克风捕获器（M8-T032：客户端 talkback 回传）。
+/// WASAPI 麦克风捕获器（客户端 talkback 回传）。
 ///
 /// 与 [`WasapiLoopbackCapture`] 同骨架，差别仅在端点（`eCapture`/
 /// `eCommunications`，默认通话麦克风）与初始化标志（**无** loopback）。
@@ -645,7 +645,7 @@ mod tests {
         );
     }
 
-    /// M8-T032：麦克风捕获器创建/析构冒烟（eCapture 端点探测；无麦克风
+    /// 麦克风捕获器创建/析构冒烟（eCapture 端点探测；无麦克风
     /// 设备 → Err(InitFailed)，不 panic、不泄漏 COM 上下文）。
     #[test]
     fn test_mic_capture_create_drop() {

@@ -47,12 +47,12 @@ impl Priority {
             PacketKind::Video => Self::Video,
             PacketKind::Audio => Self::Audio,
             PacketKind::InputEcho => Self::Input,
-            // M13-T003: 剪贴板文本——小载荷、低延迟敏感度，归入音频档
+            // 剪贴板文本——小载荷、低延迟敏感度，归入音频档
             // （中优先级，不受 max_len 拥塞丢弃）。
             PacketKind::Clipboard => Self::Audio,
-            // M13-T006: 文件块——可靠流背压，归入音频档（不参与拥塞丢弃）。
+            // 文件块——可靠流背压，归入音频档（不参与拥塞丢弃）。
             PacketKind::FileTransfer => Self::Audio,
-            // M8-T018: 控制消息（显示器/隐私等，bincode ControlMessage）——
+            // 控制消息（显示器/隐私等，bincode ControlMessage）——
             // 低延迟敏感，与键鼠同权（最高优先级，可靠流不受拥塞丢弃）。
             PacketKind::Control => Self::Input,
         }

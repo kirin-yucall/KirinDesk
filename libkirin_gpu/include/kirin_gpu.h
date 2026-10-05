@@ -7,7 +7,7 @@
 // 不直连 NVENC/AMF/QSV SDK（FFmpeg 侧由 P1C 负责）；不 spawn 任何 exe。
 //
 // 设计目标：纹理永不回读 CPU；唯一读回为微变分支 RLE（几 KB）与大动分支
-// dirty 索引（≤ 几 KB）。详见 docs/共享层/M8-T008_P1B_C++零拷贝GPU内核.md。
+// dirty 索引（≤ 几 KB）。详见 docs/共享层/_C++零拷贝GPU内核.md。
 //
 // 平台：
 //   - Windows：D3D11 Compute（HLSL）主实现

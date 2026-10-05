@@ -1,7 +1,7 @@
-﻿//! M15-T002: 审计日志 — 所有安全事件写入 `~/.kirin_desk/logs/audit.log`。
+﻿//! 审计日志 — 所有安全事件写入 `~/.kirin_desk/logs/audit.log`。
 //!
 //! 路径经 `dirs` crate 跨平台解析（复用 `logging::default_log_dir()` 约定，
-//! 同 M1-T002 路径解析策略）。行格式（S-16c 消毒后恒为单行）：
+//! 同 路径解析策略）。行格式（S-16c 消毒后恒为单行）：
 //! `2026-08-01T12:00:00.000Z | 事件类型 | 详情`。
 //!
 //! 事件类型（SRV-SEC-AUDIT-002）：连接请求、握手成功/失败、身份认证、
@@ -52,83 +52,83 @@ pub enum AuditEvent {
     RateLimited,
     /// 连接断开。
     Disconnect,
-    /// M8-T019 (PRIV-SEC-001): 隐私模式开启（黑屏/锁屏）。
+    /// (PRIV-SEC-001): 隐私模式开启（黑屏/锁屏）。
     /// detail 含等级与发起方，如 `level=black initiator=remote`。
     PrivacyEnabled,
-    /// M8-T019 (PRIV-SEC-001): 隐私模式关闭（客户端请求恢复屏幕 / 本地逃生舱）。
+    /// (PRIV-SEC-001): 隐私模式关闭（客户端请求恢复屏幕 / 本地逃生舱）。
     PrivacyDisabled,
-    /// M8-T019 (PRIV-SEC-001): 隐私模式降级（Black→Lock）或执行失败。
+    /// (PRIV-SEC-001): 隐私模式降级（Black→Lock）或执行失败。
     PrivacyDegraded,
-    /// M8-T019 (PRIV-SEC-001): 断连 / 本地解锁自动恢复。
+    /// (PRIV-SEC-001): 断连 / 本地解锁自动恢复。
     PrivacyRecovered,
-    /// M8-T020 (SKEY-SEC-002): 特殊键锁屏请求（复用 T019 锁屏调用）。
+    /// (SKEY-SEC-002): 特殊键锁屏请求（复用 T019 锁屏调用）。
     /// detail 含来源，如 `ip=... client=... combo=LockScreen`。
     LockScreen,
-    /// M8-T017: 临时连接窗口开启（生成临时挑战码）。
+    /// 临时连接窗口开启（生成临时挑战码）。
     TempModeEnabled,
-    /// M8-T017: 临时连接窗口手动关闭。
+    /// 临时连接窗口手动关闭。
     TempModeDisabled,
-    /// M8-T017: 临时连接窗口过期（倒计时归零/残留状态文件清理）。
+    /// 临时连接窗口过期（倒计时归零/残留状态文件清理）。
     TempModeExpired,
-    /// M8-T026-P1 (PUNCH-SEC-004): 打洞成功（UDP/TCP 路径建立）。
+    /// (PUNCH-SEC-004): 打洞成功（UDP/TCP 路径建立）。
     /// detail 含设备与路径，如 `device=pc-a path=udp peer=203.0.113.5:9000`。
     TunnelPunchSuccess,
-    /// M8-T026-P1 (PUNCH-SEC-004): 打洞失败（探测超时/握手失败）。
+    /// (PUNCH-SEC-004): 打洞失败（探测超时/握手失败）。
     /// detail 含设备、路径与原因。
     TunnelPunchFailed,
-    /// M8-T026-P1 (PUNCH-SEC-004): NAT 老化触发重打洞（同会话重新候选交换）。
+    /// (PUNCH-SEC-004): NAT 老化触发重打洞（同会话重新候选交换）。
     /// detail 含设备与尝试次数，如 `device=pc-a attempt=1`。
     TunnelRepunch,
-    /// M8-T026-P1 (PUNCH-SEC-004): 路径切换（PATH-003 决策执行）。
+    /// (PUNCH-SEC-004): 路径切换（PATH-003 决策执行）。
     /// detail 含源/目标路径与原因，如 `from=relay to=punch-udp reason=rtt_degraded`。
     PathSwitch,
-    /// M8-T026 (TNL-SEC-003): 隧道登录成功（token 校验通过）。
+    /// (TNL-SEC-003): 隧道登录成功（token 校验通过）。
     /// detail 含客户端地址与主机名，如 `ip=[::1]:1234 hostname=pc-a`。
     TunnelLoginSuccess,
-    /// M8-T026 (TNL-SEC-003): 隧道登录失败（token 错误 / 版本不兼容）。
+    /// (TNL-SEC-003): 隧道登录失败（token 错误 / 版本不兼容）。
     /// detail 含客户端地址与原因（**不记录 token 原文**，TNL-SEC-005）。
     TunnelLoginFailed,
-    /// M8-T026 (TNL-SEC-003): 代理注册成功（绑定公网端口）。
+    /// (TNL-SEC-003): 代理注册成功（绑定公网端口）。
     /// detail 含客户端地址与代理名/端口，如 `ip=... proxy=ssh port=60022`。
     TunnelProxyRegistered,
-    /// M8-T026 (TNL-SEC-003): 代理移除（CloseProxy / 级联清理）。
+    /// (TNL-SEC-003): 代理移除（CloseProxy / 级联清理）。
     /// detail 含客户端地址与代理名。
     TunnelProxyRemoved,
-    /// M8-T026 (TNL-SEC-003): work 连接配对成功（数据面开始泵流）。
+    /// (TNL-SEC-003): work 连接配对成功（数据面开始泵流）。
     /// detail 含客户端地址与代理名。
     TunnelWorkConnOpened,
-    /// M8-T026 (TNL-SEC-003): work 连接关闭（任一端断开 / 配对失败 / 级联清理）。
+    /// (TNL-SEC-003): work 连接关闭（任一端断开 / 配对失败 / 级联清理）。
     /// detail 含客户端地址、代理名与原因。
     TunnelWorkConnClosed,
-    /// M8-T026 (TNL-SEC-003): 隧道速率限制拒绝（控制端口防爆破）。
+    /// (TNL-SEC-003): 隧道速率限制拒绝（控制端口防爆破）。
     /// detail 含客户端地址与判定，如 `ip=... decision=TooManyAttempts`。
     TunnelRateLimited,
-    /// M8-T026-P2 (ID-022): 设备注册上线（Login 携带 device_id 登记在线表）。
+    /// (ID-022): 设备注册上线（Login 携带 device_id 登记在线表）。
     /// detail 含设备与来源地址，如 `device=pc-a ip=...`。
     DeviceRegistered,
-    /// M8-T026-P2 (ID-022): 设备上线（重连重注册刷新在线表）。
+    /// (ID-022): 设备上线（重连重注册刷新在线表）。
     /// detail 含设备 ID。
     DeviceOnline,
-    /// M8-T026-P2 (ID-022): 设备离线（控制连接断开 / 心跳超时清理）。
+    /// (ID-022): 设备离线（控制连接断开 / 心跳超时清理）。
     /// detail 含设备 ID。
     DeviceOffline,
-    /// M8-T026-P2 (ID-022): 设备解析成功（返回候选 + 公钥，响应已签名）。
+    /// (ID-022): 设备解析成功（返回候选 + 公钥，响应已签名）。
     /// detail 含设备与在线状态，如 `device=pc-a online=true`。
     DeviceResolveAccepted,
-    /// M8-T026-P2 (ID-022): 设备解析拒绝（限速 / 协议违规）。
+    /// (ID-022): 设备解析拒绝（限速 / 协议违规）。
     /// detail 含设备与原因。
     DeviceResolveRejected,
-    /// M8-T026-P2 (ID-022): 连接路径选择（ID-011 三级路径编排结果）。
+    /// (ID-022): 连接路径选择（ID-011 三级路径编排结果）。
     /// detail 含目标与路径，如 `device=pc-a path=relay`（`punch_skipped` =
     /// P1 打洞未接入）。
     TunnelPathSelected,
-    /// M8-T027 (UI-IDWL-004): 设备 ID 白名单条目新增（CLI `add-id` / GUI 保存）。
+    /// (UI-IDWL-004): 设备 ID 白名单条目新增（CLI `add-id` / GUI 保存）。
     /// detail 含设备与过期时间，如 `device=device-7 expiry=2026-08-03T00:00:00Z`。
     WhitelistIdAdded,
-    /// M8-T027 (UI-IDWL-004): 设备 ID 白名单条目删除（CLI `remove-id` / GUI
+    /// (UI-IDWL-004): 设备 ID 白名单条目删除（CLI `remove-id` / GUI
     /// 列表删除）。detail 含设备 ID，如 `device=device-7`。
     WhitelistIdRemoved,
-    /// M8-T031: 身份凭证恢复（从未配发的过期 legacy 文件损坏/不可解密 →
+    /// 身份凭证恢复（从未配发的过期 legacy 文件损坏/不可解密 →
     /// 备份后重新生成身份；或后端已有身份、忽略损坏旧文件）。
     /// detail 含路径、label 与处置，如
     /// `path=...\ed25519.json label=kirindesk.identity.G7KJ2MNQ4X backup=...\ed25519.json.corrupt.1234`
@@ -155,12 +155,12 @@ impl fmt::Display for AuditEvent {
             AuditEvent::TempModeEnabled => "temp_mode_enabled",
             AuditEvent::TempModeDisabled => "temp_mode_disabled",
             AuditEvent::TempModeExpired => "temp_mode_expired",
-            // M8-T026-P1 (PUNCH-SEC-004): 打洞与路径切换事件。
+            // (PUNCH-SEC-004): 打洞与路径切换事件。
             AuditEvent::TunnelPunchSuccess => "tunnel_punch_success",
             AuditEvent::TunnelPunchFailed => "tunnel_punch_failed",
             AuditEvent::TunnelRepunch => "tunnel_repunch",
             AuditEvent::PathSwitch => "path_switch",
-            // M8-T026 (TNL-SEC-003): 隧道事件（7 类）。
+            // (TNL-SEC-003): 隧道事件（7 类）。
             AuditEvent::TunnelLoginSuccess => "tunnel_login_success",
             AuditEvent::TunnelLoginFailed => "tunnel_login_failed",
             AuditEvent::TunnelProxyRegistered => "tunnel_proxy_registered",
@@ -168,17 +168,17 @@ impl fmt::Display for AuditEvent {
             AuditEvent::TunnelWorkConnOpened => "tunnel_work_conn_opened",
             AuditEvent::TunnelWorkConnClosed => "tunnel_work_conn_closed",
             AuditEvent::TunnelRateLimited => "tunnel_rate_limited",
-            // M8-T026-P2 (ID-022): 设备 ID 模式事件（6 类）。
+            // (ID-022): 设备 ID 模式事件（6 类）。
             AuditEvent::DeviceRegistered => "device_registered",
             AuditEvent::DeviceOnline => "device_online",
             AuditEvent::DeviceOffline => "device_offline",
             AuditEvent::DeviceResolveAccepted => "device_resolve_accepted",
             AuditEvent::DeviceResolveRejected => "device_resolve_rejected",
             AuditEvent::TunnelPathSelected => "tunnel_path_selected",
-            // M8-T027 (UI-IDWL-004): 设备 ID 白名单增删事件。
+            // (UI-IDWL-004): 设备 ID 白名单增删事件。
             AuditEvent::WhitelistIdAdded => "whitelist_id_added",
             AuditEvent::WhitelistIdRemoved => "whitelist_id_removed",
-            // M8-T031: 身份凭证恢复事件。
+            // 身份凭证恢复事件。
             AuditEvent::IdentityRecovered => "identity_recovered",
         };
         f.write_str(s)
@@ -506,16 +506,16 @@ mod tests {
         assert_eq!(AuditEvent::ConnectionRequest.to_string(), "connection_request");
         assert_eq!(AuditEvent::AuthFailure.to_string(), "auth_failure");
         assert_eq!(AuditEvent::RateLimited.to_string(), "rate_limited");
-        // M8-T019 (PRIV-SEC-001): 隐私事件 display。
+        // (PRIV-SEC-001): 隐私事件 display。
         assert_eq!(AuditEvent::PrivacyEnabled.to_string(), "privacy_enabled");
         assert_eq!(AuditEvent::PrivacyDisabled.to_string(), "privacy_disabled");
         assert_eq!(AuditEvent::PrivacyDegraded.to_string(), "privacy_degraded");
         assert_eq!(AuditEvent::PrivacyRecovered.to_string(), "privacy_recovered");
-        // M8-T017: 临时连接事件 display。
+        // 临时连接事件 display。
         assert_eq!(AuditEvent::TempModeEnabled.to_string(), "temp_mode_enabled");
         assert_eq!(AuditEvent::TempModeDisabled.to_string(), "temp_mode_disabled");
         assert_eq!(AuditEvent::TempModeExpired.to_string(), "temp_mode_expired");
-        // M8-T026 (TNL-SEC-003): 隧道事件 display。
+        // (TNL-SEC-003): 隧道事件 display。
         assert_eq!(AuditEvent::TunnelLoginSuccess.to_string(), "tunnel_login_success");
         assert_eq!(AuditEvent::TunnelLoginFailed.to_string(), "tunnel_login_failed");
         assert_eq!(AuditEvent::TunnelProxyRegistered.to_string(), "tunnel_proxy_registered");
@@ -523,12 +523,12 @@ mod tests {
         assert_eq!(AuditEvent::TunnelWorkConnOpened.to_string(), "tunnel_work_conn_opened");
         assert_eq!(AuditEvent::TunnelWorkConnClosed.to_string(), "tunnel_work_conn_closed");
         assert_eq!(AuditEvent::TunnelRateLimited.to_string(), "tunnel_rate_limited");
-        // M8-T026-P1 (PUNCH-SEC-004): 打洞与路径切换事件 display。
+        // (PUNCH-SEC-004): 打洞与路径切换事件 display。
         assert_eq!(AuditEvent::TunnelPunchSuccess.to_string(), "tunnel_punch_success");
         assert_eq!(AuditEvent::TunnelPunchFailed.to_string(), "tunnel_punch_failed");
         assert_eq!(AuditEvent::TunnelRepunch.to_string(), "tunnel_repunch");
         assert_eq!(AuditEvent::PathSwitch.to_string(), "path_switch");
-        // M8-T027 (UI-IDWL-004): 设备 ID 白名单增删事件 display。
+        // (UI-IDWL-004): 设备 ID 白名单增删事件 display。
         assert_eq!(AuditEvent::WhitelistIdAdded.to_string(), "whitelist_id_added");
         assert_eq!(AuditEvent::WhitelistIdRemoved.to_string(), "whitelist_id_removed");
     }

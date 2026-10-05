@@ -47,11 +47,11 @@ pub enum ControlMessage {
     /// 视频格式（服务端 → 客户端，会话开始时推送）。
     ///
     /// 客户端解码 DATAGRAM 重组帧时需要输出分辨率（wire 帧头不携带
-    /// 宽高信息，M8-T009 §3.5）。会话建立后服务端立即推送一次，
+    /// 宽高信息，§3.5）。会话建立后服务端立即推送一次，
     /// 分辨率变更（显示器模式切换）时重新推送。
     VideoFormat { width: u32, height: u32 },
 
-    // ── M8-T018 多显示器查看 ──────────────────────────────────
+    // ── 多显示器查看 ──────────────────────────────────
     /// 显示器列表请求（客户端 → 服务端）。握手完成后客户端主动发送
     /// （SRV-MON-004）；热插拔后客户端可手动刷新（MON-NF-001）。
     DisplayListReq,
@@ -77,7 +77,7 @@ pub enum ControlMessage {
         decode_duration_ms: f64,
     },
 
-    /// M8-T019 (SRV-PRIV-001): 隐私模式控制（客户端 → 服务端）。
+    /// (SRV-PRIV-001): 隐私模式控制（客户端 → 服务端）。
     ///
     /// 黑屏（Level 1）：被控端屏幕被全屏纯黑覆盖窗口遮挡，客户端画面与
     /// 输入注入照常（黑屏 ≠ 发送黑帧）；锁屏（Level 2）：系统锁屏，锁屏后
@@ -88,7 +88,7 @@ pub enum ControlMessage {
         on: bool,
     },
 
-    /// M8-T019 (SRV-PRIV-002): 隐私模式响应（服务端 → 客户端）。
+    /// (SRV-PRIV-002): 隐私模式响应（服务端 → 客户端）。
     ///
     /// `ok = false` → 拒绝（平台锁屏调用失败等）；`active_level` 为服务端
     /// **实际生效**等级——请求 Black 但无 GUI 时降级为 Lock（SRV-PRIV-013），
@@ -325,7 +325,7 @@ mod tests {
         assert_eq!(msg, deserialized);
     }
 
-    // M8-T019 (SRV-PRIV-001/002): 隐私模式控制消息 wire 往返。
+    // (SRV-PRIV-001/002): 隐私模式控制消息 wire 往返。
     #[test]
     fn test_privacy_mode_serde() {
         for level in [PrivacyLevel::Black, PrivacyLevel::Lock] {
@@ -370,7 +370,7 @@ mod tests {
     }
 
     // ════════════════════════════════════════════════════════════
-    // M8-T018 多显示器：DisplayList 序列化往返 / 越界索引 Nack
+    // 多显示器：DisplayList 序列化往返 / 越界索引 Nack
     // ════════════════════════════════════════════════════════════
 
     fn sample_display_list() -> Vec<DisplayInfo> {

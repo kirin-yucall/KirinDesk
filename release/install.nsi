@@ -1,4 +1,4 @@
-; KirinDesk Windows Installer — M14-T002
+; KirinDesk Windows Installer — 
 ; ----------------------------------------------
 ; 构建：makensis install.nsi（需 NSIS 3.x，https://nsis.sourceforge.io）
 ; 输出：KirinDesk-Setup-<VERSION>.exe
@@ -8,7 +8,7 @@
 ;   - 含 FFmpeg DLL（avcodec-62 / avutil-60 / swscale-9 等）
 ;   - 开始菜单 + 桌面快捷方式，注册表卸载项，卸载器
 ; 注：安装后应用数据写入 %APPDATA%\kirin_desk（配置）与
-;     ~\.kirin_desk（身份/日志/FFmpeg DLL），与 M1-T002 目录策略一致。
+;     ~\.kirin_desk（身份/日志/FFmpeg DLL），与目录策略一致。
 
 Unicode true
 

@@ -1,4 +1,4 @@
-//! TCP(SecureChannel) 媒体传输 —— M8-T025 P4：TCP 优雅降级（tcp_fallback.rs）。
+//! TCP(SecureChannel) 媒体传输 —— P4：TCP 优雅降级（tcp_fallback.rs）。
 //!
 //! 实现 [`MediaTransport`] trait 的 TCP 版本 [`TcpMediaTransport`]：给定一条
 //! **已握手**的 [`SecureChannel`]（core 侧 TCP+AEAD 通道）即可完成全部媒体
@@ -6,7 +6,7 @@
 //! 成帧（`stream::frame_packet`），**不做 wire 协议扩展**，与既有
 //! SecureChannel 阶段字节流完全兼容。
 //!
-//! # 边界（M8-T025 §并行契约）
+//! # 边界（§并行契约）
 //!
 //! - **不实现中途降级逻辑**（那是 P5 会话层职责）；本模块只保证：给定一条
 //!   已握手的 SecureChannel → 可作为 `MediaTransport` 完成媒体收发。

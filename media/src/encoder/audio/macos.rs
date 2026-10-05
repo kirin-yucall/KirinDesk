@@ -22,7 +22,7 @@
 //! # 权限
 //!
 //! 捕获系统输出音频无需 TCC 权限（与麦克风 `NSMicrophoneUsageDescription` 无关，
-//! 但 Info.plist 仍声明该项以备后续输入设备捕获，见 M14-T004 补充字段）。
+//! 但 Info.plist 仍声明该项以备后续输入设备捕获，见 补充字段）。
 
 #![cfg(target_os = "macos")]
 

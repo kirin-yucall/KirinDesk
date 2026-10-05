@@ -42,7 +42,7 @@ fn init_sig_payload(
     p.extend_from_slice(domain.as_bytes());
     p.push(b'|');
     p.extend_from_slice(device_type.as_bytes());
-    // CX-2 能力声明域（本夹具缺省：ver=0 / codecs 空 / width=0 / os 空）。
+    // 能力声明域（本夹具缺省：ver=0 / codecs 空 / width=0 / os 空）。
     p.push(b'|');
     p.extend_from_slice(&0u32.to_be_bytes());
     p.push(b'|');

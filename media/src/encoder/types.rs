@@ -184,11 +184,11 @@ pub enum PacketKind {
     Video,
     Audio,
     InputEcho,
-    /// M13-T003: 剪贴板文本推送（UTF-8，客户端 ⇄ 服务端双向）。
+    /// 剪贴板文本推送（UTF-8，客户端 ⇄ 服务端双向）。
     Clipboard,
-    /// M13-T006: 文件传输块（双向，64 KiB 大帧，走可靠流）。
+    /// 文件传输块（双向，64 KiB 大帧，走可靠流）。
     FileTransfer,
-    /// M8-T018: 显示器控制消息（bincode [`ControlMessage`]，双向可靠流；
+    /// 显示器控制消息（bincode [`ControlMessage`]，双向可靠流；
     /// 走既有的 `ChannelTag::Control`，SecureChannel 路径复用 tag 分帧）。
     ///
     /// [`ControlMessage`]: crate::transport::ControlMessage

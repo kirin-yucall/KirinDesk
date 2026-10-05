@@ -1,4 +1,4 @@
-//! M13-T006 文件传输面板：任务列表 + 进度条 + 控制按钮 + 拖拽发送。
+//! 文件传输面板：任务列表 + 进度条 + 控制按钮 + 拖拽发送。
 //!
 //! 纯状态机（[`FilePanelState`]）可单测；egui 渲染（[`show_file_workspace`]
 //! 双 tab 工作区 / [`show_tasks_tab`] 全部任务 tab）由连接窗口/服务器面板
@@ -671,7 +671,7 @@ pub fn format_quota_bar(
 }
 
 // （`file_panel_close_visible`）+ 旧队列面板渲染体（`show_file_panel`，
-// M13-T006 UI-FT-001/002）随 Desktop 窗旧面板与仪表盘文件传输卡移除——
+// UI-FT-001/002）随 Desktop 窗旧面板与仪表盘文件传输卡移除——
 // 两消费点（`show_file_workspace` Desktop 分支 / 仪表盘卡）全数随移除，
 // 零他消费（grep 矩阵在案）；i18n 专属键十枚同批移除（清单入交付报告）。
 

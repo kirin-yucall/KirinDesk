@@ -1,4 +1,4 @@
-//! M8-T026-P2: 客户端设备 ID 连接编排（ID-010~015）。
+//! 客户端设备 ID 连接编排（ID-010~015）。
 //!
 //! 职责对照：
 //! - ID-010 解析：`connect --id <device_id>` → 服务器 `ResolveDevice` →
@@ -8,7 +8,7 @@
 //! - ID-011 三级路径编排（叠加语义，对齐 P1）：
 //!   ① 直连候选（IPv6/IPv4 TCP 并行尝试）→ ② 打洞（P1 hook 已接入，
 //!   TCP 同时打开，成功路径 `PathKind::PunchUdp/PunchTcp`，接入点见
-//!   `docs/共享层/M8-T026_P2_与P1并行开发交互文档.md`）
+//!   打洞模块（punch.rs / path_manager.rs）接线）
 //!   → ③ 设备级中继兜底（`TunnelConn`，§8.1，随会话建立保证连通）；
 //! - ID-013 握手不变：直连/中继路径返回的流上由调用方执行 Ed25519 双向握手
 //!   （`client_handshake_with_confirm_generic` 等现有逻辑零改动复用），
@@ -266,7 +266,7 @@ impl IdConnector {
     /// - 结果映射：TCP 同时打开成功（`PathKind::PunchTcp`，PUNCH-SEC-001
     ///   双向握手已在打洞内完成）→ 返回已握手通道的底层流（调用方不再重复
     ///   握手）；UDP 成功（`PathKind::PunchUdp`）→ socket 属媒体层 QUIC
-    ///   升级路径（`M8-T026_接口交互协调.md` §3.6 PunchUpgradeEvent），初始
+    ///   升级路径（PunchUpgradeEvent 事件），初始
     ///   编排无法以 `TcpStream` 交付，记成功审计后返回 `None`（让位中继）；
     ///   失败/无候选/未配置 rendezvous → `None`。
     ///

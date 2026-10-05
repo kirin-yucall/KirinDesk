@@ -170,14 +170,14 @@ impl PinExpectation {
 /// 3 → **4**。本版 wire 语义变更（**无兼容包袱**：新旧对端互连允许失败，
 /// fail-closed 无半残态；README/CHANGELOG 注明**需两端升级**）：
 ///
-/// - **CX-1 挑战码响应化**：`HandshakeInit.challenge` 不再携带明文挑战码
+/// - ** 挑战码响应化**：`HandshakeInit.challenge` 不再携带明文挑战码
 ///   （v4 恒空串）——凭据以「受控端 nonce → 控制端
 ///   [`challenge_response`] 派生应答」的挑战-响应形态上线（新消息
 ///   [`HandshakeChallenge`] / [`HandshakeChallengeResp`]），线路上不再出现
 ///   可窃取重用的明文凭据（R178 ZE-01 挑战码收获位封死）；**已 pin 免挑战**
 ///   （服务端侧 known_clients/DNS-TXT 公钥绑定命中 = pin 即强凭据，免挑战轮，
-///   裁定 CX-1 方案 B 附带项）；
-/// - **CX-2 握手第一包能力纳签**：`proto_ver` / `supported_codecs` /
+///   裁定：方案 B 附带项）；
+/// - ** 握手第一包能力纳签**：`proto_ver` / `supported_codecs` /
 ///   `requested_max_width` / `client_os` 全部纳入 [`build_sig_payload`]
 ///   签名覆盖域（R178 ZE-03 主动降级/特性剥离面封死）；
 /// - **版本门 exact-match**：`server_version_gate` / `client_version_gate`
@@ -291,7 +291,7 @@ pub fn challenge_response(
     challenge_derive_from_key(key.as_slice().try_into().expect("sha256 = 32B"), nonce, client_x25519_pub, client_nonce)
 }
 
-/// **CX-1**：服务端单次挑战轮的应答材料（nonce + 客户端应答），由
+/// ****：服务端单次挑战轮的应答材料（nonce + 客户端应答），由
 /// [`server_challenge_round`] 产出、传入 `verify_server_init*` 校验。
 #[derive(Debug, Clone)]
 pub struct ChallengeAnswer {
@@ -299,10 +299,10 @@ pub struct ChallengeAnswer {
     pub response: [u8; 32],
 }
 
-/// **CX-1**：本连接是否需要挑战轮（单一判定点，双链共用）。
+/// ****：本连接是否需要挑战轮（单一判定点，双链共用）。
 ///
 /// - 客户端公钥已 pin 且与 init 自报一致（known_clients / DNS-TXT 绑定）→
-///   **免挑战**（CX-1 方案 B 附带项：pin 即强凭据；判定基于服务端自身
+///   **免挑战**（方案 B 附带项：pin 即强凭据；判定基于服务端自身
 ///   pin 存储，不信任客户端自报声明）；
 /// - 无固定挑战码且无激活临时窗口 → 无挑战（零凭据判定归 verify 层）；
 /// - 其余（固定码或激活窗口）→ 需要挑战轮。
@@ -321,7 +321,7 @@ pub fn challenge_round_required(
     has_fixed || temp_window.is_some_and(TempModeManager::is_active)
 }
 
-/// **CX-1**：服务端挑战轮（受控端臂）——下发 [`HandshakeChallenge`]（32B
+/// ****：服务端挑战轮（受控端臂）——下发 [`HandshakeChallenge`]（32B
 /// CSPRNG nonce）并限时读取 [`HandshakeChallengeResp`]。读超时/解码失败 =
 /// [`HandshakeError::InvalidMessage`]（调用方走既有拒绝+审计+限流路径）。
 pub async fn server_challenge_round<S: AsyncRead + AsyncWrite + Unpin + Send>(
@@ -347,7 +347,7 @@ pub async fn server_challenge_round<S: AsyncRead + AsyncWrite + Unpin + Send>(
     Ok(ChallengeAnswer { nonce, response: resp.response })
 }
 
-/// **CX-1**：挑战应答常量时间校验（固定码臂——服务端持有明文码，现算
+/// ****：挑战应答常量时间校验（固定码臂——服务端持有明文码，现算
 /// 派生密钥比对；临时码臂见 [`TempModeManager::verify_challenge_response`]）。
 fn challenge_resp_matches_fixed(
     fixed_code: &str,
@@ -860,7 +860,7 @@ async fn client_handshake_with_confirm_and_codecs_generic_ex<
         proto_ver: PROTOCOL_VERSION,
         requested_max_width,
         client_os: kirin_desk_utils::osinfo::detect_os_type(),
-        // CX-1: 首包恒空（应答经 HandshakeChallengeResp 独立消息送达）。
+        // 首包恒空（应答经 HandshakeChallengeResp 独立消息送达）。
         challenge_resp: Vec::new(),
     };
     let init_data = bincode::serialize(&init_msg)
@@ -878,7 +878,7 @@ async fn client_handshake_with_confirm_and_codecs_generic_ex<
     // `challenge` 参数为派生密钥回答 [`HandshakeChallengeResp`]，再读响应。
     // 无挑战轮的服务端（已 pin 免挑战 / 零凭据拒绝路径）直接回响应/拒绝。
     let mut resp_data = receive_message(&mut stream).await?;
-    // CX-1 判别双条件：反序列化成功 **且** 魔数相等（防响应首 32B 被误当
+    // 判别双条件：反序列化成功 **且** 魔数相等（防响应首 32B 被误当
     // nonce → 通道卡死，见 [`HANDSHAKE_CHALLENGE_MAGIC`]）。
     let challenge_frame = bincode::deserialize::<HandshakeChallenge>(&resp_data)
         .ok()
@@ -1265,7 +1265,7 @@ pub fn verify_server_init_with_answer(
 ///
 /// [`verify_server_init_with_answer`]：先 [`server_challenge_round`] 收应答
 /// 再校验）。本形态等价 `answer = None`：配置了挑战码且客户端未 pin 时按
-/// CX-1 语义失败（`challenge mismatch`，结构化拒绝码 `challenge_mismatch`
+/// 语义失败（`challenge mismatch`，结构化拒绝码 `challenge_mismatch`
 /// 可下发）——明文码比对不复活（ZE-01 治本口径不因兼容面回退）。
 pub fn verify_server_init(
     init: &HandshakeInit,
@@ -1284,7 +1284,7 @@ pub fn verify_server_init(
     )
 }
 
-/// 服务端握手初始化消息校验（**二态凭据**，M8-T017 / SRV-TMP-HK-001）。
+/// 服务端握手初始化消息校验（**二态凭据**，/ SRV-TMP-HK-001）。
 ///
 /// 与 [`verify_server_init`] 的差异仅在凭据一步：`temp_window` 为激活中的
 /// 临时连接窗口时，凭据接受「固定挑战码 **或** 窗口内临时挑战码」任一应答
@@ -1350,7 +1350,7 @@ fn verify_server_init_inner(
     //    002 沿革）：固定挑战码 **或** 窗口内临时挑战码任一应答正确即通过；
     //    两者均失败 → 统一错误消息（防枚举，不泄露固定码/临时码信息）。
     //    组合语义：
-    //    - **客户端已 pin（known_clients/DNS-TXT 绑定命中）→ 免挑战**（CX-1
+    //    - **客户端已 pin（known_clients/DNS-TXT 绑定命中）→ 免挑战**（
     //      方案 B 附带项：pin 即强凭据；绑定不符已在步骤 1 拒绝）；
     //    - 无固定码 + 无窗口 → S-01a (F-1) fail-closed：仅当客户端公钥已 pin
     //      或显式 `allow_no_credentials`（仅测试/loopback）才放行——零凭据
@@ -1371,7 +1371,7 @@ fn verify_server_init_inner(
     // （`is_active` 自带过期槽回收，见 `TempModeManager::reap_expired`。）
     let temp_active = temp_window.is_some_and(TempModeManager::is_active);
     let challenge_ok = if client_pinned {
-        // CX-1B：已 pin 免挑战（pin 即强凭据；挑战轮判定点
+        // 已 pin 免挑战（pin 即强凭据；挑战轮判定点
         // [`challenge_round_required`] 与本判定同源，不会对 pin 客户端发起）。
         true
     } else {
@@ -1400,7 +1400,7 @@ fn verify_server_init_inner(
         return Err(HandshakeError::InvalidMessage(msg.to_string()));
     }
 
-    // 4. 客户端 Ed25519 签名验证（对自报公钥验签；CX-2 起载荷含能力声明域）。
+    // 4. 客户端 Ed25519 签名验证（对自报公钥验签；现版本起载荷含能力声明域）。
     let client_pubkey = IdentityManager::parse_public_key(&init.client_ed25519_pub_base64)
         .map_err(|e| HandshakeError::Dns(e.to_string()))?;
     let sig_payload = build_sig_payload(
@@ -1459,7 +1459,7 @@ pub fn domain_matches_whitelist(domain: &str, pattern: &str) -> bool {
     domain == base || domain.ends_with(&format!(".{}", base))
 }
 
-/// M8-T027 (SRV-IDWL-010): 设备 ID 白名单匹配（大小写敏感，与 known_clients
+/// (SRV-IDWL-010): 设备 ID 白名单匹配（大小写敏感，与 known_clients
 /// 同 key 语义）。
 ///
 /// - 默认**精确匹配**：trim 后完全相等（`device-7` 只匹配 `device-7`）；
@@ -1591,10 +1591,10 @@ impl std::fmt::Debug for VerifiedDecision {
     }
 }
 
-/// 服务端握手（白名单 + 完整验证，M11-T001/T004）。
+/// 服务端握手（白名单 + 完整验证）。
 ///
 /// headless 服务器无 GUI 审批弹窗：**先**做白名单检查（域名 **或** ID 两维，
-/// M8-T027；temp_mode 可绕过），非白名单在响应之前直接拒绝（连接立即关闭，
+/// ；temp_mode 可绕过），非白名单在响应之前直接拒绝（连接立即关闭，
 /// 客户端收到 EOF），不泄露服务器 X25519 公钥/响应签名；白名单通过后再完成
 /// 客户端公钥绑定（SEC-PATCH / SRV-SEC-KH-001）、签名验证、nickname/challenge
 /// 校验与响应。
@@ -1632,7 +1632,7 @@ pub async fn server_handshake_with_whitelist(
     // 2. 白名单检查（headless：无 GUI 审批弹窗，直接拒绝）。
     if !temp_mode {
         let domain = &init.client_domain;
-        // M8-T027 (SRV-IDWL-020): 双白名单 OR 语义——域名命中 **或** ID 命中
+        // (SRV-IDWL-020): 双白名单 OR 语义——域名命中 **或** ID 命中
         // 即视为白名单命中（域名维度既有行为不变）。
         let is_whitelisted = allowed_domains
             .iter()
@@ -1804,7 +1804,7 @@ pub async fn client_handshake_with_confirm(
     })
 }
 
-/// M8-T027 (SRV-IDWL-021 同源语义)：白名单检查（域名 **或** ID 两维，
+/// (SRV-IDWL-021 同源语义)：白名单检查（域名 **或** ID 两维，
 /// temp_mode 跳过全部白名单维度）。
 pub async fn server_handshake_check(
     mut stream: tokio::net::TcpStream,
@@ -1904,7 +1904,7 @@ fn build_sig_payload(
     payload.extend_from_slice(peer_domain.as_bytes());
     payload.push(b'|');
     payload.extend_from_slice(device_type.as_bytes());
-    // CX-2：能力声明域（定长字段 + 分隔符，字段间无长度歧义）。
+    // 能力声明域（定长字段 + 分隔符，字段间无长度歧义）。
     payload.push(b'|');
     payload.extend_from_slice(&proto_ver.to_be_bytes());
     payload.push(b'|');
@@ -1997,7 +1997,7 @@ pub struct SecureChannelWriter {
 }
 
 impl SecureChannel {
-    /// 拆分为独立的读写半通道（M9-T002：客户端"视频接收 + 输入发送"双任务）。
+    /// 拆分为独立的读写半通道（客户端"视频接收 + 输入发送"双任务）。
     pub fn into_split(self) -> (SecureChannelReader, SecureChannelWriter) {
         let cipher = Arc::new(self.cipher);
         let (read, write) = self.stream.into_split();
@@ -2396,7 +2396,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// M8-T017 二态挑战码校验（SRV-TMP-HK-001/002/003）：固定挑战码 **或**
+    /// 二态挑战码校验（SRV-TMP-HK-001/002/003）：固定挑战码 **或**
     /// 窗口内临时挑战码任一正确即通过；无固定码 + 窗口激活 → 临时码必填；
     /// 窗口期外临时码一律失败；失败消息统一不泄露信息（防枚举）。
     ///
@@ -2416,7 +2416,7 @@ mod tests {
         let temp_code = tm.enable(300).expect("enable");
 
         /// 一次二态握手往返：`server_pin` = 服务端期望客户端公钥（`""` = 未
-        /// pin → CX-1 挑战轮必经），`fixed` = 服务端固定挑战码，`challenge` =
+        /// pin → 挑战轮必经），`fixed` = 服务端固定挑战码，`challenge` =
         /// 客户端派生密钥（= 用户输入码），`allow` = `allow_no_credentials`
         /// 凭据回归用例传 `false`）。
         async fn run_two_state(
@@ -2436,7 +2436,7 @@ mod tests {
             );
             let server_fut = async move {
                 let init = server_read_init(&mut server_end).await?;
-                // nonce、限时收应答）；已 pin 客户端免挑战（CX-1 方案 B）。
+                // nonce、限时收应答）；已 pin 客户端免挑战（方案 B）。
                 let answer = if challenge_round_required(server_pin, &init.client_ed25519_pub_base64, fixed, Some(tm)) {
                     Some(server_challenge_round(&mut server_end).await?)
                 } else {
@@ -2452,17 +2452,17 @@ mod tests {
             client_res.map(|_| ())
         }
 
-        // ── CX-1B：已 pin 客户端免挑战（pin 即强凭据；判定 = 服务端 pin 存储
+        // ── 已 pin 客户端免挑战（pin 即强凭据；判定 = 服务端 pin 存储
         //    命中，与凭据配置无关）。
         assert!(
             run_two_state(&alice, &bob, &alice_pub, &bob_pub, &tm, Some("FIXED-CODE"), "", true)
                 .await
                 .is_ok(),
-            "CX-1B: pinned client exempt from challenge even with fixed code configured"
+            "pinned client exempt from challenge even with fixed code configured"
         );
         assert!(
             run_two_state(&alice, &bob, &alice_pub, &bob_pub, &tm, None, "", true).await.is_ok(),
-            "CX-1B: pinned client exempt with active window and no code"
+            "pinned client exempt with active window and no code"
         );
         // ── 未 pin 客户端：挑战-响应应答校验本体（固定码/临时码二态）。
         // 固定码 + 窗口 → 固定码应答通过。
@@ -2703,7 +2703,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// M8-T027 (SRV-IDWL-011): `id_matches_whitelist` 匹配规则——
+    /// (SRV-IDWL-011): `id_matches_whitelist` 匹配规则——
     /// 精确命中/未命中、空 pattern、`*` 结尾前缀通配、空白 trim、大小写敏感。
     #[test]
     fn test_id_matches_whitelist_rules() {
@@ -2809,7 +2809,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// M8-T027 (SRV-IDWL-020 旧接口): `server_handshake_with_whitelist`
+    /// (SRV-IDWL-020 旧接口): `server_handshake_with_whitelist`
     /// 双白名单 OR 语义——域名未命中但设备 ID 命中 → 放行（headless 无审批）。
     #[tokio::test]
     async fn test_whitelist_handshake_id_only_accepted() {
@@ -2981,7 +2981,7 @@ mod tests {
     /// 取消（tick / timeout 到期场景）后，已消费字节不丢失，下一次
     /// `receive()` 从正确位置续读并完整重组消息。
     ///
-    /// 复现靶：self-test M13-T006 偶发 `Message too large: 3967033604
+    /// 复现靶：self-test 偶发 `Message too large: 3967033604
     /// bytes exceeds max`（文件传输回环 200ms tick `select!` 取消半程
     /// `read_exact` → 已消费部分被丢弃 → 密文字节被误读为 4B 长度前缀，
     /// 3967033604 = 0xEC742104 即 4 字节 AES-GCM 密文当长度）。旧实现
@@ -3735,11 +3735,11 @@ mod tests {
     }
 
     // ════════════════════════════════════════════════════════════
-    // CX-1 挑战-响应（正/错答/pin 免挑战/重放拒）+ CX-2 能力纳签（篡改拒）
+    // 挑战-响应（正/错答/pin 免挑战/重放拒）+ 能力纳签（篡改拒）
     // + wire 钉死（版本常量/挑战帧魔数/字段布局）。
     // ════════════════════════════════════════════════════════════
 
-    /// CX-1 正臂：未 pin 客户端 + 固定码 → 挑战轮后通道建立；**wire 钉死**：
+    /// 正臂：未 pin 客户端 + 固定码 → 挑战轮后通道建立；**wire 钉死**：
     /// init.challenge 恒空串且 challenge_resp 恒空（明文凭据不以任何形态
     /// 走预信道，ZE-01 治本口径）。
     #[tokio::test]
@@ -3756,7 +3756,7 @@ mod tests {
         let server_fut = async move {
             // 1) 读 init —— 钉死明文凭据零上线。
             let init = server_read_init(&mut server_end).await?;
-            assert!(init.challenge.is_empty(), "v4 init.challenge must be empty (CX-1)");
+            assert!(init.challenge.is_empty(), "v4 init.challenge must be empty");
             assert!(init.challenge_resp.is_empty(), "v4 init.challenge_resp must be empty");
             assert_eq!(init.proto_ver, PROTOCOL_VERSION);
             // 2) 挑战轮 + 校验 + 应答。
@@ -3771,7 +3771,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// CX-1 反臂：错误应答 → `challenge_mismatch` 拒绝（未 pin + 固定码）；
+    /// 反臂：错误应答 → `challenge_mismatch` 拒绝（未 pin + 固定码）；
     /// 无应答（None）同拒（fail-closed）。
     #[tokio::test]
     async fn test_r205_cx1_wrong_answer_rejected() {
@@ -3802,7 +3802,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// CX-1 pin 免挑战臂：服务端 pin 命中 → 不发挑战帧（wire 首帧 =
+    /// pin 免挑战臂：服务端 pin 命中 → 不发挑战帧（wire 首帧 =
     /// HandshakeResponse 直接应答）；客户端零挑战参数也通过。
     #[tokio::test]
     async fn test_r205_cx1_pinned_client_skips_round() {
@@ -3832,7 +3832,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// CX-1 重放反臂：同一 (nonce, response) 对在第二轮（新 nonce）必败
+    /// 重放反臂：同一 (nonce, response) 对在第二轮（新 nonce）必败
     /// ——收获应答跨连接不可重放。
     #[tokio::test]
     async fn test_r205_cx1_replayed_answer_rejected_on_fresh_nonce() {
@@ -3866,7 +3866,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// CX-2 反臂矩阵：能力声明字段（proto_ver / supported_codecs /
+    /// 反臂矩阵：能力声明字段（proto_ver / supported_codecs /
     /// requested_max_width / client_os）逐字段篡改（**签名保持原值** = 主动
     /// MITM 改写重序列化形态）→ 签名校验必败（主动降级/特性剥离面封死，ZE-03）。
     #[test]

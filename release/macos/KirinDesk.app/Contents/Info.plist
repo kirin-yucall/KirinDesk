@@ -2,7 +2,7 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <!-- M14-T004 基础字段 -->
+    <!-- 基础字段 -->
     <key>CFBundleIdentifier</key>
     <string>com.kirindesk.app</string>
     <key>CFBundleName</key>
@@ -30,7 +30,7 @@
     <key>NSHighResolutionCapable</key>
     <true/>
 
-    <!-- 权限声明（SRV-CAP-MAC-002 屏幕录制 / M14-T004 相机） -->
+    <!-- 权限声明（SRV-CAP-MAC-002 屏幕录制 / 相机） -->
     <key>NSDesktopCaptureUsageDescription</key>
     <string>KirinDesk 需要屏幕录制权限以远程查看和控制您的屏幕（System Settings → Privacy &amp; Security → Screen Recording）。</string>
     <key>NSCameraUsageDescription</key>

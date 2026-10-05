@@ -1,4 +1,4 @@
-//! M13-T003: 客户端剪贴板共享 — 轮询本地变更 → 推送；接收远端推送 → 写入本地。
+//! 客户端剪贴板共享 — 轮询本地变更 → 推送；接收远端推送 → 写入本地。
 //!
 //! 传输格式：`EncodedPacket { kind: PacketKind::Clipboard, data: <分片负载> }`，
 //! 复用 SecureChannel 键鼠同款可靠发送路径（`ChannelTag::Clipboard = 0x05`）。
@@ -447,7 +447,7 @@ impl ClipboardSyncState {
                     }
                     Err(e) => {
                         tracing::debug!(
-                            "[M13-T003] remote clipboard payload not valid UTF-8 ({} bytes) — dropped",
+                            "remote clipboard payload not valid UTF-8 ({} bytes) — dropped",
                             e.as_bytes().len()
                         );
                     }

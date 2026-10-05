@@ -1,4 +1,4 @@
-//! M8-T026-P1: 打洞辅助（PUNCH-001~006、PUNCH-SEC-001~004）。
+//! 打洞辅助（PUNCH-001~006、PUNCH-SEC-001~004）。
 //!
 //! `PunchSession` 打洞状态机：
 //! `Idle → Registering → CandidateExchange → Probing → Secured / Failed
@@ -86,7 +86,7 @@ pub struct PunchHandshake {
     pub challenge: String,
 }
 
-/// 打洞配置（`M8-T026_接口交互协调.md` §3.4 冻结 API + v3 扩展字段）。
+/// 打洞配置（`_接口交互协调.md` §3.4 冻结 API + v3 扩展字段）。
 #[derive(Debug, Clone)]
 pub struct PunchConfig {
     /// rendezvous 服务器地址（控制连接）。

@@ -1,4 +1,4 @@
-//! M8-T026: 内网穿透服务端主程序（frps 等价，独立部署用）。
+//! 内网穿透服务端主程序（frps 等价，独立部署用）。
 //!
 //! 薄壳包装 [`kirin_desk_relay::server::TunnelServer`]：
 //! - CLI 参数：`--bind-addrs` / `--bind-port` / `--token` / `--port-range` /
@@ -520,7 +520,7 @@ impl Config {
             .collect()
     }
 
-    /// M8-T039 P16b: 解析 `--bind-addrs` 为监听地址列表（复用
+    /// P16b: 解析 `--bind-addrs` 为监听地址列表（复用
     /// `utils::config::parse_bind_addr_list`，GUI/CLI 同一校验口径）。
     /// 空/纯空白 → 空列表（relay 回退默认双栈）；非法值（域名/空段）→ Err，
     /// 由调用方 fail-closed 拒绝启动（对齐 cmd_tunnel_serve 语义）。
@@ -863,7 +863,7 @@ mod r168_cli_tests {
     }
 }
 
-// M8-T039 P16b: Config::parse 参数解析单测（--bind-addrs 两种写法、缺值、
+// P16b: Config::parse 参数解析单测（--bind-addrs 两种写法、缺值、
 // 默认空、parse_bind_addrs 合法/非法值 fail-closed）。
 #[cfg(test)]
 mod config_parse_tests {
@@ -1893,7 +1893,7 @@ async fn tokio_main(args: Vec<String>) {
         .server_key
         .clone()
         .unwrap_or_else(kirin_desk_relay::registry::default_key_path);
-    // M8-T039 P16b: 可选显式多监听地址。空 → relay 默认双栈回退（[::] 优先 +
+    // P16b: 可选显式多监听地址。空 → relay 默认双栈回退（[::] 优先 +
     // 0.0.0.0 回退，行为零变化）；非法值 fail-closed 拒绝启动（exit 2，对齐
     // 参数解析错误路径）。
     let bind_addrs = match cfg.parse_bind_addrs() {

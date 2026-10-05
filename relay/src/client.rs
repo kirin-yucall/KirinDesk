@@ -1,4 +1,4 @@
-//! M8-T026 T003: 隧道客户端（frpc 等价）— Login + 代理注册 / 控制循环 /
+//! T003: 隧道客户端（frpc 等价）— Login + 代理注册 / 控制循环 /
 //! 心跳与判死 / 指数退避+抖动重连 / StartWorkConn 处理 / 本地拨号 / 泵流。
 //!
 //! 职责对照（TNL-CLIENT-001~008、TNL-STAB-001~003）：
@@ -103,7 +103,7 @@ pub enum TunnelClientError {
     Timeout(String),
     #[error("login rejected: {0}")]
     LoginRejected(String),
-    /// M8-T026-P3：服务器认证失败（双向认证回执校验失败 / fail-closed
+    /// 服务器认证失败（双向认证回执校验失败 / fail-closed
     /// 拒绝，TNL-SEC-007/008）。
     #[error("server authentication failed: {0}")]
     ServerAuthFailed(String),
@@ -268,7 +268,7 @@ impl TunnelClient {
                     "control channel closed",
                 )))
         };
-        // 3. Login（TNL-CLIENT-001 / TNL-PROTO-002）— M8-T026-P3 挑战-响应
+        // 3. Login（TNL-CLIENT-001 / TNL-PROTO-002）— 挑战-响应
         // 认证（TNL-SEC-006~008）：口令永不明文上线；双向认证回执校验
         // （T4 伪造服务器）；带口令客户端遇未认证服务器 fail-closed 拒绝。
         let auth_fields = crate::auth::LoginFields {
@@ -547,7 +547,7 @@ async fn write_frame_simple(
     Ok(())
 }
 
-/// 认证错误 → 客户端错误映射（M8-T026-P3 语义保持：登录被拒 → LoginRejected；
+/// 认证错误 → 客户端错误映射（语义保持：登录被拒 → LoginRejected；
 /// 双向认证/ fail-closed → ServerAuthFailed；其余 → 协议错误）。
 fn map_auth_error(e: crate::auth::ClientAuthError) -> TunnelClientError {
     use crate::auth::ClientAuthError;

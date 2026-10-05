@@ -3,7 +3,7 @@
 //! # 状态图
 //!
 //! ```text
-//!        loss > 1.5% 或 RTT ≥ 100ms (3周期)      [M13-T003: RTT 高延迟降质]
+//!        loss > 1.5% 或 RTT ≥ 100ms (3周期)          [RTT 高延迟降质]
 //!  Good ──────────────────────────────────────▶ MildCongestion
 //!    ◀─────────────────────────────────────────
 //!        loss < 0.5% 且 RTT < 100ms (3周期)
@@ -20,9 +20,9 @@
 //!  SevereCongestion ───────────────────────────▶ Good (loss < 0.5% 且 RTT < 100ms, 5周期)
 //! ```
 //!
-//! # M13-T003 扩展：RTT 作为拥塞信号
+//! # 扩展：RTT 作为拥塞信号
 //!
-//! 状态切换原只由丢包率驱动；M13-T003 把 **RTT ≥ 100ms** 追加为轻度拥塞
+//! 状态切换原只由丢包率驱动； 把 **RTT ≥ 100ms** 追加为轻度拥塞
 //! 信号（对应"高延迟 → 自动降质"）：
 //!
 //! - **降级**：Good 状态下，丢包 >1.5% **或** RTT ≥100ms 连续 3 周期 → Mild；
@@ -33,7 +33,7 @@
 use std::collections::VecDeque;
 use std::time::Instant;
 
-/// 高延迟阈值（毫秒）：RTT ≥ 此值视为轻度拥塞（M13-T003）。
+/// 高延迟阈值（毫秒）：RTT ≥ 此值视为轻度拥塞。
 pub const HIGH_RTT_MS: f64 = 100.0;
 
 /// 网络状态等级。
@@ -170,7 +170,7 @@ impl AdaptiveStateMachine {
     /// 检查降级条件（不涉及 stable_count）。
     /// 返回应降级到的目标状态，或 None。
     ///
-    /// M13-T003：采样满足 `loss > threshold` **或** `rtt_ms ≥ HIGH_RTT_MS`
+    /// 采样满足 `loss > threshold` **或** `rtt_ms ≥ HIGH_RTT_MS`
     /// 即视为该周期拥塞。RTT 只驱动 Good→Mild（高延迟降一档，不触发 Severe）。
     fn evaluate_downgrade(&self, recent: &[&NetworkSample]) -> Option<NetworkState> {
         let all_above = |threshold: f64| -> bool { recent.iter().all(|s| s.loss_rate > threshold) };
@@ -183,7 +183,7 @@ impl AdaptiveStateMachine {
                     return Some(NetworkState::SevereCongestion);
                 }
                 // Good → MildCongestion: 连续 3 周期 > 1.5%（迟滞）
-                // 或 RTT ≥ 100ms（M13-T003 高延迟降质）
+                // 或 RTT ≥ 100ms（高延迟降质）
                 if all_above(0.015) || all_high_rtt() {
                     return Some(NetworkState::MildCongestion);
                 }
@@ -204,7 +204,7 @@ impl AdaptiveStateMachine {
     /// 检查升级条件（不涉及 stable_count）。
     /// 返回 (目标状态, 需要的稳定周期数)。
     ///
-    /// M13-T003：升级需丢包率与 RTT **同时**回落（RTT ≥ 100ms 的采样阻止
+    /// 升级需丢包率与 RTT **同时**回落（RTT ≥ 100ms 的采样阻止
     /// 升级，与降级阈值对齐形成迟滞）。
     fn evaluate_upgrade(&self, recent: &[&NetworkSample]) -> Option<(NetworkState, u32)> {
         let all_healthy = |threshold: f64| -> bool {
@@ -244,7 +244,7 @@ impl AdaptiveStateMachine {
         self.stable_count = 0;
     }
 
-    /// 获取最近 required_stable 个采样（丢包率 + RTT 联合评估，M13-T003）。
+    /// 获取最近 required_stable 个采样（丢包率 + RTT 联合评估）。
     fn recent_samples(&self) -> Vec<&NetworkSample> {
         self.history
             .iter()
@@ -450,7 +450,7 @@ mod tests {
         assert_eq!(NetworkState::SevereCongestion.name(), "SevereCongestion");
     }
 
-    // ── M13-T003：RTT 拥塞信号 ─────────────────────────────────
+    // ──：RTT 拥塞信号 ─────────────────────────────────
 
     fn sample_rtt(loss_rate: f64, rtt_ms: f64) -> NetworkSample {
         NetworkSample {

@@ -1,4 +1,4 @@
-﻿//! M13-T005: 用户级开机自启（Unattended Mode 子能力）
+﻿//! 用户级开机自启（Unattended Mode 子能力）
 //!
 //! 三平台统一接口 `install()` / `uninstall()` / `is_installed()`，全部为
 //! **用户级**机制（无需管理员权限）：
@@ -9,7 +9,7 @@
 //! | Linux   | XDG autostart            | `$XDG_CONFIG_HOME/autostart/kirindesk.desktop`  |
 //! | macOS   | LaunchAgent              | `~/Library/LaunchAgents/com.kirindesk.plist`    |
 //!
-//! 所有路径经 `dirs_next` 解析（遵循 M1-T002 路径解析策略，不写死 `~`）。
+//! 所有路径经 `dirs_next` 解析（遵循 路径解析策略，不写死 `~`）。
 //! 自启拉起时统一追加 `--autostart` 参数（UA-BOOT-004）。
 
 use std::io;

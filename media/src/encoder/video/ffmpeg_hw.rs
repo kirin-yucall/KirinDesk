@@ -986,7 +986,7 @@ impl VideoEncoder for FfmpegHwEncoder {
         }
     }
 
-    /// 窗口边界清参考帧（M8-T011 T2.3）。
+    /// 窗口边界清参考帧（T2.3）。
     ///
     /// 与软编同语义：`avcodec_flush_buffers` 重置内部状态，flush 后下一帧
     /// 必须 IDR（置位 `force_idr_next` 双保险）。仅当已发过帧时才 flush
@@ -999,7 +999,7 @@ impl VideoEncoder for FfmpegHwEncoder {
     /// - `h264_nvenc`：8.1.2 构建要求 nvenc API 13.1 / 驱动 ≥610.00，本机 591.86
     ///   不满足（open2 拒绝，无 flush 语义可测）。2026-08-02 换 GyanD 8.1.1 构建
     ///   （ffnvcodec 13.0 头，libavcodec 62.28.101）后本机 h264/hevc_nvenc 实测
-    ///   出码流 ✓（决策记录见 docs/共享层/M8-T030 §5.2）。
+    ///   出码流 ✓。
     ///   注意：nvenc open 失败路径本身会堆损坏崩溃（0xc0000005/0xc0000374），
     ///   为既有隐患（更老驱动仍适用）；生产路径（软编优先 factory + qsv 兜底）
     ///   在本机不触达，不在本批次修复范围，登记观察。
@@ -1271,7 +1271,7 @@ pub(crate) fn hw_probe_dimensions(_enc_name: &str) -> (u32, u32) {
     (640, 480)
 }
 
-/// 创建 hw device：按候选设备串逐个尝试绑定（M8-T030 §3.5）。
+/// 创建 hw device：按候选设备串逐个尝试绑定（§3.5）。
 ///
 /// 候选顺序（[`crate::gpu::device_strings`]）：LUID 高32-低32 → 低32-高32 →
 /// 描述名。

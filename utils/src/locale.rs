@@ -1,6 +1,6 @@
 //! 系统 UI 语言识别（`[ui].language = "system"` 时使用）。
 //!
-//! M8-T038 (P2): Windows 桌面通常不导出 `LANG` 环境变量，`Lang::from_env()`
+//! (P2): Windows 桌面通常不导出 `LANG` 环境变量，`Lang::from_env()`
 //! 会永远回落中文基线——需经系统 API 取用户 UI 语言。
 
 /// 系统 UI 语言代码（仅区分本项目支持的语言）：`"zh"` | `"en"` | None。

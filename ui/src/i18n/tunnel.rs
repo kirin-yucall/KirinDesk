@@ -1,4 +1,4 @@
-//! M8-T039: Tunnel 独立页分区表（P3 创建骨架键；P4 追加 `tunnel.server.*`
+//! Tunnel 独立页分区表（P3 创建骨架键；P4 追加 `tunnel.server.*`
 //! 键、P5 追加 `tunnel.run.*` / `tunnel.status.*` 键——表尾追加 + 分节注释）。
 //!
 //! zh 为基线语言包；en 全量翻译（不得留空串）。
@@ -51,7 +51,7 @@ pub static TABLE: &[(&str, &str, &str)] = &[
      "已连接，配置已自动保存",
      "Connected — config auto-saved"),
 
-    // ── P4: Server 区块（M8-T039）──
+    // ── P4: Server 区块──
     ("tunnel.server.bind_addrs", "监听地址（逗号分隔，可多个）：", "Listen addresses (comma-separated, multiple allowed):"),
     ("tunnel.server.bind_addrs_hint",
      "IPv4/IPv6 均可；默认 0.0.0.0,:: 同时监听双栈；留空 = 自动回退默认双栈",
@@ -73,7 +73,7 @@ pub static TABLE: &[(&str, &str, &str)] = &[
     ("tunnel.server.token_saved", "已生成随机 Token 并保存", "Random token generated and saved"),
     ("tunnel.server.token_save_failed", "Token 保存失败", "Failed to save token"),
 
-    // ── P5: 运行控制（M8-T039）──
+    // ── P5: 运行控制──
     ("tunnel.run.start", "▶ 启动", "▶ Start"),
     ("tunnel.run.start_hint",
      "自动保存当前配置并立即运行隧道（Client/Server 按当前模式启动）",

@@ -1,4 +1,4 @@
-//! FFmpeg 软解后端（M8-T015 P2B §T2.1，迁移自 decoder_legacy.rs）。
+//! FFmpeg 软解后端（P2B §T2.1，迁移自 decoder_legacy.rs）。
 //!
 //! 软解（`h264` / `hevc`）是回退链的兜底项：任何硬件解码器不可用时使用。
 //! 解码侧软解 1080p 远程桌面帧率足够（通常 <5ms/帧）。

@@ -34,7 +34,7 @@ pub enum TcpError {
 
 /// TCP server wrapper.
 ///
-/// M8-T033：双栈监听。`[::]` 监听在 Windows 上为 IPv6-only（v4 连接被拒），
+/// 双栈监听。`[::]` 监听在 Windows 上为 IPv6-only（v4 连接被拒），
 /// 故按「v6 双栈 → v6-only + v4 双监听 → 仅 v4」逐级回退，保证 v4 客户端
 /// v4-mapped v6（`::ffff:a.b.c.d`）在事件层呈现为真实 v4 地址（前缀剥离）。
 pub struct TcpServer {
@@ -363,7 +363,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_connect_ipv4_loopback() {
-        // M8-T033: TcpServer 双栈后 v4 回环直连可用（旧版 `[::]` 监听在
+        // TcpServer 双栈后 v4 回环直连可用（旧版 `[::]` 监听在
         // Windows 为 IPv6-only、v4 被拒，此处只能绑裸 127.0.0.1 绕开）。
         let server = TcpServer::bind(0).await.unwrap();
         let port = server.port();

@@ -1,4 +1,4 @@
-﻿//! Linux PipeWire screen-cast portal 捕获后端（M12-T001 / ）。
+﻿//! Linux PipeWire screen-cast portal 捕获后端。
 //!
 //! # 方案
 //!
@@ -194,7 +194,7 @@ struct CaptureUserData {
 // 后端
 // ════════════════════════════════════════════════════════════════
 
-/// Linux PipeWire screen-cast portal 捕获源（M12-T001 / ）。
+/// Linux PipeWire screen-cast portal 捕获源。
 pub struct LinuxPipewireBackend {
     /// 从捕获线程（pw_thread_loop 内部线程）接收帧。
     frame_rx: mpsc::Receiver<PipeWireCapturedFrame>,
@@ -376,7 +376,7 @@ impl ScreenCaptureSource for LinuxPipewireBackend {
         }))
     }
 
-    /// 静默屏幕（无帧）时按超时醒来（M8-T018 MON-NF-002，同 Windows 后端）。
+    /// 静默屏幕（无帧）时按超时醒来（MON-NF-002，同 Windows 后端）。
     fn wait_for_frame_timeout(
         &mut self,
         timeout: std::time::Duration,

@@ -61,7 +61,7 @@ jniLibs 四 .so（`libkirin_desk_mobile.so` + FFmpeg 三件）随本工程入库
    **加密 DNS（DoH/DoT，默认 Cloudflare/Google/阿里）** 发现——与桌面
    Connect 页域名路径同款记录三件套与信任锚（TXT 公钥 → TOFU 首连确认 →
    Exact pin；差异：桌面经 DNS 服务商管理 API 发现需 zone 属主凭据，手机
-   无配置面，改经加密解析器公开查询，M8-T040 红线口径不变：**解析只走
+   无配置面，改经加密解析器公开查询，红线口径不变：**解析只走
    `core::dns::resolve_for_connect` 唯一入口，绝不回退明文 DNS**）。
 4. 解析失败给可读错误（中英）：域名不存在（NXDOMAIN）/ 无 A/AAAA 记录 /
    无 SRV（对端未按域名模式发布）/ 无 TXT 公钥（拒连）/ 加密 DNS 超时或

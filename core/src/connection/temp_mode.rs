@@ -1,4 +1,4 @@
-//! M8-T017: 临时连接 — 临时挑战码 + 短时间窗口（凭据化 temp-mode）。
+//! 临时连接 — 临时挑战码 + 短时间窗口（凭据化 temp-mode）。
 //!
 //! 升级旧版「纯时间窗口旁路」（ui 侧 `/tmp/kirindesk-temp` 时间戳文件）：
 //!
@@ -12,7 +12,7 @@
 //! 4. **码不落盘明文**（TMP-SEC-001）：状态文件仅存 `sha256(码 ‖ 状态文件路径)`
 //!    哈希（TMP-SEC-004，路径作盐防彩虹表）+ 过期时间戳——进程重启后窗口期内
 //!    仍生效，但明文码只在 `enable` 返回时展示一次；
-//! 5. 状态文件路径经 `dirs_next::cache_dir()` 解析（M1-T002 路径策略），
+//! 5. 状态文件路径经 `dirs_next::cache_dir()` 解析（路径策略），
 //!    同时修复旧 `/tmp` 硬编码在 Windows 原生运行下失效的缺陷。
 //!
 //! 安全边界（UA-ACCEPT-004）：无人值守是否禁用由调用方（CLI/GUI）在 `enable`
@@ -219,7 +219,7 @@ fn from_hex(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// 临时连接管理器（M8-T017 / SRV-TMP-001）。
+/// 临时连接管理器（SRV-TMP-001）。
 ///
 /// 实例无内部可变状态——所有读写都作用于状态文件，因此可安全地在
 /// 握手校验（每连接）与展示（GUI 每帧倒计时）等场景各自新建实例。
@@ -229,7 +229,7 @@ pub struct TempModeManager {
 }
 
 impl TempModeManager {
-    /// 默认状态文件：`cache_dir()/kirin_desk/temp_mode.json`（M1-T002 路径策略）。
+    /// 默认状态文件：`cache_dir()/kirin_desk/temp_mode.json`（路径策略）。
     /// `cache_dir()` 不可用时回退 `home_dir()/.kirin_desk/cache`。
     pub fn new() -> Result<Self, TempModeError> {
         let base = dirs_next::cache_dir().or_else(dirs_next::home_dir);

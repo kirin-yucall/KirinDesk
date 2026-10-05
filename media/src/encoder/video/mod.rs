@@ -127,7 +127,7 @@ pub trait VideoEncoder: Send {
     /// - `force_idr`：客户端请求 / 会话首帧 → 强制下一帧 IDR
     fn set_cpu_frame(&mut self, _rgba: &[u8], _w: u32, _h: u32, _force_idr: bool) {}
 
-    /// 清空编码器内部参考帧与未输出缓冲（窗口边界调用，M8-T011 T2.3）。
+    /// 清空编码器内部参考帧与未输出缓冲（窗口边界调用，T2.3）。
     ///
     /// 窗口式编码器要求**每个窗口自包含**（IDR per window，无跨窗口参考
     /// 依赖）：窗口间调用本方法丢弃上一窗口残留的参考帧 / lookahead 缓冲，

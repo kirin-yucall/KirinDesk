@@ -1,6 +1,6 @@
 @echo off
-rem KirinDesk Installer �� M14-T002
-rem ��װĿ¼���֣��� M1-T002 Ŀ¼����һ�£���
+rem KirinDesk Installer �� 
+rem ��װĿ¼���֣��� Ŀ¼����һ�£���
 rem   ����:   %USERPROFILE%\.kirin_desk\bin\KirinDesk.exe
 rem   FFmpeg: %USERPROFILE%\.kirin_desk\ffmpeg\bin\*.dll  ��dlls.rs ����·�� {exe_dir}/../ffmpeg/bin��
 rem   ����:   %APPDATA%\kirin_desk\default.toml

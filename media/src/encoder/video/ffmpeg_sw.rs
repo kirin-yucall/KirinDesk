@@ -511,7 +511,7 @@ impl VideoEncoder for FfmpegSwEncoder {
         }
     }
 
-    /// 窗口边界清参考帧（M8-T011 T2.3）。
+    /// 窗口边界清参考帧（T2.3）。
     ///
     /// **P0-1 修复后的正确语义：软编 no-op。** 历史实现（`avcodec_flush_buffers`，
     /// 解码器语义）对活动中的 libx264 调用会摧毁编码器：第 2 个窗口起

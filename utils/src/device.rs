@@ -27,7 +27,7 @@
 //! 新格式（三平台统一）：SHA-256(稳定源) → Crockford base32 前 10 位，无前缀。
 
 /// `[device] id` 是否应视为"未填写"（留空即自动；`default-device` 为旧版
-/// 占位符，视为未填写，M8-T031）。
+/// 占位符，视为未填写）。
 pub fn id_is_auto(id: &str) -> bool {
     let id = id.trim();
     id.is_empty() || id == "default-device"

@@ -1,4 +1,4 @@
-//! 音频解码（M8-T015 P2C）：libopus 解码 + jitter buffer + 解码流水线。
+//! 音频解码（P2C）：libopus 解码 + jitter buffer + 解码流水线。
 //!
 //! 对称编码层 P1D `encoder/audio`：本模块实现
 //! - [`OpusDecoder`]：FFmpeg `libopus` 经 avcodec 解码（`avcodec_find_decoder

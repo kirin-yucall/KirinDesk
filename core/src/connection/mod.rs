@@ -19,7 +19,7 @@ pub use file_transfer::{
     TransferScheduler, TransferStatus, TransferStore, BLOCK_SIZE, BLOCK_TIMEOUT,
     DEFAULT_MAX_FILE_SIZE, IDLE_TIMEOUT, MAX_CONCURRENT, WINDOW_SIZE,
 };
-// M8-T026-P2: 设备 ID 连接模式（ID-010~013：解析/验签/三级路径编排）。
+// 设备 ID 连接模式（ID-010~013：解析/验签/三级路径编排）。
 pub use id_mode::{IdConnectError, IdConnector, IdModeConfig, PathKind};
 pub use manager::{
     ConnectionEvent, ConnectionManager, ConnectionState, ManagedConnection, ReconnectContext,
@@ -28,7 +28,7 @@ pub use client::{
     connect_peer, perform_handshake, resolve_peer, ConnectError, ConnectOutcome, ConnectionOptions,
     DnsConfig, RefusalReason, ResolvedPeer, TrustPolicy,
 };
-// M8-T019: 隐私模式（黑屏 / 锁屏）状态机与平台执行器。
+// 隐私模式（黑屏 / 锁屏）状态机与平台执行器。
 pub use multiplex::{
     decode_header, encode_frame, spawn_demux_loop, Demultiplexer, MultiplexError, MultiplexType,
     Multiplexer,

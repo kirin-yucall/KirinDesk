@@ -1,6 +1,6 @@
 //! 工厂函数 — 根据平台自动选择捕获源。
 //!
-//! - Windows: `windows-capture` crate 唯一后端（M8-T008 §Step 1，无回退链）。
+//! - Windows: `windows-capture` crate 唯一后端（§Step 1，无回退链）。
 //! - macOS: `zed-scap` crate（ScreenCaptureKit，M12-MAC MAC-T001）。
 //! - Linux: `linux_pipewire`（PipeWire screen-cast portal，X11/Wayland 统一，
 
@@ -106,7 +106,7 @@ pub fn list_monitors() -> Result<Vec<MonitorInfo>, CaptureError> {
     }
 }
 
-/// M8-T018（SRV-CAP-MON-001）：枚举显示器为 wire 格式（`DisplayListResp` 负载）。
+/// SRV-CAP-MON-001：枚举显示器为 wire 格式（`DisplayListResp` 负载）。
 ///
 /// 遍历平台枚举结果（Windows `Monitor::from_index` 体系 / macOS zed-scap 列表）；
 /// 枚举失败或为空 → 上报 1 个默认屏（index 0，1920x1080 主屏）兜底，不报错——

@@ -1,4 +1,4 @@
-//! M11-T001: SecureChannel PTY 桥接 — 远程 Shell（PTY 模式）
+//! SecureChannel PTY 桥接 — 远程 Shell（PTY 模式）
 //!
 //! 服务端：已握手 SecureChannel → spawn PTY（`portable-pty` crate，跨平台：
 //! Windows 用 ConPTY(Windows 10+)、Linux/macOS 用 forkpty/openpty）→ 双向桥接：
@@ -469,7 +469,7 @@ fn default_shell_command() -> portable_pty::CommandBuilder {
         // ConPTY 下 PowerShell 5.1 默认控制台代码页可能为 GBK（中文乱码源）：
         // 启动参数静默切换进程级编码 + 控制台代码页为 UTF-8，无 banner/无输出。
         // -NoExit 保证命令执行后保持交互式会话（与现状无参启动等价）。
-        // （M8-T021_P3 T021-05-C；DSR：powershell 不产生 ESC[6n，无应答依赖。）
+        // （T021-05-C；DSR：powershell 不产生 ESC[6n，无应答依赖。）
         let mut c = portable_pty::CommandBuilder::new("powershell.exe");
         c.arg("-NoLogo");
         c.arg("-NoExit");
@@ -545,7 +545,7 @@ impl ShellFileBridgeIo {
     }
 }
 
-/// 服务端 PTY 桥接主循环（M11-T001）。
+/// 服务端 PTY 桥接主循环。
 ///
 /// 已握手通道 → spawn 交互 shell → 双向桥接：
 /// - **接收循环**（异步）：`ShellStdin` → PTY stdin；`ShellResize` → PTY resize

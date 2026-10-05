@@ -37,9 +37,9 @@ pub struct VideoEncoderPipeline {
     /// 帧序号（Incremental 包 [frame_id] 用）。
     frame_id: u32,
     // ── CPU RGBA 适配（windows_capture 当前产 RGBA，非 GpuTexture 句柄） ──
-    // M8-T030（GPU-FR-008）：CPU tile-hash 兜底需要帧像素 ——
+    // GPU-FR-008：CPU tile-hash 兜底需要帧像素 ——
     // `pending_rgba` 由 set_cpu_frame 存留，classify_cpu 消费（非死拷贝；
-    // M13-T004 曾因无消费方移除，现恢复消费）。
+    // 曾因无消费方移除，现恢复消费）。
     pending_rgba: Vec<u8>,
     pending_w: u32,
     pending_h: u32,
@@ -94,7 +94,7 @@ impl VideoEncoderPipeline {
         self.encoder.reconfigure(cfg)
     }
 
-    /// 窗口边界清参考帧（M8-T011 T2.3，转发到内部编码器）。
+    /// 窗口边界清参考帧（T2.3，转发到内部编码器）。
     ///
     /// 每个窗口编码前调用：清空上一窗口残留的参考帧 / 内部缓冲，保证窗口
     /// 自包含（首帧强制 IDR）。无缓冲后端为 no-op（trait 默认实现）。
@@ -113,7 +113,7 @@ impl VideoEncoderPipeline {
     /// 喂入 CPU RGBA（适配 `windows_capture`：当前捕获后端无 GPU 句柄）。
     /// 调用方在 [`on_frame`](Self::on_frame) 前调用本方法把当前帧 RGBA 喂入。
     ///
-    /// M8-T030（）：本层保留一份 RGBA 副本供 CPU tile-hash 兜底
+    /// 本层保留一份 RGBA 副本供 CPU tile-hash 兜底
     /// （`classify_cpu` 消费；GPU 内核可用时仍只转发编码器 + 缓存尺寸）。
     pub fn set_cpu_frame(&mut self, rgba: &[u8], w: u32, h: u32, force_idr: bool) {
         self.encoder.set_cpu_frame(rgba, w, h, force_idr);
@@ -136,7 +136,7 @@ impl VideoEncoderPipeline {
         self.frame_id = self.frame_id.wrapping_add(1);
 
         // 决策：GPU 内核可用 → classify（纹理 hash）；否则 CPU 路径
-        // （tex 为 null 哨兵）→ M8-T030 真实 CPU tile-hash 兜底（classify_cpu），
+        // （tex 为 null 哨兵）→ 真实 CPU tile-hash 兜底（classify_cpu），
         // 产出三态决策（首帧 FullFrame / 纯色 Static / 局部微变 Incremental）。
         let decision = if tex.is_null() {
             match self
@@ -176,7 +176,7 @@ impl VideoEncoderPipeline {
                     GpuTexture::new(tex.handle, tex.width(), tex.height())
                 };
                 // P1G：把 classify 产出的 dirty map 原样传给编码器（ROI 注入
-                // 依赖它；M8-T030 后 CPU 路径的 map 来自真实 CPU tile-hash，
+                // 依赖它；现 CPU 路径的 map 来自真实 CPU tile-hash，
                 // ROI 同样生效）。
                 self.encoder
                     .encode(&enc_tex, ts, EncodeDecision::FullFrame(map))

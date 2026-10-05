@@ -67,7 +67,7 @@ pub const MAX_PACKET_PAYLOAD: usize = MAX_DATAGRAM_SIZE
     .saturating_sub(AEAD_OVERHEAD)
     .saturating_sub(HEADER_SIZE);
 
-/// 文件传输单帧明文负载上限（M13-T006）。
+/// 文件传输单帧明文负载上限。
 ///
 /// 与 core 侧 [`Multiplexer::DEFAULT_MAX_FRAME_LEN`]（16 MiB）对齐的概念上限；
 /// 文件块（64 KiB）经 SecureChannel 大帧直接发送，**不**走本文件 1151B
@@ -113,11 +113,11 @@ pub enum PacketKindWire {
     Audio = 0x02,
     /// 键鼠回声（可靠流镜像）。
     InputEcho = 0x03,
-    /// 剪贴板文本（UTF-8，M13-T003）。
+    /// 剪贴板文本（UTF-8）。
     Clipboard = 0x05,
-    /// 文件传输帧（bincode [`FileTransferFrame`]，M13-T006）。
+    /// 文件传输帧（bincode [`FileTransferFrame`]）。
     FileTransfer = 0x06,
-    /// 显示器/隐私等控制消息（bincode [`ControlMessage`]，M8-T018；
+    /// 显示器/隐私等控制消息（bincode [`ControlMessage`]；
     /// 0x04 与 [`ChannelTag::Control`] 对齐，SecureChannel 路径 tag 分帧）。
     Control = 0x04,
 }
@@ -300,9 +300,9 @@ pub enum ChannelTag {
     Input = 0x03,
     /// 控制/心跳（DNS 心跳归属确认通道）。
     Control = 0x04,
-    /// 剪贴板文本（M13-T003，双向）。
+    /// 剪贴板文本（双向）。
     Clipboard = 0x05,
-    /// 文件传输（M13-T006，双向，64 KiB 大帧走可靠流）。
+    /// 文件传输（双向，64 KiB 大帧走可靠流）。
     FileTransfer = 0x06,
 }
 
@@ -362,9 +362,9 @@ impl QuicKind {
             PacketKind::InputEcho => Self::InputReliable,
             // 剪贴板走可靠流（不可丢，与键鼠同权）。
             PacketKind::Clipboard => Self::InputReliable,
-            // M13-T006: 文件走可靠流（不可丢，不重；背压阻塞）。
+            // 文件走可靠流（不可丢，不重；背压阻塞）。
             PacketKind::FileTransfer => Self::InputReliable,
-            // M8-T018: 显示器/隐私等控制消息走可靠流（不可丢，低延迟敏感）。
+            // 显示器/隐私等控制消息走可靠流（不可丢，低延迟敏感）。
             PacketKind::Control => Self::InputReliable,
         }
     }
@@ -559,7 +559,7 @@ mod tests {
             QuicKind::from_packet_kind(PacketKind::FileTransfer),
             QuicKind::InputReliable
         );
-        // M8-T018: 显示器/隐私等控制走可靠流（不可丢，低延迟敏感）。
+        // 显示器/隐私等控制走可靠流（不可丢，低延迟敏感）。
         assert_eq!(
             QuicKind::from_packet_kind(PacketKind::Control),
             QuicKind::InputReliable
@@ -574,7 +574,7 @@ mod tests {
             PacketKind::InputEcho,
             PacketKind::Clipboard,
             PacketKind::FileTransfer,
-            // M8-T018: 显示器控制 wire 0x04（与 ChannelTag::Control 对齐）。
+            // 显示器控制 wire 0x04（与 ChannelTag::Control 对齐）。
             PacketKind::Control,
         ] {
             let wire = PacketKindWire::from(k);
@@ -583,7 +583,7 @@ mod tests {
         // 未知 wire byte → None。
         assert_eq!(PacketKindWire::from_byte(0x00), None);
         assert_eq!(PacketKindWire::from_byte(0x99), None);
-        // M8-T018: Control tag 映射（复用既有 ChannelTag::Control 0x04）。
+        // Control tag 映射（复用既有 ChannelTag::Control 0x04）。
         assert_eq!(
             ChannelTag::from_packet_kind(PacketKind::Control),
             ChannelTag::Control

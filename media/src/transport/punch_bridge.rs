@@ -1,4 +1,4 @@
-﻿//! M8-T026-P1 (PUNCH-001 / PATH-004): 打洞路径 → 媒体传输桥。
+﻿//! (PUNCH-001 / PATH-004): 打洞路径 → 媒体传输桥。
 //!
 //! core 的 `PunchSession` 只负责打通 UDP 路径（交还 socket）；本模块把
 //! **打洞 socket 上的 QUIC 媒体传输**建起来：
@@ -9,7 +9,7 @@
 //! - 会话级升舱任务（`PunchUpgrade`）：订阅 `PunchUpgradeEvent`，收到
 //!   `UdpEstablished` → 建立媒体传输 → 推入会话既有 swap 通道
 //!   （`apply_server_swap`/`apply_client_swap` 热替换 + 强制 IDR，
-//!   对齐 M8-T025 降级机制）——"中继 → 直连"升舱（PATH-004）的执行端。
+//!   对齐降级机制）——"中继 → 直连"升舱（PATH-004）的执行端。
 
 use kirin_desk_core::crypto::ed25519::IdentityManager;
 use kirin_desk_core::crypto::handshake::PinExpectation;

@@ -144,7 +144,7 @@ cd ../..
 2. 解压后**整个目录放到** `ffmpeg/ffmpeg-8.1.1-full_build-shared/`(zip 内目录名一致,无需改名)——加载器按此目录名搜索(见 `media/src/ffmpeg/dlls.rs`);
 3. 自检:确认 `bin/` 下存在 `avcodec-62.dll`(libavcodec 62.28.101)、`avutil-60.dll`、`swscale-9.dll` 等共享库(缺库加载会直接失败)。
 
-> **为何用 8.1.1 而非 8.1.2**:8.1.2 构建捆绑 ffnvcodec 13.1 头,`h264_nvenc` 要求 NVIDIA 驱动 ≥610.00;8.1.1 捆绑 13.0 头,兼容 591 系主流驱动(本机 591.86 实测出码流 ✓,2026-08-02)。两者均为 libavcodec 62,硬编码偏移快照(`SNAPSHOT_FFMPEG_MAJOR = 62`)兼容——决策记录见 `docs/共享层/M8-T030_单GPU硬件加速与虚拟设备过滤_需求设计.md` §5.2。
+> **为何用 8.1.1 而非 8.1.2**:8.1.2 构建捆绑 ffnvcodec 13.1 头,`h264_nvenc` 要求 NVIDIA 驱动 ≥610.00;8.1.1 捆绑 13.0 头,兼容 591 系主流驱动(本机 591.86 实测出码流 ✓,2026-08-02)。两者均为 libavcodec 62,硬编码偏移快照(`SNAPSHOT_FFMPEG_MAJOR = 62`)兼容——决策记录见 `docs/共享层/_单GPU硬件加速与虚拟设备过滤_需求设计.md` §5.2。
 >
 
 
@@ -177,7 +177,7 @@ KirinDesk.exe --cli connect 2001:db8::1 59990 mynickname
 ### 内网穿透（Tunnel）加密认证
 
 relay 服务器（`tunnel serve`）的登录认证采用 **挑战-响应（SCRAM 式）** 加密验证
-（M8-T026-P3，协议 v1.1.0）：
+（协议 v1.1.0）：
 
 - **口令永不明文上线**：登录报文仅携带随机数与 HMAC-SHA256 证明（`auth_digest`），
   网络抓包无法获得口令原文；
@@ -198,7 +198,7 @@ relay 服务器（`tunnel serve`）的登录认证采用 **挑战-响应（SCRAM
 连接（服务端亦可经 `KIRIN_RELAY_TOKEN` 环境变量提供）。完整参考：
 `release/server/README.md`。
 
-**Tunnel 独立页（M8-T039，2026-08-03）**：内网穿透已从 Settings 页迁出，升级为
+**Tunnel 独立页（2026-08-03）**：内网穿透已从 Settings 页迁出，升级为
 顶部导航独立标签页（🚇 Tunnel，位于 Connect 与 Settings 之间）——Client/Server
 分区配置、Server 多地址监听（`bind_addrs`，默认 `0.0.0.0,::`，IPv6 一律 v6-only）、
 Token ✏️ 一键生成（32 字节高熵，点击立即落盘）与 📋 复制、代理列表、GUI 一键
@@ -318,7 +318,7 @@ challenge_code = ""  # 服务端必填（fail-closed）
 
 [dns]
 
-# M8-T040: 域名模式加密 DNS 强制（服务端 + 客户端，默认 enforce）
+# 域名模式加密 DNS 强制（服务端 + 客户端，默认 enforce）
 [dns.security]
 mode = "enforce"      # enforce（域名模式强制 DoH/DoT，fail-closed）| off（仅 IP 模式）
 doh = ["https://cloudflare-dns.com/dns-query", "https://dns.google/resolve", "https://dns.alidns.com/resolve"]
@@ -326,7 +326,7 @@ dot = ["1.1.1.1:853", "8.8.8.8:853", "2400:3200::1:853"]
 resolve_timeout_ms = 5000
 cache_ttl_secs = 50
 
-# M8-T040: DDNS 域名自动更新维护（GUI Domain 页「DDNS 维护」卡读写）
+# DDNS 域名自动更新维护（GUI Domain 页「DDNS 维护」卡读写）
 [ddns]
 enabled = false       # 总开关（默认关；关闭不删除已发布记录）
 interval_secs = 300   # 更新周期（下限 60s；未设置回退 [network] heartbeat_interval）

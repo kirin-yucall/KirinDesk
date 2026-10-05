@@ -39,7 +39,7 @@ use kirin_desk_core::network::tcp::set_nodelay;
 /// 控制流就绪标记（1 字节，置于控制帧流之外）。
 ///
 /// quinn 的流以**首个 STREAM 帧**隐式建立：`open_bi` 只分配流 ID，不产生
-/// 任何网络数据。若服务端 accept 后不立即写控制流（如 M8-T026-P1 打洞
+/// 任何网络数据。若服务端 accept 后不立即写控制流（如打洞
 /// 升舱/迁移场景服务端只收不发），客户端 `accept_bi` 将永久挂起直至空闲
 /// 超时（既有测试靠服务端立即发 VideoFormat 隐式规避）。服务端 open_bi
 /// 后立即写本标记强制 STREAM 帧发出，connect 端在 accept_bi 后同步消费
@@ -548,7 +548,7 @@ pub async fn connect_quic_transport(
     Ok(transport)
 }
 
-/// 创建 QUIC 传输（客户端在**预建端点**上拨号——打洞路径，M8-T026-P1）。
+/// 创建 QUIC 传输（客户端在**预建端点**上拨号——打洞路径）。
 ///
 /// 与 [`connect_quic_transport`] 的唯一区别：连接从外部预建的
 /// `QuicEndpoint`（`QuicEndpoint::client_on` 建于打洞 socket 之上）发起，
@@ -713,7 +713,7 @@ impl SecureChannelSender {
         Ok(())
     }
 
-    /// 发送一个**大帧** EncodedPacket（M13-T006 文件传输）。
+    /// 发送一个**大帧** EncodedPacket（文件传输）。
     ///
     /// 与 [`send_packets`](Self::send_packets) 的差异：跳过
     /// [`stream::MAX_PACKET_PAYLOAD`]（≈1151B）小分片检查，直接打包
@@ -862,7 +862,7 @@ impl SecureChannelTransport {
         sender.send_packets(pkts).await
     }
 
-    /// 发送一个**大帧** EncodedPacket（委托给发送半传输，M13-T006 文件传输）。
+    /// 发送一个**大帧** EncodedPacket（委托给发送半传输，文件传输）。
     ///
     /// 语义同 [`SecureChannelSender::send_big_packet`]：跳过
     /// [`stream::MAX_PACKET_PAYLOAD`] 小分片检查，payload 上限
@@ -915,7 +915,7 @@ fn trans_err_to_transport(e: TransError) -> TransportError {
 }
 
 // ════════════════════════════════════════════════════════════════
-// 动态建连工厂（M8-T025 P5-2）
+// 动态建连工厂（P5-2）
 // ════════════════════════════════════════════════════════════════
 
 /// 双栈 TCP 监听：优先 `[::]:port`（IPV6_V6ONLY=false，可收 v4-mapped 连接），
@@ -994,7 +994,7 @@ fn tcp_err_to_transport(e: kirin_desk_core::network::tcp::TcpError) -> Transport
     }
 }
 
-/// 客户端统一建连（M8-T025 §3.4 建连流程）。
+/// 客户端统一建连（§3.4 建连流程）。
 ///
 /// - `mode = Quic` + `allow_fallback = true`：QUIC 拨号 + 完整握手优先；
 ///   失败/超时（`connect_timeout`，默认 3s）→ 记日志 → TCP SecureChannel 拨号
@@ -1402,7 +1402,7 @@ mod secure_channel_tests {
 // QUIC 阶段 EncodedPacket 分派测试（P1F §T6.3）
 // ════════════════════════════════════════════════════════════════
 //
-// 真实 QUIC 端到端连接（含握手 + DATAGRAM 重组）由 M8-T013 阶段在
+// 真实 QUIC 端到端连接（含握手 + DATAGRAM 重组）由 阶段在
 // `accept_quic_transport`/`connect_quic_transport` 上做集成验证；本模块只验证
 // P1F 引入的「分派/优先级/成帧」逻辑，不依赖真实 quinn 连接（避免端口/SNI
 // 等环境耦合）。

@@ -9,9 +9,9 @@ pub(crate) static KIRIN_DATA_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::
 pub mod audit;
 pub mod autostart;
 pub mod config;
-// M8-T035: DNS 域名维护服务商注册表（Settings → DNS 组动态表单的事实源）。
+// DNS 域名维护服务商注册表（Settings → DNS 组动态表单的事实源）。
 pub mod dns_providers;
-// M8-T031: 系统设备 ID 派生（空配置 → 硬盘 UUID / machine-id / 平台 UUID）。
+// 系统设备 ID 派生（空配置 → 硬盘 UUID / machine-id / 平台 UUID）。
 pub mod device;
 pub mod logging;
 pub mod error;
@@ -26,7 +26,7 @@ pub mod git_ref;
 pub mod known_hosts;
 // SavedDevice.os_type 落库值的域约束 = KNOWN_OS_TYPES 常量集）。
 pub mod osinfo;
-// M8-T038 (P2): 系统 UI 语言识别（`[ui].language = "system"` 跟随系统用）。
+// (P2): 系统 UI 语言识别（`[ui].language = "system"` 跟随系统用）。
 pub mod locale;
 // 本批先行实现模块本体与单测；config.rs 字段接线与迁移（R13-S1 后半/S3）
 pub mod secure;

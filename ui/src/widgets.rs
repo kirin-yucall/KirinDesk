@@ -1,4 +1,4 @@
-//! M15-T008: 通用 UI 组件库（纯 egui 函数，令牌驱动，零裸色值）。
+//! 通用 UI 组件库（纯 egui 函数，令牌驱动，零裸色值）。
 //!
 //! 规则：组件只允许经 [`Theme`] 取色/取字号；仅允许 hover/pressed/selected
 //! 状态色切换，无任何持续动画（保 UI-NF-001 60fps）。本文件不依赖 lib.rs，
@@ -8,7 +8,7 @@ use eframe::egui;
 use egui::{Color32, RichText, Stroke, Ui};
 
 use crate::theme::Theme;
-// M8-T038 (P6): 组件默认 tooltip 文案走 t!()（i18n/widgets.rs 分区表）。
+// (P6): 组件默认 tooltip 文案走 t!()（i18n/widgets.rs 分区表）。
 use crate::t;
 
 // ════════════════════════════════════════════════════════════════
@@ -258,7 +258,7 @@ pub fn toolbar_button(ui: &mut Ui, theme: &Theme, icon: &str, tooltip: &str) -> 
     resp.on_hover_text(tooltip)
 }
 
-/// 小复制按钮（📋，M8-T028）：点击把文本写入剪贴板。
+/// 小复制按钮（📋）：点击把文本写入剪贴板。
 /// - `text` 为空 → 禁用（灰化不可点，UI-BTY-023）；
 /// - 点击后按钮瞬态显示 ✓（1.5s 自动还原；按按钮 id 记忆，无持续动画，UI-BTY-028）；
 /// - 返回 `(Response, bool)`：`bool` = 本帧发生复制（调用方用于状态栏浮出提示）。
@@ -290,10 +290,10 @@ pub fn copy_button(ui: &mut Ui, theme: &Theme, text: &str) -> (egui::Response, b
     (resp, copied)
 }
 
-/// M8-T028 (UI-BTY-028): 📋 复制成功反馈持续时间（按钮 ✓ 瞬态）。
+/// (UI-BTY-028): 📋 复制成功反馈持续时间（按钮 ✓ 瞬态）。
 const COPY_BUTTON_FEEDBACK: std::time::Duration = std::time::Duration::from_millis(1500);
 
-/// M8-T036: 状态按钮（开/关二态颜色切换）——ON = 品牌蓝填充 + `on_primary`
+/// 状态按钮（开/关二态颜色切换）——ON = 品牌蓝填充 + `on_primary`
 /// 文字，OFF = `bg_strong` 灰填充 + `fg_weak` 文字（与 `toggle_switch` 语义
 /// 一致：灰=停用，蓝=启用）。状态由调用方持有（`on` 为只读快照，点击后自行
 /// 翻转并持久化）。
@@ -319,10 +319,10 @@ pub fn state_button(ui: &mut Ui, theme: &Theme, label: &str, on: bool) -> egui::
 }
 
 // ════════════════════════════════════════════════════════════════
-// 滑动开关（M8-T034）
+// 滑动开关
 // ════════════════════════════════════════════════════════════════
 
-/// 滑动开关（M8-T034）：自绘圆角轨道 + 滑动圆钮，状态由调用方持有
+/// 滑动开关：自绘圆角轨道 + 滑动圆钮，状态由调用方持有
 /// （`on` 为只读快照；调用方读 `.clicked()` 后自行翻转并持久化）。
 /// - ON = 品牌主色轨道 + `on_primary` 圆钮；OFF = `bg_strong` 轨道 +
 ///   `fg_weak` 圆钮；仅 hover/pressed 状态色切换，无持续动画（UI-NF-001）；
@@ -530,8 +530,8 @@ pub fn labeled_input(
 // ════════════════════════════════════════════════════════════════
 
 /// StatCard 一行：键（弱色 Small）+ 值（Body/Mono）+ 可选行尾状态点 + 可选复制按钮。
-/// `small`（M8-T034）：值改用 `theme.small_size`（身份卡整体小字号）。
-/// `dot`（M8-T037）：`Some((color, tooltip))` → 值后渲染彩色「●」状态点
+/// `small`：值改用 `theme.small_size`（身份卡整体小字号）。
+/// `dot`：`Some((color, tooltip))` → 值后渲染彩色「●」状态点
 /// （无文字，行内紧凑；如公网检测红/绿点），`None` 不渲染（既有调用点零影响）。
 pub struct StatRow<'a> {
     pub key: &'a str,
@@ -545,14 +545,14 @@ pub struct StatRow<'a> {
 }
 
 /// 信息卡片（§4 StatCard）：标题栏（Small 弱色）+ 分隔线 + 键值行。
-/// 返回本帧被复制的内容（`None` = 未复制；M8-T028 状态栏浮出提示用）。
+/// 返回本帧被复制的内容（`None` = 未复制； 状态栏浮出提示用）。
 // 本入口无调用者——保留（组件库对称 API，供后续卡面复用）并标注。
 #[allow(dead_code)]
 pub fn stat_card(ui: &mut Ui, theme: &Theme, title: &str, rows: &[StatRow<'_>]) -> Option<String> {
     stat_card_impl(ui, theme, title, rows, None)
 }
 
-/// 信息卡片 + 底部提示行（M8-T037：公网检测建议「无公网地址建议开启内网穿透
+/// 信息卡片 + 底部提示行（：公网检测建议「无公网地址建议开启内网穿透
 /// 或端口转发」等随卡展示的提示）。`footer = Some((color, text))` → 卡底渲染
 /// 一行小字号彩色提示（无圆点）；`None` → 与 `stat_card` 完全一致。
 pub fn stat_card_with_footer(
@@ -608,7 +608,7 @@ fn stat_card_impl(
                     if row.mono {
                         rt = rt.monospace();
                     }
-                    // M8-T034: `small` → small_size（身份卡小字号）；否则按
+                    // `small` → small_size（身份卡小字号）；否则按
                     // mono/body 既有字号。
                     rt = rt.size(if row.small {
                         theme.small_size
@@ -618,7 +618,7 @@ fn stat_card_impl(
                         theme.body_size
                     });
                     ui.add(egui::Label::new(rt).selectable(true));
-                    // M8-T037: 行尾状态点（值后、复制按钮前；如公网检测红/绿点）。
+                    // 行尾状态点（值后、复制按钮前；如公网检测红/绿点）。
                     if let Some((color, tip)) = row.dot {
                         let dot = ui.add(
                             egui::Label::new(
@@ -649,7 +649,7 @@ fn stat_card_impl(
                     row_frame.response.on_hover_text(tip.as_str());
                 }
             }
-            // M8-T037: 卡底提示行（公网检测建议等）。
+            // 卡底提示行（公网检测建议等）。
             if let Some((color, text)) = footer {
                 ui.add_space(2.0);
                 ui.add(
@@ -936,7 +936,7 @@ impl ConnLogBuffer {
         self.inner.lock().unwrap().lines.iter().cloned().collect()
     }
 
-    /// M15-T008 同档：清空（连接日志框 Clear 按钮）。
+    /// 同档：清空（连接日志框 Clear 按钮）。
     pub fn clear(&self) {
         self.inner.lock().unwrap().lines.clear();
     }
@@ -1331,7 +1331,7 @@ mod tests {
         }
     }
 
-    /// M8-T028 (UI-BTY-023/028): 点击 📋 → 剪贴板写入 + 返回 (Response, bool) 上抛
+    /// (UI-BTY-023/028): 点击 📋 → 剪贴板写入 + 返回 (Response, bool) 上抛
     /// + ✓ 瞬态记忆；空值按钮禁用（headless 模拟按下/释放）。
     #[test]
     fn test_copy_button_click_and_disabled() {
@@ -1386,7 +1386,7 @@ mod tests {
         });
     }
 
-    /// M8-T034: 滑动开关 headless 行为——正常渲染（含状态文字）不 panic、
+    /// 滑动开关 headless 行为——正常渲染（含状态文字）不 panic、
     /// 无点击不上抛；帧 2 点击轨道 → `clicked()` 上抛（on 翻转由调用方完成，
     /// 组件本身只报点击）。
     #[test]

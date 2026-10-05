@@ -1,4 +1,4 @@
-//! M8-T026-P1 (PUNCH-001 / PUNCH-SEC-001 / PUNCH-NF-001): 打洞路径 →
+//! (PUNCH-001 / PUNCH-SEC-001 / PUNCH-NF-001): 打洞路径 →
 //! QUIC 媒体传输端到端。
 //!
 //! 全链路（进程内，无真实 NAT、无 FFmpeg）：

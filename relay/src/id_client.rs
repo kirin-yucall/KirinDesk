@@ -1,7 +1,7 @@
-//! M8-T026-P2: 设备侧 ID 注册客户端 + 控制器解析/中继辅助（ID-001/003/005/010/011③）。
+//! 设备侧 ID 注册客户端 + 控制器解析/中继辅助（ID-001/003/005/010/011③）。
 //!
 //! 与并行开发的 `client.rs`（T003 端口代理 frpc）**职责分离**：本模块只做
-//! 设备 ID 模式 —— `Login` 携带 `device_id` 注册在线表 + 心跳保活（与 M8-T026
+//! 设备 ID 模式 —— `Login` 携带 `device_id` 注册在线表 + 心跳保活（与 
 //! 控制连接心跳**合并**，ID-NF-003 不新增包）+ `CandidateRegister` 候选刷新
 //! （ID-005）+ `TunnelRequest` 接收（§8.1 设备级中继兜底）。
 //!
@@ -106,7 +106,7 @@ pub enum IdClientError {
     Timeout(String),
     #[error("login rejected: {0}")]
     LoginRejected(String),
-    /// M8-T026-P3：服务器认证失败（双向认证回执校验失败 / fail-closed
+    /// 服务器认证失败（双向认证回执校验失败 / fail-closed
     /// 拒绝，TNL-SEC-007/008）。
     #[error("server authentication failed: {0}")]
     ServerAuthFailed(String),
@@ -436,7 +436,7 @@ impl IdClient {
             }
         });
         *self.state.frame_tx.lock().unwrap() = Some(tx.clone());
-        // 3. Login（ID-001：携带 device_id + ed25519_pub）— M8-T026-P3
+        // 3. Login（ID-001：携带 device_id + ed25519_pub）— 
         // 挑战-响应认证（TNL-SEC-006~008）：口令永不明文上线；双向认证
         // 回执校验；带口令客户端遇未认证服务器 fail-closed 拒绝。
         let auth_fields = crate::auth::LoginFields {
@@ -636,7 +636,7 @@ impl IdClient {
                         warn!("id heartbeat timeout (no Pong for {:?})", timeout);
                         return Err(IdClientError::Timeout("heartbeat".to_string()));
                     }
-                    // ID-NF-003：心跳与 M8-T026 控制连接合并，不新增包。
+                    // ID-NF-003：心跳与控制连接合并，不新增包。
                     let ts = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .map(|d| d.as_millis() as u64)
@@ -737,7 +737,7 @@ pub async fn collect_local_candidates(extra: &[Candidate], local_port: u16) -> V
     collect_local_candidates_with(extra, local_port, true).await
 }
 
-/// 认证错误 → ID 客户端错误映射（M8-T026-P3 语义保持：登录被拒保留
+/// 认证错误 → ID 客户端错误映射（语义保持：登录被拒保留
 /// DeviceConflict 判定；双向认证 / fail-closed → ServerAuthFailed）。
 fn map_id_auth_error(e: crate::auth::ClientAuthError) -> IdClientError {
     use crate::auth::ClientAuthError;
@@ -789,7 +789,7 @@ pub async fn resolve_device(
             source: e,
         })?;
     let (mut reader, writer) = stream.into_split();
-    // Login（ID-001：纯解析不注册，device_id = None）— M8-T026-P3
+    // Login（ID-001：纯解析不注册，device_id = None）— 
     // 挑战-响应认证（TNL-SEC-006~008）：口令永不明文上线；带口令客户端
     // 遇未认证服务器 fail-closed 拒绝。
     let auth_fields = crate::auth::LoginFields {

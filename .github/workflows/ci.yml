@@ -1,6 +1,6 @@
 name: CI
 
-# M14-T001: 自动化构建/测试 + release 打包。
+# 自动化构建/测试 + release 打包。
 # - ci job（push/PR/workflow_dispatch）：三平台 build(debug) + test + build(release)。
 # - release job（workflow_dispatch 或 v* tag）：三平台 release 打包并上传 artifacts：
 #     Windows → zip（exe + FFmpeg DLL + default.toml）
@@ -11,7 +11,7 @@ name: CI
 #   `.sha256` 侧车强制校验，缺失即拒绝）。
 # - S-06d: 所有 actions 均 pin 到 commit SHA（2026-08-02 解析；升级 = 人工核对新 SHA）。
 # - 二期登记（S-06d）：macOS 正式签名（Developer ID + notarization）评估中，未实现。
-# 注：CARGO_TARGET_DIR 固定为 target-ci，规避中文路径问题（M14-T001 要求）。
+# 注：CARGO_TARGET_DIR 固定为 target-ci，规避中文路径问题。
 
 on:
   push:
@@ -23,7 +23,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # M14-T001: 固定 target 目录（本地中文路径规避 + rust-cache 可命中）
+  # 固定 target 目录（本地中文路径规避 + rust-cache 可命中）
   CARGO_TARGET_DIR: target-ci
 
 jobs:
@@ -113,7 +113,7 @@ jobs:
           Copy-Item "ffmpeg/ffmpeg-8.1.1-full_build-shared/bin/*.dll" "$dist/ffmpeg/" -ErrorAction SilentlyContinue
           Copy-Item "ffmpeg/ffmpeg-8.1.1-full_build-shared/LICENSE" "$dist/ffmpeg/LICENSE" -ErrorAction SilentlyContinue
           Compress-Archive -Path "$dist/*" -DestinationPath "KirinDesk-${{ steps.ver.outputs.version }}-windows-x86_64.zip" -Force
-          # 独立 exe 资产：updater 按平台选 asset 时优先 .exe（M14-T005）
+          # 独立 exe 资产：updater 按平台选 asset 时优先 .exe
           Copy-Item "$dist/KirinDesk.exe" "KirinDesk-${{ steps.ver.outputs.version }}-windows-x86_64.exe"
 
       # ── Ubuntu：.deb（release/debian/build_deb.sh） ──

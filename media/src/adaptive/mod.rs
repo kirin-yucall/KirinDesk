@@ -18,7 +18,7 @@
 //! | `state_machine.rs` | 网络状态机 + 迟滞切换 |
 //! | `adjuster.rs` | QP/帧率调整 + 超时保护 |
 //! | `report.rs` | 客户端 `ReportGenerator` + `DecodeStats` |
-//! | `fps_governor.rs` | M13-T002 可变帧率（内容活动度 → 1/10/30fps 档位） |
+//! | `fps_governor.rs` | 可变帧率（内容活动度 → 1/10/30fps 档位） |
 
 pub mod adjuster;
 pub mod fps_governor;
@@ -60,7 +60,7 @@ pub struct AdaptiveEngine {
     recovery: RecoveryController,
     /// 最近一次 QUIC 拥塞窗口（恢复条件 C 用）
     last_cwnd: Option<u64>,
-    /// M8-T025 P5-1：传输模式分支——TCP 模式跳过状态机/恢复，固定默认档
+    /// P5-1：传输模式分支——TCP 模式跳过状态机/恢复，固定默认档
     /// （§3.5 主文档：避免基于伪数据的错误降级）。
     mode: TransportMode,
 }
@@ -89,7 +89,7 @@ impl AdaptiveEngine {
     ///
     /// 返回 `Some(EncodeConfig)` 表示配置需要更新。
     ///
-    /// TCP 模式（M8-T025 §3.5）：可靠传输丢包恒 0，状态机/恢复基于伪数据
+    /// TCP 模式（§3.5）：可靠传输丢包恒 0，状态机/恢复基于伪数据
     /// 只会产生错误降级 → 直接返回 None，编码配置固定默认档。
     pub fn on_feedback(&mut self, report: &FeedbackReport) -> Option<EncodeConfig> {
         if self.mode == TransportMode::Tcp {
@@ -153,7 +153,7 @@ impl AdaptiveEngine {
     ///
     /// `cwnd` 单位为字节。当拥塞窗口小于一个 MTU 时强制降级。
     ///
-    /// TCP 模式（M8-T025 §3.5）：拥塞控制在内核（无应用层 cwnd 概念）→ no-op。
+    /// TCP 模式（§3.5）：拥塞控制在内核（无应用层 cwnd 概念）→ no-op。
     pub fn on_quic_stats(&mut self, rtt_ms: f64, cwnd: u64) -> Option<EncodeConfig> {
         if self.mode == TransportMode::Tcp {
             return None;
@@ -225,7 +225,7 @@ impl AdaptiveEngine {
     ///
     /// 当编码超时（>70ms）时自动降级。
     ///
-    /// TCP 模式（M8-T025 §3.5）：编码配置固定默认档，不做任何调整 → 恒 None。
+    /// TCP 模式（§3.5）：编码配置固定默认档，不做任何调整 → 恒 None。
     pub fn on_encode_complete(&mut self, encode_ms: f64) -> Option<EncodeConfig> {
         if self.mode == TransportMode::Tcp {
             return None;
@@ -328,7 +328,7 @@ mod tests {
         // 5 次: 2 warmup + 3 stable → 第 5 次触发切换
         for _ in 0..10 {
             if let Some(config) = engine.on_feedback(&report) {
-                // base 28 + 丢包 2.5%（+2）= 30；M13-T003 低带宽 3Mbps（<5M）
+                // base 28 + 丢包 2.5%（+2）= 30；低带宽 3Mbps（<5M）
                 // 追加 +2 → 32，帧率 0.5 × 0.7 = 0.35。
                 assert_eq!(config.qp, 32);
                 assert!((config.frame_ratio - 0.35).abs() < 1e-9);
@@ -374,7 +374,7 @@ mod tests {
         let mut engine = AdaptiveEngine::new(1920, 1080);
         engine.on_encode_complete(85.0); // timeout -> set qp=30
         engine.reset(1280, 720);
-        assert_eq!(engine.current_config.qp, 22); // reset → EncodeConfig::default()，默认 QP=22（M8-T016）
+        assert_eq!(engine.current_config.qp, 22); // reset → EncodeConfig::default()，默认 QP=22
         assert_eq!(engine.current_config.frame_ratio, 1.0);
         assert_eq!(engine.state_machine.current(), NetworkState::Good);
         assert_eq!(engine.consecutive_timeouts, 0);
@@ -514,7 +514,7 @@ mod tests {
         assert!(engine.is_recovering());
     }
 
-    // ── M8-T025 P5-1：TCP 模式分支（§3.5 固定"良好"档）────────────
+    // ── P5-1：TCP 模式分支（§3.5 固定"良好"档）────────────
 
     /// TCP 模式：反馈（含高丢包）不触发状态机/恢复，配置恒默认档。
     #[test]

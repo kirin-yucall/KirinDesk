@@ -1,4 +1,4 @@
-//! 端到端媒体会话（M8-T009 集成层 + M8-T025 P5 传输抽象化/降级接线）。
+//! 端到端媒体会话（集成层 + P5 传输抽象化/降级接线）。
 //!
 //! 把已有组件串成完整闭环，**传输层对会话透明**（P5 契约）：
 //!
@@ -16,8 +16,8 @@
 //!   （SecureChannel，tag 分派，无丢包）
 //! - 控制走 QUIC 可靠流 / TCP Control tag（VideoFormat / FeedbackReport / Disconnect）
 //! - 自适应：按 [`TransportMode`] 分支——QUIC 完整闭环（编码超时保护 + 状态机 +
-//!   恢复策略）；TCP 固定默认档（M8-T025 §3.5，避免基于伪数据的错误降级）
-//! - M8-T025 P5-3 中途降级：QUIC 失效（`is_alive` 轮询 / 连接级错误）→ 客户端
+//!   恢复策略）；TCP 固定默认档（§3.5，避免基于伪数据的错误降级）
+//! - P5-3 中途降级：QUIC 失效（`is_alive` 轮询 / 连接级错误）→ 客户端
 //!   以同一凭据重拨 TCP（`connect_media_transport`），服务端降级接收任务持续
 //!   accept + 完整握手 → 传输热替换（`Box<dyn MediaTransport>` swap）+ 强制 IDR，
 //!   会话不中断、帧计数不归零；不自动升级回 QUIC（B3）
@@ -96,10 +96,10 @@ pub struct SessionConfig {
     pub encode: EncodeConfig,
     /// 客户端反馈上报周期（毫秒，默认 100）
     pub feedback_interval_ms: u64,
-    /// M8-T025 P5-3：中途降级开关（true = QUIC 失效自动 TCP 重建续传；
+    /// P5-3：中途降级开关（true = QUIC 失效自动 TCP 重建续传；
     /// false = 直接断连，现状行为）。仅当会话附带了降级参数时生效。
     pub graceful_degrade: bool,
-    /// M8-T025 §3.5：TCP 模式反馈上报周期（毫秒，默认 500——可靠传输无丢包
+    /// §3.5：TCP 模式反馈上报周期（毫秒，默认 500——可靠传输无丢包
     /// 语义，放宽周期减少无意义流量）。
     pub tcp_feedback_interval_ms: u64,
     pub audio: AudioConfig,
@@ -145,9 +145,9 @@ pub struct ServerSessionStats {
     pub recovery_phase: String,
     /// 收到的反馈报告数
     pub feedback_reports: u64,
-    /// M8-T025 P5-1：当前传输模式（"QUIC"/"TCP"）
+    /// P5-1：当前传输模式（"QUIC"/"TCP"）
     pub transport_mode: String,
-    /// M8-T025 P5-3：传输切换事件计数（QUIC → TCP 降级次数）
+    /// P5-3：传输切换事件计数（QUIC → TCP 降级次数）
     pub transport_switches: u64,
     pub audio_enabled: bool,
     pub audio_packets_sent: u64,
@@ -173,9 +173,9 @@ pub struct ClientSessionStats {
     pub video_h: u32,
     /// 发送的反馈报告数
     pub feedback_sent: u64,
-    /// M8-T025 P5-1：当前传输模式（"QUIC"/"TCP"）
+    /// P5-1：当前传输模式（"QUIC"/"TCP"）
     pub transport_mode: String,
-    /// M8-T025 P5-3：传输切换事件计数（QUIC → TCP 降级次数）
+    /// P5-3：传输切换事件计数（QUIC → TCP 降级次数）
     pub transport_switches: u64,
     pub audio_enabled: bool,
     pub audio_silence_inserted: u64,
@@ -297,7 +297,7 @@ impl ControlSink {
 }
 
 // ════════════════════════════════════════════════════════════════
-// 降级参数（M8-T025 P5-3）
+// 降级参数（P5-3）
 // ════════════════════════════════════════════════════════════════
 
 /// 服务端降级回退接收：会话期间持续 accept TCP 回退连接（完整握手，凭据与
@@ -428,13 +428,13 @@ enum ServerOut {
         encode_duration_ms: f64,
     },
     Audio(Vec<crate::encoder::types::EncodedPacket>),
-    /// M8-T018：显示器切换结果（Ok=新分辨率，Err=失败原因 → Nack）。
+    /// 显示器切换结果（Ok=新分辨率，Err=失败原因 → Nack）。
     MonitorSwitched(Result<(u32, u32), String>),
     /// 致命错误（捕获不可用等 → 会话终止）
     Fatal(String),
 }
 
-/// M8-T018：控制任务 → 主循环 的显示器控制响应（经控制流发出）。
+/// 控制任务 → 主循环 的显示器控制响应（经控制流发出）。
 enum DisplayResp {
     /// 显示器列表（`DisplayListReq` 的响应负载）。
     List(Vec<crate::proto::DisplayInfo>),
@@ -479,7 +479,7 @@ pub async fn run_server_session(
     encoder: VideoEncoderPipeline,
     config: SessionConfig,
     degrade: Option<ServerDegrade>,
-    // M8-T026-P1 (PATH-004): 打洞升舱源（中继 → 打洞 QUIC 热替换）。
+    // (PATH-004): 打洞升舱源（中继 → 打洞 QUIC 热替换）。
     punch_upgrade: Option<PunchUpgrade>,
     stop: Arc<AtomicBool>,
     // 调用方（UI 层）传入共享输入状态释放闭包（`InputInjector::release_all`，
@@ -529,7 +529,7 @@ pub async fn run_server_session(
     // P5-3：热替换后强制下一窗口 IDR（捕获 task 消费）。
     let force_idr = Arc::new(AtomicBool::new(false));
 
-    // ── M8-T018: 显示器控制通道 ─────────────────────────────────
+    // ── 显示器控制通道 ─────────────────────────────────
     // 控制任务 → 主循环：显示器列表 / 切换拒绝（主循环持有 transport 发送）。
     let (display_resp_tx, mut display_resp_rx) =
         tokio::sync::mpsc::unbounded_channel::<DisplayResp>();
@@ -568,7 +568,7 @@ pub async fn run_server_session(
         pipeline.update_encode_config(config.encode.clone());
         let mut capture = capture;
         let mut windows_encoded: u64 = 0;
-        // M8-T018（SRV-CAP-MON-003）与 P5-3：显示器切换 / 传输热替换后，
+        // （SRV-CAP-MON-003）与 P5-3：显示器切换 / 传输热替换后，
         // 下一窗口强制 IDR（主循环置位，本线程消费）。
         let mut force_idr_next = false;
 
@@ -578,7 +578,7 @@ pub async fn run_server_session(
                 break;
             }
 
-            // M8-T018（SRV-CAP-MON-002）：显示器切换命令 —— 会话内热切换
+            // SRV-CAP-MON-002：显示器切换命令 —— 会话内热切换
             // （重建捕获源，无需重连）。阻塞捕获源重建放本线程执行。
             if let Ok(idx) = switch_rx.try_recv() {
                 match capture.switch_monitor(idx as usize) {
@@ -617,7 +617,7 @@ pub async fn run_server_session(
                 }
             }
 
-            // M8-T018（MON-NF-002）：带超时等待——静默屏幕（无帧到达）时
+            // MON-NF-002：带超时等待——静默屏幕（无帧到达）时
             // 定期醒来轮询切换命令，切换延迟与屏幕活动度解耦（目标 <500ms）。
             let frame = match capture.wait_for_frame_timeout(Duration::from_millis(100)) {
                 Ok(f) => f,
@@ -746,7 +746,7 @@ pub async fn run_server_session(
     // ── P5-3 降级回退 accept task（可选）─────────────────────────
     // 会话期间持续监听 TCP：收到连接 → 完整握手（凭据同初始连接）→ 注入热替换。
     // 注意：主循环只消费热替换（`swap_rx`），发送端由 accept task 独占持有。
-    // M8-T026-P1 (PATH-004)：有降级**或**打洞升舱源时创建热替换通道；
+    // (PATH-004)：有降级**或**打洞升舱源时创建热替换通道；
     // 打洞升舱任务与降级 accept 任务并存（各自独立消费事件/连接）。
     let (_swap_tx, mut swap_rx) = if degrade.is_some() || punch_upgrade.is_some() {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Box<dyn MediaTransport>>();
@@ -773,7 +773,7 @@ pub async fn run_server_session(
     let degrade_enabled = config.graceful_degrade && swap_rx.is_some() && degrade.is_some();
 
     // ── 异步主循环：窗口接收 → 自适应统计 → 发送 / 热替换 ────────
-    //    M8-T018：与显示器控制响应（列表/切换拒绝）并行——控制任务发来的
+    //    与显示器控制响应（列表/切换拒绝）并行——控制任务发来的
     //    响应统一经本循环经 transport.send_control 发回客户端。
     let mut windows_encoded: u64 = 0;
     let mut frames_encoded: u64 = 0;
@@ -925,7 +925,7 @@ pub async fn run_server_session(
                         }
                     }
                     ServerOut::MonitorSwitched(result) => {
-                        // M8-T018（SRV-CAP-MON-003）：切换成功 → 重推 VideoFormat
+                        // SRV-CAP-MON-003：切换成功 → 重推 VideoFormat
                         // （分辨率变更 → 客户端解码上下文重建 + 坐标基数跟随）；
                         // 失败 → DisplaySelectNack（客户端提示并保持当前屏）。
                         match result {
@@ -991,7 +991,7 @@ pub async fn run_server_session(
                 }
             }
             resp = display_resp_rx.recv() => {
-                // M8-T018：控制任务 → 主循环 的显示器响应（列表 / 切换拒绝）。
+                // 控制任务 → 主循环 的显示器响应（列表 / 切换拒绝）。
                 let Some(resp) = resp else { continue };
                 if stop.load(Ordering::Relaxed) {
                     info!("server session: stopping by user request");
@@ -1195,14 +1195,14 @@ fn spawn_server_control_task(
             }
             match source.recv().await {
                 Ok(ControlMessage::DisplayListReq) => {
-                    // M8-T018（SRV-MON-002）：枚举显示器 → 响应。
+                    // SRV-MON-002：枚举显示器 → 响应。
                     // 每次请求返回最新列表（热插拔后客户端可手动刷新，MON-NF-001）。
                     let displays = crate::capture::factory::enumerate_monitors();
                     info!("[Session] DisplayListReq → {} display(s)", displays.len());
                     let _ = display_resp_tx.send(DisplayResp::List(displays));
                 }
                 Ok(ControlMessage::DisplaySelect { index }) => {
-                    // M8-T018（SRV-MON-003）：越界 → Nack（保持当前屏）；
+                    // SRV-MON-003：越界 → Nack（保持当前屏）；
                     // 合法 → 捕获线程热切换（重建捕获源 + 下一窗口 IDR）。
                     let displays = crate::capture::factory::enumerate_monitors();
                     if index as usize >= displays.len() {
@@ -1342,7 +1342,7 @@ pub async fn run_client_session<F>(
     mut on_frame: F,
     config: SessionConfig,
     degrade: Option<ClientDegrade>,
-    // M8-T026-P1 (PATH-004): 打洞升舱源（中继 → 打洞 QUIC 热替换）。
+    // (PATH-004): 打洞升舱源（中继 → 打洞 QUIC 热替换）。
     punch_upgrade: Option<PunchUpgrade>,
     stop: Arc<AtomicBool>,
 ) -> Result<ClientSessionStats, String>
@@ -1453,7 +1453,7 @@ where
     };
 
     // 4. 降级热替换通道（P5-3）：QUIC 失效 → 重连 task 经此注入 TCP 传输。
-    //    M8-T026-P1 (PATH-004)：打洞升舱同样经此通道热替换（强制 IDR）。
+    //    (PATH-004)：打洞升舱同样经此通道热替换（强制 IDR）。
     let (swap_tx, mut swap_rx) = if degrade.is_some() || punch_upgrade.is_some() {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Box<dyn MediaTransport>>();
         if let Some(up) = punch_upgrade {

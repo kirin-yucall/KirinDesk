@@ -9,7 +9,7 @@ use std::sync::Mutex;
 
 use crate::secure;
 
-/// M15-T003: 白名单条目 — 域名模式 + 可选过期时间。
+/// 白名单条目 — 域名模式 + 可选过期时间。
 ///
 /// 模式支持 `*.example.com` 通配前缀（匹配 `example.com` 及其任意子域）；
 /// `expiry` 为 `Some` 时到期自动失效（SRV-SEC-WL-003）。
@@ -38,7 +38,7 @@ impl WhitelistEntry {
     }
 }
 
-/// M8-T027 (SRV-IDWL-002): ID 白名单条目 — 设备 ID + 可选过期时间。
+/// (SRV-IDWL-002): ID 白名单条目 — 设备 ID + 可选过期时间。
 ///
 /// `device_id` 为握手 `HandshakeInit.client_id`（与 known_clients 同 key，
 /// 大小写敏感精确匹配）；`expiry` 为 `Some` 时到期自动失效（对称
@@ -93,11 +93,11 @@ pub struct Config {
     /// GoDaddy DNS API settings
     pub godaddy: GoDaddyConfig,
 
-    /// M8-T035: DNS 域名维护服务商选择（`[dns]` 段，默认 "godaddy"）。
+    /// DNS 域名维护服务商选择（`[dns]` 段，默认 "godaddy"）。
     #[serde(default)]
     pub dns: DnsConfig,
 
-    /// M8-T040: DDNS 域名自动更新维护（`[ddns]` 段，域名页「DDNS 维护」卡读写）。
+    /// DDNS 域名自动更新维护（`[ddns]` 段，域名页「DDNS 维护」卡读写）。
     #[serde(default)]
     pub ddns: DdnsConfig,
 
@@ -110,23 +110,23 @@ pub struct Config {
     /// Logging settings
     pub logging: LoggingConfig,
 
-    /// M15-T008: UI 外观设置（主题模式持久化）
+    /// UI 外观设置（主题模式持久化）
     #[serde(default)]
     pub ui: UiConfig,
 
-    /// M13-T005: 无人值守模式设置（`[unattended]` 段）
+    /// 无人值守模式设置（`[unattended]` 段）
     #[serde(default)]
     pub unattended: UnattendedConfig,
 
-    /// M13-T006: 文件传输设置（`[file_transfer]` 段）
+    /// 文件传输设置（`[file_transfer]` 段）
     #[serde(default)]
     pub file_transfer: FileTransferConfig,
 
-    /// M8-T025 P5-4: 传输设置（`[transport]` 段：QUIC 优先 → TCP 优雅降级）
+    /// P5-4: 传输设置（`[transport]` 段：QUIC 优先 → TCP 优雅降级）
     #[serde(default)]
     pub transport: TransportConfig,
 
-    /// M8-T026: 内网穿透设置（`[tunnel]` 段：FRP 式通用 TCP 反向代理）
+    /// 内网穿透设置（`[tunnel]` 段：FRP 式通用 TCP 反向代理）
     #[serde(default)]
     pub tunnel: TunnelConfig,
 
@@ -249,7 +249,7 @@ fn default_input_alt_f4_forward() -> bool {
     true
 }
 
-/// M8-T025 P5-4: 传输配置（`[transport]` 段，主文档 §3.6）。
+/// P5-4: 传输配置（`[transport]` 段，主文档 §3.6）。
 ///
 /// CLI 参数（`--transport` / `--ip-family`）覆盖本配置；无参保持 auto 现状
 /// （IPv6 优先 + QUIC 主路径）。
@@ -308,7 +308,7 @@ impl Default for TransportConfig {
     }
 }
 
-/// M8-T026: 内网穿透配置（`[tunnel]` 段，FRP 式通用 TCP 反向代理）。
+/// 内网穿透配置（`[tunnel]` 段，FRP 式通用 TCP 反向代理）。
 ///
 /// 默认关闭（`enabled = false`）——可选兜底能力，与 P2P 直连并存。
 /// 客户端（client）主动出站连接公网 relay 服务器，把内网 TCP 服务
@@ -346,7 +346,7 @@ pub struct TunnelConfig {
     #[serde(default = "default_tunnel_bind_addrs")]
     pub bind_addrs: String, // 例: "0.0.0.0,::" / "127.0.0.1" / "0.0.0.0,::,192.168.1.10"
 
-    /// GUI 最后运行状态（M8-T039 §3.4.3）：GUI「启动/停止」随最后一次使用
+    /// GUI 最后运行状态（§3.4.3）：GUI「启动/停止」随最后一次使用
     /// 保持；程序启动读 true → 自动恢复隧道。仅 GUI 消费，CLI 不读；
     /// 与 `enabled`（配置级总开关，CLI 消费）语义独立、互不干扰。
     #[serde(default)]
@@ -377,7 +377,7 @@ pub struct TunnelConfig {
     pub proxies: Vec<TunnelProxy>,
 
     // ════════════════════════════════════════════════════════════
-    // M8-T026-P2 设备 ID 模式字段（ID-001 / ID-SEC-001 / ID-005）
+    // 设备 ID 模式字段（ID-001 / ID-SEC-001 / ID-005）
     // ════════════════════════════════════════════════════════════
 
     /// 注册设备 ID（ID-001：显式配置；`None` → 由本机身份 Ed25519 公钥
@@ -435,7 +435,7 @@ fn default_tunnel_bind_port() -> u16 {
     7000
 }
 
-/// M8-T039: server 监听地址默认值 —— 显式 IPv4+IPv6 双监听（跨平台稳定，
+/// server 监听地址默认值 —— 显式 IPv4+IPv6 双监听（跨平台稳定，
 /// 不依赖单地址双栈行为）。
 fn default_tunnel_bind_addrs() -> String {
     "0.0.0.0,::".to_string()
@@ -465,7 +465,7 @@ impl Default for TunnelConfig {
             server_addr: String::new(),
             token: String::new(),
             bind_port: default_tunnel_bind_port(),
-            // M8-T039：server 监听地址（默认 IPv4+IPv6 双监听）+ GUI 最后运行状态
+            // server 监听地址（默认 IPv4+IPv6 双监听）+ GUI 最后运行状态
             // （默认 false —— 旧用户曾手开 enabled=true 的，缺省不自动拉起）。
             bind_addrs: default_tunnel_bind_addrs(),
             auto_start: false,
@@ -475,7 +475,7 @@ impl Default for TunnelConfig {
             pool_count: 0,
             max_pool_count: default_tunnel_max_pool_count(),
             proxies: Vec::new(),
-            // M8-T026-P2：设备 ID 模式配置（默认关闭，None/空）。
+            // 设备 ID 模式配置（默认关闭，None/空）。
             device_id: None,
             server_pubkey: None,
             extra_candidates: Vec::new(),
@@ -554,7 +554,7 @@ impl TunnelConfig {
     }
 }
 
-/// M8-T039: 解析服务端监听地址列表（GUI 校验 + CLI/共享层使用；纯 std，不引入新依赖）。
+/// 解析服务端监听地址列表（GUI 校验 + CLI/共享层使用；纯 std，不引入新依赖）。
 /// 逗号拆分、trim、逐个解析为 IpAddr 后拼 port；非 IP 即报错
 /// （不支持域名——监听地址必须是本机 IP）。
 /// 空字符串/纯空白 → Ok(vec![])（上层回退默认双栈，兼容旧配置语义）。
@@ -581,7 +581,7 @@ pub fn parse_bind_addr_list(s: &str, port: u16) -> Result<Vec<std::net::SocketAd
     Ok(out)
 }
 
-/// M8-T039: 生成高熵随机 Token：32 字节 OsRng → 64 位 hex（128 bit 熵之上加倍，
+/// 生成高熵随机 Token：32 字节 OsRng → 64 位 hex（128 bit 熵之上加倍，
 /// 对齐 TNL-SEC-009「≥32 字节高熵随机串」建议；hex 无歧义、便于复制粘贴）。
 pub fn generate_random_token() -> String {
     use rand::RngCore;
@@ -701,7 +701,7 @@ pub fn validate_node_server_addr(s: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// M13-T006: 文件传输配置（`[file_transfer]` 段）。
+/// 文件传输配置（`[file_transfer]` 段）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileTransferConfig {
     /// 接收文件落盘目录（`None` → 默认 `~/Downloads/KirinDesk`）。
@@ -822,7 +822,7 @@ impl FileTransferConfig {
     }
 }
 
-/// M13-T005: 无人值守模式配置（`[unattended]` 段）。
+/// 无人值守模式配置（`[unattended]` 段）。
 ///
 /// `enabled` 是「自动接受连接 + 无弹窗审批」的总开关；`auto_start_on_boot`
 /// 与 `auto_start_server` 独立可配 —— 开机自启不要求开启无人值守（D6）。
@@ -839,7 +839,7 @@ pub struct UnattendedConfig {
     pub auto_start_on_boot: bool,
 
     /// 应用启动时自动开启服务端（监听 network.port + DNS 注册/心跳）。
-    /// M8-T037: 显示名「默认受控」，默认改 **false**（三开关默认全关；
+    /// 显示名「默认受控」，默认改 **false**（三开关默认全关；
     /// 旧配置文件中显式 true 保持不变——serde default 只作用于缺失字段）。
     #[serde(default = "default_auto_start_server")]
     pub auto_start_server: bool,
@@ -859,7 +859,7 @@ impl Default for UnattendedConfig {
     }
 }
 
-/// M15-T008: UI 外观配置（`[ui]` 段）。
+/// UI 外观配置（`[ui]` 段）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiConfig {
     /// 主题模式: "light"（默认）| "dark" | "system"
@@ -924,7 +924,7 @@ fn default_api_url() -> String {
     "https://api.godaddy.com".to_string()
 }
 
-/// M8-T035 + M9-DNS000: DNS 域名维护服务商选择（`[dns]` 段）。
+/// + M9-DNS000: DNS 域名维护服务商选择（`[dns]` 段）。
 ///
 /// - `provider`：当前激活服务商注册表键名（默认 "godaddy"；UI 下拉框 / CLI
 ///   `dns list-providers` 的数据源为 `dns_providers::dns_provider_defs()`）。
@@ -944,7 +944,7 @@ pub struct DnsConfig {
     #[serde(default)]
     pub providers: BTreeMap<String, BTreeMap<String, String>>,
 
-    /// M8-T040: 域名模式加密 DNS 强制（`[dns.security]` 段：DoH/DoT 端点、
+    /// 域名模式加密 DNS 强制（`[dns.security]` 段：DoH/DoT 端点、
     /// 强制开关；默认 enforce）。未配置该段 → 默认 enforce（安全默认）。
     #[serde(default)]
     pub security: DnsSecurityConfig,
@@ -964,7 +964,7 @@ fn default_dns_provider() -> String {
     "godaddy".to_string()
 }
 
-/// M8-T040: 域名模式加密 DNS 强制配置（`[dns.security]` 段，需求 §5.2）。
+/// 域名模式加密 DNS 强制配置（`[dns.security]` 段，需求 §5.2）。
 ///
 /// 域名模式（服务端 + 客户端）下的全部 DNS 解析必须走 DoH/DoT（DDNS-DOH-001）；
 /// `mode = "enforce"`（默认）时加密 DNS 全部端点不可用 → fail-closed 拒连
@@ -1041,7 +1041,7 @@ impl DnsSecurityConfig {
     }
 }
 
-/// M8-T040: DDNS 地址获取模式（IPv4/IPv6 各一，需求 §4.2/§4.3）。
+/// DDNS 地址获取模式（IPv4/IPv6 各一，需求 §4.2/§4.3）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DdnsMode {
@@ -1051,7 +1051,7 @@ pub enum DdnsMode {
     Manual,
 }
 
-/// M8-T040: DDNS 域名自动更新维护配置（`[ddns]` 段，需求 §5.1）。
+/// DDNS 域名自动更新维护配置（`[ddns]` 段，需求 §5.1）。
 ///
 /// 默认全部关闭/自动；`interval_secs` 下限 60s（防服务商 API 配额滥用，
 /// DDNS-002），未设置时回退 `[network] heartbeat_interval`（§5.3 兼容迁移）。
@@ -1136,7 +1136,7 @@ impl Default for DdnsConfig {
     }
 }
 
-/// M8-T040: DDNS 更新周期下限（60s，防服务商 API 配额滥用，DDNS-002）。
+/// DDNS 更新周期下限（60s，防服务商 API 配额滥用，DDNS-002）。
 pub const DDNS_INTERVAL_MIN_SECS: u64 = 60;
 
 impl DdnsConfig {
@@ -1167,7 +1167,7 @@ impl DdnsConfig {
 }
 
 impl Config {
-    /// M8-T040: DDNS 生效更新周期（秒；含 [network] 回退与 60s 下限收敛）。
+    /// DDNS 生效更新周期（秒；含 [network] 回退与 60s 下限收敛）。
     pub fn effective_ddns_interval(&self) -> u64 {
         self.ddns.effective_interval_secs(self.network.heartbeat_interval)
     }
@@ -1256,23 +1256,23 @@ pub struct NetworkConfig {
     #[serde(default)]
     pub temp_mode: bool,
 
-    /// M8-T017: 临时连接窗口时长（秒）。默认 300（5 分钟），可配置范围
+    /// 临时连接窗口时长（秒）。默认 300（5 分钟），可配置范围
     /// 60–3600——越界值经 [`NetworkConfig::effective_temp_mode_ttl`] 收敛。
     #[serde(default = "default_temp_mode_ttl_secs")]
     pub temp_mode_ttl_secs: u64,
 
-    /// M15-T003: 白名单条目（模式 + 过期时间，`*.example.com` 通配支持）。
+    /// 白名单条目（模式 + 过期时间，`*.example.com` 通配支持）。
     /// 兼容旧 `allowed_domains`（无过期、永久有效），两者共同生效。
     #[serde(default)]
     pub whitelist: Vec<WhitelistEntry>,
 
-    /// M8-T027 (SRV-IDWL-001): 设备 ID 白名单 — 永久精确条目（对称
+    /// (SRV-IDWL-001): 设备 ID 白名单 — 永久精确条目（对称
     /// `allowed_domains`；GUI Settings 文本框 / `whitelist add-id` 写入，
     /// 与 known_clients 同 key，大小写敏感）。
     #[serde(default)]
     pub allowed_ids: Vec<String>,
 
-    /// M8-T027 (SRV-IDWL-002): 设备 ID 白名单带过期条目（对称 `whitelist`，
+    /// (SRV-IDWL-002): 设备 ID 白名单带过期条目（对称 `whitelist`，
     /// `whitelist add-id <id> <RFC3339>` 写入；到期自动失效，`prune_expired` 清理）。
     #[serde(default)]
     pub id_whitelist: Vec<IdWhitelistEntry>,
@@ -1318,7 +1318,7 @@ fn default_report_lan_candidates() -> bool {
     true
 }
 
-/// M8-T017: 临时连接窗口默认时长（5 分钟）。
+/// 临时连接窗口默认时长（5 分钟）。
 fn default_temp_mode_ttl_secs() -> u64 {
     300
 }
@@ -1374,7 +1374,7 @@ pub struct GpuConfig {
     #[serde(default = "default_gpu_filter_virtual")]
     pub filter_virtual: bool,
 
-    /// 覆盖默认黑名单关键词（空 = 用默认表，见 M8-T030 §3.3）。
+    /// 覆盖默认黑名单关键词（空 = 用默认表，见 §3.3）。
     #[serde(default)]
     pub virtual_keywords: Vec<String>,
 }
@@ -1442,7 +1442,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             device: DeviceConfig {
-                // M8-T031: 留空 = 自动（系统硬盘 UUID / machine-id / 平台 UUID）。
+                // 留空 = 自动（系统硬盘 UUID / machine-id / 平台 UUID）。
                 id: String::new(),
                 name: "My Device".to_string(),
                 nickname: String::new(),
@@ -1503,7 +1503,7 @@ impl Default for Config {
 }
 
 impl NetworkConfig {
-    /// M8-T017: 临时连接窗口 TTL 收敛值（SRV-TMP-004，范围 60–3600）。
+    /// 临时连接窗口 TTL 收敛值（SRV-TMP-004，范围 60–3600）。
     /// 配置越界时静默收敛到边界，保证 `enable` 语义稳定。
     pub fn effective_temp_mode_ttl(&self) -> u64 {
         self.temp_mode_ttl_secs.clamp(TEMP_MODE_TTL_MIN, TEMP_MODE_TTL_MAX)
@@ -1896,7 +1896,7 @@ impl Config {
         Ok(Self::config_dir()?.join("default.toml"))
     }
 
-    // ---------- M15-T003: 白名单管理（SRV-SEC-WL-001..004） ----------
+    // ---------- : 白名单管理（SRV-SEC-WL-001..004） ----------
 
     /// 当前生效的白名单模式（过滤过期条目，兼容旧 `allowed_domains`）。
     /// 返回去重后的模式列表，供握手层匹配使用。
@@ -1973,7 +1973,7 @@ impl Config {
     ///
     /// 格式：每行 `pattern[,expiry]`，`expiry` 为 RFC3339（如 `2026-08-01T12:00:00Z`）
     /// 或留空表示永久；**`id:` 前缀行**（`id:device-1[,expiry]`）路由到设备 ID
-    /// 白名单维度（M8-T027）；空行与 `#` 注释行跳过；非法行跳过并计入未导入数。
+    /// 白名单维度；空行与 `#` 注释行跳过；非法行跳过并计入未导入数。
     /// 返回成功导入的条目数，并立即保存。
     pub fn whitelist_import_csv(&mut self, path: &Path) -> Result<usize, ConfigError> {
         let content = std::fs::read_to_string(path).map_err(|e| ConfigError::IoError {
@@ -1986,7 +1986,7 @@ impl Config {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            // M8-T027 (CLI-IDWL-004)：`id:` 前缀行 → ID 白名单维度。
+            // (CLI-IDWL-004)：`id:` 前缀行 → ID 白名单维度。
             if let Some(rest) = line.strip_prefix("id:") {
                 let mut parts = rest.split(',');
                 let device_id = parts.next().unwrap_or("").trim();
@@ -2088,7 +2088,7 @@ impl Config {
         before - self.network.whitelist.len()
     }
 
-    // ---------- M8-T027: 设备 ID 白名单（SRV-IDWL-001..008） ----------
+    // ---------- : 设备 ID 白名单（SRV-IDWL-001..008） ----------
 
     /// Settings 白名单页写入；调用方负责 `save()` 落盘）。
     pub fn set_id_whitelist_enforce(&mut self, enforce: bool) {
@@ -2913,7 +2913,7 @@ mod tests {
     #[test]
     fn test_config_default() {
         let config = Config::default();
-        // M8-T031: 默认留空 = 自动（系统硬盘 UUID）。
+        // 默认留空 = 自动（系统硬盘 UUID）。
         assert!(config.device.id.is_empty());
         // 数据段 60000+ / 22/80/443；旧配置显式端口不受 serde default 影响）。
         assert_eq!(config.network.port, DEFAULT_NETWORK_PORT);
@@ -3069,7 +3069,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ---------- M8-T017: 临时连接 TTL 配置测试 ----------
+    // ---------- : 临时连接 TTL 配置测试 ----------
 
     #[test]
     fn test_temp_mode_ttl_default() {
@@ -3110,11 +3110,11 @@ mod tests {
         assert_eq!(config.network.effective_approval_timeout_secs(), 120);
     }
 
-    // ---------- M13-T005: 无人值守配置测试 ----------
+    // ---------- : 无人值守配置测试 ----------
 
     #[test]
     fn test_unattended_defaults() {
-        // M8-T037: 三开关默认全关（含「默认受控」= auto_start_server）。
+        // 三开关默认全关（含「默认受控」= auto_start_server）。
         let config = Config::default();
         assert!(!config.unattended.enabled);
         assert!(!config.unattended.auto_start_on_boot);
@@ -3266,7 +3266,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ---------- M8-T026: 内网穿透配置测试 ----------
+    // ---------- : 内网穿透配置测试 ----------
 
     #[test]
     fn test_tunnel_defaults() {
@@ -3390,7 +3390,7 @@ mod tests {
         assert_eq!(parsed[1].remote_port, 60080);
     }
 
-    // ---------- M8-T039 (P1): bind_addrs / auto_start 字段与工具函数测试 ----------
+    // ---------- (P1): bind_addrs / auto_start 字段与工具函数测试 ----------
 
     #[test]
     fn test_tunnel_default_bind_addrs() {
@@ -3700,7 +3700,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ---------- M8-T027: 设备 ID 白名单测试（SRV-IDWL-001..008） ----------
+    // ---------- : 设备 ID 白名单测试（SRV-IDWL-001..008） ----------
 
     #[test]
     fn test_id_whitelist_defaults_and_legacy_toml() {
@@ -4102,7 +4102,7 @@ mod tests {
         assert!(sensitive_fields_nonempty(&with_token));
     }
 
-    // ---------- M13-T006 / S-10: 文件传输配额配置测试 ----------
+    // ---------- / S-10: 文件传输配额配置测试 ----------
 
     #[test]
     fn test_file_transfer_quota_defaults() {
@@ -4308,7 +4308,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ---------- M8-T038 (P2): UI 语言配置测试 ----------
+    // ---------- (P2): UI 语言配置测试 ----------
 
     #[test]
     fn test_ui_language_defaults() {
@@ -4354,7 +4354,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ---------- M8-T040 (P1): [ddns] / [dns.security] 配置测试 ----------
+    // ---------- (P1): [ddns] / [dns.security] 配置测试 ----------
 
     #[test]
     fn test_ddns_defaults() {

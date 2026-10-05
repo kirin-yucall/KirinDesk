@@ -1,4 +1,4 @@
-//! M8-T026-P1 历史二分定位测试（原 quic_bisect2~10，9 个独立文件）——
+//! 历史二分定位测试（原 quic_bisect2~10，9 个独立文件）——
 //! `SyntheticCapture`（paced 变体）/ `DummyEncoder` / `fake_window`）抽到
 //! 本文件顶部，9 个 `#[test]` 语义**逐字保留**（测试数不降，文件数 9→1）。
 //!

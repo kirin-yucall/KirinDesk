@@ -1,6 +1,6 @@
 //! 解码层入口：接口层 + 模块声明（P2A §T1.1；P2B 完成 video/ 实现）。
 //!
-//! # 架构（M8-T015 多层级拆分）
+//! # 架构（多层级拆分）
 //!
 //! ```text
 //! media/decoder/
@@ -146,7 +146,7 @@ pub trait VideoDecoder: Send {
     ///
     /// 返回 `true` 表示已触发——上层应发送
     /// `ControlMessage::AdaptiveConfig{force_idr:true}` 让服务端强制下一帧
-    /// IDR（M8-T014 自适应；P2B §T2.3 IDR 恢复策略）。
+    /// IDR（自适应；P2B §T2.3 IDR 恢复策略）。
     fn request_keyframe(&mut self) -> bool;
 
     fn codec(&self) -> Codec; // H264 | H265
@@ -223,7 +223,7 @@ impl From<crate::ffmpeg::AvError> for DecodeError {
 
 /// 把 `frame_id` 线性映射为会话相对毫秒 PTS（方案 A，P2A 采用）。
 ///
-/// 当前 wire 头部（M8-T013 §3.2，14B）无 PTS 字段，客户端单 `target_fps`
+/// 当前 wire 头部（§3.2，14B）无 PTS 字段，客户端单 `target_fps`
 /// 下用 `frame_id × (1000/fps)` 近似即可。变帧率场景误差大（编码侧跳帧时
 /// frame_id 不等间隔）；P2G 基准若验证 lip-sync 不达标，再升级方案 B
 /// （wire 头加 `pts_low16`，需同步改 `transport/datagram.rs` + 编码侧）。

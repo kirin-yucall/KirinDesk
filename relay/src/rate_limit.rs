@@ -1,6 +1,6 @@
-//! M8-T026 T002: 速率限制 — 服务端防护（TNL-SEC-002）。
+//! T002: 速率限制 — 服务端防护（TNL-SEC-002）。
 //!
-//! 语义与 `core/src/network/rate_limit.rs`（M15-T001，SRV-SEC-RL-001/002）
+//! 语义与 `core/src/network/rate_limit.rs`（SRV-SEC-RL-001/002）
 //! 完全对齐：控制端口 30s 滑窗最多 3 次连接尝试；5 次认证失败封禁 15 分钟。
 //! 本模块为 relay 自持的轻量实现 —— TNL-NF-004 约束 relay 不依赖 core，
 //! 因此不直接复用 core 类型，仅复刻其语义（参数可配置，便于测试注入小窗口）。
@@ -38,7 +38,7 @@ pub const DEFAULT_MAX_PENDING_TUNNELS: usize = 256;
 /// 默认：每目标设备同时未配对隧道数上限（S-03a）。
 pub const DEFAULT_MAX_PENDING_PER_TARGET: usize = 16;
 
-/// 速率限制参数（对齐 M15-T001 `RateLimiterConfig`）。
+/// 速率限制参数（对齐 `RateLimiterConfig`）。
 #[derive(Debug, Clone)]
 pub struct RateLimiterConfig {
     /// 滑动窗口内允许的最大连接尝试次数。

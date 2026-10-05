@@ -1,4 +1,4 @@
-//! Linux uinput 注入实现（M8-T008_P1E，Task T5.3）。
+//! Linux uinput 注入实现（Task T5.3）。
 //!
 //! 能力：绝对坐标（EV_ABS / ABS_X|ABS_Y）、鼠标按键（EV_KEY / BTN_*）、
 //! 滚轮（EV_REL / REL_WHEEL）、键盘（EV_KEY / KEY_*）。
@@ -113,7 +113,7 @@ pub fn inject(ev: &PipeEvent, dst_w: u32, dst_h: u32) -> Result<(), InjectError>
         ));
     }
 
-    // M8-T020 SRV-SKEY-013: 特殊键处理——
+    // SRV-SKEY-013: 特殊键处理——
     // - 锁屏走 `loginctl lock-session`（非注入路径，无需 uinput 设备）；
     // - 其余组合键由 build_events 展开为 EV_KEY 序列（走下方 uinput 设备）。
     if ev.kind == InputKind::SpecialKey {
@@ -407,7 +407,7 @@ fn build_events(ev: &PipeEvent) -> Vec<input_event> {
             out.push(input_event::new(EV_KEY, code, value));
             out.push(input_event::new(EV_SYN, 0, 0));
         }
-        // M8-T020 SRV-SKEY-013: 特殊键组合序列（uinput EV_KEY + SYN）。
+        // SRV-SKEY-013: 特殊键组合序列（uinput EV_KEY + SYN）。
         // LockScreen 由 inject() 提前拦截走 loginctl，不会到达这里（空序列兜底）。
         InputKind::SpecialKey => {
             out.extend(special_key_events(ev.combo));
@@ -575,7 +575,7 @@ mod tests {
         assert_eq!(evs[0], input_event::new(EV_KEY, BTN_RIGHT, 1));
     }
 
-    /// M8-T020 T003: Win 组合 → KEY_LEFTMETA + 主键（按住→点按→释放）。
+    /// T003: Win 组合 → KEY_LEFTMETA + 主键（按住→点按→释放）。
     #[test]
     fn test_special_key_events_win_combos() {
         let evs = special_key_events(Some(SpecialCombo::WinE));
@@ -696,7 +696,7 @@ mod tests {
         assert!(build_events(&unknown).is_empty());
     }
 
-    /// M8-T020 T003: Ctrl+Shift+Esc 六步序列；LockScreen/缺 combo → 空序列。
+    /// T003: Ctrl+Shift+Esc 六步序列；LockScreen/缺 combo → 空序列。
     #[test]
     fn test_special_key_events_misc() {
         let evs = special_key_events(Some(SpecialCombo::CtrlShiftEsc));

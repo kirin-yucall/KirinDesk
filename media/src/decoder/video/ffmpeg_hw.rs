@@ -1,9 +1,9 @@
-//! FFmpeg 硬件解码后端（M8-T015 P2B §T2.2）。
+//! FFmpeg 硬件解码后端（P2B §T2.2）。
 //!
 //! 后端回退链（[`factory`](crate::decoder::factory)）：qsv → cuvid →
 //! d3d11va → videotoolbox → vaapi（软解回退在 [`ffmpeg_sw`]）。
 //!
-//! # 全链路（M8-T015 §1.3 裁决：hwframe 回读不可避免）
+//! # 全链路（§1.3 裁决：hwframe 回读不可避免）
 //!
 //! ```text
 //! avcodec_receive_frame ──► hwframe（GPU 内存 NV12）
@@ -32,7 +32,7 @@ const AV_PKT_FLAG_KEY: c_int = 0x0001;
 /// FFmpeg 硬件解码后端（h264_qsv / h264_cuvid / h264_d3d11va / videotoolbox / vaapi）。
 ///
 /// 输出 NV12 hwframe → `av_hwframe_transfer_data` → CPU NV12 → sws_scale → RGBA。
-/// hwframe_transfer 不可避免（M8-T015 §1.3 裁决），但 sws_ctx 会话级复用。
+/// hwframe_transfer 不可避免（§1.3 裁决），但 sws_ctx 会话级复用。
 pub struct FfmpegHwDecoder {
     ctx: *mut ffmpeg::AVCodecContext,
     codec: *const ffmpeg::AVCodec,
@@ -67,7 +67,7 @@ fn hw_device_type_for(decoder_name: &str) -> Option<i32> {
     }
 }
 
-/// 创建 hw device：按候选设备串逐个尝试绑定（M8-T030 §3.5，与编码侧
+/// 创建 hw device：按候选设备串逐个尝试绑定（§3.5，与编码侧
 /// `ffmpeg_hw.rs::create_hw_device_with_candidates` 同语义）。
 ///
 /// 候选顺序（[`crate::gpu::device_strings`]）：LUID 高32-低32 → 低32-高32 →

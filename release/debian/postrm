@@ -1,5 +1,5 @@
 #!/bin/sh
-# KirinDesk postrm — M14-T003
+# KirinDesk postrm — 
 set -e
 
 if command -v systemctl >/dev/null 2>&1; then

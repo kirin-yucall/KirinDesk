@@ -1,11 +1,11 @@
 //! 键鼠注入器：接收可靠流事件 → 平台 HID 注入（服务端侧）。
 //!
-//! 设计要点（参见 M8-T008_P1E）：
+//! 设计要点：
 //! - 事件经 **加密可靠流**（SecureChannel / QUIC reliable stream）到达，本模块只消费事件，
 //!   **不开任何裸 TCP/UDP 端口**（裸端口无 AEAD 加密，违反安全模型）。
 //! - 可靠流保证不丢 / 不重 / 不乱序；本模块不重发用户操作（注入失败仅记日志）。
 //! - 坐标缩放：客户端/服务端分辨率不同时按比例换算（向下取整 + clamp）。
-//! - 优先级：键鼠指令为最高优先级（[`INPUT_PRIORITY`]），拥塞调度由 P1F（M8-T009）实现。
+//! - 优先级：键鼠指令为最高优先级（[`INPUT_PRIORITY`]），拥塞调度由 P1F实现。
 //!
 //! 注意：本模块的 [`InputEvent`] 是**服务端注入管线 wire 格式**，与
 //! [`crate::capture::InputEvent`]（客户端捕获格式）并列独立，互不替代。
@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 /// 键鼠指令优先级标记。`0` = 最高。
 ///
-/// 本模块仅暴露该元数据供传输层（P1F，M8-T009）调度使用；调度实现不在本任务范围。
+/// 本模块仅暴露该元数据供传输层（P1F）调度使用；调度实现不在本任务范围。
 /// 拥塞时优先丢弃视频（DATAGRAM 可丢），键鼠可靠流不丢。
 pub const INPUT_PRIORITY: u8 = 0;
 
@@ -235,7 +235,7 @@ pub fn hygiene_release_plan(residual: u8) -> u8 {
     residual & (modifier::CTRL | modifier::SHIFT | modifier::ALT | modifier::SUPER)
 }
 
-/// 特殊键组合（M8-T020 SRV-SKEY-002）：跨平台语义统一，平台注入层翻译。
+/// 特殊键组合（SRV-SKEY-002）：跨平台语义统一，平台注入层翻译。
 ///
 /// 注意：**没有** `CtrlAltDel`（CAC）变体——CAC 是系统安全注意序列（SAS），
 /// 普通进程无法注入（Windows 硬限制），UI 以 [`Self::LockScreen`] 替代
@@ -306,7 +306,7 @@ pub enum InputKind {
     /// Unicode 文本（IME 合成/粘贴，如中文）。注入侧逐字符处理，
     /// 平台无 Unicode 注入能力（uinput 等）→ [`InjectError::UnsupportedPlatform`]。
     Text,
-    /// M8-T020: 系统组合键（Win/Alt+Tab/任务管理器/锁屏），
+    /// 系统组合键（Win/Alt+Tab/任务管理器/锁屏），
     /// 实际组合取 [`InputEvent::combo`]（普通键鼠事件不含）。
     SpecialKey,
 }
@@ -331,7 +331,7 @@ pub struct InputEvent {
     /// Unicode 文本（仅 [`InputKind::Text`] 使用；其余种类为空串）。
     #[serde(default)]
     pub text: String,
-    /// M8-T020: 特殊键组合（仅 [`InputKind::SpecialKey`] 使用；其余为 `None`）。
+    /// 特殊键组合（仅 [`InputKind::SpecialKey`] 使用；其余为 `None`）。
     #[serde(default)]
     pub combo: Option<SpecialCombo>,
 }
@@ -363,7 +363,7 @@ impl InputEvent {
         Self { kind: InputKind::Text, x: 0, y: 0, button: 0, key: 0, wheel_delta: 0, modifiers: 0, text: chars.into(), combo: None }
     }
 
-    /// 便捷构造：M8-T020 特殊键组合（如 `WinE` / `LockScreen`）。
+    /// 便捷构造：特殊键组合（如 `WinE` / `LockScreen`）。
     ///
     /// 传输复用 `ChannelTag::Input` 通道（SRV-SKEY-003），无新通道/端口。
     pub fn special_key(combo: SpecialCombo) -> Self {
@@ -505,14 +505,14 @@ pub fn r132_4_caps_compensate(ev: InputEvent, local_caps: bool, remote_caps: boo
 /// `Key::Num8` 0x25）事件序列，旧格式兼容（`InputEvent` 零新增字段）。
 ///
 /// 形态（物理键流同构：修饰键按下→主键按下→主键抬起→修饰键抬起，释放步
-/// 必达不粘连——M8-T020 `plan_special_key` 同纪律）：
+/// 必达不粘连—— `plan_special_key` 同纪律）：
 /// - `KpMultiply` `KeyDown`/`KeyRepeat` → `[Shift↓, Num8↓]`（auto-repeat 期间
 ///   重复 down 再发 Shift↓ = Windows 已按下键的无害 no-op，状态无关）；
 /// - `KpMultiply` `KeyUp` → `[Num8↑, Shift↑]`；
 /// - 其余一切事件 → `None`（调用方直接用原事件，**热路径零分配**）。
 ///
 /// 失败语义（`handle` 接线处）：展开序列任一步失败**不中断**后续步
-/// （释放步必达，防 shift 粘连；M8-T020「释放批必定执行」同语义），返回
+/// （释放步必达，防 shift 粘连；「释放批必定执行」同语义），返回
 /// 首个错误。
 pub fn r132_4_kp_star_expand(ev: &InputEvent) -> Option<(InputEvent, Option<InputEvent>)> {
     if ev.key != Key::KpMultiply as u32 {
@@ -610,7 +610,7 @@ impl InputInjector {
         self.reset_move_guard_state();
     }
 
-    /// M8-T018（SRV-MON-010）：显示器切换后更新换算基准。
+    /// SRV-MON-010：显示器切换后更新换算基准。
     ///
     /// 切换显示器后客户端发送坐标的基数 = 新显示器分辨率（客户端按新窗口
     /// base_w/base_h 归一化），服务端注入侧换算基准同步更新——一次调用
@@ -660,7 +660,7 @@ impl InputInjector {
     ///
     /// 展开为 Shift+主键盘 8 序列（被控端无小键盘时打出 `*`，见该函数 doc）；
     /// 其余事件 `None` 直透（热路径零分配、行为逐位不变）。展开序列任一步
-    /// 失败不中断后续步（**释放步必达**，防 shift 粘连——M8-T020「释放批
+    /// 失败不中断后续步（**释放步必达**，防 shift 粘连——「释放批
     /// 必定执行」同语义），返回首个错误。
     pub fn handle(&mut self, ev: InputEvent) -> Result<(), InjectError> {
         match r132_4_kp_star_expand(&ev) {
@@ -695,7 +695,7 @@ impl InputInjector {
             self.last_local_priority = None;
         }
 
-        // M8-T020: 特殊键不依赖坐标/分辨率——锁屏等在捕获未启动
+        // 特殊键不依赖坐标/分辨率——锁屏等在捕获未启动
         // （分辨率未知）时也应可用，直接平台分派。
         if ev.kind == InputKind::SpecialKey {
             return self.dispatch(&ev);
@@ -1485,7 +1485,7 @@ mod tests {
         assert_eq!(INPUT_PRIORITY, 0);
     }
 
-    /// M8-T020 T001: SpecialCombo 全部变体 bincode 往返一致（wire 格式）。
+    /// T001: SpecialCombo 全部变体 bincode 往返一致（wire 格式）。
     #[test]
     fn test_special_combo_roundtrip_all_variants() {
         let combos = [
@@ -1508,7 +1508,7 @@ mod tests {
         assert_ne!(bincode::serialize(&SpecialCombo::WinE).unwrap(), bincode::serialize(&SpecialCombo::WinD).unwrap());
     }
 
-    /// M8-T020 T001: 特殊键事件构造 + wire 往返（复用 ChannelTag::Input 通道）。
+    /// T001: 特殊键事件构造 + wire 往返（复用 ChannelTag::Input 通道）。
     #[test]
     fn test_special_key_event_wire_roundtrip() {
         let ev = InputEvent::special_key(SpecialCombo::AltTab);
@@ -1529,7 +1529,7 @@ mod tests {
         }
     }
 
-    /// M8-T020 UI-SKEY-001/002: 面板文案（label）与提示（hint）齐全。
+    /// UI-SKEY-001/002: 面板文案（label）与提示（hint）齐全。
     #[test]
     fn test_special_combo_labels() {
         assert_eq!(SpecialCombo::WinE.label(), "Win+E");
@@ -1551,7 +1551,7 @@ mod tests {
         }
     }
 
-    /// M8-T020: 特殊键注入不依赖分辨率——分辨率未知（0）时
+    /// 特殊键注入不依赖分辨率——分辨率未知（0）时
     /// 平台分派正常进入（Windows 上会真实注入，故仅验证桩平台/错误语义：
     /// 非三平台 → UnsupportedPlatform，而不是分辨率 InvalidEvent）。
     #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
@@ -1577,7 +1577,7 @@ mod tests {
     }
 
     // ════════════════════════════════════════════════════════════
-    // M8-T018（SRV-MON-010）：按所选显示器分辨率的坐标换算
+    // SRV-MON-010：按所选显示器分辨率的坐标换算
     // ════════════════════════════════════════════════════════════
 
     /// 屏0（主，1920x1080）全范围换算：客户端基数 = 屏0 分辨率时，坐标

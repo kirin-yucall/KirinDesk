@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# macOS .dmg 制作脚本（M14-T004 / M12-MAC MAC-T005）。
+# macOS .dmg 制作脚本（M12-MAC MAC-T005）。
 #
 # 前置：KirinDesk.app 已按 Contents/README.md 组装完毕
 #   （MacOS/kirindesk 通用二进制 + Resources/ffmpeg/*.dylib + Info.plist）。

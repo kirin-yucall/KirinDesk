@@ -1,4 +1,4 @@
-//! M15-T008: 设计令牌（Design Tokens）——全应用唯一的颜色/字号/间距/圆角来源。
+//! 设计令牌（Design Tokens）——全应用唯一的颜色/字号/间距/圆角来源。
 //!
 //! 规则：
 //! - **令牌驱动，零裸值**：任何组件不得写裸 `Color32` 字面量，一律经 [`Theme`] 取色。
@@ -13,7 +13,7 @@
 //! - 等宽回退链 `JetBrains Mono → Consolas → Menlo → DejaVu Sans Mono`（系统字体尽力
 //!   加载，缺省时保留 egui 内置 Hack）；CJK 兜底走 UI-IME-002（Windows 微软雅黑）。
 //! - 品牌 emoji（🐉）不在 egui 内置 emoji-icon-font 子集中，Windows 走 Segoe UI Emoji
-//!   兜底（M15-T008 偏离：方案中的 `egui_emoji` crate 在 crates.io 不存在，改用纯 emoji
+//!   兜底（偏离：方案中的 `egui_emoji` crate 在 crates.io 不存在，改用纯 emoji
 //!   字形 + 系统字体回退，见 §7 汇报）。
 
 use eframe::egui;
@@ -301,7 +301,7 @@ impl Theme {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct TerminalPalette {
     // ── 终端 ANSI / 光标 ──
-    /// ANSI 标准 16 色（vt100 Idx 0..=15；M11-T002 经典色盘）。
+    /// ANSI 标准 16 色（vt100 Idx 0..=15； 经典色盘）。
     pub ansi: [Color32; 16],
     /// vt100::Color::Default 前景近似（迁移前 `Color32::GRAY`）。
     pub default_fg: Color32,
@@ -404,7 +404,7 @@ pub fn apply_theme(ctx: &egui::Context, theme: &Theme) {
     if applied != theme.dark || clobbered {
         // `visuals` 字段，且 `Style::default().visuals = Visuals::default() =
         // Visuals::dark()`）——先 `set_visuals` 会被随后的 `set_style` 把令牌
-        // visuals 抹回 egui 默认深色（M15-T008「令牌驱动零裸值」实质失效：
+        // visuals 抹回 egui 默认深色（「令牌驱动零裸值」实质失效：
         // 两主题 widget 状态色/窗口/面板填充/阴影一律按 egui 默认深色彩渲染）。
         // 必须 `set_style` 在前、`set_visuals` 在后，令牌 visuals 才存活。
         ctx.set_style(theme.style());

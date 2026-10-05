@@ -196,7 +196,7 @@ impl LogBuffer {
         inner.lines.iter().map(|l| l.as_str()).collect::<Vec<_>>().join("")
     }
 
-    /// M15-T008: 清空全部缓冲行（LogView「Clear」按钮用）。
+    /// 清空全部缓冲行（LogView「Clear」按钮用）。
     pub fn clear(&self) {
         let mut inner = self.inner.lock().unwrap();
         inner.lines.clear();

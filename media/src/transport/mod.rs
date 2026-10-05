@@ -32,7 +32,7 @@ pub mod control;
 pub mod datagram;
 pub mod loss_detection;
 pub mod priority;
-pub mod punch_bridge; // M8-T026-P1: 打洞路径 → 媒体传输桥（PATH-004 升舱）
+pub mod punch_bridge; // : 打洞路径 → 媒体传输桥（PATH-004 升舱）
 /// # S-17 接线门禁（F-22 · 接线前必读）
 ///
 /// 本模块（`quic.rs`）的 rustls 客户端校验 `SkipServerVerification` 全放行
@@ -76,7 +76,7 @@ pub use transport::{
     connect_media_transport, connect_quic_transport, connect_quic_transport_on,
     QuicMediaTransport, SecureChannelReceiver, SecureChannelSender, SecureChannelTransport,
 };
-// M8-T026-P1: 打洞桥导出（PATH-004 升舱 + 打洞 socket 媒体传输）
+// 打洞桥导出（PATH-004 升舱 + 打洞 socket 媒体传输）
 pub use punch_bridge::{
     accept_punch_transport, connect_punch_transport, punch_upgrade_accept_task,
     punch_upgrade_connect_task, PunchMediaCreds, PunchUpgrade, PunchUpgradeEvent,
@@ -170,7 +170,7 @@ pub enum TransportError {
 pub enum TransportMode {
     /// QUIC（主路径，DATAGRAM + 可靠流）。
     Quic,
-    /// TCP（SecureChannel 优雅降级路径，M8-T025 P4）。
+    /// TCP（SecureChannel 优雅降级路径，P4）。
     Tcp,
 }
 

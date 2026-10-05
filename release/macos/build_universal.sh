@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# KirinDesk macOS 通用二进制 + .app bundle 组装 — M14-T004
+# KirinDesk macOS 通用二进制 + .app bundle 组装 — 
 #
 # 前置：macOS 12+，Xcode Command Line Tools（lipo/codesign/plutil）。
 # 用法：

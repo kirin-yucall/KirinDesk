@@ -1,4 +1,4 @@
-# KirinDesk.app 打包骨架（M12-MAC MAC-T005 / M14-T004）
+# KirinDesk.app 打包骨架（M12-MAC MAC-T005）
 
 ```
 KirinDesk.app/

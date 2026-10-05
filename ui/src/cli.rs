@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// M8-T017: 临时连接管理器（状态文件经 `dirs` 解析到 cache 目录，修复旧
+/// 临时连接管理器（状态文件经 `dirs` 解析到 cache 目录，修复旧
 /// `/tmp/kirindesk-temp` 在 Windows 原生运行下失效的缺陷）。
 fn temp_mode_manager() -> Option<TempModeManager> {
     match TempModeManager::new() {
@@ -28,12 +28,12 @@ fn temp_mode_manager() -> Option<TempModeManager> {
     }
 }
 
-/// M8-T017: 临时连接窗口是否激活（统一判断点：`policy::temp_mode_window_active`）。
+/// 临时连接窗口是否激活（统一判断点：`policy::temp_mode_window_active`）。
 fn is_temp_mode_active() -> bool {
     crate::policy::temp_mode_window_active()
 }
 
-/// M8-T017: 临时连接事件审计（UI-TMP-005；打开失败静默）。
+/// 临时连接事件审计（UI-TMP-005；打开失败静默）。
 fn audit_temp_event(event: kirin_desk_utils::audit::AuditEvent, detail: &str) {
     if let Ok(mut logger) = kirin_desk_utils::audit::AuditLogger::open_default() {
         let _ = logger.record(event, detail);
@@ -41,7 +41,7 @@ fn audit_temp_event(event: kirin_desk_utils::audit::AuditEvent, detail: &str) {
 }
 
 // ════════════════════════════════════════════════════════════════
-// M8-T026-P2：设备 ID 连接模式（ID-010~015 / ID-020 / ID-022）
+// 设备 ID 连接模式（ID-010~015 / ID-020 / ID-022）
 // ════════════════════════════════════════════════════════════════
 
 /// `connect --id <device_id>`：ID 解析 → 验签 → 公钥 pin → 三级路径
@@ -294,7 +294,7 @@ pub(crate) enum CliCommand {
     SelfTest,
     /// M9-DNS023: DNS 域名维护子命令组（`dns list-providers` 等，见 §六）。
     Dns,
-    /// M8-T040: DDNS 子命令组（`ddns status/enable/disable/set-ipv4/set-ipv6/update`）。
+    /// DDNS 子命令组（`ddns status/enable/disable/set-ipv4/set-ipv6/update`）。
     Ddns,
     Version,
     /// （hex/SHA-256 指纹）、密钥文件路径、known_hosts 条目数。
@@ -357,7 +357,7 @@ pub async fn run_cli() {
             }
         }
         CliCommand::Connect => {
-            // M8-T026-P2 (ID-020)：`--id <device_id>` 与 domain/IP 位置参数互斥。
+            // (ID-020)：`--id <device_id>` 与 domain/IP 位置参数互斥。
             if let Some(pos) = args.iter().position(|a| a == "--id") {
                 let device_id = args.get(pos + 1).map(|s| s.as_str()).unwrap_or("");
                 if device_id.is_empty() || args.len() > pos + 2 {
@@ -369,7 +369,7 @@ pub async fn run_cli() {
                 cmd_connect(args).await;
             }
         }
-        // M13-T006: 文件传输（双向，复用 SecureChannel 加密通道）。
+        // 文件传输（双向，复用 SecureChannel 加密通道）。
         CliCommand::Send => {
             let path = args.get(2).map(|s| s.as_str()).unwrap_or("");
             let host = args.get(3).map(|s| s.as_str()).unwrap_or("");
@@ -416,7 +416,7 @@ pub async fn run_cli() {
             }
         }
         CliCommand::Serve => {
-            // M13-T005 (UA-CLI-003): `serve [port] [--unattended]` — 无人值守
+            // (UA-CLI-003): `serve [port] [--unattended]` — 无人值守
             // 策略运行（自动接受 known_clients/白名单，未知拒绝，temp-mode 禁用）。
             // 环境变量）等价于 `--unattended`——无头服务器跳过 GUI 审批弹窗
             // （无桌面会话时必需，service 注释承诺的语义）。
@@ -435,7 +435,7 @@ pub async fn run_cli() {
         CliCommand::KnownHosts => cmd_known_hosts(args),
         CliCommand::Whitelist => cmd_whitelist(args),
         CliCommand::TempMode => {
-            // M8-T017: `temp-mode off` = 手动关闭（无无人值守限制，关闭总是安全）。
+            // `temp-mode off` = 手动关闭（无无人值守限制，关闭总是安全）。
             if args.get(2).map(|s| s.as_str()) == Some("off") {
                 cmd_temp_mode_off();
                 // UA-ACCEPT-004: 无人值守下禁用 temp-mode **开启**旁路。
@@ -455,7 +455,7 @@ pub async fn run_cli() {
         CliCommand::SelfTest => cmd_self_test().await,
         // M9-DNS023: `dns <subcommand>` 子命令组（§六）。
         CliCommand::Dns => cmd_dns(args).await,
-        // M8-T040: `ddns <subcommand>` 子命令组（§八）。
+        // `ddns <subcommand>` 子命令组（§八）。
         CliCommand::Ddns => cmd_ddns(args).await,
         CliCommand::Version => cmd_version(),
         CliCommand::Identity => cmd_identity(args),
@@ -484,7 +484,7 @@ fn print_help() {
     println!("                       [--priority N --weight N --port N] |");
     println!("                       delete <domain> <type> <name> |");
     println!("                       register <device-id> <port> | unregister <device-id>");
-    println!("  ddns <subcommand>    DDNS auto-maintenance (M8-T040)");
+    println!("  ddns <subcommand>    DDNS auto-maintenance");
     println!("                       subcommands: status | enable | disable |");
     println!("                       set-ipv4 auto|manual [addr] | set-ipv6 auto|manual [addr] |");
     println!("                       update");
@@ -503,7 +503,7 @@ fn print_help() {
     println!("  known-hosts          List known clients (server-side trusted keys)");
     println!("  known-hosts add <id> <pubkey-base64>  Trust a client key (SRV-SEC-KH-002)");
     println!("  known-hosts remove <id>               Remove a trusted client");
-    println!("  whitelist            List whitelist entries (SRV-SEC-WL / M8-T027)");
+    println!("  whitelist            List whitelist entries (SRV-SEC-WL)");
     println!(
         "  whitelist add <pattern> [expiry]      Add domain (expiry: RFC3339 or empty=permanent)"
     );
@@ -620,7 +620,7 @@ fn identity_info(cfg: &Config) -> Result<IdentityInfo, String> {
     use kirin_desk_core::crypto::ed25519::{fingerprint, IdentityManager};
     use kirin_desk_utils::known_hosts::KnownHostsStore;
 
-    // Device ID 语义与 GUI 身份卡一致（M8-T031：空/旧占位 → 自动硬盘 UUID）。
+    // Device ID 语义与 GUI 身份卡一致（空/旧占位 → 自动硬盘 UUID）。
     let device_id = kirin_desk_utils::device::effective_device_id(&cfg.device.id);
     let identity = load_identity(cfg).map_err(|e| e.to_string())?;
     let pubkey_bytes = identity.public_key().to_bytes();
@@ -692,7 +692,7 @@ fn identity_json(info: &IdentityInfo) -> serde_json::Value {
 }
 
 // ════════════════════════════════════════════════════════════════
-// M8-T025 P5-4：传输参数解析（CLI 覆盖配置；无参保持 auto 现状）
+// P5-4：传输参数解析（CLI 覆盖配置；无参保持 auto 现状）
 // ════════════════════════════════════════════════════════════════
 
 /// 从参数表取出 `--flag <value>`（无该 flag → None）。
@@ -767,7 +767,7 @@ fn resolve_ip_family(s: &str) -> Option<IpFamily> {
     }
 }
 
-/// M8-T017: 开启临时连接（SRV-TMP-001/002 / CLI-TMP-010）——生成 10 位临时
+/// 开启临时连接（SRV-TMP-001/002 / CLI-TMP-010）——生成 10 位临时
 /// 挑战码（S-20 / F-25：8 → 10），窗口期内白名单跳过且连接须携带该码。
 ///
 /// `TempModeManager::enable` 内部 `OsRng`）——即使窗口仍处于激活期也执行
@@ -810,7 +810,7 @@ fn cmd_temp_mode() {
     }
 }
 
-/// M8-T017: 手动关闭临时连接（SRV-TMP-005 / CLI-TMP-011）。
+/// 手动关闭临时连接（SRV-TMP-005 / CLI-TMP-011）。
 fn cmd_temp_mode_off() {
     let mgr = match temp_mode_manager() {
         Some(m) => m,
@@ -1071,7 +1071,7 @@ fn cmd_config() {
                     "disabled"
                 }
             );
-            // M13-T005: 无人值守状态
+            // 无人值守状态
             println!(
                 "Unattended:    {} (autostart={}, auto-server={}, registered={})",
                 if c.unattended.enabled { "ON" } else { "OFF" },
@@ -1269,7 +1269,7 @@ async fn cmd_discover(device_id: &str) {
         Ok(info) => {
             println!("Device:    {}", info.device_id);
             println!("Subdomain: {}", info.subdomain);
-            // M8-T025 P5-4：哨兵 IPv6（`::` = 无 v6）不再直打；双栈地址如实展示。
+            // P5-4：哨兵 IPv6（`::` = 无 v6）不再直打；双栈地址如实展示。
             println!(
                 "IPv6:      {}",
                 if info.ipv6_addr == Ipv6Addr::UNSPECIFIED {
@@ -1643,7 +1643,7 @@ async fn cmd_dns(args: Vec<String>) {
             }
             println!("Done.");
         }
-        // ── M8-T040 (WBS 7.2): `dns resolve <host> [--type A|AAAA|SRV|TXT]` ──
+        // ── (WBS 7.2): `dns resolve <host> [--type A|AAAA|SRV|TXT]` ──
         // 经 DoH/DoT 加密解析（调试/验证面，需求 §八）；展示端点与耗时。
         "resolve" => {
             use kirin_desk_dns::RecordType as DnsRt;
@@ -1721,10 +1721,10 @@ fn print_dns_usage() {
     println!("  delete <domain> <type> <name>        删除记录（按 name+type）");
     println!("  register <device-id> <port>          设备注册三件套（SRV/AAAA/TXT，走当前 provider）");
     println!("  unregister <device-id>               注销设备记录（SRV/AAAA/TXT/A）");
-    println!("  resolve <host> [--type A|AAAA|SRV|TXT] 经 DoH/DoT 加密解析（M8-T040 调试面）");
+    println!("  resolve <host> [--type A|AAAA|SRV|TXT] 经 DoH/DoT 加密解析（调试面）");
 }
 
-/// M8-T040 (WBS 7.1): `ddns <subcommand>` 子命令组（需求 §八）。
+/// (WBS 7.1): `ddns <subcommand>` 子命令组（需求 §八）。
 ///
 /// status | enable | disable | set-ipv4 auto|manual [addr] |
 /// set-ipv6 auto|manual [addr] | update
@@ -1909,7 +1909,7 @@ async fn cmd_ddns(args: Vec<String>) {
     }
 }
 
-/// M8-T040: `ddns update` 状态回读展示。
+/// `ddns update` 状态回读展示。
 fn print_ddns_status(st: &kirin_desk_dns::DdnsStatus) {
     println!("状态:");
     println!("  开启: {}", st.enabled);
@@ -1933,7 +1933,7 @@ fn print_ddns_status(st: &kirin_desk_dns::DdnsStatus) {
     }
 }
 
-/// M13-T005 (UA-CLI-001): 无人值守模式开关与状态 — `unattended <on|off|status>`。
+/// (UA-CLI-001): 无人值守模式开关与状态 — `unattended <on|off|status>`。
 ///
 /// `on`：开启自动接受策略（known_clients/白名单命中自动放行，未知设备拒绝）。
 /// 前置校验（UA-SEC-002）：身份必须已生成；白名单/known_clients 为空时软警告
@@ -1958,7 +1958,7 @@ fn cmd_unattended(args: Vec<String>) {
                 );
                 return;
             }
-            // UA-SEC-003 (D3): 软警告——无白名单（域名 + ID，M8-T027）且无
+            // UA-SEC-003 (D3): 软警告——无白名单（域名 + ID）且无
             // known_clients 时开启将拒绝一切连接。
             let now = chrono::Utc::now();
             let wl = cfg.whitelist_active_patterns(now);
@@ -2022,7 +2022,7 @@ pub(crate) fn load_autostart_config() -> AutostartConfig {
     }
 }
 
-/// M13-T005 (UA-CLI-002): 开机自启注册/移除/状态 — `autostart <enable|disable|status>`。
+/// (UA-CLI-002): 开机自启注册/移除/状态 — `autostart <enable|disable|status>`。
 ///
 /// 与无人值守总开关**独立**（D6）：`autostart enable` 仅注册用户级开机自启，
 /// 是否自动开启服务端/自动接受连接仍由 `[unattended]` 配置决定。
@@ -2205,7 +2205,7 @@ fn cli_record_connection(
     let device = SavedDevice {
         id: server_id.to_string(),
         nickname: server_id.to_string(),
-        // M8-T037: 新字段默认值（CLI 自动保存路径不设备注/挑战码/排序）。
+        // 新字段默认值（CLI 自动保存路径不设备注/挑战码/排序）。
         remark: String::new(),
         challenge: String::new(),
         sort_order: 0,
@@ -2292,7 +2292,7 @@ async fn cmd_connect(args: Vec<String>) {
     use std::io::IsTerminal;
     use std::net::IpAddr;
 
-    // ── M8-T025 P5-4：`--transport` / `--ip-family`（CLI 覆盖配置；无参保持 auto）──
+    // ── P5-4：`--transport` / `--ip-family`（CLI 覆盖配置；无参保持 auto）──
     let transport_flag = flag_value(&args, "--transport");
     let family_flag = flag_value(&args, "--ip-family");
     let args = strip_transport_flags(args);
@@ -2399,7 +2399,7 @@ async fn cmd_connect(args: Vec<String>) {
             ip_family,
             provider: cfg.dns.provider.clone(),
             credentials: cfg.dns.providers.clone(),
-            // M8-T040：域名模式强制加密 DNS（DoH/DoT；mode=off/未配置 → None
+            // 域名模式强制加密 DNS（DoH/DoT；mode=off/未配置 → None
             // → fail-closed 拒连并提示，DDNS-DOH-003/007）。
             resolver: kirin_desk_core::dns::secure_resolver_from_config(&cfg),
         })
@@ -2609,7 +2609,7 @@ fn server_challenge_startup_check(cfg: &Config, allow_no_challenge: bool, mode: 
     false
 }
 
-/// M11-T004: 远程 Shell 服务器（headless，域名白名单强制，无 GUI 审批弹窗）。
+/// 远程 Shell 服务器（headless，域名白名单强制，无 GUI 审批弹窗）。
 ///
 /// 每个连接：白名单握手（temp mode 可绕过）→ SecureChannel PTY 桥接
 /// （`run_shell_bridge`，Windows=ConPTY / Unix=forkpty）。
@@ -2660,9 +2660,9 @@ async fn cmd_shell_server(port: u16, allow_no_challenge: bool) {
         }
     };
     let mut rate_limiter = RateLimiter::new();
-    // M15-T003：白名单含过期条目过滤（SRV-SEC-WL-003），兼容旧 allowed_domains。
+    // 白名单含过期条目过滤（SRV-SEC-WL-003），兼容旧 allowed_domains。
     let allowed = cfg.whitelist_active_patterns(chrono::Utc::now());
-    // M8-T027 (SRV-IDWL-023): 设备 ID 白名单（永久 + 未过期条目），与域名维度
+    // (SRV-IDWL-023): 设备 ID 白名单（永久 + 未过期条目），与域名维度
     // 并列传入策略层（OR 语义）。
     let allowed_ids = cfg.id_whitelist_active_ids(chrono::Utc::now());
     let server_name = if cfg.device.nickname.is_empty() {
@@ -2677,7 +2677,7 @@ async fn cmd_shell_server(port: u16, allow_no_challenge: bool) {
     };
     let config_temp = cfg.network.temp_mode;
     let server_pub = identity.public_key_base64();
-    // M13-T005 (UA-ACCEPT-001): 无人值守开启时走自动接受策略；UA-ACCEPT-004
+    // (UA-ACCEPT-001): 无人值守开启时走自动接受策略；UA-ACCEPT-004
     // 禁用 temp-mode 旁路（无人值守不提供任何临时放行未知设备的路径）。
     let unattended = cfg.unattended.enabled;
     let config_temp = if unattended { false } else { config_temp };
@@ -2709,7 +2709,7 @@ async fn cmd_shell_server(port: u16, allow_no_challenge: bool) {
         Ok(server) => {
             println!("Listening on [::]:{} (whitelist enforced)", server.port());
             loop {
-                // M8-T017: 临时连接窗口**逐连接**判定（窗口中途开启/过期即时
+                // 临时连接窗口**逐连接**判定（窗口中途开启/过期即时
                 // 生效），与配置静态旁路取或；无人值守下窗口维度一并关闭
                 // （UA-ACCEPT-004，策略层亦忽略）。
                 let temp_window = if unattended {
@@ -2842,7 +2842,7 @@ async fn cmd_shell_server(port: u16, allow_no_challenge: bool) {
     }
 }
 
-/// M11-T003: CLI shell 客户端 — `kirin_desk shell <host> [port] [nickname]`
+/// CLI shell 客户端 — `kirin_desk shell <host> [port] [nickname]`
 ///
 /// TCP + 握手 + SecureChannel PTY 桥接；本地终端进入 raw mode（无需回车），
 /// 尺寸变化自动发送 `ShellResize`；退出命令（exit / Ctrl+D / Ctrl+C）经通道
@@ -2950,7 +2950,7 @@ async fn cmd_shell_client(target: &str, port: u16, nickname: &str) {
                 return;
             }
         };
-        // M8-T025 P5-4：按族选择连接地址（配置 `[transport].ip_family`；
+        // P5-4：按族选择连接地址（配置 `[transport].ip_family`；
         // CLI shell 无 --ip-family 参数，走配置值）。
         let family = match resolve_ip_family(&cfg.transport.ip_family) {
             Some(f) => f,
@@ -3192,7 +3192,7 @@ fn load_identity(
     IdentityManager::load_or_generate(path, &device_id).map_err(|e| e.into())
 }
 
-/// M8-T017: temp-mode 剩余秒数（无激活时 0）。
+/// temp-mode 剩余秒数（无激活时 0）。
 fn temp_mode_remaining() -> u32 {
     TempModeManager::new()
         .map(|mgr| mgr.remaining_secs())
@@ -3200,7 +3200,7 @@ fn temp_mode_remaining() -> u32 {
 }
 
 // ════════════════════════════════════════════════════════════════
-// M13-T006: CLI 文件传输 — send / recv
+// CLI 文件传输 — send / recv
 // ════════════════════════════════════════════════════════════════
 
 /// CLI 文件传输共用连接：目标解析（domain 发现 / IP 直连）→ 信任解析 →
@@ -3303,7 +3303,7 @@ async fn cli_file_connect(
                 return None;
             }
         };
-        // M8-T025 P5-4：按族选择连接地址（配置 `[transport].ip_family`）。
+        // P5-4：按族选择连接地址（配置 `[transport].ip_family`）。
         let family = match resolve_ip_family(&cfg.transport.ip_family) {
             Some(f) => f,
             None => {
@@ -3409,12 +3409,12 @@ async fn cli_file_loop(
     use kirin_desk_media::transport::ChannelTag;
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // M8-T019 (SRV-PRIV-013): 无头 Server 模式——headless=true，
+    // (SRV-PRIV-013): 无头 Server 模式——headless=true，
     // Black 请求自动降级 Lock（或拒绝），Ack 反馈客户端。
     let privacy = Arc::new(Mutex::new(
         kirin_desk_core::connection::privacy::PrivacyController::new(true),
     ));
-    // M8-T019 (PRIV-SEC-001): 隐私审计（独立句柄，append 模式并发安全）。
+    // (PRIV-SEC-001): 隐私审计（独立句柄，append 模式并发安全）。
     let mut privacy_audit = kirin_desk_utils::audit::AuditLogger::open_default().ok();
     loop {
         tokio::select! {
@@ -3427,7 +3427,7 @@ async fn cli_file_loop(
                                 Err(e) => println!("  [file] frame decode failed: {e}"),
                             }
                         }
-                        // M8-T019 (SRV-PRIV-013/001/002): 无头 Server 隐私请求。
+                        // (SRV-PRIV-013/001/002): 无头 Server 隐私请求。
                         ChannelTag::Control => {
                             use kirin_desk_core::connection::privacy::PrivacyOutcome;
                             use kirin_desk_media::transport::ControlMessage;
@@ -3655,7 +3655,7 @@ async fn cmd_recv_file(host: &str, port: u16, nickname: &str) {
 /// 保持安全通道至客户端断开。桌面流媒体由 GUI 服务器提供；CLI serve 负责
 /// 策略强制执行与安全握手应答（修复旧实现：空白名单 + 握手后丢流不应答）。
 ///
-/// M13-T005 (UA-CLI-003)：`unattended = true` 时以无人值守策略运行——
+/// (UA-CLI-003)：`unattended = true` 时以无人值守策略运行——
 /// known_clients/白名单命中自动放行、未知设备拒绝、temp-mode 禁用；
 /// 并按客户端声明的会话类型分发（UA-ACCEPT-003）：`shell` → PTY 桥接，
 /// 其余保持通道（远控桌面流媒体由 GUI 服务器承载）。
@@ -3678,7 +3678,7 @@ async fn cmd_serve(port: u16, unattended: bool, allow_no_challenge: bool) {
     if !server_challenge_startup_check(&cfg, allow_no_challenge, "serve") {
         return;
     }
-    // M8-T026-P2：Arc 包装（设备 ID 注册回调需 'static 捕获）。
+    // Arc 包装（设备 ID 注册回调需 'static 捕获）。
     let identity = match load_identity(&cfg) {
         Ok(id) => std::sync::Arc::new(id),
         Err(e) => {
@@ -3697,7 +3697,7 @@ async fn cmd_serve(port: u16, unattended: bool, allow_no_challenge: bool) {
     // 同一实例（每隧道流新建实例 + 占位 IP 会使中继路径爆破防护失效）。
     let rate_limiter: SharedRateLimiter = new_shared_rate_limiter();
     let allowed = cfg.whitelist_active_patterns(chrono::Utc::now());
-    // M8-T027 (SRV-IDWL-023): 设备 ID 白名单（永久 + 未过期条目），与域名维度
+    // (SRV-IDWL-023): 设备 ID 白名单（永久 + 未过期条目），与域名维度
     // 并列传入策略层（OR 语义）。
     let allowed_ids = cfg.id_whitelist_active_ids(chrono::Utc::now());
     let server_name = if cfg.device.nickname.is_empty() {
@@ -3718,12 +3718,12 @@ async fn cmd_serve(port: u16, unattended: bool, allow_no_challenge: bool) {
     match TcpServer::bind(port).await {
         Ok(server) => {
             println!("Listening on [::]:{}", server.port());
-            // M8-T040 (WBS 7.3)：serve 域名模式接线 —— 启动自检（DDNS-DOH-002）
+            // (WBS 7.3)：serve 域名模式接线 —— 启动自检（DDNS-DOH-002）
             // + [ddns] enabled → 策略化地址维护（三件套周期发布）。
             let ddns_handle = start_serve_ddns(&cfg, identity.clone()).await;
             // 句柄持有即保持 DDNS 维护运行（与 tunnel_client 同模式）。
             let _ddns_guard = DdnsGuard { _handle: ddns_handle };
-            // M8-T026-P2 (ID-003/ID-013)：设备 ID 模式注册（[tunnel] enabled
+            // (ID-003/ID-013)：设备 ID 模式注册（[tunnel] enabled
             // && mode=client）—— 隧道流与本地 accept 走同一连接处理
             // （serve_incoming_stream），白名单/挑战码/临时码访问控制零降级；
             // S-03b：隧道流回调捕获与本地 accept 同一共享限速器。
@@ -3775,7 +3775,7 @@ async fn cmd_serve(port: u16, unattended: bool, allow_no_challenge: bool) {
                             let Ok(_permit) = sem.acquire_owned().await else {
                                 return;
                             };
-                            // M8-T017: 临时连接窗口**逐连接**判定（窗口中途开启/
+                            // 临时连接窗口**逐连接**判定（窗口中途开启/
                             // 过期即时生效），与配置静态旁路取或；无人值守下窗口
                             // 维度一并关闭（UA-ACCEPT-004，策略层亦忽略）。
                             let temp_window = if unattended {
@@ -3836,7 +3836,7 @@ async fn cmd_serve(port: u16, unattended: bool, allow_no_challenge: bool) {
     }
 }
 
-/// M8-T040 (WBS 7.3 / WBS 5.5): serve 域名模式接线。
+/// (WBS 7.3 / WBS 5.5): serve 域名模式接线。
 ///
 /// 1. **启动自检**（DDNS-DOH-002）：经加密 DNS（`SecureResolver`）解析本机
 ///    域名并校验 SRV/TXT/A/AAAA 发布一致性，不一致红色告警；自检依赖的
@@ -3903,17 +3903,17 @@ async fn start_serve_ddns(
     None
 }
 
-/// M8-T040: 保持 DDNS 维护任务句柄存活（drop 即脱离，任务继续运行）。
+/// 保持 DDNS 维护任务句柄存活（drop 即脱离，任务继续运行）。
 struct DdnsGuard {
     _handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 // ════════════════════════════════════════════════════════════════
-// M8-T026-P2：设备侧 ID 注册 + 隧道流处理（ID-001/003/005/013）
+// 设备侧 ID 注册 + 隧道流处理（ID-001/003/005/013）
 // ════════════════════════════════════════════════════════════════
-/// M8-T026-P2 (ID-001/ID-003/ID-005)：`serve` 时启动设备 ID 注册
+/// (ID-001/ID-003/ID-005)：`serve` 时启动设备 ID 注册
 /// （`[tunnel] enabled && mode="client"`）：RelayClient 保持控制连接 +
-/// 心跳（复用 M8-T026 心跳，ID-NF-003）+ 候选刷新；中继隧道流（§8.1）
+/// 心跳（复用 心跳，ID-NF-003）+ 候选刷新；中继隧道流（§8.1）
 /// 交给 `serve_incoming_stream`（与本地 accept 同一访问控制，ID-013）。
 ///
 /// S-03b（审计 F-6）：`shared_rate_limiter` 为进程级共享限速器 —— 隧道流
@@ -4239,7 +4239,7 @@ async fn id_registration_recheck_once(
 
 /// **同源**（`start_server` 同一时刻捕获：cfg/skip/unattended/昵称/挑战码/
 /// expected_nick + 同一 `known` Arc + 同一共享限速器）。会话不变量语义
-/// 不变（M8-T034：运行中 Settings 变更下次启动生效）。
+/// 不变（运行中 Settings 变更下次启动生效）。
 #[derive(Clone)]
 pub(crate) struct GuiTunnelCtx {
     /// 服务端会话配置快照（与 accept 循环闭包 `cfg` 同源）。
@@ -4419,7 +4419,7 @@ async fn serve_tunnel_stream_headless(
                     }
                 },
             ));
-            // M8-T027 (SRV-IDWL-023): 隧道流与本地 accept 同一访问控制——
+            // (SRV-IDWL-023): 隧道流与本地 accept 同一访问控制——
             // 域名 + ID 双白名单快照一并传入。
             let (allowed, allowed_ids) = allowed_snapshot();
             // accept（CLI serve 相同判定，见本文件 cmd_serve 循环）——此前
@@ -4460,7 +4460,7 @@ async fn serve_tunnel_stream_headless(
 }
 
 /// `serve_incoming_stream` 所需白名单快照（避免回调闭包捕获 cfg 生命周期）。
-/// 返回 (域名维度, ID 维度) 双白名单（M8-T027 / SRV-IDWL-023）。
+/// 返回 (域名维度, ID 维度) 双白名单（SRV-IDWL-023）。
 fn allowed_snapshot() -> (Vec<String>, Vec<String>) {
     Config::load()
         .map(|c| {
@@ -4526,7 +4526,7 @@ fn tunnel_rate_limit_key(device_id: &str) -> std::net::IpAddr {
 ///   持有 shell 通道写端，§12.3-4）。
 ///
 /// S-1a 遗留① 重测结论（设计 §12.3-2 必核项，交付报告在案）：静默接收臂
-/// （非 shell 分支，M13-T006）原本即 per-连接（每流 `FileSession::new` +
+/// （非 shell 分支）原本即 per-连接（每流 `FileSession::new` +
 /// 分支原本无 FileSession → S-2 经本函数在 shell 分支建 per-连接
 /// FileSession = per-连接化完成。与 PM D2 裁定「静默接收臂非 per-连接 =
 /// 仅非 shell 分支存在」交叉验证一致：非 shell 分支的 FileSession 不流入
@@ -4688,7 +4688,7 @@ async fn serve_incoming_stream(
                 "  Session ACCEPTED: {} <{}> ({})",
                 ch.peer_id, ch.peer_domain, ch.peer_device_type
             );
-            // M13-T005 (UA-ACCEPT-003): 会话类型分发——客户端声明 "shell" →
+            // (UA-ACCEPT-003): 会话类型分发——客户端声明 "shell" →
             // PTY 桥接；否则保持通道至断开。
             if ch.peer_device_type == "shell" {
                 let peer_id = ch.peer_id.clone();
@@ -4708,7 +4708,7 @@ async fn serve_incoming_stream(
                     Err(e) => println!("  Shell session ended with error: {}", e),
                 }
             } else {
-                // M13-T006 (UI-FT-005): 无头服务端静默接收文件 + 保持通道至
+                // (UI-FT-005): 无头服务端静默接收文件 + 保持通道至
                 // 客户端断开（流媒体由 GUI 服务器承载）。
                 use kirin_desk_media::transport::{SecureChannelReceiver, SecureChannelSender};
                 let peer_id = ch.peer_id.clone();
@@ -4866,7 +4866,7 @@ fn cmd_known_hosts(args: Vec<String>) {
     }
 }
 
-/// M15 (SRV-SEC-WL-001..004) + M8-T027 (SRV-IDWL-001..008, CLI-IDWL-001..006):
+/// M15 (SRV-SEC-WL-001..004) + (SRV-IDWL-001..008, CLI-IDWL-001..006):
 /// 白名单管理 — `whitelist [list|add|add-id|remove|remove-id|import|export|export-json]`。
 ///
 /// 域名模式支持 `*.example.com` 通配（匹配子域）；设备 ID 精确匹配（`*` 结尾
@@ -4958,7 +4958,7 @@ fn cmd_whitelist(args: Vec<String>) {
                 Err(e) => println!("Save error: {}", e),
             }
         }
-        // M8-T027 (CLI-IDWL-001): 新增设备 ID 白名单条目（expiry 留空 = 永久）。
+        // (CLI-IDWL-001): 新增设备 ID 白名单条目（expiry 留空 = 永久）。
         "add-id" => {
             let device_id = match args.get(3) {
                 Some(v) if !v.is_empty() => v.as_str(),
@@ -4993,7 +4993,7 @@ fn cmd_whitelist(args: Vec<String>) {
                 Err(e) => println!("Save error: {}", e),
             }
         }
-        // M8-T027 (CLI-IDWL-002): 删除设备 ID 白名单条目（同时清理两维）。
+        // (CLI-IDWL-002): 删除设备 ID 白名单条目（同时清理两维）。
         "remove-id" => {
             let device_id = match args.get(3) {
                 Some(v) if !v.is_empty() => v.as_str(),
@@ -5084,7 +5084,7 @@ fn cmd_status() {
                 cfg.network.allowed_domains.join(", ")
             };
             println!("Whitelist:     {}", wl);
-            // M8-T027 (CLI-IDWL-005): ID 白名单统计行（条目数 + 过期条目数），
+            // (CLI-IDWL-005): ID 白名单统计行（条目数 + 过期条目数），
             // 与域名白名单并列。
             let now = chrono::Utc::now();
             let active_ids = cfg.id_whitelist_active_ids(now);
@@ -5120,7 +5120,7 @@ fn cmd_status() {
         Ok(ip) => println!("IPv6:          {}", ip),
         Err(_) => println!("IPv6:          N/A"),
     }
-    // M8-T017 (CLI-TMP-012): 临时连接状态行（窗口 + 剩余秒数）。
+    // (CLI-TMP-012): 临时连接状态行（窗口 + 剩余秒数）。
     if is_temp_mode_active() {
         println!(
             "Temp Mode:     ACTIVE ({}s remaining)",
@@ -5129,7 +5129,7 @@ fn cmd_status() {
     } else {
         println!("Temp Mode:     off");
     }
-    // M8-T026-P2 (ID-020): Tunnel/ID 模式注册状态行。
+    // (ID-020): Tunnel/ID 模式注册状态行。
     if let Ok(cfg) = Config::load() {
         let t = &cfg.tunnel;
         if t.enabled && t.mode == "client" {
@@ -5290,7 +5290,7 @@ async fn rendezvous_client_addr(
 ///
 /// self-test 临时目录 = `temp_dir()/kirin_desk_self_test_<pid>/`（S-24 单一
 /// 收敛，`cmd_self_test_inner` 创建/清理）。自测的一切配置读写落这里，用户
-/// 旧 self-test M8-T027 段经 `id_whitelist_add/remove` 的**隐式 `self.save()`**
+/// 旧 self-test 段经 `id_whitelist_add/remove` 的**隐式 `self.save()`**
 /// （注释自称「不触碰真实 default.toml」与事实相反）每波门禁覆写一次用户
 /// 真实配置（物证：device-temp+24h 残留、token 加密空串、两日 32 次 id 派生
 /// 回写行）。
@@ -5386,7 +5386,7 @@ async fn cmd_self_test_inner(prog: std::sync::Arc<SelfTestProgress>) {
 
     // 已落在 self-test 隔离目录（由 `run()` 单线程段、Runtime 创建前 set
     // `KIRIN_DATA_DIR` 置位）。不满足 = 该段 FAIL 并立即中止：隔离目录未生效
-    // 意味着后续任何段的隐式 `Config::save()`（如 M8-T027 段
+    // 意味着后续任何段的隐式 `Config::save()`（如 ID 白名单段
     // `id_whitelist_add`）会重新污染用户真实配置，不得带病继续。
     prog.enter("config-sandbox");
     let sandbox_cfg_dir = self_test_config_sandbox_dir();
@@ -5562,12 +5562,12 @@ async fn cmd_self_test_inner(prog: std::sync::Arc<SelfTestProgress>) {
                 (_, Err(e)) => println!("  Reply receive FAILED: {}", e),
             }
 
-            // ── M8-T017: 临时连接往返自测 ──
+            // ── 临时连接往返自测 ──
             // 注入临时状态文件路径（不污染真实 cache 目录）：enable → 校验对/错码 →
-            // 过期失效 → disable。置于 M13-T006 之前，避免被其既有帧大小问题阻断。
+            // 过期失效 → disable。置于文件传输自测段之前，避免被其既有帧大小问题阻断。
             println!();
-            prog.enter("M8-T017 temp-mode");
-            println!("=== M8-T017 temp-mode tests ===");
+            prog.enter("temp-mode");
+            println!("=== temp-mode tests ===");
             {
                 use kirin_desk_core::connection::temp_mode::TempModeManager;
                 let tmp_tm = tmp.join("kirin_desk_self_test_temp_mode.json");
@@ -5604,12 +5604,12 @@ async fn cmd_self_test_inner(prog: std::sync::Arc<SelfTestProgress>) {
                 );
                 println!("  2. expiry + stale cleanup OK ✓");
             }
-            println!("=== M8-T017 temp-mode tests COMPLETE (2/2) ===");
+            println!("=== temp-mode tests COMPLETE (2/2) ===");
 
-            // ── M8-T027: 设备 ID 白名单自测（匹配规则 + 策略层决策 e2e）──
+            // ── 设备 ID 白名单自测（匹配规则 + 策略层决策 e2e）──
             println!();
-            prog.enter("M8-T027 ID whitelist");
-            println!("=== M8-T027 ID whitelist tests ===");
+            prog.enter("ID whitelist");
+            println!("=== ID whitelist tests ===");
             {
                 use kirin_desk_core::crypto::handshake::{
                     client_handshake_with_confirm_generic, id_matches_whitelist, server_read_init,
@@ -5811,12 +5811,12 @@ async fn cmd_self_test_inner(prog: std::sync::Arc<SelfTestProgress>) {
                 let _ = std::fs::remove_dir_all(&dir);
                 println!("  3. policy decisions: ID-hit accept / dual-miss reject / pin not bypassed OK ✓");
             }
-            println!("=== M8-T027 ID whitelist tests COMPLETE (3/3) ===");
+            println!("=== ID whitelist tests COMPLETE (3/3) ===");
 
-            // ── M13-T006: 文件传输往返自测（分块 + 滑窗 + SHA-256 校验落盘）──
+            // ── 文件传输往返自测（分块 + 滑窗 + SHA-256 校验落盘）──
             println!();
-            prog.enter("M13-T006 file transfer");
-            println!("=== M13-T006 file transfer round-trip ===");
+            prog.enter("file transfer");
+            println!("=== file transfer round-trip ===");
             use kirin_desk_media::transport::{
                 ChannelTag, SecureChannelReceiver, SecureChannelSender,
             };
@@ -6017,17 +6017,17 @@ async fn cmd_self_test_inner(prog: std::sync::Arc<SelfTestProgress>) {
                     ft_ok, verified
                 );
                 // 任一段 FAIL → 非零退出）。修复前本段仅打印 FAILED 不
-                // mark → 失败被吞、exit 恒 0——M13-T006 偶发失败因此长期
+                // mark → 失败被吞、exit 恒 0——偶发失败因此长期
                 prog.mark_failed();
             }
             let _ = src_sha;
             let _ = std::fs::remove_dir_all(&file_dir);
 
-            // ── M8-T026-P2: 设备 ID 连接模式 e2e（进程内 relay + 注册 +
+            // ── 设备 ID 连接模式 e2e（进程内 relay + 注册 +
             //    凭 ID 解析 → 中继路径 → Ed25519 握手 → 加密发送）──
             println!();
-            prog.enter("M8-T026-P2 device ID e2e");
-            println!("=== M8-T026-P2 device ID mode e2e ===");
+            prog.enter("device ID e2e");
+            println!("=== device ID mode e2e ===");
             {
                 use kirin_desk_core::connection::id_mode::{IdConnector, IdModeConfig, PathKind};
                 use kirin_desk_core::crypto::handshake::{
@@ -6360,15 +6360,15 @@ async fn cmd_self_test_inner(prog: std::sync::Arc<SelfTestProgress>) {
                 srv_task.abort();
             }
 
-            // ── M8-T026-P1: 打洞辅助与多路径叠加 ──
+            // ── 打洞辅助与多路径叠加 ──
             //   1) 打洞：进程内 rendezvous（PUNCH-006 边界：仅登记/互转）→
             //      双端 UDP 打洞（loopback）→ socket 交还 + 审计断言
             //      （PUNCH-SEC-004）；
             //   2) PathManager：多路径分配（中继→直连升舱）+ RTT 劣化
             //      默认保持期 2s 内触发换路（PATH-002/003）。
             println!();
-            prog.enter("M8-T026-P1 punch");
-            println!("=== M8-T026-P1 punch tests ===");
+            prog.enter("punch");
+            println!("=== punch tests ===");
             'p1_punch: {
                 use kirin_desk_core::connection::punch::{PunchConfig, PunchResult, PunchSession};
                 use kirin_desk_relay::rendezvous::RendezvousServer;
@@ -6447,8 +6447,8 @@ async fn cmd_self_test_inner(prog: std::sync::Arc<SelfTestProgress>) {
             }
 
             println!();
-            prog.enter("M8-T026-P1 path manager");
-            println!("=== M8-T026-P1 path manager tests ===");
+            prog.enter("path manager");
+            println!("=== path manager tests ===");
             {
                 use kirin_desk_core::connection::path_manager::{
                     PathKind, PathManager, PathMetrics, PathState, SwitchReason,
@@ -6784,9 +6784,9 @@ async fn cmd_self_test_inner(prog: std::sync::Arc<SelfTestProgress>) {
         }
     }
 
-    // ── M8-T040 (WBS 8.2): DOH 段 —— 加密解析（成功 / 失败注入 / fail-closed） ──
-    prog.enter("M8-T040 DOH/DoT");
-    println!("=== M8-T040 DOH/DoT resolver self-test ===");
+    // ── (WBS 8.2): DOH 段 —— 加密解析（成功 / 失败注入 / fail-closed） ──
+    prog.enter("DOH/DoT");
+    println!("=== DOH/DoT resolver self-test ===");
     {
         use kirin_desk_dns::{IpFamily, RecordType, ResolverError, SecureResolver};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -6860,11 +6860,11 @@ async fn cmd_self_test_inner(prog: std::sync::Arc<SelfTestProgress>) {
         );
         println!("  3. fail-closed → EncryptedDnsRequired ✓");
     }
-    println!("=== M8-T040 DOH/DoT resolver tests COMPLETE (3/3) ===");
+    println!("=== DOH/DoT resolver tests COMPLETE (3/3) ===");
 
-    // ── M8-T040 (WBS 8.2): DDNS 段 —— mock 公网 IP + 服务开→发布→状态回读 ──
-    prog.enter("M8-T040 DDNS");
-    println!("=== M8-T040 DDNS self-test ===");
+    // ── (WBS 8.2): DDNS 段 —— mock 公网 IP + 服务开→发布→状态回读 ──
+    prog.enter("DDNS");
+    println!("=== DDNS self-test ===");
     {
         use kirin_desk_dns::{
             DdnsService, DdnsStatus, PubIpError, PubIpSource, PublicIpFetcher,
@@ -6918,7 +6918,7 @@ async fn cmd_self_test_inner(prog: std::sync::Arc<SelfTestProgress>) {
         let _ = handle.await;
         println!("  4. graceful shutdown (records retained, DDNS-REC-007) ✓");
     }
-    println!("=== M8-T040 DDNS self-test COMPLETE (4/4) ===");
+    println!("=== DDNS self-test COMPLETE (4/4) ===");
 
     // S-24 (F-29)：正常退出清理自测临时子目录（含全部密钥/状态文件）——
     // "self-test 后临时目录为空"。中断残留由下次运行的开头清理兜底。
@@ -6930,7 +6930,7 @@ async fn cmd_self_test_inner(prog: std::sync::Arc<SelfTestProgress>) {
 // ════════════════════════════════════════════════════════════════
 
 // ════════════════════════════════════════════════════════════════
-// M8-T026 T004: CLI 内网穿透 — tunnel start / serve / status（TNL-CFG-003）
+// T004: CLI 内网穿透 — tunnel start / serve / status（TNL-CFG-003）
 // ════════════════════════════════════════════════════════════════
 
 /// CLI 侧隧道审计适配器：relay 审计事件 → `utils::audit` 落盘（TNL-SEC-003）。
@@ -6975,7 +6975,7 @@ impl kirin_desk_relay::audit::AuditSink for CliTunnelAudit {
                 AuditEvent::TunnelRateLimited,
                 format!("ip={} reason={}", client, reason),
             ),
-            // M8-T026-P2 (ID-022)：设备注册/离线/解析/中继事件。
+            // (ID-022)：设备注册/离线/解析/中继事件。
             TunnelAuditEvent::DeviceRegistered { client, device_id } => (
                 AuditEvent::DeviceRegistered,
                 format!("ip={} device={}", client, device_id),
@@ -7024,7 +7024,7 @@ impl kirin_desk_relay::audit::AuditSink for CliTunnelAudit {
                 AuditEvent::TunnelWorkConnClosed,
                 format!("target={} conn_id={} reason={}", target, conn_id, reason),
             ),
-            // M8-T026-P1 打洞事件（PUNCH-SEC-004）由打洞集成方落盘。
+            // 打洞事件（PUNCH-SEC-004）由打洞集成方落盘。
             _ => return,
         };
         if let Ok(mut logger) = AuditLogger::open_default() {
@@ -7074,7 +7074,7 @@ async fn cmd_tunnel_start() {
         println!("ERROR: [tunnel].server_addr is empty — set the relay server address.");
         return;
     }
-    // M8-T026-P3 (TNL-CFG-007)：口令为空时服务器将拒绝登录（已配置口令）
+    // (TNL-CFG-007)：口令为空时服务器将拒绝登录（已配置口令）
     // 或处于未认证状态（legacy），二者都不应继续 —— 提示设置口令。
     if t.token.is_empty() {
         println!(
@@ -7146,7 +7146,7 @@ async fn cmd_tunnel_serve() {
         }
     };
     let t = &cfg.tunnel;
-    // M8-T026-P3 (TNL-SEC-008)：fail-closed —— 空口令拒绝启动（防服务器
+    // (TNL-SEC-008)：fail-closed —— 空口令拒绝启动（防服务器
     // 被任意接入滥用 / 运营者躺枪）。
     if t.token.is_empty() {
         println!(
@@ -7167,7 +7167,7 @@ async fn cmd_tunnel_serve() {
             t.port_range
         );
     }
-    // M8-T039：可选显式监听地址列表（默认 "0.0.0.0,::" 或空串 → relay 回退
+    // 可选显式监听地址列表（默认 "0.0.0.0,::" 或空串 → relay 回退
     // 默认双栈，行为与现状一致）。解析失败 → 拒绝启动（fail-closed，对齐
     // 空 token 拒绝语义）。
     let bind_addrs = if t.bind_addrs.trim().is_empty() {
@@ -7281,7 +7281,7 @@ fn cmd_tunnel_status() {
 }
 
 /// 解析 `"start-end"` 端口区间（TNL-CFG-001 `[tunnel].port_range`）。
-/// M8-T039 (P4)：提升为 `pub(crate)` 供 lib.rs（Tunnel 页端口范围校验/组装）复用。
+/// (P4)：提升为 `pub(crate)` 供 lib.rs（Tunnel 页端口范围校验/组装）复用。
 pub(crate) fn parse_tunnel_port_range(s: &str) -> Option<(u16, u16)> {
     let (a, b) = s.trim().split_once('-')?;
     let start: u16 = a.trim().parse().ok()?;

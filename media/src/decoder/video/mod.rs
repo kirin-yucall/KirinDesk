@@ -1,4 +1,4 @@
-//! 视频解码入口：流式管线 + extradata 管理 + IDR 恢复（M8-T015 P2B §T2.3）。
+//! 视频解码入口：流式管线 + extradata 管理 + IDR 恢复（P2B §T2.3）。
 //!
 //! # 流式核心（P2B 修复）
 //!
@@ -20,7 +20,7 @@
 //!   4. 达 3 次 → request_keyframe() → flush（清参考帧）+ stats.idr_requests++
 //!   5. 上层检测到 idr_requests 增长 → 发送
 //!      ControlMessage::AdaptiveConfig { force_idr: true, .. }
-//!   6. 服务端（M8-T014 自适应）收到 → 强制下一帧 IDR
+//!   6. 服务端（自适应）收到 → 强制下一帧 IDR
 //!   7. 客户端收下一个 IDR → 正常解码恢复
 //! ```
 //!
@@ -369,7 +369,7 @@ impl VideoDecoder for VideoDecoderPipeline {
     ///
     /// 返回 true 表示已触发——上层应发送
     /// `ControlMessage::AdaptiveConfig{force_idr:true}` 让服务端强制下一帧
-    /// IDR（M8-T014 自适应；P2B §T2.3 IDR 恢复策略）。
+    /// IDR（自适应；P2B §T2.3 IDR 恢复策略）。
     fn request_keyframe(&mut self) -> bool {
         self.backend.flush();
         self.stats.idr_requests += 1;

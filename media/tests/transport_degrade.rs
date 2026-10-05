@@ -1,4 +1,4 @@
-//! M8-T025 P5-5：会话降级全链路集成测试（transport_degrade.rs）。
+//! P5-5：会话降级全链路集成测试（transport_degrade.rs）。
 //!
 //! 覆盖（P5-5 测试表）：
 //! - `degrade_connect_fallback`：QUIC 端口不可达 → `connect_media_transport(Quic, fallback)`
@@ -326,7 +326,7 @@ async fn run_degrade_scenario(tag: &str, hold_after_resume: Duration) {
                 expected_nickname: None,
                 expected_challenge: None,
             }),
-            None, // M8-T026-P1：不启用打洞升舱
+            None, // 不启用打洞升舱
             stop_server,
         )
         .await
@@ -360,7 +360,7 @@ async fn run_degrade_scenario(tag: &str, hold_after_resume: Duration) {
                 challenge: "challenge".to_string(),
                 connect_timeout: Duration::from_secs(3),
             }),
-            None, // M8-T026-P1：不启用打洞升舱
+            None, // 不启用打洞升舱
             stop_client,
         )
         .await
@@ -471,7 +471,7 @@ async fn accept_dual_listen() {
             })
         };
         // 仅 QUIC 客户端连接。注：客户端 connect_quic_transport 内的
-        // accept_bi（控制流）依赖服务端**写入**控制流才解析——M8-T026-P1
+        // accept_bi（控制流）依赖服务端**写入**控制流才解析——
         // 起服务端 open_bi 后写 1 字节就绪标记（CONTROL_STREAM_READY，
         // transport.rs）强制 STREAM 帧发出，connect 端同步消费；本测试
         // 服务端 accept 返回后仍先发 VideoFormat 再 join（与既有流程一致）。

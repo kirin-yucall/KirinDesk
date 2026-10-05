@@ -72,7 +72,7 @@ pub const CODEC_AV1: &str = "av1";
 /// 上报——即 AV1 协商成功仅当编码器真的落在 AV1 上）。
 pub fn detect_supported_codecs() -> Vec<&'static str> {
     let mut codecs = Vec::new();
-    // 优先级：AV1（码率效率 ~6×，M13-T002 探索结论）→ H.265 → H.264 兜底。
+    // 优先级：AV1（码率效率 ~6×，探索结论）→ H.265 → H.264 兜底。
     if let Ok(enc) = factory::create_video_encoder(Codec::AV1, None) {
         if enc.codec() == Codec::AV1 {
             codecs.push(CODEC_AV1);

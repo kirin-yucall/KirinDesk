@@ -24,13 +24,13 @@ api_secret = ""
 domain = "example.com"
 api_url = "https://api.godaddy.com"
 
-# M8-T035: DNS 域名维护服务商（Settings → DNS 组 ComboBox 写入；
+# DNS 域名维护服务商（Settings → DNS 组 ComboBox 写入；
 # 值 = utils dns_providers 注册表中已实现服务商 id，未知值自动回退 "godaddy"）。
 # `[godaddy]` 段为 GoDaddy 客户端实际使用的字段，结构不变（CLI 直接读写）。
 [dns]
 provider = "godaddy"
 
-# M8-T040: 域名模式加密 DNS 强制（服务端 + 客户端，需求 §5.2）。
+# 域名模式加密 DNS 强制（服务端 + 客户端，需求 §5.2）。
 # 域名模式下全部 DNS 解析必须走 DoH/DoT，fail-closed（DDNS-DOH-003）；
 # mode = "off" 显式关闭强制（仅限 IP 模式；域名模式将无法解析 → 提示不可用）。
 [dns.security]
@@ -50,7 +50,7 @@ dot = [
 resolve_timeout_ms = 5000       # 单端点超时
 cache_ttl_secs = 50             # 解析缓存 TTL（沿用 discovery 缓存语义）
 
-# M8-T040: DDNS 域名自动更新维护（域名页「DDNS 维护」卡读写，需求 §5.1）。
+# DDNS 域名自动更新维护（域名页「DDNS 维护」卡读写，需求 §5.1）。
 # IPv4 自动 = 公网出口 IP（非本机网卡地址）；IPv6 自动 = 本机全局单播；
 # 手动模式地址心跳永不覆盖（仅刷新 TTL）。
 [ddns]
@@ -75,9 +75,9 @@ dns_ttl = 600
 # 真实监听端口；排除 CGNAT 100.64/10 与链路本地）——同局域网自动直连
 # 不走公网中继；隐私敏感环境可置 false（仅上报 [tunnel] extra_candidates）
 report_lan_candidates = true
-# M8-T017: 临时连接窗口时长（秒，范围 60–3600，默认 300 = 5 分钟）
+# 临时连接窗口时长（秒，范围 60–3600，默认 300 = 5 分钟）
 temp_mode_ttl_secs = 300
-# M8-T027: 设备 ID 白名单（按握手 client_id 精确匹配，大小写敏感；
+# 设备 ID 白名单（按握手 client_id 精确匹配，大小写敏感；
 # 与域名白名单 OR 生效。GUI Settings / `whitelist add-id` 写入，无需手改）
 # allowed_ids = []            # 永久条目（精确；`office-*` = 前缀通配）
 # id_whitelist = []           # 带过期条目（`whitelist add-id <id> <RFC3339>`）
@@ -87,20 +87,20 @@ encoder = "auto"
 framerate = 30
 bitrate = 5000
 
-# M8-T030: 单 GPU 硬件加速与虚拟设备过滤
+# 单 GPU 硬件加速与虚拟设备过滤
 # prefer: auto(默认,第一个真实硬件适配器) | intel | nvidia | amd | luid:0x…(调试)
 # 开发机双 GPU 调试：切 intel 验 QSV / 切 nvidia 验 NVENC
 # （也可用环境变量 KIRIN_GPU_PREFER 覆盖，不动配置文件）
 [media.gpu]
 prefer = "auto"
 filter_virtual = true        # 过滤虚拟驱动（适配器 + 显示器）
-virtual_keywords = []        # 覆盖默认黑名单（空 = 默认表，见 M8-T030 §3.3）
+virtual_keywords = []        # 覆盖默认黑名单（空 = 默认表，见 §3.3）
 
 [logging]
 level = "info"
 format = "text"
 
-# M8-T025 P5-4: 传输设置（QUIC 优先 → TCP 优雅降级；CLI --transport/--ip-family 覆盖）
+# P5-4: 传输设置（QUIC 优先 → TCP 优雅降级；CLI --transport/--ip-family 覆盖）
 [transport]
 mode = "auto"                 # auto | quic | tcp（B1：auto = QUIC 优先，失败回退 TCP）
 ip_family = "auto"            # auto | ipv4 | ipv6（A4：auto = IPv6 优先，无 v6 用 v4）
@@ -109,7 +109,7 @@ graceful_degrade = true       # 会话中途降级开关（B2：QUIC 失效自�
 tcp_mode_feedback_interval_ms = 500  # TCP 模式反馈上报周期（§3.5）
 
 [file_transfer]
-# M13-T006: 接收文件落盘目录（留空 = 默认 ~/Downloads/KirinDesk）
+# 接收文件落盘目录（留空 = 默认 ~/Downloads/KirinDesk）
 download_dir = ""
 # 单文件大小上限（字节，默认 4 GiB）
 max_file_size = 4294967296
@@ -118,7 +118,7 @@ max_file_size = 4294967296
 file_transfer_allowed = true
 clipboard_allowed = true
 
-# M8-T026: 内网穿透设置（FRP 式通用 TCP 反向代理）。
+# 内网穿透设置（FRP 式通用 TCP 反向代理）。
 # 默认关闭——可选兜底能力，与 P2P 直连并存；开启仅在有公网 relay 服务器时。
 # 客户端核心字段（server_addr / token / proxies）可在 GUI Settings 页
 # 「Tunnel (内网穿透)」分组编辑；本段为完整配置与默认值。
@@ -126,11 +126,11 @@ clipboard_allowed = true
 enabled = false               # 总开关（默认关闭）
 mode = "client"               # client（frpc 等价，默认）| server（frps 等价）
 server_addr = ""              # relay 服务器地址：域名 / IPv4 / IPv6，支持 :port 后缀
-# M8-T026-P3（TNL-CFG-005）：认证口令 —— 挑战-响应加密验证（HMAC-SHA256，
+# TNL-CFG-005：认证口令 —— 挑战-响应加密验证（HMAC-SHA256，
 # 口令永不明文上线，TNL-SEC-006）；server 模式必填（空口令拒绝启动，
 # TNL-SEC-008）；建议 ≥32 字节高熵随机串（TNL-SEC-009）；不写日志；
 token = ""
-# --- 以下为 server 模式 / 稳定性参数（GUI Tunnel 页可编辑（M8-T039）） ---
+# --- 以下为 server 模式 / 稳定性参数（GUI Tunnel 页可编辑） ---
 bind_port = 7000              # server 控制端口
 bind_addrs = "0.0.0.0,::"     # server 监听地址（逗号分隔可多个，IPv4/IPv6 均可；
                               # 默认 IPv4+IPv6 双监听；空 = relay 回退 [::] 优先 + 0.0.0.0 回退）
@@ -141,7 +141,7 @@ pool_count = 0                # 连接池预建 work 连接数（P1 增强，0=�
 max_pool_count = 5            # server 每代理池上限（P1 增强）
 # GUI 最后运行状态（仅 GUI 写；CLI 不读；与 enabled 语义独立；默认 false）
 auto_start = false
-# --- M8-T026-P2 设备 ID 模式（ID 注册/解析/中继） ---
+# --- 设备 ID 模式（ID 注册/解析/中继） ---
 device_id = ""                # 注册设备 ID（留空 = 由本机身份公钥指纹派生，ID-001）
 server_pubkey = ""            # relay 服务器 Ed25519 公钥（base64；`connect --id` 验签必需，
                               # 首次 `tunnel serve` 启动时输出，ID-SEC-001）

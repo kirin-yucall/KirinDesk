@@ -1,4 +1,4 @@
-//! M8-T026 T001: 协议层 — 控制消息 + 帧编解码（TNL-PROTO-001/007）。
+//! T001: 协议层 — 控制消息 + 帧编解码（TNL-PROTO-001/007）。
 //!
 //! 帧格式：`[type:u8][len:u32 BE][bincode payload]`（对齐 `core/connection/
 //! multiplex.rs` 的 `[type:u8][len:u32 BE][payload]` 风格；本模块自持实现以
@@ -7,7 +7,7 @@
 //! type 域划分（TNL-PROTO-001）：
 //! - `0x01` 控制消息（`ControlMsg`，bincode 枚举自带变体标记）；
 //! - `0x10` work 连接首帧（`WorkConnHeader`）；
-//! - `0x80+` 中继扩展区（§8）：**M8-T026-P2 设备 ID 模式已启用**
+//! - `0x80+` 中继扩展区（§8）：** 设备 ID 模式已启用**
 //!   `0x80~0x86`（解析/候选/设备级中继）；`0x87~0x8A` 为 P1 打洞
 //!   （`PeerCandidates` / `PunchResult` / `PathProbe` / `PathProbeAck`，
 //!   P1 并行开发使用；`PunchProbe` 不经服务器、在打洞 socket 上直发，
@@ -25,7 +25,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// 协议主版本（TNL-PROTO-008：主版本不兼容 → 登录拒绝）。
 ///
-/// M8-T026-P3（TNL-PROTO-009）：1.0.0 → 1.1.0 —— `Login`/`LoginResp` 追加
+/// TNL-PROTO-009：1.0.0 → 1.1.0 —— `Login`/`LoginResp` 追加
 /// auth 字段（serde default 向后兼容）+ 枚举末尾追加 `AuthChallenge` 变体
 /// （不影响既有 wire 变体索引）；major 仍为 1，版本协商不受影响。
 ///
@@ -70,7 +70,7 @@ pub const TYPE_WORK_HEADER: u8 = 0x10;
 pub const TYPE_RESERVED_BASE: u8 = 0x80;
 
 // ════════════════════════════════════════════════════════════════
-// M8-T026-P2 设备 ID 模式 — 0x80+ 扩展区（ID-010/ID-011/ID-005）
+// 设备 ID 模式 — 0x80+ 扩展区（ID-010/ID-011/ID-005）
 // ════════════════════════════════════════════════════════════════
 
 /// 扩展区：设备解析请求（控制器 → 服务器控制连接，ID-010）。
@@ -254,7 +254,7 @@ pub struct DeviceInfo {
 /// `session_id`（P1 字段，`#[serde(default)]` 向后兼容）：打洞会话的 128 位
 /// 随机标识（仅双端与服务器知晓，PUNCH-SEC-003）；`Some` = P1 打洞流程
 /// （服务器按 session 关联双端并互转候选），`None` = P2 注册表候选刷新
-/// （服务器仅按 device_id 存最新候选）。见 `M8-T026_接口交互协调.md` §3.1。
+/// （服务器仅按 device_id 存最新候选）。见 `_接口交互协调.md` §3.1。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CandidateRegister {
     pub device_id: String,
@@ -626,11 +626,11 @@ pub const FRAME_HEADER_LEN: usize = 5;
 pub enum ControlMsg {
     /// frpc → frps：登录（token 认证 + 版本协商，TNL-PROTO-002）。
     ///
-    /// M8-T026-P2（ID-001）：`device_id` / `ed25519_pub` 为设备 ID 模式
+    /// ID-001：`device_id` / `ed25519_pub` 为设备 ID 模式
     /// 注册字段 —— 有 `device_id` 时服务器登记在线表；`None` 为纯控制
     /// 连接（如仅解析）。`device_id` 优先显式配置，否则由公钥指纹派生。
     ///
-    /// M8-T026-P3（TNL-PROTO-011）：`auth_nonce` / `auth_digest` 为挑战-
+    /// TNL-PROTO-011：`auth_nonce` / `auth_digest` 为挑战-
     /// 响应认证字段（TNL-SEC-006，口令永不明文上线）—— 探测帧携带
     /// `auth_nonce`（客户端随机数，token 恒为空串），证明帧携带
     /// `auth_digest`（HMAC-SHA256 证明）；旧载荷（无此二字段）serde
@@ -650,7 +650,7 @@ pub enum ControlMsg {
     },
     /// frps → frpc：登录应答（TNL-PROTO-002）。
     ///
-    /// M8-T026-P3（TNL-PROTO-012）：`auth_digest` 为服务端回执（双向认证，
+    /// TNL-PROTO-012：`auth_digest` 为服务端回执（双向认证，
     /// TNL-SEC-007），仅 `ok=true` 时携带。
     LoginResp {
         ok: bool,
@@ -686,7 +686,7 @@ pub enum ControlMsg {
     Ping { ts: u64 },
     /// 双向心跳应答（TNL-PROTO-005）。
     Pong { ts: u64 },
-    /// M8-T026-P3（TNL-PROTO-010）：服务端挑战（口令模式两阶段握手，
+    /// TNL-PROTO-010：服务端挑战（口令模式两阶段握手，
     /// TNL-SEC-006）—— `nonce` 为每次连接全新随机数（16 字节 CSPRNG，
     /// TNL-NF-006 防重放，无需服务端 nonce 去重缓存）。
     ///
@@ -832,7 +832,7 @@ pub fn decode_work_header(ty: u8, payload: &[u8]) -> Result<WorkConnHeader, Prot
     bincode::deserialize(payload).map_err(|e| ProtocolError::Bincode(e.to_string()))
 }
 
-/// 编码 0x80+ 扩展区消息（M8-T026-P2：解析/候选/中继；P1：候选互转/打洞结果）。
+/// 编码 0x80+ 扩展区消息（解析/候选/中继；P1：候选互转/打洞结果）。
 pub fn encode_extension<T: Serialize>(ty: u8, msg: &T) -> Result<Vec<u8>, ProtocolError> {
     debug_assert!(ty >= TYPE_RESERVED_BASE && ty <= TYPE_EXT_END, "type out of extension range");
     let payload = bincode::serialize(msg)
@@ -1057,7 +1057,7 @@ mod tests {
             ControlMsg::Logout,
             ControlMsg::Ping { ts: 12345 },
             ControlMsg::Pong { ts: 12345 },
-            // M8-T026-P3：挑战帧 + 带 auth 字段的登录消息。
+            // 挑战帧 + 带 auth 字段的登录消息。
             ControlMsg::Login {
                 token: String::new(),
                 version: PROTOCOL_VERSION.into(),
@@ -1186,7 +1186,7 @@ mod tests {
     }
 
     // ════════════════════════════════════════════════════════════
-    // M8-T026-P2：0x80+ 扩展区消息 round-trip
+    // 0x80+ 扩展区消息 round-trip
     // ════════════════════════════════════════════════════════════
 
     fn sample_candidates() -> Vec<Candidate> {
@@ -1309,7 +1309,7 @@ mod tests {
     }
 
     // ════════════════════════════════════════════════════════════
-    // M8-T026-P3：挑战-响应认证（TNL-PROTO-009~013）
+    // 挑战-响应认证（TNL-PROTO-009~013）
     // ════════════════════════════════════════════════════════════
 
     #[test]
@@ -1403,7 +1403,7 @@ mod tests {
     }
 
     // ════════════════════════════════════════════════════════════
-    // M8-T026-P1：PathProbe/PathProbeAck + 打洞探测报文（0x89/0x8A）
+    // PathProbe/PathProbeAck + 打洞探测报文（0x89/0x8A）
     // ════════════════════════════════════════════════════════════
 
     #[test]

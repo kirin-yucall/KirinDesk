@@ -1,4 +1,4 @@
-# KirinDesk Debian control 模板 — M14-T003
+# KirinDesk Debian control 模板 — 
 # build_deb.sh 会将 %VERSION% / %ARCH% 替换为实际值。
 Package: kirin-desk
 Version: %VERSION%

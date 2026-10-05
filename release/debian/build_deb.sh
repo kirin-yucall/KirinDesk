@@ -1,5 +1,5 @@
 ﻿#!/usr/bin/env bash
-# KirinDesk Ubuntu .deb 打包脚本 — M14-T003
+# KirinDesk Ubuntu .deb 打包脚本 — 
 #
 # 前置：Linux 环境（dpkg-deb），Ubuntu 20.04+ / Debian 11+。
 # 用法：

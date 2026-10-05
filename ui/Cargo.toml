@@ -6,7 +6,7 @@ edition.workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
-# M8-T040 (WBS 8.2): self-test mock PubIpSource / Resolver 实现（dns 侧同版本）
+# (WBS 8.2): self-test mock PubIpSource / Resolver 实现（dns 侧同版本）
 async-trait = "0.1"
 kirin-desk-core = { path = "../core" }
 kirin-desk-dns = { path = "../dns" }
@@ -33,7 +33,7 @@ raw-window-handle = "0.6"
 vt100 = "0.16"
 crossterm = "0.29"
 
-# M13-T003: 剪贴板共享（客户端 ⇄ 服务端）
+# 剪贴板共享（客户端 ⇄ 服务端）
 arboard = "3.4"
 # winuser=剪贴板 API、shellapi=DragQueryFileW——设计依赖行「shell32」勘误：
 # winapi 0.3.9 无 shell32 feature/module，DragQueryFileW 实际位于

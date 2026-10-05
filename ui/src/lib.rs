@@ -51,7 +51,7 @@ use kirin_desk_core::connection::reconnection::attempt_reconnect;
 // 语义，relay = 兜底路径）——FileSession 配额按路径取上限（P2P 字节不限）。
 use kirin_desk_core::connection::PathKind;
 use kirin_desk_core::connection::ShellMessage;
-// M8-T019: 隐私模式（黑屏 / 锁屏）状态机。
+// 隐私模式（黑屏 / 锁屏）状态机。
 use kirin_desk_core::connection::privacy::{PrivacyController, PrivacyLevel, PrivacyOutcome};
 use kirin_desk_core::connection::temp_mode::TempModeManager;
 use kirin_desk_core::crypto::ed25519::IdentityManager;
@@ -76,7 +76,7 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 use terminal::Terminal;
 
-// M15-T008: 设计令牌 + 通用组件（本文件全部取色/字号经 theme 令牌，零裸 Color32）。
+// 设计令牌 + 通用组件（本文件全部取色/字号经 theme 令牌，零裸 Color32）。
 use theme::{Theme, ThemeMode};
 use widgets::{
     action_button, badge, card, card_with_title_tip, conn_log_view, copy_button, labeled_input,
@@ -95,7 +95,7 @@ use kirin_desk_utils::known_hosts::{
 };
 
 // M9: 远程输入注入（客户端捕获 → 加密通道 → 服务端注入）。
-// M8-T020: SpecialCombo 特殊键（Win/Alt+Tab/任务管理器/锁屏）。
+// SpecialCombo 特殊键（Win/Alt+Tab/任务管理器/锁屏）。
 use kirin_desk_input::injector::{
     button as hid_button, modifier as hid_modifier,
     modifier_bit_for_key as hid_modifier_bit_for_key, InputEvent as WireInputEvent,
@@ -109,7 +109,7 @@ use kirin_desk_media::proto::DisplayInfo;
 use kirin_desk_media::transport::{
     ChannelTag, ControlMessage, MAX_PACKET_PAYLOAD, SecureChannelReceiver, SecureChannelSender,
 };
-// M14-T005: 自动更新（Settings Update 面板 + 每周后台检查）。
+// 自动更新（Settings Update 面板 + 每周后台检查）。
 use kirin_desk_updater::{InstallOutcome, ReleaseInfo, UpdateChannel, UpdateStatus, Updater};
 use std::path::{Path, PathBuf};
 
@@ -119,7 +119,7 @@ fn gui_log_buffer() -> Arc<LogBuffer> {
     BUF.get_or_init(|| LogBuffer::new(500)).clone()
 }
 
-/// M15-T008: LogView「Clear」按钮回调——清空共享日志缓冲（`fn()` 无借用冲突）。
+/// LogView「Clear」按钮回调——清空共享日志缓冲（`fn()` 无借用冲突）。
 pub(crate) fn clear_gui_log() {
     gui_log_buffer().clear();
 }
@@ -489,7 +489,7 @@ fn server_stop_watch() -> &'static tokio::sync::watch::Sender<bool> {
     })
 }
 
-/// M8-T034: 服务端真实运行态（监听线程写 → GUI 每帧读）。
+/// 服务端真实运行态（监听线程写 → GUI 每帧读）。
 /// 修复旧实现「bind 失败只打日志、`server_running` 保持 true」的假死：
 /// 失败时写 `error` 并置 `listening=false`，开关即时回 OFF 并展示原因。
 #[derive(Debug, Clone, Default)]
@@ -510,7 +510,7 @@ fn server_runtime_state() -> &'static Mutex<ServerRuntimeState> {
     S.get_or_init(|| Mutex::new(ServerRuntimeState::default()))
 }
 
-/// M8-T039 §3.4.3: 隧道真实运行态（后台线程写 → GUI 每帧读；仿 ServerRuntimeState）。
+/// §3.4.3: 隧道真实运行态（后台线程写 → GUI 每帧读；仿 ServerRuntimeState）。
 #[derive(Debug, Clone, Default)]
 struct TunnelRuntimeState {
     /// 启动进行中（GUI 点击后置位，后台线程确认后复位）。
@@ -1025,7 +1025,7 @@ async fn server_accept_loop<F>(
     }
 }
 
-/// M8-T039: 隧道状态行文案（运行中 ● / 已停止 ○ / 启动失败: 原因（配置保持启用…））。
+/// 隧道状态行文案（运行中 ● / 已停止 ○ / 启动失败: 原因（配置保持启用…））。
 fn tunnel_status_text(st: &TunnelRuntimeState, mode: &str) -> String {
     if let Some(e) = &st.error {
         return tf!("tunnel.run.failed", e); // 「启动失败: {0}（配置保持启用，下次启动将自动重试）」
@@ -1380,7 +1380,7 @@ pub(crate) fn connect_wait_elapsed(status: &str) -> Option<std::time::Duration> 
     connect_episode_start().lock().unwrap().map(|s| now.duration_since(s))
 }
 
-/// M8-T038 (P1): 连接状态 → 语义色（Shell 前缀剥离后判定；与既有 Connect 页
+/// (P1): 连接状态 → 语义色（Shell 前缀剥离后判定；与既有 Connect 页
 /// 7868-7877 映射一致：已连接绿 / 发现·解析·连接·握手蓝 / 其余红）。
 /// danger 红，「等待对方审批」被呈现为失败信号）。
 fn conn_status_color(theme: &Theme, status: &str) -> egui::Color32 {
@@ -1399,7 +1399,7 @@ fn conn_status_color(theme: &Theme, status: &str) -> egui::Color32 {
     }
 }
 
-/// M8-T038 (P1): 连接状态 → Stepper 步数（0=发现/解析 1=连接 2=握手 3=已连接；
+/// (P1): 连接状态 → Stepper 步数（0=发现/解析 1=连接 2=握手 3=已连接；
 /// 其余 None）。与 Connect 页 step 推导同逻辑，另剥离 `[shell] ` 前缀
 /// （"[shell] Connected to …" → 第 3 步）。
 fn conn_step(status: &str) -> Option<usize> {
@@ -1424,7 +1424,7 @@ fn conn_step(status: &str) -> Option<usize> {
 ///   Discovering/Resolving/Connecting/Handshaking〔`[shell] ` 前缀约定〕/
 ///   错误终态 /「Connected to …」成功终态；**断连不改写本串**——断开检测
 ///   只能靠窗口侧输入通道状态）；
-/// - `disconnected`：本窗口会话已判死（输入发送通道关闭，M15-T008 断连
+/// - `disconnected`：本窗口会话已判死（输入发送通道关闭，断连
 ///   检测同口径；Shell 窗 `input_tx = None` → 恒 false）。
 ///
 /// 输出：
@@ -1484,7 +1484,7 @@ pub(crate) fn conn_banner_offset_y(mode: ConnBannerMode, bar_bottom: f32) -> f32
 /// - 进行态（Discovering/Resolving/Connecting/Handshaking，`[shell] ` 前缀
 ///   剥离后判定）→ `Some((步骤表, 当前步索引))`——步索引走既有
 ///   [`conn_step`]；步骤表：「Resolving…」进行态自 Resolving 步起，其余
-///   自 Discovering 步起（M8-T038 口径不变）；
+///   自 Discovering 步起（口径不变）；
 /// - 其余状态（成功终态/错误/空串）→ `None`（不渲染 stepper）。
 pub(crate) fn conn_banner_stepper(status: &str) -> Option<(&'static [&'static str], usize)> {
     let cur = conn_step(status)?;
@@ -1890,7 +1890,7 @@ where
     })
 }
 
-/// M8-T038 (P6): 特殊键按钮文案（input crate 的 `SpecialCombo::label` 为硬编码
+/// (P6): 特殊键按钮文案（input crate 的 `SpecialCombo::label` 为硬编码
 /// 中文——UI 层以 t!() 覆盖，input 层保持平台通用不依赖 ui/i18n；键名同义）。
 fn special_combo_label(c: SpecialCombo) -> &'static str {
     match c {
@@ -1906,7 +1906,7 @@ fn special_combo_label(c: SpecialCombo) -> &'static str {
     }
 }
 
-/// M8-T038 (P6): 特殊键按钮 tooltip（同上，覆盖 input crate 的 `hint()`）。
+/// (P6): 特殊键按钮 tooltip（同上，覆盖 input crate 的 `hint()`）。
 fn special_combo_hint(c: SpecialCombo) -> &'static str {
     match c {
         SpecialCombo::WinE => t!("session.special_key.win_e_hint"),
@@ -1936,10 +1936,10 @@ pub(crate) fn audio_enabled() -> bool {
 }
 
 ///
-/// M8-T032：本开关为**总开关**——`false` 同时关三个子开关
+/// 本开关为**总开关**——`false` 同时关三个子开关
 /// （① 服务端发送 / ② 客户端播放 / ③ 客户端麦克风回传），兼容
 /// CLI `--no-audio` 全关语义；重新开启 → 三个子开关恢复默认
-/// （开 / 开 / 关，M8-T032 §3.1）。
+/// （开 / 开 / 关，§3.1）。
 pub(crate) fn set_audio_enabled(enabled: bool) {
     audio_enabled_global().store(enabled, Ordering::Relaxed);
     // 关 → 三子开关强制关；总开关开 → 不触碰子开关——此处 `enabled=true`
@@ -1962,13 +1962,13 @@ pub(crate) fn set_audio_enabled(enabled: bool) {
 }
 
 // ════════════════════════════════════════════════════════════════
-// M8-T032：音频三开关（进程级原子量，会话任务循环内逐轮读取——
+// 音频三开关（进程级原子量，会话任务循环内逐轮读取——
 // 运行时切换立即生效，无需重连）
 // ════════════════════════════════════════════════════════════════
 
 /// 服务端是否把本机声音（WASAPI 环回）传给客户端。
 /// Dashboard Server 卡开关读写；关 → 服务端不启动/停止音频发送。
-/// M8-T035：**默认关**（需求 8；总开关开启不回写子开关默认值，故
+/// **默认关**（需求 8；总开关开启不回写子开关默认值，故
 /// 「总开关 开→关→开」循环后本开关仍保持关）。
 /// 客户端→服务端音频控制消息——客户端工具栏 🔊/🎤 分别是客户端侧静音 /
 /// 「置位函数从未被调用」的混淆主因。
@@ -2012,10 +2012,10 @@ pub(crate) fn server_audio_toggle_next(current: bool, clicked: bool) -> Option<b
 }
 
 ///
-/// 总开关关 → 三个子开关强制关（CLI `--no-audio` 全关语义，M8-T032）；
-/// 总开关开 → 三个子开关保持现状**不回写默认**（M8-T035：「总开关
+/// 总开关关 → 三个子开关强制关（CLI `--no-audio` 全关语义）；
+/// 总开关开 → 三个子开关保持现状**不回写默认**（：「总开关
 /// 开→关→开」循环后「服务端音频」仍保持关）。生产调用点 =
-/// `set_audio_enabled`（GUI 无总开关写入入口，M8-T037 起仅 CLI `--no-audio`）。
+/// `set_audio_enabled`（GUI 无总开关写入入口，起仅 CLI `--no-audio`）。
 pub(crate) fn audio_master_cascade(
     master_on: bool,
     server_allowed: bool,
@@ -2092,7 +2092,7 @@ fn audio_window_state() -> &'static Mutex<HashMap<u64, AudioUiState>> {
 /// 产出的 EncodedWindow 帧经广播总线分发给全部注册观众。
 
 /// 客户端已知的远端捕获分辨率（接收循环按 session_id 写入；视口输入捕获读取）。
-/// M8-T021 P1 (T021-02): 键控 map——多连接各窗口读取自身会话的分辨率，
+/// P1 (T021-02): 键控 map——多连接各窗口读取自身会话的分辨率，
 /// 不再后写覆盖。
 fn client_resolution() -> &'static Mutex<HashMap<u64, (u32, u32)>> {
     static R: OnceLock<Mutex<HashMap<u64, (u32, u32)>>> = OnceLock::new();
@@ -2107,13 +2107,13 @@ struct ConnectionStats {
     resolution: String,
 }
 
-/// 共享连接统计（M8-T021 P1: 按 session_id 键控，多窗口各自读取自身会话）。
+/// 共享连接统计（P1: 按 session_id 键控，多窗口各自读取自身会话）。
 fn connection_stats() -> &'static Mutex<HashMap<u64, ConnectionStats>> {
     static S: OnceLock<Mutex<HashMap<u64, ConnectionStats>>> = OnceLock::new();
     S.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// M8-T018: 显示器查看状态（接收循环写，连接窗口读）。
+/// 显示器查看状态（接收循环写，连接窗口读）。
 ///
 /// - `list`：`DisplayListResp` 填充的显示器列表（CLI-MON-001）；
 /// - `nack`：`DisplaySelectNack` 拒绝原因（切换失败提示，MON-NF-001）。
@@ -2125,14 +2125,14 @@ struct DisplayViewState {
     nack: Option<String>,
 }
 
-/// 共享显示器查看状态（M8-T021 P1: 按 session_id 键控，多窗口互不串扰）。
+/// 共享显示器查看状态（P1: 按 session_id 键控，多窗口互不串扰）。
 fn display_view_state() -> &'static Mutex<HashMap<u64, DisplayViewState>> {
     static S: OnceLock<Mutex<HashMap<u64, DisplayViewState>>> = OnceLock::new();
     S.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 // ════════════════════════════════════════════════════════════════
-// M8-T019: 隐私模式 — 跨线程共享状态
+// 隐私模式 — 跨线程共享状态
 // ════════════════════════════════════════════════════════════════
 
 /// 客户端隐私状态（接收循环写 ack，连接窗口读徽标/输入禁用/toast）。
@@ -2144,13 +2144,13 @@ struct PrivacyClientState {
     ack: Option<privacy::PrivacyAckState>,
 }
 
-/// 客户端隐私共享状态（UI-PRIV-002/004；M8-T021 P1: 按 session_id 键控）。
+/// 客户端隐私共享状态（UI-PRIV-002/004； P1: 按 session_id 键控）。
 fn client_privacy_state() -> &'static Mutex<HashMap<u64, PrivacyClientState>> {
     static S: OnceLock<Mutex<HashMap<u64, PrivacyClientState>>> = OnceLock::new();
     S.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// M8-T021 P1 (T021-02) / P2 (T021-02): 会话退出时清理自身的键控状态条目
+/// P1 (T021-02) / P2 (T021-02): 会话退出时清理自身的键控状态条目
 ///（P2 在两个会话启动器退出路径调用；无论窗口关闭与会话退出谁先发生，最终无残留）。
 fn cleanup_session_state(session_id: u64) {
     if let Ok(mut m) = client_resolution().lock() {
@@ -2599,7 +2599,7 @@ fn server_privacy_controller() -> &'static Mutex<Option<PrivacySlot>> {
 }
 
 // ════════════════════════════════════════════════════════════════
-// M13-T006: 文件传输 — 跨线程共享状态
+// 文件传输 — 跨线程共享状态
 // ════════════════════════════════════════════════════════════════
 
 /// 客户端文件面板状态（客户端会话任务写，连接窗口读）。
@@ -2739,7 +2739,7 @@ fn client_file_notices() -> &'static Mutex<std::collections::VecDeque<String>> {
 // 者胜）。
 //
 // 结构归属（交付报告 §1 在案）：传输成功提示族 = 本文件
-// `file_notices` 通道双窗——① 服务端主窗（KirinDeskApp，M13-T006
+// `file_notices` 通道双窗——① 服务端主窗（KirinDeskApp，
 // 接收反馈）。卡面锚 :3975 单槽 = `privacy_toast` = 隐私 ack 专属
 // （非本族）→ 零触碰。
 //
@@ -2814,7 +2814,7 @@ pub(crate) fn r137_9_notice_faded_line(win: u64, removed: usize, remaining: usiz
 // 收敛为在途登记」）。
 // ════════════════════════════════════════════════════════════════
 
-/// M13-T006: 文件传输会话盐——握手双方一致（本端 ID 与对端 ID 排序拼接）。
+/// 文件传输会话盐——握手双方一致（本端 ID 与对端 ID 排序拼接）。
 /// transfer_id = hash(文件名|大小|盐)，双方必须派生相同值。
 fn file_transfer_salt(my_id: &str, peer_id: &str) -> String {
     let mut parts = [my_id.to_string(), peer_id.to_string()];
@@ -2822,7 +2822,7 @@ fn file_transfer_salt(my_id: &str, peer_id: &str) -> String {
     parts.concat()
 }
 
-/// M13-T006: 会话断点存储路径（客户端/服务端分离，避免双会话并发写冲突）。
+/// 会话断点存储路径（客户端/服务端分离，避免双会话并发写冲突）。
 /// （与 FileSession 同一路径口径；纯读，零引擎改动）。
 pub(crate) fn transfers_store_path(role: &str) -> PathBuf {
     kirin_desk_utils::config::Config::config_dir()
@@ -2939,7 +2939,7 @@ pub(crate) fn config_invalid_banner_text(
 }
 
 // ════════════════════════════════════════════════════════════════
-// M14-T005: 自动更新 — 全局更新器 + 跨线程共享状态
+// 自动更新 — 全局更新器 + 跨线程共享状态
 // 模式同连接/服务端：工作线程（自建 tokio runtime）写共享状态，
 // GUI 每帧读；`request_repaint` 通知 UI 刷新。
 // ════════════════════════════════════════════════════════════════
@@ -3366,7 +3366,7 @@ fn audit_record(
     }
 }
 
-/// M8-T019 (SRV-PRIV-002): 发送 `PrivacyModeAck`（复用 M8-T018 控制通道，
+/// (SRV-PRIV-002): 发送 `PrivacyModeAck`（复用 控制通道，
 /// `ChannelTag::Control`，bincode `ControlMessage`）。
 /// `sender` 为 tokio Mutex 共享写半（与输入/文件发送任务共用，帧边界安全）。
 async fn send_privacy_ack(
@@ -3393,7 +3393,7 @@ async fn send_privacy_ack(
     }
 }
 
-/// M8-T019 (SRV-PRIV-001/002/013 + PRIV-SEC-001): 处理客户端隐私模式请求
+/// (SRV-PRIV-001/002/013 + PRIV-SEC-001): 处理客户端隐私模式请求
 /// （`ControlMessage::PrivacyMode`）→ 执行黑屏/锁屏 → Ack + 审计。
 ///
 /// - Black 且无 GUI（headless）→ 自动降级 Lock（由 [`PrivacyController::request`] 返回）；
@@ -3652,7 +3652,7 @@ pub fn run() {
     }
 
     let has_cli_flag = std::env::args().any(|a| a == "--cli");
-    // M13-T005 (UA-BOOT-004): `--autostart` 由系统开机自启拉起——与 `--cli` 互斥
+    // (UA-BOOT-004): `--autostart` 由系统开机自启拉起——与 `--cli` 互斥
     // （CLI 场景忽略自启参数），驱动窗口最小化启动（UA-UI-003）。
     let autostart_launched = std::env::args().any(|a| a == "--autostart") && !has_cli_flag;
     if autostart_launched {
@@ -3702,7 +3702,7 @@ pub fn run() {
 }
 
 fn start_gui(autostart_launched: bool) -> Result<(), String> {
-    // M8-T038: 语言初始化（Config `[ui] language`，首个 UI 帧前生效；
+    // 语言初始化（Config `[ui] language`，首个 UI 帧前生效；
     // tooltip/菜单初始文案须按配置语言取词。
     let initial_lang = kirin_desk_utils::config::Config::load()
         .map(|cfg| cfg.ui.language.clone())
@@ -3744,7 +3744,7 @@ fn start_gui(autostart_launched: bool) -> Result<(), String> {
         "KirinDesk",
         options,
         Box::new(move |cc| {
-            // M15-T008: 令牌 + 字体回退链 + 主题安装；初始模式取自 Config `[ui] theme`。
+            // 令牌 + 字体回退链 + 主题安装；初始模式取自 Config `[ui] theme`。
             let initial_mode = kirin_desk_utils::config::Config::load()
                 .map(|cfg| ThemeMode::from_str(&cfg.ui.theme))
                 .unwrap_or_default();
@@ -3768,7 +3768,7 @@ fn start_gui(autostart_launched: bool) -> Result<(), String> {
                 theme_mode: initial_mode,
                 ui_language: initial_lang,
                 server_subsection: "tunnel".to_string(),
-                // M13-T005: --autostart 标记（驱动最小化启动）
+                // --autostart 标记（驱动最小化启动）
                 autostart_launched,
                 tray,
                 ..Default::default()
@@ -3818,11 +3818,11 @@ enum WindowKind {
     File,
 }
 
-/// M8-T020 UI-SKEY-004: 被控端（服务端）平台——特殊键面板据此禁用
+/// UI-SKEY-004: 被控端（服务端）平台——特殊键面板据此禁用
 /// 不支持项（macOS 不支持 Alt+Tab 注入，SRV-SKEY-014）。
 ///
 /// 平台传播通道预留：当前默认 `Unknown`（不限制）；待控制消息
-/// 基础设施（M8-T019 控制通道）就绪后由连接建立路径填充
+/// 基础设施（控制通道）就绪后由连接建立路径填充
 /// （`Windows`/`Linux` 变体为传播机制预留，见 UI-SKEY-004）。
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)] // 变体为平台传播机制预留（UI-SKEY-004 P2）
@@ -3836,7 +3836,7 @@ enum RemotePlatform {
 /// A remote connection window (desktop or terminal).
 struct ConnectionWindow {
     id: u64,
-    /// M8-T021 P1: 会话标识——键控状态（分辨率/统计/显示/隐私）的 key；
+    /// P1: 会话标识——键控状态（分辨率/统计/显示/隐私）的 key；
     /// 与窗口 id（`ViewportId`）解耦。
     session_id: u64,
     addr: String,
@@ -3889,13 +3889,13 @@ struct ConnectionWindow {
     /// **per-会话窗**语义：两会话窗对同一板各自去重（用户在每窗显式粘贴 =
     /// 独立手势）。新窗 0。
     last_upload_seq: u32,
-    /// M8-T015 P2D: 远端帧纹理缓存（TextureHandle::set 复用上传，
+    /// P2D: 远端帧纹理缓存（TextureHandle::set 复用上传，
     /// 避免每帧 `ctx.load_texture` 重建；分辨率变化时 set 自动重建）。
     texture: Option<egui::TextureHandle>,
-    /// M8-T021 P1: 本会话的渲染桥（随信号而来；每窗口每帧 pop 自己的帧，
+    /// P1: 本会话的渲染桥（随信号而来；每窗口每帧 pop 自己的帧，
     /// 替代原全局 `render_bridge()` / `client_frame()` 互抢）。
     bridge: Option<kirin_desk_media::decoder::RenderBridge>,
-    /// M8-T021 P1: 会话退出通知通道（窗口持有；关闭 / 被去重丢弃时 drop）。
+    /// P1: 会话退出通知通道（窗口持有；关闭 / 被去重丢弃时 drop）。
     /// P1 只引入不消费（P2 用 close_rx 侧实现会话退出）。
     #[allow(dead_code)] // P2（会话线程生命周期）读取；P1 仅持有 drop 语义
     close_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
@@ -3903,16 +3903,16 @@ struct ConnectionWindow {
     terminal: Option<Arc<Mutex<Terminal>>>,
     /// M11: 远程 Shell — 输入/尺寸消息发送通道（UI 线程 → tokio 发送任务）。
     shell_tx: Option<tokio::sync::mpsc::UnboundedSender<ShellMessage>>,
-    /// M13-T006: 文件传输命令通道（UI → 会话文件任务；窗口关闭时 drop）。
+    /// 文件传输命令通道（UI → 会话文件任务；窗口关闭时 drop）。
     file_tx: Option<tokio::sync::mpsc::UnboundedSender<FileCommand>>,
-    /// M8-T018: 显示器控制消息发送通道（下拉 → `DisplaySelect` / ⟳ → `DisplayListReq`）。
+    /// 显示器控制消息发送通道（下拉 → `DisplaySelect` / ⟳ → `DisplayListReq`）。
     /// 窗口关闭时 drop，控制发送任务收到 None 后自行退出。
     control_tx: Option<tokio::sync::mpsc::UnboundedSender<ControlMessage>>,
-    /// M8-T018: 显示器列表缓存（`DisplayListResp` 填充，下拉渲染用）。
+    /// 显示器列表缓存（`DisplayListResp` 填充，下拉渲染用）。
     display_list: Vec<DisplayInfo>,
-    /// M8-T018: 当前所选显示器索引（None = 未选择/服务端默认屏）。
+    /// 当前所选显示器索引（None = 未选择/服务端默认屏）。
     display_selected: Option<u32>,
-    /// M8-T018: 最近一次切换拒绝原因（`DisplaySelectNack`；新选择/新列表后清除）。
+    /// 最近一次切换拒绝原因（`DisplaySelectNack`；新选择/新列表后清除）。
     display_nack: Option<String>,
     /// 面板切换态）随旧面板移除——文件传输入口迁移至文件传输模式（Shell
     /// 窗 📁 = `show_file_mgr`）与 ctrl+cv 剪贴板链路，Desktop 窗旧面板
@@ -3936,21 +3936,21 @@ struct ConnectionWindow {
     /// 写入，本窗口每帧 drain；「在文件夹中显示」依赖文案内落盘路径）。
     /// 替换旧提示并重置 5s 计时（`R137_9_TRANSFER_NOTICE_TTL`，最新者
     /// 胜；任意时刻至多一个传输提示窗）；到期自动消失 + 关闭按钮即时
-    /// 消失（M8-T019 语义保留）。
+    /// 消失（语义保留）。
     file_notices: Option<FileNotice>,
     // 源 = 真实视口态（`ctx.input(|i| i.viewport().fullscreen)`），本地镜像可
-    /// M8-T020 UI-SKEY-001: 特殊键面板开关（工具栏 🔑 切换）。
+    /// UI-SKEY-001: 特殊键面板开关（工具栏 🔑 切换）。
     show_special_key_panel: bool,
-    /// M8-T020 UI-SKEY-004: 被控端平台（macOS → 禁用 Alt+Tab）。
+    /// UI-SKEY-004: 被控端平台（macOS → 禁用 Alt+Tab）。
     remote_platform: RemotePlatform,
-    /// M8-T020 UI-SKEY-003: 上次特殊键点击时刻（1s 内禁止重复点击，防连点）。
+    /// UI-SKEY-003: 上次特殊键点击时刻（1s 内禁止重复点击，防连点）。
     last_special_key: std::time::Instant,
-    /// M8-T019 (UI-PRIV-002/004): 当前隐私状态（来自 `PrivacyModeAck`；
+    /// (UI-PRIV-002/004): 当前隐私状态（来自 `PrivacyModeAck`；
     /// 驱动徽标、锁屏输入禁用与菜单状态）。
     privacy_level: Option<PrivacyLevel>,
-    /// M8-T019: 已消费的 ack 序号（toast 只弹一次）。
+    /// 已消费的 ack 序号（toast 只弹一次）。
     privacy_ack_seq: u64,
-    /// M8-T019: 待显示 toast（(文案, 起始时刻)，5s 自动消失）。
+    /// 待显示 toast（(文案, 起始时刻)，5s 自动消失）。
     privacy_toast: Option<(String, std::time::Instant)>,
     reconnect_ctx: Option<Arc<ReconnectCtx>>,
     reconnect_stop: Option<Arc<AtomicBool>>,
@@ -3972,15 +3972,15 @@ struct ConnectionWindow {
 }
 
 impl ConnectionWindow {
-    /// M8-T018（CLI-MON-003）：当前所选显示器的信息（列表 + 选中索引；
+    /// CLI-MON-003：当前所选显示器的信息（列表 + 选中索引；
     /// 未选择 = 服务端默认屏，即列表首项）。
     fn current_display(&self) -> Option<&DisplayInfo> {
         let idx = self.display_selected.unwrap_or(0) as usize;
         self.display_list.get(idx)
     }
 
-    /// M8-T018（MON-NF-001）：同步共享显示器状态（接收循环 → 本窗口缓存）。
-    /// M8-T021 P1: 按 `session_id` 读取自身会话的键控状态。
+    /// MON-NF-001：同步共享显示器状态（接收循环 → 本窗口缓存）。
+    /// P1: 按 `session_id` 读取自身会话的键控状态。
     ///
     /// - 新列表（`DisplayListResp`）→ 更新缓存 + 校验选中索引 + 清 Nack；
     /// - Nack 一次性取走（窗口内持续显示，直到用户重新选择或新列表到达）。
@@ -4004,7 +4004,7 @@ impl ConnectionWindow {
         }
     }
 
-    /// M8-T018（CLI-MON-002）：发送显示器控制消息（切换 / 刷新请求）。
+    /// CLI-MON-002：发送显示器控制消息（切换 / 刷新请求）。
     /// 发送失败 = 会话已关闭（发送任务退出），忽略即可。
     fn send_display_control(&self, msg: ControlMessage) {
         if let Some(tx) = &self.control_tx {
@@ -4020,15 +4020,15 @@ impl ConnectionWindow {
         }
     }
 
-    /// M8-T019（UI-PRIV-001/003）：发送隐私模式控制消息（黑屏/锁屏/恢复），
-    /// 复用 M8-T018 控制通道（`ChannelTag::Control`，bincode `ControlMessage`）。
+    /// UI-PRIV-001/003：发送隐私模式控制消息（黑屏/锁屏/恢复），
+    /// 复用控制通道（`ChannelTag::Control`，bincode `ControlMessage`）。
     /// 发送失败 = 会话已关闭（发送任务退出），忽略即可。
     fn send_privacy(&self, msg: ControlMessage) {
         self.send_display_control(msg);
     }
 
-    /// M8-T019（UI-PRIV-002）：把共享 ack 状态同步到本窗口（徽标 + 一次性 toast）。
-    /// M8-T021 P1: 按 `session_id` 读取自身会话的键控状态。
+    /// UI-PRIV-002：把共享 ack 状态同步到本窗口（徽标 + 一次性 toast）。
+    /// P1: 按 `session_id` 读取自身会话的键控状态。
     fn sync_privacy_state(&mut self) {
         let st = client_privacy_state().lock().unwrap();
         let Some(st) = st.get(&self.session_id) else {
@@ -4061,7 +4061,7 @@ struct InputFlushReport {
     sent_ms: u64,
 }
 
-/// M9-T002: 客户端输入捕获队列（每连接窗口一个）。
+/// 客户端输入捕获队列（每连接窗口一个）。
 ///
 /// - 鼠标移动：只保留最新位置（合并），按 125fps（[`INPUT_MOVE_INTERVAL`]，
 ///   每帧无条件重发的 ~60Hz 同坐标流；该流是「本机操作时鼠标忽然弹到远端
@@ -5743,7 +5743,7 @@ fn kbd_hook_lifecycle(
     }
 }
 
-/// M8-T021 P1: 全局会话 id（跨 UI/会话线程原子递增）。随窗口信号传递给窗口，
+/// P1: 全局会话 id（跨 UI/会话线程原子递增）。随窗口信号传递给窗口，
 /// 作为一切键控状态（分辨率/统计/显示/隐私）的 key。窗口 id（`ViewportId`）
 /// 与之解耦，两者各自单调。
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
@@ -5751,7 +5751,7 @@ fn next_session_id() -> u64 {
     NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-/// M8-T021 P1: 桌面窗口信号（替换 `add_window_signal` 的元组载荷）。
+/// P1: 桌面窗口信号（替换 `add_window_signal` 的元组载荷）。
 /// 会话握手成功后 push；UI 帧 drain 创建窗口。
 struct DesktopWindowSignal {
     session_id: u64,
@@ -5769,7 +5769,7 @@ struct DesktopWindowSignal {
 }
 
 /// Signal to add a new connection window (addr + 输入发送通道 + 文件命令通道
-/// + M8-T018 显示器控制通道 + M8-T021 P1 会话标识/渲染桥/关闭通道)。
+/// + 显示器控制通道 + P1 会话标识/渲染桥/关闭通道)。
 fn add_window_signal() -> &'static Mutex<Vec<DesktopWindowSignal>> {
     static W: OnceLock<Mutex<Vec<DesktopWindowSignal>>> = OnceLock::new();
     W.get_or_init(|| Mutex::new(Vec::new()))
@@ -5792,13 +5792,13 @@ fn add_resume_signal() -> &'static Mutex<Vec<ResumeSignal>> {
     R.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-/// M10-T003: 连接线程成功保存设备后置位，UI 每帧检查并刷新 Devices 列表。
+/// 连接线程成功保存设备后置位，UI 每帧检查并刷新 Devices 列表。
 fn devices_dirty() -> &'static AtomicBool {
     static D: AtomicBool = AtomicBool::new(false);
     &D
 }
 
-/// M8-T021 P1: Shell 窗口信号（替换 `add_shell_window_signal` 的元组载荷）。
+/// P1: Shell 窗口信号（替换 `add_shell_window_signal` 的元组载荷）。
 struct ShellWindowSignal {
     session_id: u64,
     addr: String,
@@ -5819,7 +5819,7 @@ struct ShellWindowSignal {
         Option<tokio::sync::mpsc::UnboundedReceiver<clipboard::FileClipMeta>>,
 }
 
-/// M11-T005: 信号——添加远程 Shell 连接窗口（addr + 终端消息发送通道）。
+/// 信号——添加远程 Shell 连接窗口（addr + 终端消息发送通道）。
 /// 每设备+每端口 = 独立 PTY 会话，断开单个不影响其他。
 fn add_shell_window_signal() -> &'static Mutex<Vec<ShellWindowSignal>> {
     static W: OnceLock<Mutex<Vec<ShellWindowSignal>>> = OnceLock::new();
@@ -5852,7 +5852,7 @@ fn add_file_window_signal() -> &'static Mutex<Vec<FileWindowSignal>> {
     W.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-/// M8-T021 P1 (T021-01-D): 信号队列是否有同目标 pending（会话已握手成功、
+/// P1 (T021-01-D): 信号队列是否有同目标 pending（会话已握手成功、
 /// 信号已 push、UI 帧尚未 drain）。Domain 模式会话线程无法访问窗口列表，
 /// 仅能以此查 pending；已有窗口场景由 UI 帧 drain 去重兜底。
 ///
@@ -6307,7 +6307,7 @@ fn record_known_host(device_id: &str, pubkey_base64: &str) {
     }
 }
 
-/// M11-T002/T005: 客户端远程 Shell 会话启动器（GUI IP 模式）。
+/// 客户端远程 Shell 会话启动器（GUI IP 模式）。
 ///
 /// TCP → 完整握手（与 `run_client_session` 相同安全级别：`ClientTrust` 信任策略
 /// ——known_hosts / DNS TXT 公钥绑定或首次指纹确认）→ 拆分读写半通道 →
@@ -6489,7 +6489,7 @@ async fn run_client_shell_session_on_stream(
     use kirin_desk_core::crypto::handshake::{
         client_handshake_with_confirm_ex, CoreReason, PinExpectation,
     };
-    // M8-T021 P1: 会话标识（窗口键控状态 key；窗口 id 与之解耦）。
+    // P1: 会话标识（窗口键控状态 key；窗口 id 与之解耦）。
     let session_id = next_session_id();
     // 默认端口）；拨号仍用补默认端口后的完整 `addr`（零改动）。
     let (s_ip, s_port) = split_connect_addr(&addr);
@@ -6577,7 +6577,7 @@ async fn run_client_shell_session_on_stream(
             tracing::error!("[shell] Handshake FAILED: {}", e);
             connect_retry_record_failure(&connect_retry_target_key(&server_id));
             // FAILED + 分类文案首句 ≤2 行），完整分类文案 + 3 条排查提示进
-            // 详提示槽（show_connect_form「查看详情」弹窗；M8-T017-P2 提示
+            // 详提示槽（show_connect_form「查看详情」弹窗；临时连接提示
             // 语义并入 detail 段，带码才有）。
             let parts = crate::policy::handshake_failure_parts(&e, &challenge);
             if let Ok(mut s) = connection_status().lock() {
@@ -6782,7 +6782,7 @@ async fn run_client_shell_session_on_stream(
     }
 
     // 接收任务：ShellStdout → 终端 feed（egui Context 跨线程安全）+
-    // M8-T021 P2: 保存 JoinHandle 供会话尾部 select（连接断开 → 循环 break →
+    // P2: 保存 JoinHandle 供会话尾部 select（连接断开 → 循环 break →
     // 任务结束 → 会话退出）。
     let term_recv = terminal.clone();
     let ctx_recv = ctx.clone();
@@ -6838,7 +6838,7 @@ async fn run_client_shell_session_on_stream(
     });
 
     // 通知 UI 打开独立 Shell 窗口（多会话：每窗口独立）。
-    // M8-T021 P1: 携带 session_id + 会话侧已 feed 的终端实例（P1-5 修复断链——
+    // P1: 携带 session_id + 会话侧已 feed 的终端实例（P1-5 修复断链——
     // 窗口直接渲染此实例，不再另建空终端）+ close_tx（去重丢弃/关窗 → drop →
     // 会话退出，P2 消费）。
     let (close_tx, mut close_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
@@ -6860,7 +6860,7 @@ async fn run_client_shell_session_on_stream(
         });
     }
 
-    // M8-T021 P2 (T021-03-A): 会话退出通道——窗口关闭（close_tx sender drop →
+    // P2 (T021-03-A): 会话退出通道——窗口关闭（close_tx sender drop →
     // close_rx 返回 None）或连接断开（接收任务结束）任一触发即返回，不再
     // pending 挂起；返回后 runtime drop → 任务 abort → 线程回收，杜绝泄漏。
     tokio::select! {
@@ -6871,7 +6871,7 @@ async fn run_client_shell_session_on_stream(
             tracing::info!("[shell] session ended: connection closed");
         }
     }
-    // M8-T021 P2 (T021-02): 清理本会话的键控状态条目（窗口关闭先于会话退出
+    // P2 (T021-02): 清理本会话的键控状态条目（窗口关闭先于会话退出
     // 亦无残留——无论退出顺序如何，最终清空）
     // 同型一行复用文件会话同一入口（键控清理 + 连接状态槽两槽全清，事件
     // 残留；桌面会话收尾（:12510 同形点）不属本卡文件集，零改动）。
@@ -6977,7 +6977,7 @@ async fn run_client_file_session_on_stream(
     use kirin_desk_core::crypto::handshake::{
         client_handshake_with_confirm_ex, CoreReason, PinExpectation,
     };
-    // M8-T021 P1: 会话标识（窗口键控状态 key；窗口 id 与之解耦）。
+    // P1: 会话标识（窗口键控状态 key；窗口 id 与之解耦）。
     let session_id = next_session_id();
     let (s_ip, s_port) = split_connect_addr(&addr);
     let addr_disp = display_connect_addr(&s_ip, s_port);
@@ -7318,7 +7318,7 @@ async fn run_client_file_session_on_stream(
         });
     }
 
-    // M8-T021 P2 (T021-03-A): 会话退出通道——窗口关闭（close_tx drop →
+    // P2 (T021-03-A): 会话退出通道——窗口关闭（close_tx drop →
     // close_rx None）或连接断开（接收任务结束）任一触发即返回；返回后
     // runtime drop → 任务 abort → 线程回收，杜绝泄漏（**关闭行为 = 会话断开**）。
     tokio::select! {
@@ -7329,7 +7329,7 @@ async fn run_client_file_session_on_stream(
             tracing::info!("[file] session ended: connection closed");
         }
     }
-    // M8-T021 P2 (T021-02): 清理本会话的键控状态条目（无论退出顺序，最终清空）
+    // P2 (T021-02): 清理本会话的键控状态条目（无论退出顺序，最终清空）
     client_file_session_exit_cleanup(session_id);
 }
 
@@ -7449,7 +7449,7 @@ fn shell_server_file_session_gui(
 }
 
 // ════════════════════════════════════════════════════════════════
-// M13-T006: 文件会话引擎（客户端/服务端共用）
+// 文件会话引擎（客户端/服务端共用）
 // ════════════════════════════════════════════════════════════════
 
 /// 把 core 侧 [`TransferStatus`] 映射为 UI 任务状态。
@@ -8157,7 +8157,7 @@ fn exec_fs_op(
     }
 }
 
-/// M13-T006: 会话内文件任务引擎。
+/// 会话内文件任务引擎。
 ///
 /// 职责：
 /// - 发送：FIFO 调度（并发 ≤3）→ Offer → 滑窗 64 块 → Ack/Nack → Finish →
@@ -9102,7 +9102,7 @@ impl FileSession {
         }
     }
 
-    /// M8-T019 (SRV-PRIV-002): 发送隐私模式响应（无头 Server 模式 ack；
+    /// (SRV-PRIV-002): 发送隐私模式响应（无头 Server 模式 ack；
     /// 复用控制通道 `ChannelTag::Control`，与 GUI 服务端一致）。
     pub(crate) async fn send_privacy_ack(
         &self,
@@ -11629,12 +11629,12 @@ pub(crate) async fn send_audio_packets(
     }
 }
 
-/// M10-T001/T003: 共享客户端会话启动器（IP 模式 + Domain 模式共用）。
+/// 共享客户端会话启动器（IP 模式 + Domain 模式共用）。
 ///
 /// 流程: TCP 连接 → 完整握手（`ClientTrust` 信任策略：known_hosts 指纹 / DNS TXT
 /// 公钥绑定（CLI-HSK-SEC-001）或首次指纹确认（CLI-KH-001））→ 拆分读写半通道 →
 /// 输入发送/视频接收任务 → 通知 UI 开窗口。握手成功后自动保存设备到
-/// `devices.json`（M10-T003）并记录 known_hosts（CLI-KH-002），置位
+/// `devices.json`并记录 known_hosts（CLI-KH-002），置位
 /// `devices_dirty` 让 Devices 页即时刷新。
 async fn run_client_session(
     addr: String,
@@ -11716,7 +11716,7 @@ async fn run_client_session(
                 // 文案（被拒/审批超时等）；传输层失败 → 「对方离线」类；
                 // 其余（协议/信任类）→ 原文案。`handshake_failure_parts`
                 // 统一判定（纯函数可单测）。
-                // 完整分类文案 + 3 条排查提示（M8-T017-P2 语义，带码才有）
+                // 完整分类文案 + 3 条排查提示（语义，带码才有）
                 // 进详提示槽（「查看详情」弹窗）。
                 let parts = match &e {
                     ConnectError::Handshake(inner) => {
@@ -11744,7 +11744,7 @@ async fn run_client_session(
     if let Ok(mut s) = connection_status().lock() {
         *s = format!("Connected to {}@{} (transport: TCP)", server_id, addr_disp);
     }
-    // M15 (CLI-KH-002): 连接成功 → 记录 known_hosts；M10-T003: 自动保存设备。
+    // M15 (CLI-KH-002): 连接成功 → 记录 known_hosts；自动保存设备。
     let trusted_key = match &trust {
         ClientTrust::Verified(k) => Some(k.clone()),
         ClientTrust::Confirm => confirmed_key.lock().ok().and_then(|k| k.clone()),
@@ -11776,7 +11776,7 @@ async fn run_client_session(
     .await;
 }
 
-/// M8-T026-P2 (ID-021)：会话入口的**已连接流**变体 —— 供设备 ID 模式
+/// (ID-021)：会话入口的**已连接流**变体 —— 供设备 ID 模式
 /// （`connect_stream` 已建立直连/中继流）与既有 connect 路径共用同一套
 /// 握手 + 媒体会话逻辑（ID-013 访问控制零降级）。
 ///
@@ -11912,7 +11912,7 @@ async fn run_client_session_with_stream(
             // 定案的客户端侧主修点——此前传输层失败呈现裸
             // "TCP error: I/O error: early eof"；现结构化拒绝码 → 按码
             // 文案〔被拒/审批超时〕，传输层失败 → 「对方离线」类）。
-            // 完整分类文案 + 3 条排查提示（M8-T017-P2 语义，带码才有）
+            // 完整分类文案 + 3 条排查提示（语义，带码才有）
             // 进详提示槽（「查看详情」弹窗）。
             let parts = crate::policy::handshake_failure_parts(&e, &challenge);
             if let Ok(mut s) = connection_status().lock() {
@@ -11931,7 +11931,7 @@ async fn run_client_session_with_stream(
     // 用户场景：正常连接含文件传输出入/对端关闭后，再次发起必须成功）。
     connect_retry_clear(&connect_retry_target_key(&server_id));
     if let Ok(mut s) = connection_status().lock() {
-        // M8-T025 P5-4 (B5)：连接状态显示传输模式（GUI 会话走 TCP/SecureChannel 路径；
+        // P5-4 (B5)：连接状态显示传输模式（GUI 会话走 TCP/SecureChannel 路径；
         // QUIC 主路径经 media 会话接入后由 stats.transport_mode 驱动同一状态位）。
         *s = format!("Connected to {}@{} (transport: TCP)", server_id, display_label);
     }
@@ -11941,7 +11941,7 @@ async fn run_client_session_with_stream(
         ClientTrust::Verified(k) => Some(k.clone()),
         ClientTrust::Confirm => confirmed_key.lock().ok().and_then(|k| k.clone()),
     };
-    // M10-T003: 连接成功后自动保存设备（按 id 去重 + last_seen 刷新由 DeviceStore 维护）。
+    // 连接成功后自动保存设备（按 id 去重 + last_seen 刷新由 DeviceStore 维护）。
     if let Some(key) = &trusted_key {
         record_known_host(&server_id, key);
         // 显式落 `Id` 模式——回填/历史/展示按 mode 路由。
@@ -12146,7 +12146,7 @@ async fn run_client_session_with_channel(
     // known_hosts 同源回查；`None` = 无带外凭据 = 公钥臂恒不命中）。
     peer_verified_key: Option<String>,
 ) {
-    // M8-T021 P1: 会话标识（窗口键控状态 key；窗口 id 与之解耦）。
+    // P1: 会话标识（窗口键控状态 key；窗口 id 与之解耦）。
     let session_id = resume_session_id.unwrap_or_else(next_session_id);
     // `into_split()` 字段不可用，先取出（Copy 枚举，可自由捕获进解码线程）。
     // 空/未知 → H.264 兜底（未协商/旧服务端场景与既有行为一致）。
@@ -12163,7 +12163,7 @@ async fn run_client_session_with_channel(
     };
     // M9: 拆分通道为读写半通道——视频接收（读半）与输入发送（写半）
     // 各自单任务独占、无锁并发（TCP 双工 + 每消息随机 nonce）。
-    // M13-T006: 写半进一步由多个任务共享（input/clipboard/文件），
+    // 写半进一步由多个任务共享（input/clipboard/文件），
     // 用 Arc<tokio::sync::Mutex<SecureChannelSender>> 保证帧边界。
     let peer_id = channel.peer_id.clone();
     // 控制 peer」（对端自报设备 ID；guard 随本函数存活，会话终态统一
@@ -12180,15 +12180,15 @@ async fn run_client_session_with_channel(
     // M9: 输入发送任务（UI 线程事件批次 → 加密可靠流 InputEcho）。
     // 窗口关闭 → UI 侧 Sender drop → recv 返回 None → 任务退出。
     let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<WireInputEvent>>();
-    // M13-T003: 剪贴板推送通道（轮询任务产出的 EncodedPacket 批）。
+    // 剪贴板推送通道（轮询任务产出的 EncodedPacket 批）。
     let (clip_tx, mut clip_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<EncodedPacket>>();
-    // M8-T018: 显示器控制消息通道（下拉切换 / 列表刷新 → `ChannelTag::Control`）。
+    // 显示器控制消息通道（下拉切换 / 列表刷新 → `ChannelTag::Control`）。
     let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel::<ControlMessage>();
-    // M13-T006: 文件命令（UI → 文件会话）与帧转发（接收循环 → 文件会话）。
+    // 文件命令（UI → 文件会话）与帧转发（接收循环 → 文件会话）。
     let (file_cmd_tx, mut file_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<FileCommand>();
     let (file_frame_tx, mut file_frame_rx) =
         tokio::sync::mpsc::unbounded_channel::<FileTransferFrame>();
-    // （输入发送）退出 → `input_tx` 关闭 → UI 既有 M15-T008 断连覆盖层
+    // （输入发送）退出 → `input_tx` 关闭 → UI 既有断连覆盖层
     // 「输入发送任务恰好发送失败」——静默死连接 + 用户未发送输入时旧画面
     // 停留数分钟（用户实测根因）。
     let (lost_tx, mut lost_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
@@ -12266,7 +12266,7 @@ async fn run_client_session_with_channel(
                         }
                     }
                 }
-                // M8-T018: 显示器控制消息（DisplaySelect / DisplayListReq）→
+                // 显示器控制消息（DisplaySelect / DisplayListReq）→
                 // `ChannelTag::Control` 可靠流（与键鼠同优先，不丢）。
                 msg = control_rx.recv() => {
                     let Some(msg) = msg else {
@@ -12342,12 +12342,12 @@ async fn run_client_session_with_channel(
             }
         }
     });
-    // M8-T021 P1: 渲染桥在 push 信号**之前**创建（原 2398 位于 push 之后需调整
+    // P1: 渲染桥在 push 信号**之前**创建（原在 push 之后，需调整
     // 顺序）——桥克隆进信号随窗口走，会话保留一份给解码线程 push_decoded。
     // 1-2 帧——初始 = 1（LAN 稳态目标：拆除固定 2 帧的无效缓冲，稳态
     // +54~108ms 中的无效部分）；j 尾部（在途 ≥2 连续 3 样本 = 抖动期）→
     // 纯函数 `r135_10_jitter_tick` 单测钉死；行为面不受打点门控）。
-                                                                      // M8-T021 P1: close_tx——窗口持有；去重丢弃信号 / 窗口关闭 → sender drop →
+                                                                      // P1: close_tx——窗口持有；去重丢弃信号 / 窗口关闭 → sender drop →
                                                                       // 会话退出（P2 消费 close_rx）。
     let (close_tx, mut close_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     // `Arc<Mutex>`，与 `clip_state` 同批创建（`clip_state` 在下方同区；槽须
@@ -12367,7 +12367,7 @@ async fn run_client_session_with_channel(
     // 已持主句柄——与槽同构的双克隆纪律）。
     let clip_pending_base_seq_teardown = clip_pending_base_seq.clone();
     // Signal main thread to open connection window (addr + 输入通道 + 文件命令通道
-    // + M8-T018 显示器控制通道 + M8-T021 P1 会话标识/渲染桥/关闭通道)
+    // + 显示器控制通道 + P1 会话标识/渲染桥/关闭通道)
     // session_id 更新既有窗口的通道，不新建窗口）。
     if resume_session_id.is_some() {
         if let Ok(mut w) = add_resume_signal().lock() {
@@ -12395,9 +12395,9 @@ async fn run_client_session_with_channel(
             pending_clip_meta: clip_pending.clone(),
         });
     }
-    // M8-T018（CLI-MON-001）：连接建立后自动请求显示器列表（与既有控制
+    // CLI-MON-001：连接建立后自动请求显示器列表（与既有控制
     // 消息流程一致，无握手协议改动）。热插拔后可经工具栏 ⟳ 手动刷新（MON-NF-001）。
-    // M8-T021 P1: 键控清空本会话的显示状态。
+    // P1: 键控清空本会话的显示状态。
     if let Ok(mut m) = display_view_state().lock() {
         let st = m.entry(session_id).or_default();
         st.list.clear();
@@ -12405,7 +12405,7 @@ async fn run_client_session_with_channel(
     }
     let _ = control_tx.send(ControlMessage::DisplayListReq);
 
-    // 直读——跨会话保留，重连/多会话窗各推本进程当前档；与 M8-T018
+    // 直读——跨会话保留，重连/多会话窗各推本进程当前档；与 
     // DisplayListReq 初始推送同位点先例）。服务端只消费高画质位（2 = 编码
     // 2× 阶梯基准；0/1/未知值 = 常态）。旧受控端收未知变体 = 既有「Control
     // 降级同构）。
@@ -12423,7 +12423,7 @@ async fn run_client_session_with_channel(
         let _ = control_tx.send(ControlMessage::CapsState { caps });
     }
 
-    // M13-T003: 剪贴板同步——本地轮询（500ms）→ 变更推送；远端推送在接收
+    // 剪贴板同步——本地轮询（500ms）→ 变更推送；远端推送在接收
     // 循环按 `ChannelTag::Clipboard` 分发（见下）。共享状态机防回环。
     let clip_state: Arc<Mutex<clipboard::ClipboardSyncState>> =
         Arc::new(Mutex::new(clipboard::ClipboardSyncState::new()));
@@ -12641,7 +12641,7 @@ async fn run_client_session_with_channel(
         });
     }
 
-    // M13-T006: 文件会话任务——命令（UI）/ 帧事件（接收循环）/ 1s tick 三路驱动。
+    // 文件会话任务——命令（UI）/ 帧事件（接收循环）/ 1s tick 三路驱动。
     // 发送：FIFO ≤3 调度 + 滑窗 + 重传 + 断点续传；接收：分片重组 + 校验落盘。
     {
         let sender_ft = sender_shared.clone();
@@ -12720,11 +12720,11 @@ async fn run_client_session_with_channel(
         });
     }
 
-    // M8-T015 P2D：解码与 UI 线程分离（重写旧实现——原 tokio
+    // P2D：解码与 UI 线程分离（重写旧实现——原 tokio
     // 接收循环内直接 decode 且只解窗口首帧 IDR、无 PTS/抖动缓冲）。
     // 拓扑：tokio 接收循环（重组 + 投递）→ DecoderPacket channel
     // → 解码线程（专用 std::thread）→ RenderBridge（抖动缓冲）
-    // → 各连接窗口 pop 自己的桥 → 窗口纹理上传（M8-T021 P1）。
+    // → 各连接窗口 pop 自己的桥 → 窗口纹理上传（P1）。
     // 桥已在 push 信号前创建（见上）：信号里放克隆给窗口，会话保留本份给解码线程。
     let (pkt_tx, pkt_rx) = std::sync::mpsc::channel::<kirin_desk_media::decoder::DecoderPacket>();
 
@@ -12876,7 +12876,7 @@ async fn run_client_session_with_channel(
         }
         None
     };
-    // M8-T032：② 播放开关进程级持久——上次会话关闭的播放开关跨会话保持，
+    // ② 播放开关进程级持久——上次会话关闭的播放开关跨会话保持，
     // 新会话初始徽标对齐（关 → 静音；总开关关时不覆盖 Disabled）。
     if audio_pkt_tx.is_some() && !client_audio_play() {
         if let Ok(mut m) = audio_window_state().lock() {
@@ -12884,7 +12884,7 @@ async fn run_client_session_with_channel(
         }
     }
 
-    // M8-T032：③ 客户端麦克风回传（talkback）——本机麦克风 → 服务端播放。
+    // ③ 客户端麦克风回传（talkback）——本机麦克风 → 服务端播放。
     // 捕获+编码为阻塞调用 → blocking 线程池；`client_mic_enabled()` 逐轮读取
     // （关 → 停发，动态生效）；批次经 tokio 通道交发送循环（与输入/控制/文件
     // 写半互斥，tag=Audio，wire 映射与 ChannelTag 对齐——无需协议改动）。
@@ -12919,7 +12919,7 @@ async fn run_client_session_with_channel(
                 if mic_pkt_tx.is_closed() {
                     break;
                 }
-                // M8-T032：③ 动态门控——关 → 停发（消费丢弃防通道堆积）；
+                // ③ 动态门控——关 → 停发（消费丢弃防通道堆积）；
                 // 再开 → 恢复（无需重连）。
                 if !client_mic_enabled() {
                     let _ = pipeline.next_packets();
@@ -12956,7 +12956,7 @@ async fn run_client_session_with_channel(
     // 2. 接收循环（tokio，瘦身：仅重组 + 投递 DecoderPacket，不再解码）。
     // NOTE: runs in the SAME tokio runtime as the handshake to avoid
     // "Tokio 1.x context was found, but it is being shutdown" errors.
-    // M8-T021 P2: 保存 JoinHandle 供会话尾部 select（连接断开 → 循环 break →
+    // P2: 保存 JoinHandle 供会话尾部 select（连接断开 → 循环 break →
     // join 解码线程 → 任务结束）。
     let recv_handle = tokio::spawn(async move {
         let mut total_bytes: u64 = 0;
@@ -12965,7 +12965,7 @@ async fn run_client_session_with_channel(
         let mut current_fps: f32 = 0.0;
         let mut current_bandwidth: f32 = 0.0;
         let mut current_resolution = String::new();
-        // M8-T032：② 播放开关上次值（状态变化检测 → 徽标同步）。
+        // ② 播放开关上次值（状态变化检测 → 徽标同步）。
         let mut audio_play_last = client_audio_play();
         // 首个视频窗口到达时打 info 日志（服务端锚点：捕获任务起点 → 首 IDR
         // 窗口广播）。两锚点相减即「服务端首窗产出 → 客户端收到」的网络段。
@@ -13126,15 +13126,15 @@ async fn run_client_session_with_channel(
                 }
                 continue;
             }
-            // M8-T018: 显示器控制响应（DisplayListResp / DisplaySelectNack）
+            // 显示器控制响应（DisplayListResp / DisplaySelectNack）
             // → 更新共享查看状态（窗口下拉/状态栏每帧读取）。
-            // M8-T019: 隐私模式响应（PrivacyModeAck）→ 共享隐私状态
+            // 隐私模式响应（PrivacyModeAck）→ 共享隐私状态
             // （连接窗口徽标 / 锁屏输入禁用 / toast，UI-PRIV-002）。
             if tag == ChannelTag::Control {
                 match bincode::deserialize::<ControlMessage>(&payload) {
                     Ok(ControlMessage::DisplayListResp { displays }) => {
                         tracing::info!("DisplayListResp: {} display(s) available", displays.len());
-                        // M8-T021 P1: 键控写入本会话的显示列表（多窗口互不覆盖）。
+                        // P1: 键控写入本会话的显示列表（多窗口互不覆盖）。
                         if let Ok(mut m) = display_view_state().lock() {
                             let st = m.entry(session_id).or_default();
                             st.list = displays;
@@ -13149,7 +13149,7 @@ async fn run_client_session_with_channel(
                     }
                     Ok(ControlMessage::PrivacyModeAck { ok, active_level }) => {
                         tracing::info!("PrivacyModeAck: ok={} active={:?}", ok, active_level);
-                        // M8-T021 P1: 键控写入本会话的隐私状态。
+                        // P1: 键控写入本会话的隐私状态。
                         let mut st = client_privacy_state().lock().unwrap();
                         let st = st.entry(session_id).or_default();
                         // 降级判断：请求 Black 但生效 Lock（SRV-PRIV-013）→ toast。
@@ -13208,7 +13208,7 @@ async fn run_client_session_with_channel(
                 }
                 continue;
             }
-            // M13-T006: 远端文件帧 → 文件会话任务（帧处理 + 回复由它统一发送）。
+            // 远端文件帧 → 文件会话任务（帧处理 + 回复由它统一发送）。
             if tag == ChannelTag::FileTransfer {
                 match FileTransferFrame::decode(&payload) {
                     Ok(frame) => {
@@ -13231,7 +13231,7 @@ async fn run_client_session_with_channel(
                 continue;
             }
             // jitter 排序 + WASAPI 播放；会话开关关闭时服务端不发音频包）。
-            // M8-T032：② 播放开关——关 → 丢弃到达的包（动态静音），
+            // ② 播放开关——关 → 丢弃到达的包（动态静音），
             // 状态切换时同步徽标（静音/播放中）。
             if tag == ChannelTag::Audio {
                 let play = client_audio_play();
@@ -13348,13 +13348,13 @@ async fn run_client_session_with_channel(
                     if window.base_w > 0 && window.base_h > 0 {
                         current_resolution = format!("{}×{}", window.base_w, window.base_h);
                         // M9: 发布远端分辨率（视口输入捕获按此换算像素坐标）。
-                        // M8-T021 P1: 键控写入本会话。
+                        // P1: 键控写入本会话。
                         if let Ok(mut m) = client_resolution().lock() {
                             *m.entry(session_id).or_default() = (window.base_w, window.base_h);
                         }
                     }
                     // 状态栏统计（解码结果不影响网络统计更新）。
-                    // M8-T021 P1: 键控写入本会话（多窗口各自独立）。
+                    // P1: 键控写入本会话（多窗口各自独立）。
                     if let Ok(mut m) = connection_stats().lock() {
                         m.insert(
                             session_id,
@@ -13446,7 +13446,7 @@ async fn run_client_session_with_channel(
             tracing::error!("Video decode thread panicked");
         }
     });
-    // M8-T021 P2 (T021-03-A): 会话退出通道——窗口关闭或连接断开任一触发即返回，
+    // P2 (T021-03-A): 会话退出通道——窗口关闭或连接断开任一触发即返回，
     // 不再 pending 挂起；返回后 runtime drop → 任务 abort → 线程回收，杜绝泄漏。
     tokio::select! {
         _ = close_rx.recv() => {
@@ -13466,7 +13466,7 @@ async fn run_client_session_with_channel(
     clip_pending_base_seq_teardown.store(0, Ordering::Relaxed);
     // 占位文本，防「会话已死、板上仍承诺可粘贴」的悬挂格式）。
     clipboard_delay::disarm("s2c session teardown");
-    // M8-T021 P2 (T021-02): 清理本会话的键控状态条目（窗口关闭先于会话退出
+    // P2 (T021-02): 清理本会话的键控状态条目（窗口关闭先于会话退出
     // 亦无残留——无论退出顺序如何，最终清空）。
     cleanup_session_state(session_id);
 }
@@ -13526,7 +13526,7 @@ fn connect_form_buttons(_mode: ConnectFormMode) -> &'static [ConnectButtonRole] 
     ]
 }
 
-/// = Secondary（M11-T002 先例）。
+/// = Secondary（先例）。
 fn connect_button_kind(role: ConnectButtonRole) -> ButtonKind {
     match role {
         ConnectButtonRole::Desktop => ButtonKind::Primary,
@@ -14599,7 +14599,7 @@ fn short_id_label(id: &str) -> String {
     }
 }
 
-/// M8-T026-P2 (ID-021): GUI 设备 ID 模式连接线程 —— 解析（ID-010）→ 服务器
+/// (ID-021): GUI 设备 ID 模式连接线程 —— 解析（ID-010）→ 服务器
 /// 签名验签（ID-SEC-001）→ 公钥 pin（known_hosts 命中强制比对 / 未命中首次
 /// 指纹确认，ID-012）→ 三级路径编排（ID-011：直连 → 打洞 hook → 中继兜底）
 /// → 复用 `run_client_session_with_stream` 握手 + 媒体会话（ID-013）。
@@ -14921,9 +14921,9 @@ struct KirinDeskApp {
     connect_challenge: String,
     /// 日志框（①连接提示通道）——本字段退役删除；各写入点改经
     /// [`conn_log_push_text`] 入框。
-    /// M8-T026-P2 (ID-021): 设备 ID 模式输入框。
+    /// (ID-021): 设备 ID 模式输入框。
     connect_device_id: String,
-    /// M8-T026-P2 (ID-021): 设备 ID 模式选中态（三态：IP / Domain / ID）。
+    /// (ID-021): 设备 ID 模式选中态（三态：IP / Domain / ID）。
     connect_id_mode: bool,
     /// `reload_devices` 重建；Connect 页 ID 模式下拉单击回填）。
     id_history: Vec<IdHistoryEntry>,
@@ -14943,10 +14943,10 @@ struct KirinDeskApp {
     nickname: String,
     challenge_code: String,
     allowed_domains: String,
-    /// M8-T027 (UI-IDWL-001): Settings ID 白名单文本框（逗号/换行分隔 device-id，
+    /// (UI-IDWL-001): Settings ID 白名单文本框（逗号/换行分隔 device-id，
     /// 保存写 `[network].allowed_ids`，永久条目，即时生效）。
     allowed_ids: String,
-    /// M8-T027 (UI-IDWL-002): ID 白名单条目列表缓存（含过期条目与永久条目，
+    /// (UI-IDWL-002): ID 白名单条目列表缓存（含过期条目与永久条目，
     /// 供 Settings 展示过期/永久标记与逐条删除；随保存/删除刷新）。
     id_whitelist_entries: Vec<kirin_desk_utils::config::IdWhitelistEntry>,
     listen_port: String,
@@ -14969,7 +14969,7 @@ struct KirinDeskApp {
     next_pending_id: u64,
     // Status bar
     local_ipv6: String,
-    // M8-T033: 本机全局 IPv4（身份卡展示；无则 "N/A"）。
+    // 本机全局 IPv4（身份卡展示；无则 "N/A"）。
     local_ipv4: String,
     /// 一并计算；Dashboard 每帧只读——不引入探测开销、不外呼外部 IP 服务）。
     v4_reachability: kirin_desk_core::network::Reachability,
@@ -15005,40 +15005,40 @@ struct KirinDeskApp {
     /// 迟滞窗内 `set_sink` 复用此快照；gate off 帧绝不写本字段，防陈旧
     /// sender 在失焦态复活转发面）。
     hook_last_sink: Option<tokio::sync::mpsc::UnboundedSender<Vec<WireInputEvent>>>,
-    /// M13-T006 (UI-FT-005): 服务端接收完成提示弹窗（可关闭）。
+    /// (UI-FT-005): 服务端接收完成提示弹窗（可关闭）。
     /// 替换旧提示并重置 5s 计时（`R137_9_TRANSFER_NOTICE_TTL`，最新者
     /// 胜；任意时刻至多一个传输提示窗 = 覆盖为要求终形，仅最新可见 +
     /// 5s 自动消失，不累积）+ 关闭按钮即时消失。
     file_notices: Option<FileNotice>,
     // 裁决 = 会话内 B2 开关四格决策（自动 toast/审计，无框）。
-    // M10-T005: 设备编辑弹窗状态
+    // 设备编辑弹窗状态
     editing_device: Option<String>,
     edit_nickname: String,
-    /// M8-T037: 编辑弹窗「地址 (IP/域名)」输入（预填：有域名 → 域名，否则 IPv6）。
+    /// 编辑弹窗「地址 (IP/域名)」输入（预填：有域名 → 域名，否则 IPv6）。
     edit_host: String,
     edit_port: String,
-    /// M8-T037: 编辑弹窗「备注名」「挑战码」（挑战码密文 + 👁）。
+    /// 编辑弹窗「备注名」「挑战码」（挑战码密文 + 👁）。
     edit_remark: String,
     edit_challenge: String,
     show_secret_edit_challenge: bool,
-    // M15-T008: 主题模式（Config `[ui] theme`，默认 Light）+ 密文输入可见开关
+    // 主题模式（Config `[ui] theme`，默认 Light）+ 密文输入可见开关
     theme_mode: ThemeMode,
-    /// M8-T038: 语言选择（"system" 跟随系统 | "zh" | "en"；Config `[ui] language`）。
+    /// 语言选择（"system" 跟随系统 | "zh" | "en"；Config `[ui] language`）。
     ui_language: String,
     show_secret_connect: bool,
     // M9-DNS022: show_secret_api 随 DNS 组迁至 Domain 页（domain_panel 内部持有）。
     show_secret_challenge: bool,
-    // M13-T005: 无人值守模式（Settings 页状态 + 启动时序；M8-T037 三开关联动）
+    // 无人值守模式（Settings 页状态 + 启动时序；三开关联动）
     unattended_enabled: bool,
     unattended_autostart: bool,
-    /// M8-T037: 显示名「默认受控」——应用启动自动开启服务端（自动监听）。
+    /// 显示名「默认受控」——应用启动自动开启服务端（自动监听）。
     unattended_auto_server: bool,
     // 显示/保存 = `[tunnel] forbid_mutual_control`，serde 缺省 true = 禁止）。
     forbid_mutual_control: bool,
     // （显示 = 当前生效值：`[file_transfer].download_dir` 显式值或默认解析
     // `~/Downloads/KirinDesk`；变更即落盘，复用既有字段零新字段）。
     ft_download_dir_text: String,
-    // M8-T026: 内网穿透设置（Tunnel 独立页，M8-T039；proxies 多行文本）。
+    // 内网穿透设置（Tunnel 独立页，proxies 多行文本）。
     // 与「▶ 启动」语义重复易混淆，合并为「▶ 启动 / ■ 停止」单一运行控制。
     // （ID 注册放行条件，见 tunnel_start）；「停止」不回写 false，其余 GUI
     // 交互不触碰该键——用户仍可显式配置 false 关闭注册。
@@ -15051,7 +15051,7 @@ struct KirinDeskApp {
     tunnel_server_pubkey: String,
     tunnel_proxies: String,
     show_secret_tunnel_token: bool,
-    // M8-T039 新增（表单值，P3；运行态字段 tunnel_runtime_state 归 P5 追加）：
+    // 新增（表单值，P3；运行态字段 tunnel_runtime_state 归 P5 追加）：
     tunnel_bind_addrs: String, // 监听地址列表（逗号分隔，默认 "0.0.0.0,::"）
     tunnel_bind_port: String,  // 端口（默认 "7000"）
     tunnel_port_range: String, // 端口范围（默认 "60000-61000"）
@@ -15094,20 +15094,20 @@ struct KirinDeskApp {
     // 后续使用）——保留并标注。
     #[allow(dead_code)]
     server_auto_started: bool,
-    // M8-T017: 临时连接（Dashboard 卡片）状态——明文码仅本次进程持有
+    // 临时连接（Dashboard 卡片）状态——明文码仅本次进程持有
     // （TMP-SEC-001，状态文件只存哈希）；窗口过期/关闭后复位。
     temp_code: Option<String>,
     /// 上一帧临时窗口是否激活（用于归零瞬间的过期检测 + 审计，UI-TMP-004）。
     temp_window_was_active: bool,
     /// 卡片内操作结果提示（enable 失败等）。
     temp_status: String,
-    /// M8-T034: Dashboard 服务端设置保存反馈（小保存按钮旁展示）。
+    /// Dashboard 服务端设置保存反馈（小保存按钮旁展示）。
     dashboard_status: String,
-    /// M8-T028 (UI-BTY-028): 复制成功浮出提示（(预览文案, 点击时刻)，2s 自动消失）。
+    /// (UI-BTY-028): 复制成功浮出提示（(预览文案, 点击时刻)，2s 自动消失）。
     copied_feedback: Option<(String, std::time::Instant)>,
     /// M9-DNS000: 域名维护页面状态（Domain 标签页，Dashboard 右侧按钮进入）。
     domain_panel: domain_panel::DomainPanelState,
-    /// M8-T040: DDNS 维护卡控制器（状态共享槽 + worker 句柄；WBS 6.2）。
+    /// DDNS 维护卡控制器（状态共享槽 + worker 句柄；WBS 6.2）。
     ddns_ui: domain_panel::DdnsUi,
     /// 退化，无托盘运行；CLI/self-test 路径不创建 → 零干扰）。创建时点 =
     /// `run_native` 闭包（事件循环线程——tray-icon 硬性要求，见
@@ -15121,7 +15121,7 @@ struct KirinDeskApp {
     fingerprint_gate_active: bool,
 }
 
-/// M8-T028 (UI-BTY-028): 状态栏「Copied: …」浮出提示持续时间。
+/// (UI-BTY-028): 状态栏「Copied: …」浮出提示持续时间。
 const COPY_TOAST_DURATION: std::time::Duration = std::time::Duration::from_secs(2);
 
 ///
@@ -15153,7 +15153,7 @@ enum Tab {
     Domain,
     Devices,
     Connect,
-    /// M8-T039：内网穿透独立页（通用 TCP 反向代理）。
+    /// 内网穿透独立页（通用 TCP 反向代理）。
     Tunnel,
     Settings,
 }
@@ -15163,7 +15163,7 @@ impl Default for Tab {
     }
 }
 
-/// M10-T004: 上次在线时间的本地时区展示——今天显示"今天 HH:MM"，否则"MM-DD HH:MM"。
+/// 上次在线时间的本地时区展示——今天显示"今天 HH:MM"，否则"MM-DD HH:MM"。
 fn format_last_seen(dt: chrono::DateTime<chrono::Utc>) -> String {
     use chrono::Local;
     let local = dt.with_timezone(&Local);
@@ -16199,7 +16199,7 @@ fn qr_feedback() -> &'static Mutex<Option<(String, std::time::Instant)>> {
     M.get_or_init(|| Mutex::new(None))
 }
 
-/// M10-T003: 连接成功后自动保存设备到 `devices.json`（桌面会话与 Shell 会话共用）。
+/// 连接成功后自动保存设备到 `devices.json`（桌面会话与 Shell 会话共用）。
 /// 按 id 去重 + last_seen 刷新由 `DeviceStore` 维护；保存成功置位 `devices_dirty`
 /// 让 Devices 页即时刷新。
 ///
@@ -16235,7 +16235,7 @@ fn save_device_to_store(
         // → 表单昵称从未持久化 = 用户 09-09 回填为空根因之一）。IP 模式
         // 忽略入参，`nickname = server_id` = 握手凭据（服务端按配置昵称
         nickname: if id_mode { nickname.to_string() } else { server_id.to_string() },
-        // M8-T037: 新字段默认值（GUI 自动保存路径不设备注/挑战码/排序）。
+        // 新字段默认值（GUI 自动保存路径不设备注/挑战码/排序）。
         remark: String::new(),
         challenge: String::new(),
         sort_order: 0,
@@ -16522,14 +16522,14 @@ impl eframe::App for KirinDeskApp {
         if !self.config_loaded {
             self.load_config();
             self.config_loaded = true;
-            // M13-T005 (UA-SRV-001): 无人值守自动开启服务端——启动即监听，
+            // (UA-SRV-001): 无人值守自动开启服务端——启动即监听，
             // 无需人工点击 Dashboard 启动按钮；失败处理见 start_server 内审计。
-            // M8-T037: 条件放宽为仅「默认受控」——默认受控独立于无人值守
+            // 条件放宽为仅「默认受控」——默认受控独立于无人值守
             // 总开关生效（无人值守关、默认受控开时同样自动监听）。
             if self.unattended_auto_server {
                 self.start_server();
             }
-            // M8-T039 §3.4.3: 隧道最后运行状态恢复——auto_start=true →
+            // §3.4.3: 隧道最后运行状态恢复——auto_start=true →
             // 按上次模式自动启动；失败 → 状态行显示原因且 auto_start 保持
             // true（下次启动继续尝试，与启动失败同语义）。
             if self.tunnel_auto_start {
@@ -16548,7 +16548,7 @@ impl eframe::App for KirinDeskApp {
         //    退出（quit_all）。
         self.update_tray(ctx);
 
-        // M14-T005: 每周后台自动检查更新（启动时一次，静默；结果写入 Update 面板）。
+        // 每周后台自动检查更新（启动时一次，静默；结果写入 Update 面板）。
         // 网络失败不记录时间戳，下次启动重试；成功后进入 7 天检查周期。
         static AUTO_CHECK_DONE: AtomicBool = AtomicBool::new(false);
         if !AUTO_CHECK_DONE.swap(true, Ordering::Relaxed) {
@@ -16575,7 +16575,7 @@ impl eframe::App for KirinDeskApp {
         let theme = self.theme_mode.resolve();
         theme::apply_theme(ctx, &theme);
 
-        // M8-T028 (UI-BTY-028): 复制成功浮出提示 2s 自动消失；
+        // (UI-BTY-028): 复制成功浮出提示 2s 自动消失；
         // 提示存活期间持续请求重绘，避免窗口无输入时提示残留。
         if let Some((_, t)) = &self.copied_feedback {
             if t.elapsed() >= COPY_TOAST_DURATION {
@@ -16585,7 +16585,7 @@ impl eframe::App for KirinDeskApp {
             }
         }
 
-        // M10-T003: 连接线程自动保存设备后刷新列表（跨线程信号，非每帧读盘）。
+        // 连接线程自动保存设备后刷新列表（跨线程信号，非每帧读盘）。
         if devices_dirty().swap(false, Ordering::Relaxed) {
             self.reload_devices();
         }
@@ -16636,7 +16636,7 @@ impl eframe::App for KirinDeskApp {
             main_repaint(ctx);
         }
 
-        // M8-T017 (UI-TMP-004/005): 临时连接窗口逐帧检测——窗口激活期间每秒
+        // (UI-TMP-004/005): 临时连接窗口逐帧检测——窗口激活期间每秒
         // 重绘驱动倒计时（mm:ss）；归零瞬间（上一帧激活 → 本帧失效）复位卡片
         // 并审计 TempModeExpired。手动关闭在卡片按钮内处理（审计 Disabled）。
         let temp_active = crate::policy::temp_mode_window_active();
@@ -16655,7 +16655,7 @@ impl eframe::App for KirinDeskApp {
             main_repaint_after(ctx, std::time::Duration::from_secs(1));
         }
 
-        // M8-T034: 每帧从共享运行态同步服务端状态——bind 失败 / 监听线程
+        // 每帧从共享运行态同步服务端状态——bind 失败 / 监听线程
         // 退出即时反映到「允许受控」开关（修复旧实现 bind 失败只打日志、
         // `server_running` 假死）。`server_status` 保留连接审批等消息文案
         // （仅「Starting…」阶段由运行态接管为「监听中 :port」）。
@@ -16766,7 +16766,7 @@ impl eframe::App for KirinDeskApp {
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
-                    // M15-T008: 卡片化——设备名加粗 + 类型徽标 + 指纹 Mono + 语义按钮。
+                    // 卡片化——设备名加粗 + 类型徽标 + 指纹 Mono + 语义按钮。
                     ui.add(
                         egui::Label::new(
                             egui::RichText::new(t!("dialog.approve.desc"))
@@ -16781,7 +16781,7 @@ impl eframe::App for KirinDeskApp {
                             egui::Label::new(egui::RichText::new(&pc.client_id).strong())
                                 .selectable(true),
                         );
-                        // M8-T028 (UI-BTY-026): 设备名（client_id）一键复制。
+                        // (UI-BTY-026): 设备名（client_id）一键复制。
                         self.copied_button(ui, &theme, &pc.client_id);
                         badge(ui, &theme, &pc.device_type, BadgeKind::Info);
                     });
@@ -16797,7 +16797,7 @@ impl eframe::App for KirinDeskApp {
                             )
                             .selectable(true),
                         );
-                        // M8-T028 (UI-BTY-026): Domain 一键复制（空值按钮自动禁用）。
+                        // (UI-BTY-026): Domain 一键复制（空值按钮自动禁用）。
                         self.copied_button(ui, &theme, &pc.client_domain);
                     });
                     // S-21 (F-26)：指纹 = 客户端**公钥**的真实 SHA-256 指纹
@@ -16816,7 +16816,7 @@ impl eframe::App for KirinDeskApp {
                         )
                         .selectable(true),
                     );
-                    // M8-T028 (UI-BTY-026): 指纹一键复制（真实公钥指纹）。
+                    // (UI-BTY-026): 指纹一键复制（真实公钥指纹）。
                     self.copied_button(ui, &theme, &client_fp);
                     ui.add_space(2.0);
                     ui.add(
@@ -17012,7 +17012,7 @@ impl eframe::App for KirinDeskApp {
         egui::TopBottomPanel::top("nav_bar").show(ctx, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                // M15-T008: 品牌区——品牌 emoji + 名称。
+                // 品牌区——品牌 emoji + 名称。
                 // 入窗口标题（`app_title_base`，主窗 `with_title` 同源）；
                 // 原徽标为裸版本串（`kirin_desk_updater::APP_VERSION`），无
                 // i18n 键涉（更新卡内「当前版本」展示不属左上角，保留）。
@@ -17067,7 +17067,7 @@ impl eframe::App for KirinDeskApp {
                         self.current_tab = tab;
                     }
                 }
-                // M15-T008: pending 计数改红色 Badge
+                // pending 计数改红色 Badge
                 let wc = waiting.len();
                 if wc > 0 {
                     badge(
@@ -17093,7 +17093,7 @@ impl eframe::App for KirinDeskApp {
                     .selectable(true),
                 );
                 ui.separator();
-                // M15-T008: API 状态改语义 Badge
+                // API 状态改语义 Badge
                 // M9-DNS000 (UI-DNS-004): 文案泛化——不再出现 GoDaddy 字样，
                 // 判定走 `dns_configured`（任意已注册服务商，非 godaddy 专属）。
                 if self.dns_configured {
@@ -17102,14 +17102,14 @@ impl eframe::App for KirinDeskApp {
                     badge(ui, &theme, t!("session.statusbar.dns_na"), BadgeKind::Warning);
                 }
                 ui.separator();
-                // M15-T008: StatusDot——监听=绿 / 停止=灰
+                // StatusDot——监听=绿 / 停止=灰
                 if self.server_running {
                     status_dot(ui, theme.success, t!("session.statusbar.server_listening"));
                 } else {
                     status_dot_char(ui, theme.fg_weak, "○", t!("session.statusbar.server_stopped"));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // M8-T028 (UI-BTY-028): 复制成功浮出提示（右侧弱色，2s 自动消失）。
+                    // (UI-BTY-028): 复制成功浮出提示（右侧弱色，2s 自动消失）。
                     if let Some((value, _)) = &self.copied_feedback {
                         ui.add(
                             egui::Label::new(
@@ -17134,9 +17134,9 @@ impl eframe::App for KirinDeskApp {
             Tab::Settings => self.show_settings(ui, &theme),
         });
 
-        // M13-T006 (UI-FT-005): 服务端接收完成提示弹窗（会话写队列 → 本帧 drain）。
+        // (UI-FT-005): 服务端接收完成提示弹窗（会话写队列 → 本帧 drain）。
         // 替换旧提示并重置 5s 计时（最新者胜；任意时刻至多一个传输提示
-        // （M8-T019 语义保留）。
+        // （语义保留）。
         if let Ok(mut q) = server_file_notices().lock() {
             let now = std::time::Instant::now();
             let mut latest: Option<FileNotice> = None;
@@ -17397,7 +17397,7 @@ impl eframe::App for KirinDeskApp {
         }
 
         // Connection windows (auto-opened per connection)
-        // M8-T021 P1 (T021-01-A/B): drain 窗口信号 + 去重——同 addr+kind 已有窗口
+        // P1 (T021-01-A/B): drain 窗口信号 + 去重——同 addr+kind 已有窗口
         // → 丢弃新信号（不建窗口、不建重复连接）+ 聚焦已有窗口（egui 0.28.1 无
         // BringToFront，仅 Focus）。信号 drop → close_tx drop → 重复会话退出（P2）。
         {
@@ -17480,8 +17480,8 @@ impl eframe::App for KirinDeskApp {
                     tracing::info!("Connection window opened: id={}", wid);
                 }
             }
-            // M11-T005: 远程 Shell 会话窗口（每设备+每端口独立 PTY 会话）。
-            // M8-T021 P1: 同 addr 去重 + 聚焦；terminal 用会话侧实例（断链修复）。
+            // 远程 Shell 会话窗口（每设备+每端口独立 PTY 会话）。
+            // P1: 同 addr 去重 + 聚焦；terminal 用会话侧实例（断链修复）。
             if let Ok(mut signals) = add_shell_window_signal().lock() {
                 for sig in signals.drain(..) {
                     if let Some(existing) = self
@@ -17713,7 +17713,7 @@ impl eframe::App for KirinDeskApp {
         let mut closed = Vec::new();
         // 只读快照** = 文件传输模式窗（Shell 窗面板开 / File 窗全窗形态）FM
         // 远端栏选中/当前目录（root 相对；`None` = 无在位语境），按对端
-        // `addr` 键控（三窗共有、连接表单同源、窗口去重同键〔M8-T021〕——
+        // `addr` 键控（三窗共有、连接表单同源、窗口去重同键——
         // Shell/File 窗 `reconnect_ctx` 结构性 None，`server_id` 不可用作键）
         // ——会话窗（Desktop）粘贴派发臂消费（跨窗只读快照与下方 `iter_mut`
         // 目标仅经既有 `OfferV2` 帧既有 `target_dir` 字段上链。
@@ -17761,7 +17761,7 @@ impl eframe::App for KirinDeskApp {
                     .with_inner_size([960.0, 600.0])
                     .with_close_button(true),
                 |ctx, _class| {
-                    // M15-T008: 子视口独立 egui Context——共享字体回退链与主题令牌。
+                    // 子视口独立 egui Context——共享字体回退链与主题令牌。
                     theme::ensure_fonts(ctx);
                     theme::apply_theme(ctx, &theme);
 
@@ -17770,27 +17770,27 @@ impl eframe::App for KirinDeskApp {
                         return;
                     }
 
-                    // M8-T007: Status bar at top (replaces right-click context menu)
-                    // M8-T021 P1: 键控读取本会话统计（多窗口各自独立）。
+                    // Status bar at top (replaces right-click context menu)
+                    // P1: 键控读取本会话统计（多窗口各自独立）。
                     let stats = connection_stats()
                         .lock()
                         .unwrap()
                         .get(&win.session_id)
                         .cloned()
                         .unwrap_or_default();
-                    // M8-T018: 同步显示器列表 / Nack（接收循环 → 本窗口缓存）。
+                    // 同步显示器列表 / Nack（接收循环 → 本窗口缓存）。
                     if win.kind == WindowKind::Desktop {
                         win.sync_display_state();
                     }
-                    // M8-T019 (UI-PRIV-002): 同步隐私 ack（徽标 / 输入禁用 / toast）。
+                    // (UI-PRIV-002): 同步隐私 ack（徽标 / 输入禁用 / toast）。
                     win.sync_privacy_state();
                     win.sync_audio_state();
-                    // M8-T038 (P1): 连接状态条——随弹出页出现/消失（零残留）。
+                    // (P1): 连接状态条——随弹出页出现/消失（零残留）。
                     // 状态为进程级全局单例，多窗口并存时各窗口显示最近一次
                     // 写入（主设计 §7-4 已知限制）。本面板由 P1 独占，P6 不得改动。
                     // 单测钉死）——「Connected to …」成功终态**隐藏**（用户
                     // 2026-09-08 复测：连接成功后状态条不再常驻）；会话判死
-                    // （输入发送通道关闭，M15-T008 断连检测同口径）后显示
+                    // （输入发送通道关闭，断连检测同口径）后显示
                     // 「连接已断开」文案（断连不改写全局串，见函数文档）。
                     // 满足——仍在 CentralPanel 之前）；渲染条件/内容/文案零变化
                     // 见下。）
@@ -17799,8 +17799,8 @@ impl eframe::App for KirinDeskApp {
                     // 未展示画面）。改 `egui::Area` 顶边锚定全宽半透明浮层
                     // （`Order::Foreground` + `interactable(false)` 指针恒穿透
                     // 自此恒占满窗体（CentralPanel 不再被顶面板挤压，letterbox
-                    // 居中零偏移不变）；渲染条件/内容/文案零变化（M8-T038/
-                    // 让位（既有 `r114_offset_y` 机制零变化：状态条可见→工具栏
+                    // 居中零偏移不变）；渲染条件/内容/文案零变化；
+                    // 状态条让位（既有 `r114_offset_y` 机制零变化：状态条可见→工具栏
                     // 锚其下沿；隐藏→0；决策抽纯函数 [`conn_banner_offset_y`]，
                     // 真值表单测钉死）。
                     let status = connection_status().lock().unwrap().clone();
@@ -17853,7 +17853,7 @@ impl eframe::App for KirinDeskApp {
                         }
                         ConnBannerMode::Lost => {
                             // 会话判死且全局串无断连信息（空/陈旧成功终态）→
-                            // 紧凑「连接已断开」条（详情在下方 M15-T008 覆盖层：
+                            // 紧凑「连接已断开」条（详情在下方覆盖层：
                             // 重连进度/按钮，不重复渲染）。
                             let resp = egui::Area::new(egui::Id::new(("conn_state_overlay", wid)))
                                 .order(egui::Order::Foreground)
@@ -17886,7 +17886,7 @@ impl eframe::App for KirinDeskApp {
                     };
                     let r114_offset_y: f32 = conn_banner_offset_y(r127_mode, r127_bar_bottom);
 
-                    // `conn_status_{wid}` TopBottomPanel，M8-T007）═══
+                    // `conn_status_{wid}` TopBottomPanel）═══
                     // 浮层不再挤压画面——视频区占满窗体（原面板每帧吞掉的
                     // 顶部 ~40px 归还画面）；全部既有按钮原样迁入（功能/命令
                     // 语义零变化，只改容器形态）。三态（per-窗
@@ -18103,10 +18103,10 @@ impl eframe::App for KirinDeskApp {
                                 // `config_cache_load`（mtime 比对，文件不变零
                                 // 磁盘 IO），保存配置后下一帧热更新。配置加载
                                 // 失败 → 缺省 false = 隐藏（fail-closed 口径）。
-                                // 下方为原 M15-T008 徽标组，开态行为不变。
+                                // 下方为原徽标组，开态行为不变。
                                 if stats.fps > 0.0 {
-                                    // M15-T008: FPS/BW/Res 改 Mono 徽标
-                                    // M8-T021 P1: 键控 map 默认值为空 → 显示占位。
+                                    // FPS/BW/Res 改 Mono 徽标
+                                    // P1: 键控 map 默认值为空 → 显示占位。
                                     badge(
                                         ui,
                                         &theme,
@@ -18136,7 +18136,7 @@ impl eframe::App for KirinDeskApp {
                                 // 当前选中显示在按钮文本）功能重复，用户裁定冗余；
                                 // 紧随的 ✖ 断开钮保留（关窗语义不冗余）。信息零
                                 // 丢失：显示器下拉 + 状态栏调试徽标（开态）均在。
-                                // M8-T018（MON-NF-001）：切换被拒 → 错误提示（保持当前屏）。
+                                // MON-NF-001：切换被拒 → 错误提示（保持当前屏）。
                                 if let Some(reason) = &win.display_nack {
                                     badge(
                                         ui,
@@ -18145,7 +18145,7 @@ impl eframe::App for KirinDeskApp {
                                         BadgeKind::Danger,
                                     );
                                 }
-                                // M8-T019 (UI-PRIV-002): 隐私徽标（黑屏 / 锁屏）。
+                                // (UI-PRIV-002): 隐私徽标（黑屏 / 锁屏）。
                                 match win.privacy_level {
                                     Some(PrivacyLevel::Black) => {
                                         badge(
@@ -18172,7 +18172,7 @@ impl eframe::App for KirinDeskApp {
                             // `session.toolbar.audio_play` 按钮及其图标态零改动
                             // （用户认可，保留）。
                             }
-                            // M15-T008: 工具栏（显示器 🖥 / 文件 📁 / 特殊键 🔑 / 全屏 ▣ / 断开 ✖）
+                            // 工具栏（显示器 🖥 / 文件 📁 / 特殊键 🔑 / 全屏 ▣ / 断开 ✖）
                             // 前取；与右段末游标经纯函数 [`toolbar_content_width`]
                             // 换算还原「内容自然宽」；旧实测 = 被拉伸的 Area 全宽
                             // = 决策回退分支恒触发 = 永久全宽「宽度最大」根因）。
@@ -18226,7 +18226,7 @@ impl eframe::App for KirinDeskApp {
                                         }
                                     }
                                     if win.kind == WindowKind::Desktop {
-                                        // M8-T018（CLI-MON-002 / UI-BTY-016）：显示器下拉。
+                                        // CLI-MON-002 / UI-BTY-016：显示器下拉。
                                         // 列表显示 `名称 分辨率 [主屏]`；切换即发 DisplaySelect。
                                         if !win.display_list.is_empty() {
                                             let cur = win.display_selected.unwrap_or(0);
@@ -18497,7 +18497,7 @@ impl eframe::App for KirinDeskApp {
                                                 t!("session.toolbar.display_mode.title"),
                                             );
                                         }
-                                        // M8-T020 UI-SKEY-001: 特殊键面板（Win/Alt+Tab/任务管理器/锁屏）。
+                                        // UI-SKEY-001: 特殊键面板（Win/Alt+Tab/任务管理器/锁屏）。
                                         if toolbar_button(
                                             ui,
                                             &theme,
@@ -18514,7 +18514,7 @@ impl eframe::App for KirinDeskApp {
                                         // 补偿按钮不再是最小可达路径，删除安全。
                                         // 对应 i18n 键（session.toolbar.caps_lock /
                                         // kp_multiply / kp_decimal）零消费一并删除。
-                                        // M8-T032：② 播放音频开关（进程级原子量，
+                                        // ② 播放音频开关（进程级原子量，
                                         // 会话内动态生效，无需重连）。关 → 丢弃
                                         // 到达的音频包（动态静音）+ 徽标立即同步。
                                         if audio_enabled_global().load(Ordering::Relaxed) {
@@ -18538,7 +18538,7 @@ impl eframe::App for KirinDeskApp {
                                                     m.insert(win.session_id, win.audio_state);
                                                 }
                                             }
-                                            // M8-T032：③ 麦克风开关（talkback）——
+                                            // ③ 麦克风开关（talkback）——
                                             // 本机麦克风 → 服务端播放（默认关）。
                                             let mut mic = client_mic_enabled();
                                             if toolbar_button(
@@ -18557,7 +18557,7 @@ impl eframe::App for KirinDeskApp {
                                         // 移除——文件传输已迁移至文件传输模式（Shell
                                         // 窗工具栏 📁 = `show_file_mgr`，下方门控段在位）
                                         // 与 ctrl+cv 剪贴板链路；工具栏 12 → 11 件
-                                        // M8-T019 (UI-PRIV-001/002): 隐私模式菜单——
+                                        // (UI-PRIV-001/002): 隐私模式菜单——
                                         // 黑屏（Level 1）/ 锁屏（Level 2）/ 恢复屏幕。
                                         // 激活时按钮文案显示当前状态（高亮由状态栏徽标承担）。
                                         let privacy_label = match win.privacy_level {
@@ -18600,7 +18600,7 @@ impl eframe::App for KirinDeskApp {
                                                     )
                                                     .clicked()
                                                 {
-                                                    // M8-T021 P1: 键控写入本会话
+                                                    // P1: 键控写入本会话
                                                     // （多窗口各自的 requested 互不串扰）。
                                                     client_privacy_state()
                                                         .lock()
@@ -18627,7 +18627,7 @@ impl eframe::App for KirinDeskApp {
                                                     )
                                                     .clicked()
                                                 {
-                                                    // M8-T021 P1: 键控写入本会话。
+                                                    // P1: 键控写入本会话。
                                                     client_privacy_state()
                                                         .lock()
                                                         .unwrap()
@@ -18651,7 +18651,7 @@ impl eframe::App for KirinDeskApp {
                                                     )
                                                     .clicked()
                                                 {
-                                                    // M8-T021 P1: 键控写入本会话。
+                                                    // P1: 键控写入本会话。
                                                     client_privacy_state()
                                                         .lock()
                                                         .unwrap()
@@ -18920,7 +18920,7 @@ impl eframe::App for KirinDeskApp {
                     // F11 逐 repeat 帧重复 toggle；③经 `win.fullscreen` 本地标志
                     // 工具栏按钮）。
 
-                    // M13-T006 (UI-FT-003): 拖拽文件到连接窗口 → 发送。
+                    // (UI-FT-003): 拖拽文件到连接窗口 → 发送。
                     // 逻辑体零改动 = D1b；`win.file_tx` = 无通道时 `if let
                     // Some` 天然短路 = §2.0 无通道无入口既有口径）。
                     // → 同意流 `SendWithConsent`（一次拖入 = 一条命令，批量
@@ -19115,7 +19115,7 @@ impl eframe::App for KirinDeskApp {
                     // 一次一框/唤起全删）——接收侧裁决 = 会话内 B2 开关四格
                     // 决策（自动 toast/审计，无框）。
 
-                    // M8-T020 UI-SKEY-001/002/003/004: 特殊键面板（🔑 切换）。
+                    // UI-SKEY-001/002/003/004: 特殊键面板（🔑 切换）。
                     // Win+E/D/L/R、Alt+Tab、任务管理器、Alt+F4、锁屏（CAC 替代）；
                     // 1s 防连点；macOS 被控端禁用 Alt+Tab。
                     if win.kind == WindowKind::Desktop && win.show_special_key_panel {
@@ -19203,7 +19203,7 @@ impl eframe::App for KirinDeskApp {
                         }
                     }
 
-                    // M8-T019 (UI-PRIV-002): 隐私 toast（5s 自动消失；关闭按钮即时消失）。
+                    // (UI-PRIV-002): 隐私 toast（5s 自动消失；关闭按钮即时消失）。
                     if let Some((text, at)) = &win.privacy_toast {
                         let elapsed = at.elapsed();
                         if elapsed < std::time::Duration::from_secs(5) {
@@ -19250,10 +19250,10 @@ impl eframe::App for KirinDeskApp {
                         theme.video_bg
                     };
                     egui::CentralPanel::default()
-                        // M15-T008: letterbox 黑底（视频画布底色令牌）
+                        // letterbox 黑底（视频画布底色令牌）
                         .frame(egui::Frame::none().fill(central_fill))
                         .show(ctx, |ui| {
-                        // M11-T002/T005: 远程 Shell 终端渲染（独立会话，互不影响）。
+                        // 远程 Shell 终端渲染（独立会话，互不影响）。
                         if win.kind == WindowKind::Shell {
                             let (focused, events) = ctx.input(|i| (i.focused, i.events.clone()));
                             // 接受偏差项）：`file_mgr_focus` 清除条件——窗口失焦
@@ -19272,7 +19272,7 @@ impl eframe::App for KirinDeskApp {
                                 win.file_mgr_focus = false;
                             }
                             // 1. 画布填充（先铺黑底再绘内容）。
-                            // （theme.video_bg），终端保持 M11-T002 经典深色 ANSI
+                            // （theme.video_bg），终端保持经典深色 ANSI
                             // 调色板可读性（深色主题下与 video_bg=纯黑 视觉一致）。
                             // （值 == 原 Color32::BLACK，行为等值）。
                             // 提示先入队、被随后覆盖整个 max_rect 的黑矩形埋掉
@@ -19444,7 +19444,7 @@ impl eframe::App for KirinDeskApp {
                         } else {
                             None
                         };
-                        // M8-T015 P2D + M8-T021 P1: 每窗口 pop **自己的**渲染桥 →
+                        // P2D + P1: 每窗口 pop **自己的**渲染桥 →
                         // 直接上本窗口纹理（原全局 pop → client_frame() 只有第一个
                         // 窗口能取到帧；键控后各窗口互不抢帧）。
                         // TextureHandle::set 复用，避免每帧 ctx.load_texture 重建；
@@ -19622,7 +19622,7 @@ impl eframe::App for KirinDeskApp {
                                 }
                             }
                         }
-                        // M15-T008: 断开检测（输入发送通道已关闭 = 远端会话结束）→
+                        // 断开检测（输入发送通道已关闭 = 远端会话结束）→
                         // 错误覆盖层 + 重连按钮。
                         // 不重复），覆盖层显示"自动重连中（第 N 次/共 M 次）"，按钮
                         // 禁用态随状态机；不可重连路径给出明确原因（R03-S5）。
@@ -19632,7 +19632,7 @@ impl eframe::App for KirinDeskApp {
                             .map(|tx| tx.is_closed())
                             .unwrap_or(false);
                         if disconnected {
-                            // M8-T019: 断连后隐私徽标清空（服务端已本地恢复，SRV-PRIV-014）。
+                            // 断连后隐私徽标清空（服务端已本地恢复，SRV-PRIV-014）。
                             win.privacy_level = None;
                             // 自动重连：仅首次触发（Retrying/Failed 状态下不重复）。
                             let auto_start = reconnect_state_map()
@@ -19744,7 +19744,7 @@ impl eframe::App for KirinDeskApp {
                             ctx.request_repaint();
                             return;
                         };
-                        // M15-T008: letterbox——等比缩放 + 居中；黑底由面板
+                        // letterbox——等比缩放 + 居中；黑底由面板
                         // `theme.video_bg` 提供（Frame::dark 的令牌化实现）。
                         // 全屏（F11/工具栏）在大屏上看低分辨率远端需要放大铺满，
                         // 小窗模式放大也是远控惯例（AnyDesk/向日葵同款）。
@@ -19764,10 +19764,10 @@ impl eframe::App for KirinDeskApp {
                         // 修复）已整体移除（用户裁定走移除预案）——OS 光标在
                         // 远程桌面画布内恢复直显；画布内隐藏 OS 光标的前提逻辑
 
-                        // M9-T002/T004: 远程输入捕获（仅窗口聚焦 + 指针在图像内）。
-                        // M8-T019 (UI-PRIV-004): 锁屏期间本地输入禁用
+                        // 远程输入捕获（仅窗口聚焦 + 指针在图像内）。
+                        // (UI-PRIV-004): 锁屏期间本地输入禁用
                         // （服务端也不接收注入，双保险；黑屏期间输入照常）。
-                        // M8-T021 P1: 键控读取本会话分辨率（多窗口各自独立）。
+                        // P1: 键控读取本会话分辨率（多窗口各自独立）。
                         let (base_w, base_h) = client_resolution()
                             .lock()
                             .unwrap()
@@ -20071,7 +20071,7 @@ impl eframe::App for KirinDeskApp {
                                         let total = files.entries.len();
                                         let batch = total.min(CLIP_PASTE_MAX_FILES);
                                         // c→s 粘贴上传落点 = **同 peer**（同 `addr`，
-                                        // 连接表单同源/窗口去重同键〔M8-T021〕）文件
+                                        // 连接表单同源/窗口去重同键）文件
                                         // 传输模式窗（Shell 面板开 / File 全窗）远端栏
                                         // 选中/当前目录（逐帧快照消费，零 wire——既有
                                         // `OfferV2.target_dir` 承载；服务端
@@ -20780,7 +20780,7 @@ impl eframe::App for KirinDeskApp {
                                         });
                                 }
                             }
-                            // M8-T019 (UI-PRIV-004): 锁屏期间输入暂停提示
+                            // (UI-PRIV-004): 锁屏期间输入暂停提示
                             // （视频照常显示，输入捕获已禁用）。
                             // （`r114_offset_y`，与工具栏/失焦细条/clip badge 同
                             // 挤压），浮层化后画面顶边=窗顶边，加状态条下沿保持
@@ -20897,7 +20897,7 @@ impl eframe::App for KirinDeskApp {
             }
         }
 
-        // M8-T019 (SRV-PRIV-011/016): 被控端黑屏覆盖窗口（全屏纯黑 + 提示条 +
+        // (SRV-PRIV-011/016): 被控端黑屏覆盖窗口（全屏纯黑 + 提示条 +
         // 本地逃生舱）。控制器无活跃黑屏时本调用立即返回（覆盖窗口自动关闭，
         // 断连恢复无网络依赖，SRV-PRIV-014）。
         match privacy::show_black_overlay(ctx) {
@@ -20930,7 +20930,7 @@ impl KirinDeskApp {
     /// 清理路径已衔接。
     fn close_connection_windows(&mut self, wids: &[u64]) {
         for &wid in wids {
-            // 会话真拆除 → 落点语境清位；三窗同键〔M8-T021〕下 Desktop/File
+            // 会话真拆除 → 落点语境清位；三窗同键下 Desktop/File
             // 任一余留 = 语境合法保留，跨窗粘贴语境不误伤）。
             let r167_closed_addr = self
                 .windows
@@ -21064,7 +21064,7 @@ impl KirinDeskApp {
         std::process::exit(0);
     }
 
-    /// M8-T021 P1 (T021-01-B): 聚焦已有窗口——egui 0.28.1 无 `BringToFront`，
+    /// P1 (T021-01-B): 聚焦已有窗口——egui 0.28.1 无 `BringToFront`，
     /// 仅 `ViewportCommand::Focus`（窗口 id → ViewportId::from_hash_of）。
     fn focus_window(ctx: &egui::Context, wid: u64) {
         ctx.send_viewport_cmd_to(
@@ -21073,7 +21073,7 @@ impl KirinDeskApp {
         );
     }
 
-    /// M8-T021 P1 (T021-01-D): 连接前置查重——已存在同目标窗口 → 聚焦并拒绝
+    /// P1 (T021-01-D): 连接前置查重——已存在同目标窗口 → 聚焦并拒绝
     /// 新连接；信号队列有同目标 pending（本帧未 drain）→ 拒绝新连接。
     /// 返回 true = 已去重，调用方不再启动会话。
     ///
@@ -21123,13 +21123,13 @@ impl KirinDeskApp {
             self.dns_configured = dns_provider_configured(&cfg);
             // M9-DNS022: DNS 服务商选择迁至 Domain 页（domain_panel 内部
             // 自配置读取并回填表单），App 不再持有该字段。
-            // M8-T031: 配置留空 / 旧占位 `default-device` → 自动派生
+            // 配置留空 / 旧占位 `default-device` → 自动派生
             // （系统盘硬盘 UUID 等）；显式值原样保留。
             self.device_id = kirin_desk_utils::device::effective_device_id(&cfg.device.id);
             self.nickname = cfg.device.nickname;
             self.challenge_code = cfg.device.challenge_code;
             self.allowed_domains = cfg.network.allowed_domains.join(", ");
-            // M8-T027 (UI-IDWL-001/002): ID 白名单文本框 + 条目列表缓存加载。
+            // (UI-IDWL-001/002): ID 白名单文本框 + 条目列表缓存加载。
             self.allowed_ids = cfg.network.allowed_ids.join(", ");
             self.id_whitelist_entries = cfg.network.id_whitelist.clone();
             self.ip_mode_allowed = cfg.network.ip_mode_allowed;
@@ -21137,12 +21137,12 @@ impl KirinDeskApp {
             self.id_whitelist_enforce = cfg.network.id_whitelist_enforce;
             self.temp_mode = cfg.network.temp_mode;
             self.listen_port = cfg.network.port.to_string();
-            // M15-T008: 主题模式（启动时 install 已用同源值，此处保持一致防漂移）。
+            // 主题模式（启动时 install 已用同源值，此处保持一致防漂移）。
             self.theme_mode = ThemeMode::from_str(&cfg.ui.theme);
-            // M8-T038: 语言（启动时已 set_lang_code；此处同源防漂移）。
+            // 语言（启动时已 set_lang_code；此处同源防漂移）。
             self.ui_language = cfg.ui.language.clone();
             i18n::set_lang_code(&cfg.ui.language);
-            // M13-T005: 无人值守模式状态（Settings 页 + 启动时序共用）。
+            // 无人值守模式状态（Settings 页 + 启动时序共用）。
             self.unattended_enabled = cfg.unattended.enabled;
             self.unattended_autostart = cfg.unattended.auto_start_on_boot;
             self.unattended_auto_server = cfg.unattended.auto_start_server;
@@ -21163,7 +21163,7 @@ impl KirinDeskApp {
                         .into_owned()
                 });
             self.ft_clip_direct = cfg.file_transfer.clip_direct_paste;
-            // M8-T026: 内网穿透设置（Tunnel 独立页回填；proxies 转多行文本）。
+            // 内网穿透设置（Tunnel 独立页回填；proxies 转多行文本）。
             // 落盘为 true（ID 注册放行），语义对 CLI/ID 注册消费方保持不动。
             // 磁盘侧；此处兜底内存构造路径——KirinDeskApp derive Default
             // 的 String 默认空串）。
@@ -21177,7 +21177,7 @@ impl KirinDeskApp {
             self.tunnel_server_pubkey = cfg.tunnel.server_pubkey.clone().unwrap_or_default();
             self.tunnel_proxies =
                 kirin_desk_utils::config::TunnelConfig::format_proxy_lines(&cfg.tunnel.proxies);
-            // M8-T039: Tunnel 页表单字段回填（Server 模式参数 + 最后运行状态；
+            // Tunnel 页表单字段回填（Server 模式参数 + 最后运行状态；
             // 运行态 auto_start 供 P5 首帧自动恢复，见 update() config_loaded 块）。
             self.tunnel_bind_addrs = cfg.tunnel.bind_addrs.clone();
             self.tunnel_bind_port = cfg.tunnel.bind_port.to_string();
@@ -21194,7 +21194,7 @@ impl KirinDeskApp {
         if self.tunnel_mode.trim().is_empty() {
             self.tunnel_mode = "client".to_string();
         }
-        // M10-T003: 启动时加载已保存设备列表（文件不存在 → 空列表）。
+        // 启动时加载已保存设备列表（文件不存在 → 空列表）。
         self.reload_devices();
         // ULA 时如实显示地址而非一律 "N/A"，配合警告态提示），再否则 "N/A"。
         if let Ok(ip) = kirin_desk_core::network::ipv6::get_global_ipv6() {
@@ -21204,7 +21204,7 @@ impl KirinDeskApp {
         } else {
             self.local_ipv6 = "N/A".to_string();
         }
-        // M8-T033: 本机全局 IPv4（失败显示 N/A）。
+        // 本机全局 IPv4（失败显示 N/A）。
         if let Ok(ip) = kirin_desk_core::network::ipv4::get_global_ipv4() {
             self.local_ipv4 = ip.to_string();
         } else {
@@ -21214,7 +21214,7 @@ impl KirinDeskApp {
         self.v4_reachability = kirin_desk_core::network::ipv4::reachability();
         self.v6_reachability = kirin_desk_core::network::ipv6::reachability();
         // Load or generate persistent device identity
-        // M8-T031: device_id 已解析（空/占位 → 自动硬盘 UUID），不再回落 "default"。
+        // device_id 已解析（空/占位 → 自动硬盘 UUID），不再回落 "default"。
         let device_id = &self.device_id;
         match IdentityManager::load_or_generate(
             std::path::PathBuf::from(
@@ -21272,7 +21272,7 @@ impl KirinDeskApp {
         }
     }
 
-    /// M8-T028 (UI-BTY-028): 复制成功反馈——记录状态栏浮出提示
+    /// (UI-BTY-028): 复制成功反馈——记录状态栏浮出提示
     /// （`Copied: <值前 24 字符>…`，2s 自动消失；空值不提示）。
     fn notify_copied(&mut self, value: &str) {
         if value.is_empty() {
@@ -21287,7 +21287,7 @@ impl KirinDeskApp {
         self.copied_feedback = Some((shown, std::time::Instant::now()));
     }
 
-    /// M8-T028: 📋 复制按钮 + 成功反馈（空值禁用由 `copy_button` 内部处理）。
+    /// 📋 复制按钮 + 成功反馈（空值禁用由 `copy_button` 内部处理）。
     fn copied_button(&mut self, ui: &mut egui::Ui, theme: &Theme, text: &str) {
         let (_, copied) = copy_button(ui, theme, text);
         if copied {
@@ -21298,17 +21298,17 @@ impl KirinDeskApp {
     fn show_dashboard(&mut self, ui: &mut egui::Ui, theme: &Theme) {
         ui.heading(t!("dashboard.title"));
         ui.separator();
-        // M8-T035 (需求 9): Dashboard 整体滚动区（对齐 Settings 页做法；
+        // (需求 9): Dashboard 整体滚动区（对齐 Settings 页做法；
         // Live Log 内部滚动条保留，双滚动不冲突）。
         egui::ScrollArea::vertical().show(ui, |ui| {
-            // M15-T008: ① 身份信息卡（值 Mono + 📋 复制按钮）
-            // M8-T035 (需求 13): 移除 Nickname/API/Allowed 三行——Nickname 在
+            // ① 身份信息卡（值 Mono + 📋 复制按钮）
+            // (需求 13): 移除 Nickname/API/Allowed 三行——Nickname 在
             // 服务端设置卡可编辑、白名单配置仍在 Settings → Whitelist；本卡仅保留
             // 设备身份五行（Device ID / IPv6 / IPv4 / Domain / Listen Port）。
-            // M8-T028 (UI-BTY-024): 身份卡三行（Device ID / IPv6 / Domain）均带 📋；
+            // (UI-BTY-024): 身份卡三行（Device ID / IPv6 / Domain）均带 📋；
             // stat_card 返回本帧复制的内容 → 状态栏浮出提示（UI-BTY-028）。
-            // M8-T033: 增加 IPv4 行（与 IPv6 并列；无本机 IPv4 时显示 N/A）。
-            // M8-T034: 各行 `small: true`——身份卡字号整体调小。
+            // 增加 IPv4 行（与 IPv6 并列；无本机 IPv4 时显示 N/A）。
+            // 各行 `small: true`——身份卡字号整体调小。
             // 分类（`core::network::ipv4/ipv6::reachability`，load_config 时
             // 缓存，每帧只读）：
             //   · 公网地址 → 绿点（可直连）；
@@ -21421,13 +21421,13 @@ impl KirinDeskApp {
             }
             ui.add_space(theme.spacing);
 
-            // M15-T008: ② 服务器控制卡（M8-T034 重构——滑动开关替代 Start/Stop
+            // ② 服务器控制卡（重构——滑动开关替代 Start/Stop
             // 按钮，连接状态实时呈现在开关旁；含麦克风/模式/临时连接开关）
-            // M8-T035 (需求 6/7): 「允许受控」+「允许麦克风」同一行；停止态不再
+            // (需求 6/7): 「允许受控」+「允许麦克风」同一行；停止态不再
             // 显示「已停止 / ○ Stopped」文字（开关位置即状态）；「允许音频」会话级
             // 总开关迁自 Settings Server 组（需求 4）；高危警告同步迁入（需求 4）。
             card(ui, theme, t!("dashboard.server.title"), |ui| {
-                // ── ① 允许受控 + 服务端音频（同一行，M8-T035 需求 7；
+                // ── ① 允许受控 + 服务端音频（同一行，需求 7；
                 // 允许受控：开关 = 服务端启停；状态文字 = 真实运行态。
                 let runtime_status = {
                     let st = server_runtime_state().lock().unwrap();
@@ -21443,7 +21443,7 @@ impl KirinDeskApp {
                         }
                         Some(s)
                     } else {
-                        // M8-T035 (需求 6): 停止态不显示「已停止」——开关位置已直观表达。
+                        // (需求 6): 停止态不显示「已停止」——开关位置已直观表达。
                         None
                     }
                 };
@@ -21498,7 +21498,7 @@ impl KirinDeskApp {
                             self.start_server();
                         }
                     }
-                    // ── ② 服务端音频（M8-T032 ①：服务端声音 → 客户端，动态生效）──
+                    // ── ② 服务端音频（①：服务端声音 → 客户端，动态生效）──
                     // 恒 = 真值）；写入决策经纯函数 `server_audio_toggle_next`
                     // （未点击不写、点击翻转——行为与修复前逐位等价）。本开关
                     // 是 `server_audio_allowed` 唯一 GUI 写入入口；置位锚点 =
@@ -21657,7 +21657,7 @@ impl KirinDeskApp {
                         }
                     });
                 }
-                // M8-T037: 「允许音频（会话级）」开关已移除——音频总开关不再
+                // 「允许音频（会话级）」开关已移除——音频总开关不再
                 // 提供 GUI 写入入口（保持默认开；CLI `--no-audio` 语义不变，
                 // 三个子开关仍可独立控制：服务端「服务端音频」在本卡
                 // 「播放音频」/「麦克风」在连接窗口工具栏）。
@@ -22124,7 +22124,7 @@ impl KirinDeskApp {
                     }
                 }
                 // 状态行：运行态 StatusDot + 临时模式/无人值守/待审批徽标。
-                // M8-T035 (需求 6): 仅运行时渲染——停止时无「○ Stopped」。
+                // (需求 6): 仅运行时渲染——停止时无「○ Stopped」。
                 if self.server_running {
                     ui.horizontal(|ui| {
                         status_dot(ui, theme.success, t!("dashboard.server.status_listening"));
@@ -22146,11 +22146,11 @@ impl KirinDeskApp {
                                 BadgeKind::Warning,
                             );
                         }
-                        // M8-T017 (UI-TMP-004): 临时连接窗口激活徽标（状态行）。
+                        // (UI-TMP-004): 临时连接窗口激活徽标（状态行）。
                         if crate::policy::temp_mode_window_active() {
                             badge(ui, theme, t!("dashboard.temp.window_badge"), BadgeKind::Warning);
                         }
-                        // M13-T005 (UA-UI-002): 无人值守模式徽标。
+                        // (UA-UI-002): 无人值守模式徽标。
                         if self.unattended_enabled {
                             badge(ui, theme, t!("dashboard.unattended_badge"), BadgeKind::Info);
                         }
@@ -22189,9 +22189,9 @@ impl KirinDeskApp {
             });
             ui.add_space(theme.spacing);
 
-            // M8-T034: ③ 服务端设置（小字号；端口/昵称/挑战码迁自 Settings，
+            // ③ 服务端设置（小字号；端口/昵称/挑战码迁自 Settings，
             // 下次启动服务端生效；页面内小保存按钮即时落盘）
-            // M8-T035 (需求 1/2): 端口输入迁入（原 Settings Server 组 Listen Port），
+            // (需求 1/2): 端口输入迁入（原 Settings Server 组 Listen Port），
             // 三项横向一排——端口定窄宽、昵称/挑战码弹性宽度。
             // 2 行小字）收进卡标题 hover。
             card_with_title_tip(
@@ -22209,7 +22209,7 @@ impl KirinDeskApp {
                                 egui::FontId::new(theme.small_size, egui::FontFamily::Proportional),
                             );
                         }
-                        // M8-T035: 端口校验（1–65535）——非法红边 + 提示 + 禁用保存。
+                        // 端口校验（1–65535）——非法红边 + 提示 + 禁用保存。
                         let port_validity = match self.listen_port.parse::<u16>() {
                             Ok(p) if p >= 1 => Validity::None,
                             _ => Validity::Invalid(t!("dashboard.server_settings.port_invalid")),
@@ -22294,7 +22294,7 @@ impl KirinDeskApp {
                                         .selectable(false),
                                     );
                                 } else {
-                                    // M15-T008: 挑战码密文输入（圆点遮蔽 + 👁 切换）。
+                                    // 挑战码密文输入（圆点遮蔽 + 👁 切换）。
                                     //（原「选填」口径废除；白名单旁路放行本就以挑战码
                                     // 为前提，空值即 fail-closed 拒绝，不如显式必填）。
                                     let chal_validity = if self.challenge_code.trim().is_empty() {
@@ -22342,7 +22342,7 @@ impl KirinDeskApp {
                                 self.save_dashboard_settings();
                             }
                             if !self.dashboard_status.is_empty() {
-                                // M8-T038: 成功判定与同键文案比较（语言无关）。
+                                // 成功判定与同键文案比较（语言无关）。
                                 let ok = self.dashboard_status == t!("dashboard.status.saved");
                                 ui.add(
                                     egui::Label::new(
@@ -22365,7 +22365,7 @@ impl KirinDeskApp {
             // 路径随移除（键清单入交付报告）。
             ui.add_space(theme.spacing);
     
-            // M15-T008: ③ Live Log → LogView（级别着色 + 清空/复制）
+            // ③ Live Log → LogView（级别着色 + 清空/复制）
             log_view(
                 ui,
                 theme,
@@ -22408,7 +22408,7 @@ impl KirinDeskApp {
         }
     }
 
-    /// M8-T015 P2D: 提取 EncodedWindow 内逐帧 NALU 列表。
+    /// P2D: 提取 EncodedWindow 内逐帧 NALU 列表。
     ///
     /// 兼容两种存储格式：扁平 `nalus + frame_nalu_counts`（新格式）与
     /// 嵌套 `frames`（旧格式，当前服务端 window_pipeline 使用）。
@@ -22463,7 +22463,7 @@ impl KirinDeskApp {
         }
     }
 
-    /// M8-T027 (UI-IDWL-002): 逐条删除 ID 白名单条目（同时清理 `allowed_ids`
+    /// (UI-IDWL-002): 逐条删除 ID 白名单条目（同时清理 `allowed_ids`
     /// 与 `id_whitelist` 两维），刷新列表缓存并写审计 `WhitelistIdRemoved`。
     fn remove_id_whitelist_entry(&mut self, device_id: &str) {
         match kirin_desk_utils::config::Config::load() {
@@ -22520,7 +22520,7 @@ impl KirinDeskApp {
             .listen_port
             .parse()
             .unwrap_or(kirin_desk_utils::config::DEFAULT_NETWORK_PORT);
-        // M8-T035 (需求 5): 白名单快照不再在启动时冻结——握手层逐连接
+        // (需求 5): 白名单快照不再在启动时冻结——握手层逐连接
         // 读取 `whitelist_active_patterns()`（含 CLI 条目，与 headless 一致）。
         let temp_mode = self.temp_mode;
         let ip_mode = self.ip_mode_allowed;
@@ -22532,7 +22532,7 @@ impl KirinDeskApp {
 
         self.server_running = true;
         self.server_status = format!("Starting on port {}...", port);
-        // M8-T034: 运行态置「启动中」——bind 结果由监听线程回写
+        // 运行态置「启动中」——bind 结果由监听线程回写
         // （成功 → listening/port；失败 → error）。
         {
             let mut st = server_runtime_state().lock().unwrap();
@@ -22571,7 +22571,7 @@ impl KirinDeskApp {
             },
         ));
         let cfg = kirin_desk_utils::config::Config::load().unwrap_or_default();
-        // M13-T005 (UA-ACCEPT-004): 无人值守下强制关闭 temp-mode/ip-mode 旁路——
+        // (UA-ACCEPT-004): 无人值守下强制关闭 temp-mode/ip-mode 旁路——
         // unused_assignments——初始 false 从未被读取。）
         let unattended = cfg.unattended.enabled;
         if unattended {
@@ -22614,7 +22614,7 @@ impl KirinDeskApp {
                 match kirin_desk_core::network::tcp::TcpServer::bind(port).await {
                     Ok(server) => {
                         info!("Server listening on port {}", server.port());
-                        // M8-T034: 运行态回写——GUI 每帧读取（开关状态/端口真实化）。
+                        // 运行态回写——GUI 每帧读取（开关状态/端口真实化）。
                         {
                             let mut st = server_runtime_state().lock().unwrap();
                             st.starting = false;
@@ -22739,7 +22739,7 @@ impl KirinDeskApp {
                         // 停随释放，不等下面的注销等待结束，保证「停止 → 立即
                         // 再次启动」不因旧线程残留端口占用而 bind 失败。
                         drop(server);
-                        // M8-T034: 监听线程退出（用户停止）→ 运行态回写。
+                        // 监听线程退出（用户停止）→ 运行态回写。
                         {
                             let mut st = server_runtime_state().lock().unwrap();
                             st.listening = false;
@@ -22774,7 +22774,7 @@ impl KirinDeskApp {
                     }
                     Err(e) => {
                         error!("Server bind error on port {}: {}", port, e);
-                        // M8-T034: bind 失败 → 回写运行态（GUI 开关回 OFF +
+                        // bind 失败 → 回写运行态（GUI 开关回 OFF +
                         // 展示失败原因，修复旧实现「只打日志、开关假死」）。
                         {
                             let mut st = server_runtime_state().lock().unwrap();
@@ -22789,7 +22789,7 @@ impl KirinDeskApp {
         });
     }
 
-    /// M8-T034: Dashboard「服务端设置」保存——ip_mode + 端口 + 昵称 + 挑战码
+    /// Dashboard「服务端设置」保存——ip_mode + 端口 + 昵称 + 挑战码
     /// 即时落盘（Settings 统一 Save 仍保留完整落盘；本按钮提供 Dashboard 页面
     /// 内保存入口）。已运行会话不受影响（下次启动服务端生效）。
     /// `unwrap_or_default` 全默认配置整份写盘冲掉用户已有字段）。
@@ -22806,7 +22806,7 @@ impl KirinDeskApp {
         cfg.network.id_mode_allowed = self.id_mode_allowed;
         cfg.device.nickname = self.nickname.clone();
         cfg.device.challenge_code = self.challenge_code.clone();
-        // M8-T035 (需求 1): 端口迁入服务端设置——随本按钮一并落盘（非法值
+        // (需求 1): 端口迁入服务端设置——随本按钮一并落盘（非法值
         // 已被 UI 校验禁用保存，此处仍防御性跳过）。
         if let Ok(p) = self.listen_port.parse::<u16>() {
             cfg.network.port = p;
@@ -22828,7 +22828,7 @@ impl KirinDeskApp {
     /// 打开（append 模式多句柄并发安全，同隐私审计路径）。
     ///
     /// 本函数即 S-01c 追加每连接校验的落点（合并顺序 S-02 → S-01c）。
-    /// M8-T035 (需求 5): 域名白名单判定改用 `whitelist_active_patterns()`——
+    /// (需求 5): 域名白名单判定改用 `whitelist_active_patterns()`——
     /// 含旧 `allowed_domains` + CLI `whitelist add` 写入的 `network.whitelist`
     /// 带过期/通配条目（去重），与 headless/CLI 语义完全一致（原 `allowed`
     /// 快照仅含 GUI 文本域条目，CLI 条目在 GUI 模式下不生效）。
@@ -22964,7 +22964,7 @@ impl KirinDeskApp {
                 crate::policy::resolve_expected_client_key(&known_snapshot, &cfg, &init.client_id)
                     .await;
             // 3) 白名单检查；未知公钥且非白名单 → 审批弹窗（temp/ip 模式跳过）。
-            // M8-T017 (SRV-TMP-006): 临时连接窗口**逐连接**判定
+            // (SRV-TMP-006): 临时连接窗口**逐连接**判定
             // （窗口中途开启/过期即时生效），与配置旁路取或；
             // 无人值守下窗口维度一并关闭（UA-ACCEPT-004）。
             let temp_window: Option<TempModeManager> = if unattended {
@@ -23006,11 +23006,11 @@ impl KirinDeskApp {
                 return;
             }
             let skip = skip_whitelist || temp_window.is_some();
-            // M8-T027 (SRV-IDWL-021): 双白名单 OR——
+            // (SRV-IDWL-021): 双白名单 OR——
             // 域名命中 **或** ID 命中即视为白名单命中（域名
             // 行为不变）；ID 列表**逐连接**从配置快照读取，
             // Settings 保存后即时生效（UI-IDWL-001）。
-            // M8-T035 (需求 5): 域名维度改用 `whitelist_active_patterns`——
+            // (需求 5): 域名维度改用 `whitelist_active_patterns`——
             // 旧 `allowed_domains` + CLI `whitelist add` 写入的
             // `network.whitelist`（带过期/通配条目，去重）共同生效，
             // 与 headless/CLI 语义一致：白名单命中 → 免人工审批，
@@ -23147,7 +23147,7 @@ impl KirinDeskApp {
             }
             let mut was_approved = false;
             if !skip && !is_whitelisted && expected_key.is_none() {
-                // M13-T005 (UA-ACCEPT-002): 无人值守下
+                // (UA-ACCEPT-002): 无人值守下
                 // 未知设备自动拒绝——无人工审批弹窗，
                 // 立即审计 + 记握手失败后断开。
                 if unattended {
@@ -23341,7 +23341,7 @@ impl KirinDeskApp {
                 was_approved = true;
             }
             // 4) pin/nickname/challenge/签名校验 + 应答。
-            // M8-T017 (SRV-TMP-HK-001/003): 挑战码二态——固定
+            // (SRV-TMP-HK-001/003): 挑战码二态——固定
             // 挑战码 **或** 窗口内临时挑战码任一正确即通过。
             // S-01a (F-1)：生产路径零凭据 → 拒绝
             // ID + 空域名）的昵称不是其凭据——跳过昵称校验（对齐 CLI headless
@@ -23356,7 +23356,7 @@ impl KirinDeskApp {
             };
             // 窗）→ 挑战-响应轮（下发 nonce、限时收应答；失败/超时 = 审计 +
             // 限流 + 结构化拒绝，与 verify 失败同处置面）。已 pin 客户端免挑战
-            // （CX-1 方案 B 附带项，判定与 headless 链同源 `challenge_round_required`）。
+            // （方案 B 附带项，判定与 headless 链同源 `challenge_round_required`）。
             let challenge_answer =
                 if kirin_desk_core::crypto::handshake::challenge_round_required(
                     expected_key.as_deref().unwrap_or(""),
@@ -23518,7 +23518,7 @@ impl KirinDeskApp {
             rate_limiter.lock().unwrap().reset(&ip);
             crate::policy::record_successful_handshake(&mut known.lock().unwrap(), &ch.peer_id);
             info!("Handshake SUCCESS with {}", addr);
-            // M13-T005 (UA-ACCEPT-003): 会话类型分发——
+            // (UA-ACCEPT-003): 会话类型分发——
             // 客户端声明 "shell" → PTY 桥接（无头/远程终端）；
             // 其余（desktop）→ 远程桌面（捕获+编码+输入注入）。
             // 单端口统一监听，远控与 shell 会话互不冲突
@@ -23610,14 +23610,14 @@ impl KirinDeskApp {
                 // 会话为准——与反向拦截的准入级覆盖互补，见 admit 臂）。
                 let _r169_guard = r169_mark_controlled_by(&peer_id_ft, session_id);
 
-                // M13-T006: 服务端文件命令/帧事件通道。
+                // 服务端文件命令/帧事件通道。
                 // （先到先得 + 死槽接管 + tick 重试）；此处不再覆盖式写入。
                 let (server_file_cmd_tx, mut server_file_cmd_rx) =
                     tokio::sync::mpsc::unbounded_channel::<FileCommand>();
                 let (server_file_frame_tx, mut server_file_frame_rx) =
                     tokio::sync::mpsc::unbounded_channel::<FileTransferFrame>();
 
-                // M13-T006: 服务端文件会话任务（接收落盘 + 推送下载）。
+                // 服务端文件会话任务（接收落盘 + 推送下载）。
                 {
                     let sender_ft = sender_shared.clone();
                     let my_id = global_identity()
@@ -23788,18 +23788,18 @@ impl KirinDeskApp {
                     });
                 }
 
-                // M9/M13-T006: 服务端接收分发——Input → 注入；
+                // M9/: 服务端接收分发——Input → 注入；
                 // FileTransfer → 文件会话；其他 tag 忽略。
                 let file_frame_tx_dispatch = server_file_frame_tx.clone();
-                // M8-T020 SKEY-SEC-002: 锁屏请求审计 detail（对端身份）。
+                // SKEY-SEC-002: 锁屏请求审计 detail（对端身份）。
                 let audit_peer = format!("ip={} client={}", ip, peer_id_ft);
-                // M8-T019 (SRV-PRIV-010/014): 服务端隐私控制器——
+                // (SRV-PRIV-010/014): 服务端隐私控制器——
                 // GUI 模式（headless=false）可绘制黑屏覆盖窗口；
                 // 接收任务与 UI 线程共享（UI 每帧轮询 active_level）。
                 let privacy_controller = Arc::new(Mutex::new(PrivacyController::new(false)));
                 *server_privacy_controller().lock().unwrap() =
                     Some((session_id, privacy_controller.clone()));
-                // M8-T019 (PRIV-SEC-001): 隐私审计独立句柄
+                // (PRIV-SEC-001): 隐私审计独立句柄
                 // （append 模式多句柄并发安全；与主审计流互不干扰）。
                 let mut privacy_audit = kirin_desk_utils::audit::AuditLogger::open_default().ok();
                 let sender_privacy = sender_shared.clone();
@@ -23823,7 +23823,7 @@ impl KirinDeskApp {
                 let mut r132_4_peer_caps = false;
                 // 才打日志，初值 `false` 无法与「帧未送达」区分）。
                 let mut r133_5_caps_initial_seen = false;
-                // M8-T032：服务端 talkback 播放线程——客户端麦克风回传（③）
+                // 服务端 talkback 播放线程——客户端麦克风回传（③）
                 // → 本机扬声器（WASAPI 共享渲染）。与客户端播放线程同模式：
                 // `AudioDecodePipeline::new(rx)` + `start_playback()` + `run()`；
                 // 线程退出条件 = 会话结束（talkback_tx drop → run 返回），
@@ -23885,7 +23885,7 @@ impl KirinDeskApp {
                 let mut kbd_des_failed: u64 = 0;
                 let mut kbd_stats_watch = tokio::time::interval(Duration::from_secs(60));
                 kbd_stats_watch.tick().await; // 消费首次立即 tick（同 kick_watch 口径）
-                // M8-T019 (SRV-PRIV-015): 锁屏解锁轮询节流（1s）。
+                // (SRV-PRIV-015): 锁屏解锁轮询节流（1s）。
                 let mut last_unlock_poll = std::time::Instant::now() - Duration::from_secs(1);
                 // （关键帧补投超时/通道死，`broadcast_packet` 踢出）→ 退出
                 // 本分发任务：停止向被踢观众注入输入 + 收敛本连接各发送端
@@ -23966,7 +23966,7 @@ impl KirinDeskApp {
                         info!("Input receive loop stopping by user request");
                         break;
                     }
-                    // M8-T019 (SRV-PRIV-015): 锁屏被本地解锁 →
+                    // (SRV-PRIV-015): 锁屏被本地解锁 →
                     // 自动恢复注入 + 通知客户端（无需重连）。
                     if last_unlock_poll.elapsed() >= Duration::from_secs(1) {
                         last_unlock_poll = std::time::Instant::now();
@@ -24179,7 +24179,7 @@ impl KirinDeskApp {
                                     }
                                 }
                             };
-                            // M8-T019 (SRV-PRIV-015): 锁屏期间注入暂停
+                            // (SRV-PRIV-015): 锁屏期间注入暂停
                             // （SendInput 对安全桌面无效），解锁自动恢复。
                             if privacy_controller.lock().unwrap().injection_paused() {
                                 dropped_input += 1;
@@ -24253,9 +24253,9 @@ impl KirinDeskApp {
                                                 as u32;
                                         }
                                     }
-                                    // M8-T020 SKEY-SEC-002: 锁屏请求写审计日志
+                                    // SKEY-SEC-002: 锁屏请求写审计日志
                                     // （锁屏调用本身由注入管线执行，单一实现 =
-                                    // M8-T019 privacy::platform_lock_screen）。
+                                    // privacy::platform_lock_screen）。
                                     if ev.kind == InputKind::SpecialKey
                                         && ev.combo == Some(SpecialCombo::LockScreen)
                                     {
@@ -24360,13 +24360,13 @@ impl KirinDeskApp {
                                 }
                             }
                         }
-                        // M8-T019 (SRV-PRIV-001/002/013 + PRIV-SEC-001):
-                        // 隐私模式控制（复用 M8-T018 控制通道）。
-                        // M8-T018: 显示器枚举/切换控制（同通道分发）。
+                        // (SRV-PRIV-001/002/013 + PRIV-SEC-001):
+                        // 隐私模式控制（复用 控制通道）。
+                        // 显示器枚举/切换控制（同通道分发）。
                         ChannelTag::Control => {
                             match bincode::deserialize::<ControlMessage>(&payload) {
                                 Ok(ControlMessage::DisplayListReq) => {
-                                    // M8-T018（SRV-CAP-MON-001）：枚举显示器
+                                    // SRV-CAP-MON-001：枚举显示器
                                     // → DisplayListResp（空时兜底默认屏）。
                                     let displays =
                                         kirin_desk_media::capture::factory::enumerate_monitors(
@@ -24451,7 +24451,7 @@ impl KirinDeskApp {
                             }
                             Err(e) => warn!("File frame decode failed: {}", e),
                         },
-                        // M8-T032：客户端麦克风回传（③）→ 解码 + WASAPI
+                        // 客户端麦克风回传（③）→ 解码 + WASAPI
                         // 播放（talkback）。投递失败 = 播放线程已退出
                         // （会话结束）→ 随接收循环退出。
                         ChannelTag::Audio => {
@@ -24544,7 +24544,7 @@ impl KirinDeskApp {
                         _ => {}
                     }
                 }
-                // M8-T019 (SRV-PRIV-014 安全红线): 断连/停止 →
+                // (SRV-PRIV-014 安全红线): 断连/停止 →
                 // 本地状态复位（黑屏覆盖随之关闭，无网络依赖）。
                 if let Some(was) = privacy_controller.lock().unwrap().on_connection_lost() {
                     audit_record(
@@ -24741,11 +24741,11 @@ impl KirinDeskApp {
                             egui::Stroke::new(1.5_f32, theme.primary),
                         );
                     }
-                    // M10-T004: 单击 → 自动填入 Connect 页并切换标签页。
+                    // 单击 → 自动填入 Connect 页并切换标签页。
                     if click.clicked() {
                         self.fill_connect_from_device(&d);
                     }
-                    // M10-T004/T005: 右键菜单 — 连接 / 编辑 / 删除。
+                    // 右键菜单 — 连接 / 编辑 / 删除。
                     click.context_menu(|ui| {
                         if ui.button(t!("devices.menu.connect")).clicked() {
                             self.fill_connect_from_device(&d);
@@ -24765,7 +24765,7 @@ impl KirinDeskApp {
             });
         }
 
-        // M10-T005: 设备编辑弹窗（昵称 / 域名 / 端口）。
+        // 设备编辑弹窗（昵称 / 域名 / 端口）。
         if let Some(id) = self.editing_device.clone() {
             let mut open = true;
             egui::Window::new(t!("devices.edit.title"))
@@ -24795,7 +24795,7 @@ impl KirinDeskApp {
                             .selectable(true),
                         )
                         .on_hover_text(&id);
-                        // M8-T028 (UI-BTY-027): 设备 ID 只读行一键复制。
+                        // (UI-BTY-027): 设备 ID 只读行一键复制。
                         self.copied_button(ui, theme, &id);
                     });
                     ui.separator();
@@ -24809,7 +24809,7 @@ impl KirinDeskApp {
                         None,
                         false,
                     );
-                    // M8-T037: 地址（IP/域名）——update 选择性保存：可解析为 IP →
+                    // 地址（IP/域名）——update 选择性保存：可解析为 IP →
                     // 更新 IPv6 清空域名；否则视为域名；空 → 地址保持不变。
                     labeled_input(
                         ui,
@@ -24875,9 +24875,9 @@ impl KirinDeskApp {
         }
     }
 
-    /// M10-T004: 设备 → 自动填入 Connect 页并切换标签页。
+    /// 设备 → 自动填入 Connect 页并切换标签页。
     /// 有域名且 DNS 服务商已配置 → Domain 模式（DNS 发现）；否则 IP 模式直连。
-    /// M8-T037: 设备保存的挑战码非空时预填连接表单（表单必填校验不变；
+    /// 设备保存的挑战码非空时预填连接表单（表单必填校验不变；
     /// 设备无挑战码 → 不预填，由用户输入）。
     /// Unknown 回落既有启发式）——非指纹 ID（自定义 ID / relay 注册键
     /// `HD-XXXX`）的 ID 模式记录不再误入 IP 表单（旧判别式只看 64hex 指纹
@@ -24923,11 +24923,11 @@ impl KirinDeskApp {
         self.current_tab = Tab::Connect;
     }
 
-    /// M10-T005: 打开设备编辑弹窗（预填当前值）。
+    /// 打开设备编辑弹窗（预填当前值）。
     fn start_edit_device(&mut self, d: &SavedDevice) {
         self.editing_device = Some(d.id.clone());
         self.edit_nickname = d.nickname.clone();
-        // M8-T037: 地址预填——有域名 → 域名，否则 IPv6（直连回退值）。
+        // 地址预填——有域名 → 域名，否则 IPv6（直连回退值）。
         // label，预填会让用户误当地址编辑、保存时误写进 `domain`）→ 预填空，
         // 保存时空 host 走选择性保存语义（地址字段保持原值）。
         self.edit_host = if device_record_is_id_mode(d) {
@@ -24942,16 +24942,16 @@ impl KirinDeskApp {
         self.edit_challenge = d.challenge.clone();
     }
 
-    /// M10-T005: 提交编辑 → 持久化到 devices.json → 刷新列表。
+    /// 提交编辑 → 持久化到 devices.json → 刷新列表。
     fn commit_device_edit(&mut self, id: &str, port: u16) {
         let nickname = self.edit_nickname.trim().to_string();
         let remark = self.edit_remark.trim().to_string();
         let challenge = self.edit_challenge.trim().to_string();
         let host = self.edit_host.trim().to_string();
-        // M8-T037: 取消「昵称必填」限制——空昵称允许保存（卡片展示回退设备 ID）。
+        // 取消「昵称必填」限制——空昵称允许保存（卡片展示回退设备 ID）。
         match DeviceStore::load() {
             Ok(mut store) => {
-                // M8-T037: 备注名/挑战码允许为空（空挑战码 = 无挑战码）；
+                // 备注名/挑战码允许为空（空挑战码 = 无挑战码）；
                 // 地址选择性保存：空 → 原地址不变（update 语义）。
                 if store.update(id, &remark, &host, port, &nickname, &challenge) {
                     if let Err(e) = store.save() {
@@ -24965,7 +24965,7 @@ impl KirinDeskApp {
         self.editing_device = None;
     }
 
-    /// M10-T005: 删除设备记录 → 持久化 → 刷新列表。
+    /// 删除设备记录 → 持久化 → 刷新列表。
     fn delete_device(&mut self, id: &str) {
         match DeviceStore::load() {
             Ok(mut store) => {
@@ -24980,7 +24980,7 @@ impl KirinDeskApp {
         }
     }
 
-    /// M8-T037: 上移/下移设备（交换相邻 sort_order）→ 持久化 → 刷新列表。
+    /// 上移/下移设备（交换相邻 sort_order）→ 持久化 → 刷新列表。
     /// 首项上移 / 末项下移 / 未知 id 无效果（按钮已按边界禁用，防御性兜底）。
     fn move_device(&mut self, id: &str, up: bool) {
         match DeviceStore::load() {
@@ -25019,10 +25019,10 @@ impl KirinDeskApp {
         ui.heading(t!("connect.title"));
         ui.separator();
 
-        // 本页不再显示顶部状态点行（原「IP Address 上方」位置，M10-T001/M15-T008 块已删）。
+        // 本页不再显示顶部状态点行（原「IP Address 上方」位置，块已删）。
 
-        // M15-T008: 模式行改 SegmentedControl（IP/Domain，选中项品牌色底）
-        // M8-T026-P2 (ID-021): 新增第三段「ID Mode」（relay 设备 ID）。
+        // 模式行改 SegmentedControl（IP/Domain，选中项品牌色底）
+        // (ID-021): 新增第三段「ID Mode」（relay 设备 ID）。
         let mut mode = if self.connect_id_mode {
             2
         } else if self.ip_mode_allowed {
@@ -25060,7 +25060,7 @@ impl KirinDeskApp {
             });
         ui.add_space(4.0);
 
-        // M8-T036 (需求 2): 双栏布局——左 = 表单（输入框 + Connect 按钮），
+        // (需求 2): 双栏布局——左 = 表单（输入框 + Connect 按钮），
         // 右 = 连接日志（原页面底部 LogView 移至右侧，与表单并排）。
         ui.horizontal_top(|ui| {
             ui.vertical(|ui| {
@@ -25100,16 +25100,16 @@ impl KirinDeskApp {
         });
         ui.separator();
 
-        // M8-T036 (需求 2): Connect 页下方展示「连接过的设备」（Devices 页同源
+        // (需求 2): Connect 页下方展示「连接过的设备」（Devices 页同源
         // 数据 self.devices）——单击自动填入表单，右键菜单：连接/编辑/删除。
         self.show_connect_devices(ui, theme);
     }
 
-    /// M8-T036: Connect 页左侧连接表单（IP / Domain / ID 三模式共用入口；
+    /// Connect 页左侧连接表单（IP / Domain / ID 三模式共用入口；
     /// 原 show_connect 主体，双栏化后独立成方法）。
     ///
     /// 禁用（防重复点击/连接中改单）。此前 Connect 页连接期零进度、零失败
-    /// 文案呈现（M8-T038 删进度快照写入，状态条仅在会话弹出页——连接等待期
+    /// 文案呈现（删进度快照写入，状态条仅在会话弹出页——连接等待期
     /// 该窗尚不存在）= 用户「点连接后没反应」的呈现侧根因；按钮置灰亦因
     /// waiting_approval 本地化串失配英文前缀匹配而失效（决策表修）。
     /// - 进行态：置灰 + 阶段文案（≤2.5s 原进度串 `Connecting: …`；≥2.5s
@@ -25264,7 +25264,7 @@ impl KirinDeskApp {
         }
     }
 
-    /// M8-T036: 连接表单主体（IP / Domain / ID 三模式分支）。
+    /// 连接表单主体（IP / Domain / ID 三模式分支）。
     ///
     /// 决策（locale 无关；旧匹配对 waiting_approval 本地化串失配 → 按钮不置灰）。
     fn draw_connect_form_body(
@@ -25274,7 +25274,7 @@ impl KirinDeskApp {
         decision: &crate::policy::ConnectWaitDecision,
     ) {
         if self.ip_mode_allowed {
-            // M15-T008: 表单校验——IP（v4/v6 均可，M8-T033）/ 端口 1-65535 /
+            // 表单校验——IP（v4/v6 均可）/ 端口 1-65535 /
             // 昵称与挑战码必填（UI-CON-010/022）
             let ip_empty = self.connect_ipv6.trim().is_empty();
             let ip_ok = self
@@ -25370,7 +25370,7 @@ impl KirinDeskApp {
             ui.add_space(6.0);
 
             // 匹配对 waiting_approval 本地化串失配 → 按钮不置灰/可重复点击；
-            // M15-T008 Stepper 已迁移弹出页状态条 M8-T038 P1，本页仅以 busy
+            // Stepper 已迁移弹出页状态条 P1，本页仅以 busy
             // 驱动按钮禁用/⏳）。
             let busy = !decision.controls_enabled;
             // 同源的 server_id〔IP/域名模式 = 表单昵称 trim 后入参，归一化幂等〕；
@@ -25380,7 +25380,7 @@ impl KirinDeskApp {
             ));
             let busy = busy || retry_rem.is_some();
             // 进行中 → ⏳ 前缀禁用；必填/非法 → 灰化禁用（UI-CON-010 联动按钮）。
-            // can_connect（M15-T008 既有规则抽 `ip_form_can_connect` 纯函数；
+            // can_connect（既有规则抽 `ip_form_can_connect` 纯函数；
             // 状态决策 = `connect_button_state` 单一决策点，fail-closed：
             // 文件模式同样必填，设计 §2.1）。
             let can_connect = ip_form_can_connect(ip_ok, port_ok, nick_ok, chal_ok);
@@ -25399,7 +25399,7 @@ impl KirinDeskApp {
                 );
             }
 
-            // M11-T002: Connect（桌面）与 Connect Shell（远程终端）并排。
+            // Connect（桌面）与 Connect Shell（远程终端）并排。
             // 三钮单行 = 远程桌面（Primary）/ 文件传输（Secondary）/ 连接
             // Shell（Secondary）——按钮集/排序/权重/键 = `connect_form_buttons`
             // 单一事实源；480px 表单宽单行判定 = `connect_button_row_fits`
@@ -25466,7 +25466,7 @@ impl KirinDeskApp {
                         t!("connect.error.nickname_empty"),
                     );
                 } else {
-                    // M8-T033: v4 不加方括号（`[192.168.1.5]:port` 非法）；
+                    // v4 不加方括号（`[192.168.1.5]:port` 非法）；
                     // v6 保持 `[ip]:port` 规范形式。
                     let addr = if ip.parse::<std::net::Ipv4Addr>().is_ok() {
                         format!("{}:{}", ip, port)
@@ -25478,14 +25478,14 @@ impl KirinDeskApp {
                     // Shell/Desktop 零变化）。
                     let is_shell = do_file || do_shell;
                     let kind = connect_window_kind(do_file, do_shell, false);
-                    // M8-T021 P1 (T021-01-D): 前置查重——同目标已有窗口 → 聚焦 +
+                    // P1 (T021-01-D): 前置查重——同目标已有窗口 → 聚焦 +
                     // 提示，不 spawn（session_id 不分配、TCP/握手零浪费；握手期间
                     // 竞态由 drain 去重兜底）。
                     if self.try_dedup_connect(ui.ctx(), &addr, kind) {
                         conn_log_push_text(ConnLogLevel::Warn, t!("connect.dedup_hit"));
                         tracing::info!("[dedup] connect pre-check hit for {}, not spawning", addr);
                     } else {
-                        // M8-T038 (P1): 进度快照类 connect_status 写入已删除
+                        // (P1): 进度快照类 connect_status 写入已删除
                         // （进度改由弹出页状态条承载；本行保留 tracing 日志）。
                         tracing::info!(
                             "Connect button: target={} nickname={} shell={} file={}",
@@ -25560,7 +25560,7 @@ impl KirinDeskApp {
             // `connect.hint.ip_whitelist_na` 两行常驻说明已收进上方 IP 输入框
             // hover（分隔线随之移除，表单视觉收干净）。
         } else if self.connect_id_mode {
-            // M8-T026-P2 (ID-021): 设备 ID 模式 —— 经 relay 服务器按 ID 解析 +
+            // (ID-021): 设备 ID 模式 —— 经 relay 服务器按 ID 解析 +
             // 三级路径（直连/打洞/中继）连接（ID-010~013）。
             // CLI-HSK-007）必填字段；连接按钮真实发起 ID 模式连接并反馈状态。
             let id_ok = !self.connect_device_id.trim().is_empty();
@@ -25750,7 +25750,7 @@ impl KirinDeskApp {
                 );
             }
             ui.add_space(6.0);
-            // M8-T038 P1 Stepper 已迁移弹出页状态条，本页仅驱动按钮禁用）。
+            // P1 Stepper 已迁移弹出页状态条，本页仅驱动按钮禁用）。
             let busy = !decision.controls_enabled;
             // 限流 SRV-SEC-RL-001/002；退避参数口径 = policy::connect_retry_backoff，
             // 记账点 = 各握手失败终态臂，握手成功清零）。
@@ -25824,9 +25824,9 @@ impl KirinDeskApp {
                         t!("connect.id.error_configure"),
                     );
                 } else {
-                    // M8-T026-P2: ID 模式连接线程：解析 → 验签 → pin → 三级路径 →
+                    // ID 模式连接线程：解析 → 验签 → pin → 三级路径 →
                     // 握手 → 会话（复用 run_client_session_with_stream）。
-                    // M8-T038 (P1): 进度快照类 connect_status 写入已删除（弹出页状态条承载）。
+                    // (P1): 进度快照类 connect_status 写入已删除（弹出页状态条承载）。
                     // 失败原因由线程写入 connection_status（弹出页状态条 + 本页 step 驱动）。
                     tracing::info!(
                         "Connect button (ID mode): device={} nickname={} file={} shell={}",
@@ -25860,7 +25860,7 @@ impl KirinDeskApp {
             }
             // 双钮同挂）。
         } else {
-            // M10-T002: 无 DNS 服务商配置 → 友好提示 + 直接跳转 Domain 页。
+            // 无 DNS 服务商配置 → 友好提示 + 直接跳转 Domain 页。
             // M9-DNS022 (UI-DNS-004): 泛化——任意服务商，不再出现 GoDaddy 字样。
             if !self.dns_configured {
                 ui.add(
@@ -25883,7 +25883,7 @@ impl KirinDeskApp {
                 }
                 ui.separator();
             }
-            // M15-T008: Domain 模式表单（校验 + secret 挑战码）
+            // Domain 模式表单（校验 + secret 挑战码）
             let domain_ok = !self.connect_domain.trim().is_empty();
             let nick_ok = !self.connect_nickname.trim().is_empty();
             let chal_ok = !self.connect_challenge.trim().is_empty();
@@ -25930,7 +25930,7 @@ impl KirinDeskApp {
                 false,
             );
             ui.add_space(6.0);
-            // M8-T038 P1 Stepper 已迁移弹出页状态条，本页仅驱动按钮禁用）。
+            // P1 Stepper 已迁移弹出页状态条，本页仅驱动按钮禁用）。
             let busy = !decision.controls_enabled;
             // 同源的 server_id〔域名模式 = 表单昵称 trim 后入参，归一化幂等〕；
             // 退避参数口径 = policy::connect_retry_backoff，握手成功清零）。
@@ -26009,16 +26009,16 @@ impl KirinDeskApp {
                         t!("connect.error.nickname_empty"),
                     );
                 } else if !self.dns_configured {
-                    // M10-T002: 无 DNS 服务商配置 → 拒绝执行（页面上方已有引导提示）。
+                    // 无 DNS 服务商配置 → 拒绝执行（页面上方已有引导提示）。
                     conn_log_push_text(
                         ConnLogLevel::Error,
                         t!("domain.error.not_configured"),
                     );
                 } else {
-                    // M10-T001 + M15: Domain 模式 — DNS 发现（SRV 端口 + TXT 公钥 +
+                    // + M15: Domain 模式 — DNS 发现（SRV 端口 + TXT 公钥 +
                     // AAAA IPv6）→ 信任解析（known_hosts 优先于 TXT；未命中首次指纹
                     // 确认）→ TCP 连接 → 完整握手（TXT 公钥强制验证）→ 自动保存设备。
-                    // M8-T038 (P1): 进度快照类 connect_status 写入已删除（弹出页状态条承载）。
+                    // (P1): 进度快照类 connect_status 写入已删除（弹出页状态条承载）。
                     tracing::info!(
                         "Connect button: domain={} device={} file={} shell={}",
                         domain,
@@ -26067,7 +26067,7 @@ impl KirinDeskApp {
                             };
                             match discovery_res {
                                 Ok(info) => {
-                                    // M8-T025 P5-4：地址族按配置 `[transport].ip_family`
+                                    // P5-4：地址族按配置 `[transport].ip_family`
                                     // 选择（P1 `select_connect_addr` 契约；哨兵 IPv6 在
                                     // 此消化）；无可用地址 → 明确报错。
                                     let cfg = kirin_desk_utils::config::Config::load()
@@ -26108,7 +26108,7 @@ impl KirinDeskApp {
                                             return;
                                         }
                                     };
-                                    // ── M8-T040：域名模式强制加密 DNS（DDNS-DOH-001/003）──
+                                    // ──：域名模式强制加密 DNS（DDNS-DOH-001/003）──
                                     // GUI 连接路径同样收敛 `resolve_for_connect` 加密解析入口；
                                     // 未配置解析器（mode=off）/ 全端点不可用 → fail-closed 拒连，
                                     // 绝不回退明文（DDNS-UI-007 状态行指示）。
@@ -26145,13 +26145,13 @@ impl KirinDeskApp {
                                                         }
                                                     }
                                                     tracing::info!(
-                                                        "[M8-T040] domain-mode encrypted resolve '{}' -> {} (records={})",
+                                                        "[] domain-mode encrypted resolve '{}' -> {} (records={})",
                                                         host, resolved_addr, addrs.len()
                                                     );
                                                 }
                                                 Err(e) => {
                                                     tracing::error!(
-                                                        "[M8-T040] encrypted DNS unavailable for '{}': {}",
+                                                        "[] encrypted DNS unavailable for '{}': {}",
                                                         host, e
                                                     );
                                                     if let Ok(mut s) = connection_status().lock() {
@@ -26164,7 +26164,7 @@ impl KirinDeskApp {
                                         }
                                         None => {
                                             tracing::error!(
-                                                "[M8-T040] domain-mode connect refused: \
+                                                "[] domain-mode connect refused: \
                                                  no encrypted resolver (mode=off / not configured)"
                                             );
                                             if let Ok(mut s) = connection_status().lock() {
@@ -26209,7 +26209,7 @@ impl KirinDeskApp {
                                         do_shell_domain,
                                         info.device_type == "server",
                                     );
-                                    // M8-T021 P1 (T021-01-D): 前置查重——会话线程
+                                    // P1 (T021-01-D): 前置查重——会话线程
                                     // 无法访问 UI 窗口列表，此处仅查 pending 信号队列；
                                     // 已有窗口场景由 UI 帧 drain 去重兜底。
                                     if pending_signal_has(&addr, kind) {
@@ -26259,7 +26259,7 @@ impl KirinDeskApp {
                                                 // 凭据表为事实源）。
                                                 provider: cfg.dns.provider.clone(),
                                                 credentials: cfg.dns.providers.clone(),
-                                                // M8-T040: 域名模式强制加密 DNS
+                                                // 域名模式强制加密 DNS
                                                 // （DoH/DoT；mode=off/未配置 → None
                                                 // → fail-closed 拒连并提示）。
                                                 resolver:
@@ -26356,9 +26356,9 @@ impl KirinDeskApp {
         }
     }
 
-    /// M8-T036 (需求 2): Connect 页下方「连接过的设备」列表（与 Devices 页同源
+    /// (需求 2): Connect 页下方「连接过的设备」列表（与 Devices 页同源
     /// `self.devices`）——单击自动填入表单并切换 Connect 页，右键菜单
-    /// 连接 / 编辑 / 删除（M10-T004/T005 语义复用，轻量行渲染）。
+    /// 连接 / 编辑 / 删除（语义复用，轻量行渲染）。
     fn show_connect_devices(&mut self, ui: &mut egui::Ui, theme: &Theme) {
         ui.add(
             egui::Label::new(
@@ -26457,7 +26457,7 @@ impl KirinDeskApp {
             });
     }
 
-    /// M8-T037: 「默认受控」联动 Dashboard「允许受控」——默认受控开启
+    /// 「默认受控」联动 Dashboard「允许受控」——默认受控开启
     /// （或经无人值守跟随开启）时立即启动服务端监听；已运行则保持。
     /// bind 失败由每帧运行态同步自动回位开关并显示原因（见 update 帧同步），
     /// 无需额外处理；「允许受控」手动关闭不回写默认受控（单向联动）。
@@ -26520,9 +26520,9 @@ impl KirinDeskApp {
         ui.heading(t!("settings.title"));
         ui.separator();
         egui::ScrollArea::vertical().show(ui, |ui| {
-            // M15-T008: 可折叠分组（Tunnel / Unattended / Identity / Whitelist /
+            // 可折叠分组（Tunnel / Unattended / Identity / Whitelist /
             // Logging / Appearance / Update / About）+ 底部统一 Save。
-            // M8-T035 (需求 4): 「Server」组已移除（Listen Port → Dashboard 服务端
+            // (需求 4): 「Server」组已移除（Listen Port → Dashboard 服务端
             // 设置；音频总开关/高危警告 → Dashboard Server 卡；模式按钮 Dashboard 已有）。
             // M9-DNS022: 「DNS」组移除——服务商选择/凭据表单/测试连接全部迁至
             // Domain 页「服务商」卡（见 `domain_panel.rs`）；`[dns]`/`[godaddy]`
@@ -26531,11 +26531,11 @@ impl KirinDeskApp {
             // M9-DNS022: 「DNS」分组已移除——服务商选择/凭据表单/测试连接
             // 迁至 Domain 页「服务商」卡；此处不再渲染（见 `domain_panel.rs`）。
 
-            // M8-T035 (需求 4/5): Settings「Server」组整体移除——Listen Port 迁
-            // Dashboard「服务端设置」、连接模式迁 Dashboard 工作模式按钮（M8-T034）、
+            // (需求 4/5): Settings「Server」组整体移除——Listen Port 迁
+            // Dashboard「服务端设置」、连接模式迁 Dashboard 工作模式按钮、
             // 音频总开关与高危警告迁 Dashboard Server 卡（会话级 toggle / 挑战码
             // 所在页提示闭环）；静态 temp_mode 仅由 CLI/config 管理（GUI 无入口）。
-            // M8-T039: 「Tunnel (内网穿透)」分组整体移除——迁至顶部导航独立页
+            // 「Tunnel (内网穿透)」分组整体移除——迁至顶部导航独立页
             // （show_tunnel，Tab::Tunnel）；本页不再渲染（见 show_tunnel）。
 
             // 2026-09-28 裁定：呈现面显著化，零行为变化）：设置页常显显著
@@ -26552,7 +26552,7 @@ impl KirinDeskApp {
                 });
             ui.add_space(6.0);
 
-            // M13-T005 (UA-UI-001): 无人值守模式卡片——总开关 + 子选项 +
+            // (UA-UI-001): 无人值守模式卡片——总开关 + 子选项 +
             // 自启注册状态 + 安全提示。保存按钮统一落盘（见下方 Save 分支）。
             egui::CollapsingHeader::new(t!("settings.unattended.title")).show(ui, |ui| {
                 ui.add(
@@ -26564,8 +26564,8 @@ impl KirinDeskApp {
                     .selectable(false),
                 );
                 ui.add_space(4.0);
-                // M8-T035 (需求 3) + M8-T037: 三个开关滑块横向一排——无人值守
-                // （master）/ 开机自启 / 默认受控。M8-T037 联动：无人值守
+                // (需求 3) + : 三个开关滑块横向一排——无人值守
+                // （master）/ 开机自启 / 默认受控。 联动：无人值守
                 // 开 → 开机自启、默认受控跟随打开；关 → 跟随关闭（仅改配置，
                 // 不停止运行中监听）；两个子开关均可独立翻转（只改自身）。
                 // 默认受控开启 → 立即联动 Dashboard「允许受控」（启动监听）。
@@ -26582,7 +26582,7 @@ impl KirinDeskApp {
                     .on_hover_text(t!("settings.unattended.master_hint"));
                     if ua_resp.clicked() {
                         self.unattended_enabled = !ua;
-                        // M8-T037: 跟随打开/关闭（内存即时；保存时统一落盘）。
+                        // 跟随打开/关闭（内存即时；保存时统一落盘）。
                         self.unattended_autostart = !ua;
                         self.unattended_auto_server = !ua;
                         // 子开关跟随开启 → 默认受控立即生效（启动服务端监听）。
@@ -26598,7 +26598,7 @@ impl KirinDeskApp {
                     if asb_resp.clicked() {
                         self.unattended_autostart = !asb;
                     }
-                    // 默认受控（原「启动时自动开启服务端」，M8-T037 改名）——
+                    // 默认受控（原「启动时自动开启服务端」，改名）——
                     // 开启立即联动 Dashboard「允许受控」；关闭仅下次启动不自动监听。
                     let ass = self.unattended_auto_server;
                     let ass_resp = toggle_switch(
@@ -26683,7 +26683,7 @@ impl KirinDeskApp {
                     theme,
                     t!("settings.identity.device_id"),
                     &mut self.device_id,
-                    // M8-T031: 留空保存 = 自动（系统盘硬盘 UUID）。
+                    // 留空保存 = 自动（系统盘硬盘 UUID）。
                     t!("settings.identity.auto_hint"),
                     Validity::None,
                     None,
@@ -26746,7 +26746,7 @@ impl KirinDeskApp {
                     .selectable(false),
                 );
 
-                // M8-T027 (UI-IDWL-001): 设备 ID 白名单文本框（逗号/换行分隔，
+                // (UI-IDWL-001): 设备 ID 白名单文本框（逗号/换行分隔，
                 // 保存写 `[network].allowed_ids` 永久条目，重启持久化）。
                 ui.add_space(8.0);
                 // 双入口互通；切换即落盘）。
@@ -26787,7 +26787,7 @@ impl KirinDeskApp {
                     theme,
                     t!("settings.whitelist.ids_hint"),
                 );
-                // M8-T027 (UI-IDWL-002): ID 白名单条目列表（永久/过期标记 +
+                // (UI-IDWL-002): ID 白名单条目列表（永久/过期标记 +
                 // 逐条删除；过期条目自动失效但仍展示直至被删/清理）。
                 ui.add_space(6.0);
                 ui.add(
@@ -26877,7 +26877,7 @@ impl KirinDeskApp {
                         };
                         // 即时生效：update() 帧首 apply_theme 检测明暗变化即全量重设。
                     }
-                    // M8-T038: 语言三段（System / 中文 / English）——选项以自身语言
+                    // 语言三段（System / 中文 / English）——选项以自身语言
                     // 显示（语言选择器惯例）；选中即即时切换（与 Theme 同款交互）。
                     ui.add_space(6.0);
                     ui.add(
@@ -27014,7 +27014,7 @@ impl KirinDeskApp {
                 }
             });
 
-            // M14-T005: 自动更新分组——检查 / 下载进度 / 安装重启。
+            // 自动更新分组——检查 / 下载进度 / 安装重启。
             // 状态由后台线程写入 `update_state()`，本面板每帧读取。
             egui::CollapsingHeader::new(t!("settings.update.title"))
                 .default_open(true)
@@ -27190,9 +27190,9 @@ impl KirinDeskApp {
                 if action_button(ui, theme, ButtonKind::Primary, t!("settings.save"), ButtonState::Enabled)
                     .clicked()
                 {
-                    // M8-T027 (UI-IDWL-001): 改为基于**现有配置**修改而非重建——
+                    // (UI-IDWL-001): 改为基于**现有配置**修改而非重建——
                     // 否则 GUI 保存会清空 CLI 添加的域名/ID 过期条目（`whitelist`/
-                    // `id_whitelist`）与 tunnel 服务端参数（M8-T026）。
+                    // `id_whitelist`）与 tunnel 服务端参数。
                     // 不得以 unwrap_or_default 的全默认配置整份写盘冲掉用户
                     // 已有字段。
                     let mut cfg = match kirin_desk_utils::config::Config::load() {
@@ -27225,7 +27225,7 @@ impl KirinDeskApp {
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty())
                         .collect();
-                    // M8-T027 (UI-IDWL-001): ID 白名单文本框（逗号/换行分隔）→
+                    // (UI-IDWL-001): ID 白名单文本框（逗号/换行分隔）→
                     // `[network].allowed_ids` 永久条目（即时生效：accept 循环
                     // 逐连接读取配置快照）。
                     let new_ids: Vec<String> = self
@@ -27238,18 +27238,18 @@ impl KirinDeskApp {
                     cfg.network.ip_mode_allowed = self.ip_mode_allowed;
                     cfg.network.id_mode_allowed = self.id_mode_allowed;
                     cfg.network.temp_mode = self.temp_mode;
-                    // M15-T008: 主题模式持久化（`[ui] theme`，默认 light）
+                    // 主题模式持久化（`[ui] theme`，默认 light）
                     cfg.ui.theme = self.theme_mode.as_str().to_string();
-                    // M8-T038: 语言选择持久化（`[ui] language`，默认 system）
+                    // 语言选择持久化（`[ui] language`，默认 system）
                     cfg.ui.language = self.ui_language.clone();
-                    // M13-T005 (UA-CFG-002): 无人值守配置持久化
+                    // (UA-CFG-002): 无人值守配置持久化
                     cfg.unattended.enabled = self.unattended_enabled;
                     cfg.unattended.auto_start_server = self.unattended_auto_server;
                     cfg.unattended.auto_start_on_boot = self.unattended_autostart;
                     // 双臂消费点 = 被叫端准入兜底臂 + 发起端 ID 入口预检臂，
                     // 即时读配置，保存后下次连接/准入即生效）。
                     cfg.tunnel.forbid_mutual_control = self.forbid_mutual_control;
-                    // M8-T039: Tunnel 字段不再归 Settings 保存——迁移至 Tunnel 页
+                    // Tunnel 字段不再归 Settings 保存——迁移至 Tunnel 页
                     // 独立「保存」（tunnel_save，不写 enabled / auto_start）。
                     match cfg.save() {
                         Ok(()) => {
@@ -27281,7 +27281,7 @@ impl KirinDeskApp {
                             if let Ok(p) = self.listen_port.parse::<u16>() {
                                 self.connect_port = p.to_string();
                             }
-                            // M13-T005 (UA-BOOT-001/002): 自启开关与系统状态同步——
+                            // (UA-BOOT-001/002): 自启开关与系统状态同步——
                             // 开启则注册用户级自启，关闭则移除（幂等）。
                             if self.unattended_autostart {
                                 if let Err(e) = kirin_desk_utils::autostart::install() {
@@ -27297,9 +27297,9 @@ impl KirinDeskApp {
                         }
                     }
                 }
-                // M15-T008: 保存反馈改横幅 Badge（success/danger）
+                // 保存反馈改横幅 Badge（success/danger）
                 if !self.settings_status.is_empty() {
-                    // M8-T038: 成功文案走 t!()，此处与同键结果比较判定语义色。
+                    // 成功文案走 t!()，此处与同键结果比较判定语义色。
                     let kind = if self.settings_status == t!("settings.status.saved") {
                         BadgeKind::Success
                     } else {
@@ -27311,7 +27311,7 @@ impl KirinDeskApp {
         });
     }
 
-    /// M8-T039 §3.1/§3.4：内网穿透独立页（通用 TCP 反向代理）。
+    /// §3.1/§3.4：内网穿透独立页（通用 TCP 反向代理）。
     fn show_tunnel(&mut self, ui: &mut egui::Ui, theme: &Theme) {
         // 磁盘 IO；与 Connect 页 ID 配置齐备判定同口径）。
         self.nodes_load();
@@ -27472,7 +27472,7 @@ impl KirinDeskApp {
                     .response
                     .on_hover_text(t!("tunnel.proxies_format"));
             } else {
-                // Server 区块（M8-T039 P4：配置输入 + 校验；Token 行含 ✏️📋）。
+                // Server 区块（P4：配置输入 + 校验；Token 行含 ✏️📋）。
                 ui.heading(t!("tunnel.server.title"));
                 let addrs_ok = self.tunnel_addrs_valid();
                 let port_ok = self.tunnel_port_valid();
@@ -27658,7 +27658,7 @@ impl KirinDeskApp {
             });
     }
 
-    /// M8-T039：Tunnel 页保存（§3.4.3）——只落盘配置字段，不写 enabled / auto_start。
+    /// Tunnel 页保存（§3.4.3）——只落盘配置字段，不写 enabled / auto_start。
     ///
     /// 原因的可见提示（旧实现 `if let Ok` 吞错，用户实报「点保存没反应」）；
     /// 兜底 client、server_addr/token 落盘前 trim）。
@@ -27673,13 +27673,13 @@ impl KirinDeskApp {
         }
     }
 
-    /// M8-T039 P4：保存允许判定——Server 模式且 Server 区块输入非法 → 禁用保存。
+    /// P4：保存允许判定——Server 模式且 Server 区块输入非法 → 禁用保存。
     /// 校验不阻断保存路径之外的行为（模式切换 / 表单编辑 / ✏️ / 📋 始终可用）。
     fn tunnel_save_allowed(&self) -> bool {
         self.tunnel_server_form_valid()
     }
 
-    /// M8-T039 P4：Server 区块表单整体合法（渲染红边与保存允许判定同源，
+    /// P4：Server 区块表单整体合法（渲染红边与保存允许判定同源，
     /// 防双写漂移；Client 模式无 Server 区块校验）。
     fn tunnel_server_form_valid(&self) -> bool {
         if self.tunnel_mode != "server" {
@@ -27688,7 +27688,7 @@ impl KirinDeskApp {
         self.tunnel_addrs_valid() && self.tunnel_port_valid() && self.tunnel_range_valid()
     }
 
-    /// M8-T039 P4：监听地址合法——空（含纯空白）= 合法（落盘空串 → relay
+    /// P4：监听地址合法——空（含纯空白）= 合法（落盘空串 → relay
     /// 回退默认双栈，P7）；非空 → `parse_bind_addr_list` 各分支失败（非 IP /
     /// 空段 / 域名）→ 非法。端口不参与地址段校验（由 `tunnel_port_valid` 独立提示）。
     fn tunnel_addrs_valid(&self) -> bool {
@@ -27699,7 +27699,7 @@ impl KirinDeskApp {
         kirin_desk_utils::config::parse_bind_addr_list(s, 7000).is_ok()
     }
 
-    /// M8-T039 P4：端口合法（1-65535，对齐 Dashboard 端口校验先例）。
+    /// P4：端口合法（1-65535，对齐 Dashboard 端口校验先例）。
     fn tunnel_port_valid(&self) -> bool {
         self.tunnel_bind_port
             .trim()
@@ -27708,14 +27708,14 @@ impl KirinDeskApp {
             .unwrap_or(false)
     }
 
-    /// M8-T039 P4：端口范围合法（"start-end"，复用 cli.rs
+    /// P4：端口范围合法（"start-end"，复用 cli.rs
     /// `parse_tunnel_port_range`；空串合法 = remote_port 显式必填语义）。
     fn tunnel_range_valid(&self) -> bool {
         let s = self.tunnel_port_range.trim();
         s.is_empty() || crate::cli::parse_tunnel_port_range(s).is_some()
     }
 
-    /// M8-T039 §3.3：✏️ 生成随机高熵 Token（32 字节 → 64 hex）并**立即落盘**
+    /// §3.3：✏️ 生成随机高熵 Token（32 字节 → 64 hex）并**立即落盘**
     /// （覆盖旧 token，生成即生效；落盘失败仅提示，输入框值不回滚）。
     /// 「Token 保存失败」，用户无从排查）。
     fn tunnel_gen_token(&mut self) {
@@ -28771,7 +28771,7 @@ impl KirinDeskApp {
         });
     }
 
-    /// M8-T039 §3.4.3: 启动隧道（GUI 唯一运行控制入口）。
+    /// §3.4.3: 启动隧道（GUI 唯一运行控制入口）。
     /// 校验（fail-closed）→ 自动落盘当前表单 → auto_start=true 落盘 → 后台运行。
     fn tunnel_start(&mut self) {
         // ── 1. 校验（对齐 cli.rs cmd_tunnel_serve 4860-4871 / cmd_tunnel_start）──
@@ -28983,7 +28983,7 @@ impl KirinDeskApp {
         });
     }
 
-    /// M8-T039 §3.4.3: 停止隧道（auto_start=false 落盘 → 优雅关闭 → 线程回收）。
+    /// §3.4.3: 停止隧道（auto_start=false 落盘 → 优雅关闭 → 线程回收）。
     /// 幂等：未运行点「停止」→ 仅落盘 false + 复位状态（无句柄即跳过关闭调用）。
     fn tunnel_stop(&mut self) {
         self.tunnel_auto_start = false;
@@ -29015,7 +29015,7 @@ impl KirinDeskApp {
         }
     }
 
-    /// M8-T039 P5：隧道运行态错误写入（状态行跨帧展示；auto_start 不回位
+    /// P5：隧道运行态错误写入（状态行跨帧展示；auto_start 不回位
     /// 的「保留 intent」语义由调用路径保证——校验失败先于落盘，不写 true）。
     fn tunnel_set_error(&self, msg: &str) {
         let mut st = tunnel_runtime_state().lock().unwrap();
@@ -29026,7 +29026,7 @@ impl KirinDeskApp {
 }
 
 // ════════════════════════════════════════════════════════════════
-// M9-T007: 客户端输入捕获单测（键映射表 / 节流合并队列）
+// 客户端输入捕获单测（键映射表 / 节流合并队列）
 // ════════════════════════════════════════════════════════════════
 #[cfg(test)]
 mod m9_input_tests {
@@ -30094,7 +30094,7 @@ mod r110a1_tests {
     }
 
     /// `connect.button.connect`（键名不动、键文更名）；文件传输/连接 Shell =
-    /// Secondary + 各自键（M11-T002 先例）。
+    /// Secondary + 各自键（先例）。
     #[test]
     fn test_r110a1_button_kind_and_key() {
         assert_eq!(connect_button_kind(ConnectButtonRole::Desktop), ButtonKind::Primary);
@@ -30501,7 +30501,7 @@ mod r110v13b2_tests {
         .with_consent_switches(file_transfer, clipboard)
     }
 
-    /// 用户 2026-09-28 裁定 C-1+CX-1+CX-2 三件合并一次重冻，
+    /// 用户 2026-09-28 裁定 C-1++ 三件合并一次重冻，
     /// `PROTOCOL_VERSION = 4`（core/handshake.rs 常量子集，本断言防位漂移；
     /// 无兼容包袱：旧对端互连 fail-closed，需两端升级）。
     #[test]
@@ -38925,7 +38925,7 @@ mod r79b_tests {
     }
 
     /// （`run_client_session_with_channel`）完整收尾 **<1s**：
-    /// ① lost 分发 → 输入任务退出 → `input_tx.is_closed()`（UI M15-T008
+    /// ① lost 分发 → 输入任务退出 → `input_tx.is_closed()`（UI 
     /// ② 接收任务收尾（drop pkt_tx → 解码线程退出 → join 返回）→
     ///    「[session] ended: connection closed」臂（会话函数返回 = 该臂
     ///    执行——窗口全程未关闭，close 臂不可达）→ **无 join 悬挂**；
@@ -42738,7 +42738,7 @@ mod r81d_tests {
         );
     }
 
-    /// `--no-audio` 全关）；总开 → 三子开关保持现状不回写默认（M8-T035：
+    /// `--no-audio` 全关）；总开 → 三子开关保持现状不回写默认（：
     /// 「总开关 开→关→开」循环后「服务端音频」仍保持关）。
     #[test]
     fn r81d_audio_master_cascade_semantics() {
@@ -42754,7 +42754,7 @@ mod r81d_tests {
         assert_eq!(
             audio_master_cascade(true, false, true, false),
             (false, true, false),
-            "总开关开不回写子开关（服务端音频保持关 = M8-T035）"
+            "总开关开不回写子开关（服务端音频保持关 =）"
         );
         assert_eq!(
             audio_master_cascade(true, true, false, true),
@@ -42764,7 +42764,7 @@ mod r81d_tests {
     }
 
     /// （UI 显示态每帧读同一 getter，故显示态恒 = 原子量真值）；默认关
-    /// （M8-T035）。原子量为进程级静态，经 `server_media::test_serial()`
+    /// 。原子量为进程级静态，经 `server_media::test_serial()`
     /// 串行化防并行测试互扰；先存后复原（r79b 同口径）。
     #[tokio::test]
     async fn r81d_server_audio_toggle_atomic_sync() {
@@ -46511,7 +46511,7 @@ mod r129_tests {
 // 本模块 = 生产 GUI 服务端栈 1:1 复刻（std::thread + 多线程 Runtime +
 // `block_on`{ TcpServer::bind → spawn_server_clip_poller →
 // start_device_registration(Gui) → server_accept_loop(on_accept → spawn
-// handle_incoming_connection) } + 进程内 relay〔M8-T026-P2 同源 harness〕）。
+// handle_incoming_connection) } + 进程内 relay〔 同源 harness〕）。
 // 客户端 = 完整 shell 握手 + Fs-List 文件帧（文件窗等价）+ 保持数秒 +
 // drop 流（关窗）。
 //
@@ -46630,7 +46630,7 @@ mod r133_tests {
         ));
         std::fs::create_dir_all(&tmp).unwrap();
 
-        // ── 1. 进程内 relay（M8-T026-P2 同源：127.0.0.1 + 短心跳——sweep 周期
+        // ── 1. 进程内 relay（同源：127.0.0.1 + 短心跳——sweep 周期
         //    = heartbeat_timeout/2 = 1s；心跳死 → ~3s 内判离线，测试判定窗口
         //    关窗后 5s = 确定性）。
         let relay_key = tmp.join("relay_key.der");
@@ -48147,7 +48147,7 @@ mod r137_11_tests {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.heading(t!("dashboard.title"));
                     ui.separator();
-                    // 生产同构：M8-T035 整体滚动区。
+                    // 生产同构：整体滚动区。
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         // ① 身份卡（生产组件 + 探针值；五行的生产形态）。
                         {
@@ -50809,7 +50809,7 @@ mod r137_9_tests {
         );
         assert!(slot.is_some());
         r137_9_notice_close(&mut slot);
-        assert!(slot.is_none(), "手动关闭 = 即时消失（不候 5s，M8-T019 语义）");
+        assert!(slot.is_none(), "手动关闭 = 即时消失（不候 5s， 语义）");
         r137_9_notice_close(&mut slot);
         assert!(slot.is_none(), "重复关闭幂等");
     }

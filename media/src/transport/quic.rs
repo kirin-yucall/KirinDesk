@@ -148,8 +148,8 @@ pub fn make_client_config() -> quinn::ClientConfig {
         .expect("QuicClientConfig from rustls ClientConfig");
 
     let mut transport = TransportConfig::default();
-    // M8-T025 P5-3：idle 超时 30s → 10s —— 会话降级判定辅助（QUIC 失效时
-    // is_alive() 尽快翻转 false，配合会话层 500ms 轮询触发 TCP 重建；M8-T009 §12.2）。
+    // P5-3：idle 超时 30s → 10s —— 会话降级判定辅助（QUIC 失效时
+    // is_alive() 尽快翻转 false，配合会话层 500ms 轮询触发 TCP 重建）。
     transport.max_idle_timeout(Some(Duration::from_secs(10).try_into().unwrap()));
 
     let mut config = quinn::ClientConfig::new(Arc::new(quic_client_config));
@@ -177,7 +177,7 @@ pub fn make_server_config(
         .map_err(|e| TransportError::Quic(format!("QuicServerConfig: {e}")))?;
 
     let mut transport = TransportConfig::default();
-    // M8-T025 P5-3：同客户端 —— idle 10s，会话降级判定辅助。
+    // P5-3：同客户端 —— idle 10s，会话降级判定辅助。
     transport.max_idle_timeout(Some(Duration::from_secs(10).try_into().unwrap()));
 
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(quic_server_config));
@@ -341,7 +341,7 @@ impl QuicConnection {
         )
     }
 
-    /// 本地地址（M8-T026-P1 PATH-007 路径采样：识别当前源地址/映射变化）。
+    /// 本地地址（PATH-007 路径采样：识别当前源地址/映射变化）。
     pub fn local_ip(&self) -> Option<std::net::IpAddr> {
         self.conn.local_ip()
     }
@@ -369,7 +369,7 @@ impl QuicConnection {
 
 /// 绑定 UDP socket：优先双栈（`[::]:port` + IPV6_V6ONLY=false，可收 v4-mapped），
 /// 平台不支持双栈（socket 创建/bind 失败或 `set_only_v6(false)` 失败）→ 回退
-/// `0.0.0.0:port`（仅 v4，`warn!` 告警）。见 M8-T025_P3 Task P3-1。
+/// `0.0.0.0:port`（仅 v4，`warn!` 告警）。见 Task P3-1。
 ///
 /// 说明：`std::net::UdpSocket` 没有 `set_only_v6`（仅 `TcpSocket` 有），
 /// 双栈 socket 需经 socket2 预建（bind 前设 V6ONLY=false，与 quinn 内部一致）。
@@ -462,7 +462,7 @@ impl QuicEndpoint {
     }
 
     // ════════════════════════════════════════════════════════════
-    // M8-T026-P1 (PUNCH-001 / PATH-004): 预建 socket 端点（打洞路径复用）
+    // (PUNCH-001 / PATH-004): 预建 socket 端点（打洞路径复用）
     // ════════════════════════════════════════════════════════════
 
     /// 服务端：在**外部预建的 socket**（打洞成功后交还的 UDP socket）上建端点。

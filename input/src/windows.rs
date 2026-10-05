@@ -82,7 +82,7 @@ pub fn inject_input(_event: &InputEvent) -> Result<(), String> {
 }
 
 // ============================================================================
-// 注入流水线 API（M8-T008_P1E，Task T5.2）：面向 `injector::InputEvent`
+// 注入流水线 API（Task T5.2）：面向 `injector::InputEvent`
 // 与上面的旧 `inject_input(&capture::InputEvent)` 并列独立。
 // ============================================================================
 
@@ -191,7 +191,7 @@ pub fn map_scan_code(key: u32) -> Option<u16> {
         k if k == Key::Left as u32 => EXTENDED | 0x4B,
         k if k == Key::Down as u32 => EXTENDED | 0x50,
         k if k == Key::Up as u32 => EXTENDED | 0x48,
-        // LWin=0x5B 扩展键——与 M8-T020 `scan` 模块口径一致）。桌面端独立
+        // LWin=0x5B 扩展键——与 `scan` 模块口径一致）。桌面端独立
         // down/up 事件经此表走 KEYEVENTF_SCANCODE = 物理层键流同流，被控端
         // IME 的 Shift 中英文切换 / Ctrl+Space 检测直接监听（IME 切换快捷键
         // 修复的关键注入参数；VK-only 补按路仅保留给移动端 flag-only 路径）。
@@ -497,7 +497,7 @@ pub fn inject(ev: &PipeEvent, dst_w: u32, dst_h: u32) -> Result<(), InjectError>
             inputs.push(INPUT { type_: INPUT_KEYBOARD, u });
         }
         InputKind::SpecialKey => {
-            // M8-T020: 系统组合键——独立序列注入（含 Alt+Tab 延迟 / 锁屏非注入路径）。
+            // 系统组合键——独立序列注入（含 Alt+Tab 延迟 / 锁屏非注入路径）。
             let combo = ev.combo.ok_or_else(|| {
                 InjectError::InvalidEvent("SpecialKey event without combo".to_string())
             })?;
@@ -525,7 +525,7 @@ pub fn inject(ev: &PipeEvent, dst_w: u32, dst_h: u32) -> Result<(), InjectError>
 }
 
 // ============================================================================
-// M8-T020 特殊键注入（SRV-SKEY-010/011/012/016）
+// 特殊键注入（SRV-SKEY-010/011/012/016）
 // ============================================================================
 
 /// PS/2 Set 1 扫描码（KEYEVENTF_SCANCODE 注入，规避 Windows 10+ 对
@@ -1064,7 +1064,7 @@ mod tests {
         assert_eq!(map_scan_code(0xFFFF_FFFF), None);
     }
 
-    /// M8-T020 T002: 修饰键 + 主键 四步序列（按住→点按→释放）。
+    /// T002: 修饰键 + 主键 四步序列（按住→点按→释放）。
     fn plan_keys(combo: SpecialCombo) -> Vec<Kbd> {
         match plan_special_key(combo) {
             SpecialKeyPlan::Keys { batches, inter_batch_delay_ms } => {

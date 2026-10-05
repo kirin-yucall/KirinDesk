@@ -1,7 +1,7 @@
-//! M15-T004 / SEC-PATCH: 已知主机指纹存储（客户端 + 服务端双视角）。
+//! SEC-PATCH: 已知主机指纹存储（客户端 + 服务端双视角）。
 //!
 //! 本文件包含两个方向的「已知主机」存储（路径均经 `dirs` crate 跨平台解析，
-//! 复用 `Config::config_dir()`，同 M1-T002 策略）：
+//! 复用 `Config::config_dir()`，同 策略）：
 //!
 //! - **[`KnownClientsStore`]（服务端视角，SRV-SEC-KH-001/002）**：服务端维护
 //!   `device_id → Ed25519 公钥指纹` 列表（`kirin_desk/known_clients.json`）。握手
@@ -122,7 +122,7 @@ fn backup_corrupt(path: &Path) {
 }
 
 impl KnownClientsStore {
-    /// 默认存储路径: `{config_dir}/kirin_desk/known_clients.json`（同 M1-T002 策略）。
+    /// 默认存储路径: `{config_dir}/kirin_desk/known_clients.json`（同 策略）。
     pub fn default_path() -> Result<PathBuf, KnownClientsError> {
         let base = Config::config_dir().map_err(|_| KnownClientsError::NoConfigDir)?;
         Ok(base.join("known_clients.json"))
@@ -374,7 +374,7 @@ mod tests {
     }
 }
 
-// ── 客户端视角：已知主机指纹验证（CLI-KH-001..004 / M15-T004） ──────────────
+// ── 客户端视角：已知主机指纹验证（CLI-KH-001..004 /） ──────────────
 
 /// 客户端「已知主机」记录：设备 ID → 公钥指纹。
 ///
@@ -429,7 +429,7 @@ pub struct KnownHostsStore {
 }
 
 impl KnownHostsStore {
-    /// 默认存储路径: `{config_dir}/kirin_desk/known_hosts`（CLI-KH-002，同 M1-T002 策略）。
+    /// 默认存储路径: `{config_dir}/kirin_desk/known_hosts`（CLI-KH-002，同 策略）。
     pub fn default_path() -> Result<PathBuf, KnownHostsError> {
         let base = Config::config_dir().map_err(|_| KnownHostsError::NoConfigDir)?;
         Ok(base.join("known_hosts"))

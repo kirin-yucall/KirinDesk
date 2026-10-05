@@ -1,5 +1,5 @@
 #!/bin/sh
-# KirinDesk postinst — M14-T003
+# KirinDesk postinst — 
 # 注册并启用 systemd 服务；设置 KIRINDESK_NO_SERVICE=1 可跳过。
 set -e
 

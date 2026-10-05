@@ -1,7 +1,7 @@
-//! M8-T026 T002: 隧道服务端（frps 等价）— 控制端口 / Login 校验 + 速率限制 /
+//! T002: 隧道服务端（frps 等价）— 控制端口 / Login 校验 + 速率限制 /
 //! ProxyManager 注册表 / work 连接配对与泵流 / 心跳判死 / 级联清理 / 审计。
 //!
-//! - 控制端口监听（`[::]` 优先 + `0.0.0.0` 回退，对齐 M8-T025 双栈）；
+//! - 控制端口监听（`[::]` 优先 + `0.0.0.0` 回退，对齐 双栈）；
 //! - 每 frpc 连接一个 Control 任务；新连接首帧区分 `Login`（新会话）与
 //!   `WorkConnHeader`（数据面回连），其余一律关闭；
 //! - work 配对：公网 accept → 生成 `conn_id` → `StartWorkConn` → 8s 等回连 →
@@ -154,7 +154,7 @@ pub enum DirectoryFrameOutcome {
 pub struct TunnelServerConfig {
     /// 控制端口（0 = 系统分配，测试用）。
     pub bind_port: u16,
-    /// 显式监听地址列表（多地址多监听器，M8-T039 §3.2.2；空 = 默认
+    /// 显式监听地址列表（多地址多监听器，§3.2.2；空 = 默认
     /// `[::]` 优先 + `0.0.0.0` 回退，兼容现状）。每个地址独立 `TcpListener`；
     /// **IPv6 地址一律 `set_only_v6(true)`**（与 v4 显式监听并存，规避平台
     /// 双栈差异与 EADDRINUSE 冲突）。
@@ -184,7 +184,7 @@ pub struct TunnelServerConfig {
     pub preauth_per_ip: usize,
     /// 审计回调（None = 不记录）。
     pub audit: Option<Arc<dyn AuditSink>>,
-    /// M8-T026-P2 (ID-SEC-001)：服务器 Ed25519 密钥路径（None = 默认
+    /// (ID-SEC-001)：服务器 Ed25519 密钥路径（None = 默认
     /// `~/.kirin_desk/relay_server_key.pem`；测试注入临时路径避免污染真实目录）。
     pub server_key_path: Option<std::path::PathBuf>,
     /// 隧道控制连接上的打洞帧解码校验后丢弃审计，不静默忽略）。
@@ -236,7 +236,7 @@ pub enum TunnelServerError {
     Bind { port: u16, source: std::io::Error },
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
-    /// M8-T026-P2 (ID-SEC-001)：服务器密钥加载/生成失败。
+    /// (ID-SEC-001)：服务器密钥加载/生成失败。
     #[error("server key error: {0}")]
     ServerKey(String),
 }
@@ -252,7 +252,7 @@ struct ClientSession {
     last_activity: Mutex<Instant>,
     /// 后台任务（代理监听 + work 泵流）；级联清理时全部 abort。
     tasks: Mutex<Vec<AbortHandle>>,
-    /// M8-T026-P2 (ID-001)：本会话注册的设备 ID（None = 纯穿透/纯解析会话）。
+    /// (ID-001)：本会话注册的设备 ID（None = 纯穿透/纯解析会话）。
     device_id: Mutex<Option<String>>,
     /// （首次打洞帧时经 [`RendezvousServer::alloc_conn_id`] 分配并缓存；
     /// 会话清理时同步移除，PUNCH-003 无状态残留）。
@@ -294,7 +294,7 @@ struct ServerShared {
     pending_by_target: Mutex<HashMap<String, usize>>,
     /// accept 时 acquire，首帧分发任务完成时 release）。
     preauth: Mutex<PreAuthLimiter>,
-    /// M8-T026-P2 (ID-002)：设备在线表（注册/解析/中继配对）。
+    /// (ID-002)：设备在线表（注册/解析/中继配对）。
     registry: Arc<Registry>,
     rendezvous: Option<Arc<RendezvousServer>>,
     /// 优雅关闭：置位后 accept 循环停止（`TunnelServer::shutdown`）。
@@ -361,8 +361,8 @@ impl TunnelServer {
         self.shutdown_handle().shutdown();
     }
 
-    /// 绑定控制端口（M8-T039：多地址多监听器。`bind_addrs` 为空 → 默认
-    /// `[::]` 优先 + `0.0.0.0` 回退，对齐 M8-T025 双栈；显式指定 → 每个地址
+    /// 绑定控制端口（多地址多监听器。`bind_addrs` 为空 → 默认
+    /// `[::]` 优先 + `0.0.0.0` 回退，对齐双栈；显式指定 → 每个地址
     /// 独立 `TcpListener`，IPv6 一律 `set_only_v6(true)`（与 v4 显式监听并存，
     /// 规避平台双栈差异与 EADDRINUSE 冲突；S-24/F-29 语义不变——自测 relay
     /// 传 `["127.0.0.1:0"]` 仅监听回环）。任一地址绑定失败 → 整体失败）。
@@ -372,7 +372,7 @@ impl TunnelServer {
     /// 同端口（TNL-STAB-003 重连场景的生产前提）。
     pub async fn bind(cfg: TunnelServerConfig) -> Result<Self, TunnelServerError> {
         let port = cfg.bind_port;
-        // M8-T039：多地址多监听器。空列表 → 旧默认双栈逻辑
+        // 多地址多监听器。空列表 → 旧默认双栈逻辑
         // （bind_reuseaddr 失败回退 bind_reuseaddr_v4，语义零变化）。
         let listeners: Vec<TcpListener> = if cfg.bind_addrs.is_empty() {
             match bind_reuseaddr(port).await {
@@ -394,7 +394,7 @@ impl TunnelServer {
         };
         let rate_limit_cfg = cfg.rate_limit.clone();
         let tunnel_conn_rate_limit_cfg = cfg.tunnel_conn_rate_limit.clone();
-        // M8-T026-P2 (ID-SEC-001)：服务器签名密钥（加载或首次生成持久化）。
+        // (ID-SEC-001)：服务器签名密钥（加载或首次生成持久化）。
         let key_path = cfg
             .server_key_path
             .clone()
@@ -474,7 +474,7 @@ impl TunnelServer {
                 }
             }
         });
-        // M8-T039：每 listener 一个 accept 任务（共享 Arc<Shared>），
+        // 每 listener 一个 accept 任务（共享 Arc<Shared>），
         // 循环体逐字保留原单循环（shutting_down 检查 + handle_incoming 分发）。
         // 优雅关闭：shutdown 广播 → 各 accept 任务检查到标志后退出。
         //
@@ -563,7 +563,7 @@ fn canonical_peer_addr(addr: SocketAddr) -> SocketAddr {
     }
 }
 
-/// 登录请求信息（含 M8-T026-P3 挑战-响应字段，TNL-PROTO-011）。
+/// 登录请求信息（含 挑战-响应字段，TNL-PROTO-011）。
 struct LoginInfo {
     token: String,
     version: String,
@@ -575,7 +575,7 @@ struct LoginInfo {
 }
 
 /// 处理一条新连接：读首帧 → Login（新会话）/ WorkConnHeader（数据面）/
-/// M8-T026-P2 扩展首帧（TunnelConn 控制器数据面 / TunnelHeader 设备回连）。
+/// 扩展首帧（TunnelConn 控制器数据面 / TunnelHeader 设备回连）。
 async fn handle_incoming(
     shared: Arc<ServerShared>,
     mut stream: TcpStream,
@@ -625,7 +625,7 @@ async fn handle_incoming(
                 }
             };
             match msg {
-                // M8-T026-P2 (ID-001)：device_id / ed25519_pub 为设备注册字段。
+                // (ID-001)：device_id / ed25519_pub 为设备注册字段。
                 ControlMsg::Login {
                     token,
                     version,
@@ -661,7 +661,7 @@ async fn handle_incoming(
             };
             handle_work_arrival(shared, stream, addr, header).await
         }
-        // M8-T026-P2 (§8.1)：控制器数据连接（设备级中继请求）。
+        // (§8.1)：控制器数据连接（设备级中继请求）。
         TYPE_TUNNEL_CONN => {
             let req = match decode_extension::<TunnelConn>(ty, &payload, TYPE_TUNNEL_CONN) {
                 Ok(r) => r,
@@ -669,7 +669,7 @@ async fn handle_incoming(
             };
             handle_tunnel_conn(shared, stream, addr, req).await
         }
-        // M8-T026-P2 (§8.1)：设备回连（中继配对）。
+        // (§8.1)：设备回连（中继配对）。
         TYPE_TUNNEL_HEADER => {
             let header = match decode_extension::<TunnelHeader>(ty, &payload, TYPE_TUNNEL_HEADER) {
                 Ok(h) => h,
@@ -898,9 +898,9 @@ fn log_hostname(s: &str) -> String {
 /// 认证通过后的会话建立（速率复位 + 审计 + 会话对象 + 设备注册 +
 /// `LoginResp{ok:true}` + 控制循环）。
 ///
-/// M8-T026-P2 (ID-001/ID-004)：`device_id` 存在时登记在线表（同 ID 不同公钥
+/// (ID-001/ID-004)：`device_id` 存在时登记在线表（同 ID 不同公钥
 /// → 后到者拒绝 + LoginResp{ok:false}）。
-/// M8-T026-P3：`auth_receipt` 为双向认证回执（仅口令模式携带，TNL-SEC-007）。
+/// `auth_receipt` 为双向认证回执（仅口令模式携带，TNL-SEC-007）。
 async fn start_session(
     shared: Arc<ServerShared>,
     stream: TcpStream,
@@ -1119,7 +1119,7 @@ async fn run_session(shared: Arc<ServerShared>, session: Arc<ClientSession>, mut
                             break;
                         }
                     },
-                    // M8-T026-P2 (ID-010)：设备解析（限速 + 在线表 + 签名响应）。
+                    // (ID-010)：设备解析（限速 + 在线表 + 签名响应）。
                     TYPE_RESOLVE_DEVICE => {
                         match decode_extension::<ResolveDevice>(ty, &payload, TYPE_RESOLVE_DEVICE) {
                             Ok(req) => handle_resolve(shared.clone(), session.clone(), &req).await,
@@ -1129,7 +1129,7 @@ async fn run_session(shared: Arc<ServerShared>, session: Arc<ClientSession>, mut
                             }
                         }
                     }
-                    // M8-T026-P2 (ID-005)：候选刷新（含服务器观察地址附加）。
+                    // (ID-005)：候选刷新（含服务器观察地址附加）。
                     // S-09（审计 F-9）：候选登记归属校验 —— 仅允许会话为其
                     // 自身注册的 device_id 提交候选（`reg.device_id ==
                     // session.device_id`）；会话未注册设备（None）或跨设备
@@ -1243,7 +1243,7 @@ async fn run_session(shared: Arc<ServerShared>, session: Arc<ClientSession>, mut
             }
             _ = heartbeat.tick() => {
                 let idle = session.last_activity.lock().unwrap().elapsed();
-                // M8-T026-P2 (ID-003)：控制连接心跳同时刷新在线表 last_seen。
+                // (ID-003)：控制连接心跳同时刷新在线表 last_seen。
                 let device_id = session.device_id.lock().unwrap().clone();
                 if let Some(did) = device_id {
                     shared.registry.heartbeat(&did).await;
@@ -1431,7 +1431,7 @@ async fn handle_deprecated_directory_frame(
     );
 }
 
-/// M8-T026-P2 (ID-010 / ID-SEC-002)：设备解析 —— 限速 + 在线表查询 +
+/// (ID-010 / ID-SEC-002)：设备解析 —— 限速 + 在线表查询 +
 /// 签名响应（未知/离线/限速统一响应，不泄露设备存在性）。
 async fn handle_resolve(
     shared: Arc<ServerShared>,
@@ -1463,7 +1463,7 @@ async fn handle_resolve(
     let _ = session.control_tx.send(frame);
 }
 
-/// M8-T026-P2 (§8.1)：控制器数据连接 —— 登记 pending + 牵线目标设备 +
+/// (§8.1)：控制器数据连接 —— 登记 pending + 牵线目标设备 +
 /// 等待配对（超时 `work_conn_timeout`）→ `TunnelResp` → 双向泵流。
 ///
 /// S-03（审计 F-6）：未认证放大攻击防护 —— ① 按源 IP 未认证限速（独立于
@@ -1619,7 +1619,7 @@ async fn handle_tunnel_conn(
     Ok(())
 }
 
-/// M8-T026-P2 (§8.1)：设备回连到达 —— 按 conn_id 精确配对（未知/重复 → 关闭）。
+/// (§8.1)：设备回连到达 —— 按 conn_id 精确配对（未知/重复 → 关闭）。
 async fn handle_tunnel_arrival(
     shared: Arc<ServerShared>,
     stream: TcpStream,
@@ -1740,7 +1740,7 @@ async fn register_proxy(
     .map(|f| session.control_tx.send(f));
 }
 
-/// `[::]` 优先 + `0.0.0.0` 回退（对齐 M8-T025 双栈）。
+/// `[::]` 优先 + `0.0.0.0` 回退（对齐 双栈）。
 async fn bind_proxy_listener(
     port_range: Option<(u16, u16)>,
     remote_port: u16,
@@ -1783,7 +1783,7 @@ async fn bind_reuseaddr_addr(addr: SocketAddr) -> Result<TcpListener, std::io::E
     socket.listen(1024)
 }
 
-/// M8-T039：绑定**显式地址**（SO_REUSEADDR）；`only_v6: true` 时 IPv6 socket
+/// 绑定**显式地址**（SO_REUSEADDR）；`only_v6: true` 时 IPv6 socket
 /// 一律 `set_only_v6(true)`（与 v4 显式监听并存，规避平台双栈差异与
 /// EADDRINUSE 冲突）；v4 地址走 [`bind_reuseaddr_addr`] 既有路径。
 async fn bind_reuseaddr_addr_opt(
@@ -1791,7 +1791,7 @@ async fn bind_reuseaddr_addr_opt(
     only_v6: bool,
 ) -> Result<TcpListener, std::io::Error> {
     if addr.is_ipv6() && only_v6 {
-        // M8-T025 同款做法（tokio TcpSocket 未暴露 set_only_v6 setter）：
+        // 同款做法（tokio TcpSocket 未暴露 set_only_v6 setter）：
         // socket2 显式 IPV6_V6ONLY=true —— v6-only 监听只收 IPv6。
         use socket2::{Domain, Protocol, Socket, Type};
         let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
@@ -1811,7 +1811,7 @@ async fn bind_reuseaddr(port: u16) -> Result<TcpListener, std::io::Error> {
     use socket2::{Domain, Protocol, Socket, Type};
     use std::net::{Ipv6Addr, SocketAddrV6};
     let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
-    // M8-T025（Windows 打包验收）：显式 IPV6_V6ONLY=false —— Windows 上裸
+    // Windows 打包验收：显式 IPV6_V6ONLY=false —— Windows 上裸
     // AF_INET6 socket 默认 v6-only，`[::]` 监听会拒绝 IPv4 客户端连接；
     // Linux 默认双栈，此设置使各平台行为一致（tokio TcpSocket 未暴露该
     // setter，用 socket2，对齐 media/quic.rs 同款做法）。失败仅告警，回退
@@ -2049,10 +2049,10 @@ async fn handle_work_arrival(
 
 /// 无残留协程。控制连接关闭由 writer 任务随 `control_tx` drop 自然完成。
 ///
-/// M8-T026-P2 (ID-003)：注册设备随控制连接断开立即离线（在线表移除 + 审计）。
+/// (ID-003)：注册设备随控制连接断开立即离线（在线表移除 + 审计）。
 async fn cleanup_session(shared: Arc<ServerShared>, session: Arc<ClientSession>) {
     shared.sessions.lock().unwrap().remove(&session.id);
-    // M8-T026-P2 (ID-003)：设备离线（控制连接断开即离线）。
+    // (ID-003)：设备离线（控制连接断开即离线）。
     let device_id = session.device_id.lock().unwrap().take();
     if let Some(did) = device_id {
         shared.registry.unregister(&did).await;

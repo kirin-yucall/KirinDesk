@@ -1,4 +1,4 @@
-//! M8-T009 端到端 loopback 集成测试（T013 Task 3.10 + P1F「端到端重组待实测」验证）。
+//! 端到端 loopback 集成测试（T013 Task 3.10 + P1F「端到端重组待实测」验证）。
 //!
 //! 真实 QUIC 连接（quinn UDP loopback [::1]）完整闭环：
 //!
@@ -184,7 +184,7 @@ async fn quic_loopback_end_to_end() {
             encoder,
             SessionConfig::default(),
             None, // P5：不启用降级（纯 QUIC 主路径回归）
-            None, // M8-T026-P1：不启用打洞升舱
+            None, // 不启用打洞升舱
             Arc::clone(&stop_server),
         )
         .await
@@ -221,7 +221,7 @@ async fn quic_loopback_end_to_end() {
             on_frame,
             SessionConfig::default(),
             None, // P5：不启用降级（纯 QUIC 主路径回归）
-            None, // M8-T026-P1：不启用打洞升舱
+            None, // 不启用打洞升舱
             stop_client,
         )
         .await

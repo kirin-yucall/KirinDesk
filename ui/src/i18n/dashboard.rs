@@ -1,9 +1,9 @@
-//! M8-T038 (P5): Dashboard 页键值表（zh 基线 + en 全量）。
-//! 本分区文件由 M8-T038_P5 独占认领。
+//! (P5): Dashboard 页键值表（zh 基线 + en 全量）。
+//! 本分区文件由 独占认领。
 //!
 //! zh 为基线语言包；en 全量翻译（不得留空串）。
 //! 动态文案模板使用 `{0}`/`{1}` 位置参数，zh/en 占位符一一对应。
-//! 公网检测提示为 M8-T037 用户要求逐字文案——zh 模板保持逐字不变。
+//! 公网检测提示为 用户要求逐字文案——zh 模板保持逐字不变。
 
 pub static TABLE: &[(&str, &str, &str)] = &[
     // ── 页面标题 / 身份卡 ──
@@ -20,7 +20,7 @@ pub static TABLE: &[(&str, &str, &str)] = &[
     ("dashboard.identity.ipv4", "IPv4：", "IPv4:"),
     ("dashboard.identity.domain", "域名：", "Domain:"),
     ("dashboard.identity.listen_port", "监听端口：", "Listen Port:"),
-    // M8-T037 逐字文案（zh 不改动）。
+    // 逐字文案（zh 不改动）。
     ("dashboard.identity.dot_public", "公网地址，可直连", "Public address — directly connectable"),
     // IPv4 私网/无公网 → 警告 + 引导；IPv6 仅链路本地/ULA/过渡隧道 → 警告；
     // 协议未启用/无地址 → 灰（不再标绿）。

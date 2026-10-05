@@ -247,7 +247,7 @@ pub struct ResolvedDomain {
 /// 1. SRV `_remote._tcp.{host}` → 端口（无 SRV → [`domain_err::NO_SRV`]）；
 /// 2. TXT `{host}` → DeviceMeta Ed25519 公钥（缺失/无 key → [`NO_TXT`]
 ///    ——CLI-DNS-006 缺失即拒）；
-/// 3. 地址解析收敛 `core::dns::resolve_for_connect` **唯一入口**（M8-T040
+/// 3. 地址解析收敛 `core::dns::resolve_for_connect` **唯一入口**（
 ///    红线；A/AAAA 并行、Auto 族 v6 优先；空列表 → [`NO_RECORDS`]）。
 ///
 /// 与桌面 Connect 页域名路径（ui/src/lib.rs 10542 起）的差异：桌面经
@@ -1235,7 +1235,7 @@ async fn connect_peer_with_width(
     } else {
         opts.client_domain.clone()
     };
-    // M8-T040（红线，与 core 同源）：peer.addr 必须是 IP 字面量——先解析为
+    // 红线，与 core 同源：peer.addr 必须是 IP 字面量——先解析为
     // SocketAddr 再直连，禁止字符串形态直连（触发系统明文 DNS）。
     let addr: std::net::SocketAddr = peer.addr.parse().map_err(|_| {
         ConnectError::Tcp(std::io::Error::new(
@@ -2393,11 +2393,11 @@ mod tests {
         assert_eq!(humanize_reject_text("early eof"), "early eof");
     }
 
-    /// ID 模式握手段对当前桌面 HEAD（协议 v4 + CX-1 挑战轮）的互通回归：
+    /// ID 模式握手段对当前桌面 HEAD（协议 v4 + 挑战轮）的互通回归：
     /// 与 [`connect_and_run_id`] 握手调用同构的字段口径（client_id = 本机
     /// 完整设备 ID、Exact pin、挑战码经共享 client 握手内 HMAC 应答）打
     /// 真实 loopback——服务端用 core v4 入口
-    /// `server_handshake_verified_with_nickname_generic`（内含 CX-1 挑战轮，
+    /// `server_handshake_verified_with_nickname_generic`（内含挑战轮，
     /// 绑定 = 注册设备 ID）。双端任一失败即 fail。
     #[tokio::test]
     async fn r206_id_mode_handshake_loopback_head() {
@@ -2420,7 +2420,7 @@ mod tests {
                 bind_id,
                 "", // 无客户端 pin 预置
                 None, // ID 模式（空域名客户端）：无昵称门
-                Some(&chall), // 挑战码凭据 → CX-1 挑战轮
+                Some(&chall), // 挑战码凭据 → 挑战轮
             )
             .await
         });
@@ -2448,13 +2448,13 @@ mod tests {
         assert_eq!(channel.peer_id, bind_id, "服务端签名绑定名 = 注册设备 ID");
         assert!(
             srv.await.expect("srv task").is_ok(),
-            "服务端侧握手（含 CX-1 挑战轮校验）须同样成功"
+            "服务端侧握手（含挑战轮校验）须同样成功"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
 
     /// 域名模式解析产物直接喂 [`connect_peer_with_width`] 的前置不变量
-    /// （M8-T040 红线：`peer.addr` 必须是「IP 字面量:port」，禁止字符串
+    /// （红线：`peer.addr` 必须是「IP 字面量:port」，禁止字符串
     /// 解析路径）——v4 与 v6（方括号形态）两态解析输出都可零改直连。
     #[tokio::test]
     async fn r206_resolved_domain_addr_is_ip_literal_for_connect() {

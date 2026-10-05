@@ -16,7 +16,7 @@ const DEFAULT_INTERVAL_SECS: u64 = 30;
 /// API 调用（配额/滥用风险），配置值低于下限一律收敛到下限。
 const MIN_INTERVAL_SECS: u64 = 10;
 
-/// M8-T040 (WBS 4.2): IPv4 地址策略（DDNS 双模式，需求 §4.2）。
+/// (WBS 4.2): IPv4 地址策略（DDNS 双模式，需求 §4.2）。
 ///
 /// - `Auto`：**公网出口 IP**（经 [`PublicIpFetcher`] 多源 HTTPS 获取，
 ///   非本机网卡地址——本需求核心语义修正，DDNS-IPV4-002/003）；
@@ -30,7 +30,7 @@ pub enum Ipv4Policy {
     Manual(Ipv4Addr),
 }
 
-/// M8-T040 (WBS 4.2): IPv6 地址策略（需求 §4.3）。
+/// (WBS 4.2): IPv6 地址策略（需求 §4.3）。
 ///
 /// - `Auto`：本机全局单播 IPv6（无端口转发需求，DDNS-IPV6-002）；
 /// - `Manual`：固定地址（上游固定前缀/转发场景），永不覆盖（DDNS-IPV6-003）。
@@ -51,7 +51,7 @@ pub enum Ipv6Policy {
 /// M9-DNS000：多服务商化——持 `Arc<dyn Provider>`（可跨任务共享），
 /// 不感知厂商差异。
 ///
-/// M8-T040：策略化——`with_policies(ipv4, ipv6)` 注入双模式策略；策略为
+/// 策略化——`with_policies(ipv4, ipv6)` 注入双模式策略；策略为
 /// `None` 时保持旧行为（IPv4 = 本机网卡地址检测，CLI `heartbeat` 兼容面）。
 pub struct HeartbeatService {
     provider: Arc<dyn Provider>,
@@ -61,9 +61,9 @@ pub struct HeartbeatService {
     dns_ttl: u32,
     interval: Duration,
     shutdown_tx: watch::Sender<bool>,
-    /// M8-T040：IPv4 策略（None = 旧行为：本机网卡全局单播检测）。
+    /// IPv4 策略（None = 旧行为：本机网卡全局单播检测）。
     ipv4_policy: Option<Ipv4Policy>,
-    /// M8-T040：IPv6 策略（None = 旧行为：本机网卡全局单播检测）。
+    /// IPv6 策略（None = 旧行为：本机网卡全局单播检测）。
     ipv6_policy: Option<Ipv6Policy>,
 }
 
@@ -95,7 +95,7 @@ impl HeartbeatService {
         }
     }
 
-    /// M8-T040 (WBS 4.2)：注入 IPv4/IPv6 双模式策略（`None` = 旧行为）。
+    /// (WBS 4.2)：注入 IPv4/IPv6 双模式策略（`None` = 旧行为）。
     /// `DdnsService` 以 `Some(Auto(fetcher))` / `Some(Manual(addr))` 装配；
     /// CLI `heartbeat` 不调用 → 保持本机网卡语义。
     pub fn with_policies(
@@ -124,7 +124,7 @@ impl HeartbeatService {
         // Initial registration
         self.register_all(public_key_base64).await;
 
-        // M8-T040：初始「上次值」按策略解析（Auto(v4) 经缓存复用 register_all 的取址）。
+        // 初始「上次值」按策略解析（Auto(v4) 经缓存复用 register_all 的取址）。
         let mut last_ipv6 = self.resolve_ipv6();
         let mut last_ipv4 = self.resolve_ipv4().await;
 
@@ -226,7 +226,7 @@ impl HeartbeatService {
                 warn!("No global IPv6 address detected");
             }
         } else {
-            // M8-T040：Manual 永不覆盖（DDNS-IPV6-003）——不写 AAAA。
+            // Manual 永不覆盖（DDNS-IPV6-003）——不写 AAAA。
             debug!("AAAA skipped: ipv6 mode = manual (never overwrite)");
         }
 
@@ -246,12 +246,12 @@ impl HeartbeatService {
                 warn!("No global IPv4 address detected");
             }
         } else {
-            // M8-T040：Manual 永不覆盖（DDNS-IPV4-004）——不写 A。
+            // Manual 永不覆盖（DDNS-IPV4-004）——不写 A。
             debug!("A skipped: ipv4 mode = manual (never overwrite)");
         }
     }
 
-    // ---- M8-T040 (WBS 4.2): 策略化地址解析 ----
+    // ---- (WBS 4.2): 策略化地址解析 ----
 
     fn ipv4_manual(&self) -> bool {
         matches!(self.ipv4_policy, Some(Ipv4Policy::Manual(_)))
@@ -366,7 +366,7 @@ impl HeartbeatService {
 }
 
 /// Detect a global unicast IPv6 address using OS interfaces.
-/// M8-T040：`pub(crate)` —— DdnsService（ddns.rs）复用同一取址语义（DDNS-IPV6-002）。
+/// `pub(crate)` —— DdnsService（ddns.rs）复用同一取址语义（DDNS-IPV6-002）。
 pub(crate) fn detect_global_ipv6() -> Option<Ipv6Addr> {
     let ifaces = get_if_addrs::get_if_addrs().ok()?;
     for iface in &ifaces {
@@ -610,7 +610,7 @@ mod tests {
         assert_eq!(provider.delete_count(), delete_before + 4);
     }
 
-    // ═══════════ M8-T040 (WBS 4.2): 策略化测试 ═══════════
+    // ═══════════ (WBS 4.2): 策略化测试 ═══════════
 
     /// 构造固定值 mock 公网 IP 源（Auto 策略注入用）。
     fn fixed_ip_source(ip: &'static str) -> Arc<PublicIpFetcher> {
@@ -627,7 +627,7 @@ mod tests {
         Arc::new(PublicIpFetcher::from_sources(vec![Box::new(Fixed(ip))]))
     }
 
-    /// M8-T040：Auto(v4) 策略 → 取址走公网 IP 源（而非本机网卡）。
+    /// Auto(v4) 策略 → 取址走公网 IP 源（而非本机网卡）。
     #[tokio::test]
     async fn test_ipv4_auto_policy_uses_public_fetcher() {
         let fetcher = fixed_ip_source("203.0.113.55");
@@ -650,7 +650,7 @@ mod tests {
         );
     }
 
-    /// M8-T040：Manual 策略 → register_all 不写 A/AAAA（永不覆盖，DDNS-IPV4-004）。
+    /// Manual 策略 → register_all 不写 A/AAAA（永不覆盖，DDNS-IPV4-004）。
     #[tokio::test]
     async fn test_ipv4_manual_policy_never_writes_a() {
         let provider = Arc::new(MockProvider::new("mock"));
@@ -678,7 +678,7 @@ mod tests {
             .is_empty());
     }
 
-    /// M8-T040：Manual 值不随周期变化 → tick 不产生 A 写操作。
+    /// Manual 值不随周期变化 → tick 不产生 A 写操作。
     #[tokio::test]
     async fn test_ipv4_manual_tick_no_write() {
         let provider = Arc::new(MockProvider::new("mock"));
@@ -695,7 +695,7 @@ mod tests {
         assert!(a_records(&provider).is_empty());
     }
 
-    /// M8-T040：resolve_ipv6 按策略返回（Manual 固定值 / Auto=本机检测）。
+    /// resolve_ipv6 按策略返回（Manual 固定值 / Auto=本机检测）。
     #[test]
     fn test_ipv6_policy_resolution() {
         let hb = HeartbeatService::new(
@@ -721,7 +721,7 @@ mod tests {
         assert!(!hb2.ipv6_manual());
     }
 
-    /// M8-T040：Auto 取址失败 → None（保留上次成功值语义由调用方维护）。
+    /// Auto 取址失败 → None（保留上次成功值语义由调用方维护）。
     #[tokio::test]
     async fn test_ipv4_auto_fetch_failure_returns_none() {
         use crate::public_ip::{PubIpError, PubIpSource};

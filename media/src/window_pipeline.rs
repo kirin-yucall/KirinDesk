@@ -9,10 +9,10 @@
 //!
 //! # M13 优化
 //!
-//! - **M13-T002 可变帧率**：`FpsGovernor` 按内容活动度（相邻帧 tile 采样
+//! - ** 可变帧率**：`FpsGovernor` 按内容活动度（相邻帧 tile 采样
 //!   运动 30fps）。静态场景下窗口在编码前被门控跳过（返回空窗口，不触碰
 //!   编码器），带宽与 CPU 消耗随内容自动收敛。
-//! - **M13-T004 零拷贝**：无 padding 时直接引用 `RawFrame` 的 `Arc` 缓冲
+//! - ** 零拷贝**：无 padding 时直接引用 `RawFrame` 的 `Arc` 缓冲
 //!   （原实现每帧 `to_vec()` 全量拷贝 RGBA，1080p 单帧 8MB）；跳帧选择
 //!   改为索引引用，不再 clone。
 
@@ -41,7 +41,7 @@ pub struct WindowPipeline {
     window_id: u64,
     /// 上一帧时间
     last_frame_time: Option<SystemTime>,
-    /// M13-T002 可变帧率控制器（内容活动度 → 目标帧率档位 + 频率门控）
+    /// 可变帧率控制器（内容活动度 → 目标帧率档位 + 频率门控）
     fps_governor: FpsGovernor,
     /// 上一帧像素缓冲（Arc 零拷贝引用，用于静帧/运动检测）
     prev_frame: Option<(Arc<Vec<u8>>, u32, u32)>,
@@ -107,7 +107,7 @@ impl WindowPipeline {
         self.low_latency
     }
 
-    /// 设置可变帧率控制器配置（M13-T002；默认档位 1/10/30fps 已可用，
+    /// 设置可变帧率控制器配置（默认档位 1/10/30fps 已可用，
     /// 需要自定义阈值时调用本方法）。
     pub fn set_fps_governor_config(&mut self, cfg: FpsGovernorConfig) {
         self.fps_governor = FpsGovernor::with_config(cfg);
@@ -122,12 +122,12 @@ impl WindowPipeline {
         self.fps_governor.set_floor(fps);
     }
 
-    /// 当前目标帧率（M13-T002，诊断/日志）。
+    /// 当前目标帧率（诊断/日志）。
     pub fn target_fps(&self) -> f64 {
         self.fps_governor.target_fps()
     }
 
-    /// 当前内容活动度（0.0~1.0，M13-T002，诊断/日志）。
+    /// 当前内容活动度（0.0~1.0，诊断/日志）。
     pub fn activity(&self) -> f64 {
         self.fps_governor.activity()
     }
@@ -135,10 +135,10 @@ impl WindowPipeline {
     /// 推入一帧捕获数据。
     ///
     /// 返回 `Some(EncodedWindow)` 当当前窗口关闭（到期/满额/超时/分辨率变化）。
-    /// M13-T002：窗口到期但频率门控不放行（静态场景降频）时返回 `Ok(None)`，
+    /// 窗口到期但频率门控不放行（静态场景降频）时返回 `Ok(None)`，
     /// 窗口保持打开继续收集最新帧，恢复编码时内容仍最新。
     pub fn push_frame(&mut self, frame: RawFrame) -> Result<Option<EncodedWindow>, String> {
-        // M13-T002 静帧/运动检测：与上一帧做 tile 采样比较（零拷贝，
+        // 静帧/运动检测：与上一帧做 tile 采样比较（零拷贝，
         // 仅 ~10KB 读取；分辨率变化 / 首帧视为大动）。
         let tile_act = match &self.prev_frame {
             Some((prev, pw, ph)) if *pw == frame.width && *ph == frame.height => {
@@ -239,7 +239,7 @@ impl WindowPipeline {
             || idle_expired;
 
         if should_close {
-            // M13-T002 频率门控：静态降频时跳过本窗口编码（返回 None，
+            // 频率门控：静态降频时跳过本窗口编码（返回 None，
             // 窗口保持打开）。flush_window 显式请求不经门控。
             if self.fps_governor.should_encode(Instant::now()) {
                 // `encode_current_window` 编码完成后的 mark——旧口径把编码器
@@ -401,7 +401,7 @@ impl WindowPipeline {
         let aligned_w = align(base_w).max(64);
         let aligned_h = align(base_h).max(64);
 
-        // 准备帧数据（pad 到对齐尺寸）—— M13-T004 零拷贝：
+        // 准备帧数据（pad 到对齐尺寸）—— 零拷贝：
         // 无需 pad 时直接借用 RawFrame 的 Arc 缓冲（原实现每帧 to_vec()
         // 全量拷贝，1080p 单帧 8MB）；pad 仅在确实需要时分配。
         let need_pad = base_w != aligned_w || base_h != aligned_h;
@@ -422,7 +422,7 @@ impl WindowPipeline {
         };
 
         // 应用跳帧策略（复用 adaptive::select_frames 保持算法一致）。
-        // 保留的是帧视图的**索引**而非 clone 出的像素（M13-T004）。
+        // 保留的是帧视图的**索引**而非 clone 出的像素。
         let kept: Vec<usize> = if self.encode_config.frame_ratio < 1.0 {
             let indices =
                 crate::adaptive::select_frames(views.len(), self.encode_config.frame_ratio);
@@ -806,7 +806,7 @@ mod tests {
     }
 
     // ════════════════════════════════════════════════════════════
-    // M8-T011 T2.7 测试：窗口到期 / IDR / P 帧 / 跳帧 / 对齐 / 配置更新
+    // T2.7 测试：窗口到期 / IDR / P 帧 / 跳帧 / 对齐 / 配置更新
     // ════════════════════════════════════════════════════════════
 
     /// 解析 Annex B 字节流中的所有 NAL type（跳过 00 00 01 / 00 00 00 01 起始码）。
@@ -1032,7 +1032,7 @@ mod tests {
 
     /// 窗口 ID 单调连续递增（跨多个窗口）。
     ///
-    /// M13-T002 注：快速连续推送（<33ms）可能被频率门控节流（push_frame
+    /// 注：快速连续推送（<33ms）可能被频率门控节流（push_frame
     /// 返回 None、窗口保持打开）——显式 `flush_window` 请求不经门控，
     /// 保证窗口 ID 按序推进。
     #[test]
@@ -1124,7 +1124,7 @@ mod tests {
     }
 
     // ════════════════════════════════════════════════════════════
-    // M8-T011 T2.6 测试：编码超时保护
+    // T2.6 测试：编码超时保护
     // ════════════════════════════════════════════════════════════
 
     /// 慢编码器（超时保护测试注入）：每帧固定 sleep，产出 1 个假包。
@@ -1248,7 +1248,7 @@ mod tests {
     }
 
     // ════════════════════════════════════════════════════════════
-    // M13-T002 测试：可变帧率（静帧降频门控 + 运动恢复）
+    // 测试：可变帧率（静帧降频门控 + 运动恢复）
     // ════════════════════════════════════════════════════════════
 
     /// 静帧场景：首窗口编码后，后续相同内容窗口被频率门控节流
